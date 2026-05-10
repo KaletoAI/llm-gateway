@@ -1,0 +1,27 @@
+# LLM Gateway Config
+# Port des Gateways
+port: 4000
+
+# Optionaler API Key (leer lassen = kein Auth)
+api_key: "sk-lokal-geheim"
+
+# Wie oft Backends auf Verfügbarkeit geprüft werden (Sekunden)
+health_check_interval: 30
+
+# Backends in Prioritätsreihenfolge (1 = bevorzugt)
+backends:
+  - name: evo-x2
+    url: http://192.168.8.XXX:8080   # llama-swap EVO X2
+    priority: 1
+
+  - name: ubuntu-gpu
+    url: http://192.168.8.XXX:8080   # llama-swap ubuntu-gpu
+    priority: 2
+
+# Pseudo-Modelle: Alias → echtes Modell
+# Einfach austauschen ohne Clients anzupassen
+virtual_models:
+  "translator":  "Aya-Expanse-8B"
+  "vision":      "Qwen3-VL-8B-Abliterated-Caption"
+  "fast":        "Qwen3.5-9B-heretic"
+  "caption":     "llama-joycaption-beta-one"
