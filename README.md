@@ -21,6 +21,7 @@ backends:
   - name: ubuntu-gpu
     url: http://192.168.8.XXX:8080
     priority: 2
+    # enabled: false   # temporär stilllegen (kein health-check, kein routing); restart erforderlich
 
 virtual_models:
   "translator": "Aya-Expanse-8B"          # gleiches Modell auf allen Backends

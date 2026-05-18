@@ -29,6 +29,14 @@ backend_healthy: dict[str, bool] = {}       # name → bool
 
 # ── Health / Discovery ────────────────────────────────────────────────────────
 
+def is_enabled(backend: dict) -> bool:
+    return backend.get("enabled", True)
+
+
+def enabled_backends() -> list[dict]:
+    return [b for b in backends if is_enabled(b)]
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     name, url = backend["name"], backend["url"]
     try:
@@ -49,16 +57,19 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
 async def health_loop() -> None:
     async with httpx.AsyncClient() as client:
         while True:
-            for backend in backends:
+            for backend in enabled_backends():
                 await refresh_backend(backend, client)
             await asyncio.sleep(health_check_interval)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting LLM Gateway — discovering backends...")
+    enabled = enabled_backends()
+    disabled = [b["name"] for b in backends if not is_enabled(b)]
+    logger.info(f"Starting LLM Gateway — discovering {len(enabled)} enabled backend(s)"
+                + (f"; disabled: {disabled}" if disabled else ""))
     async with httpx.AsyncClient() as client:
-        await asyncio.gather(*[refresh_backend(b, client) for b in backends])
+        await asyncio.gather(*[refresh_backend(b, client) for b in enabled])
     task = asyncio.create_task(health_loop())
     yield
     task.cancel()
@@ -99,7 +110,7 @@ def resolve_for_backend(alias: str, backend_name: str) -> Optional[str]:
 def get_routes_for(alias: str) -> list[tuple[dict, str]]:
     """(backend, real_model) pairs to try, in priority order."""
     routes = []
-    for b in backends:
+    for b in enabled_backends():
         if not backend_healthy.get(b["name"]):
             continue
         real = resolve_for_backend(alias, b["name"])
@@ -160,7 +171,7 @@ async def list_models(authorization: Optional[str] = Header(None)):
     seen: set[str] = set()
     data = []
 
-    for backend in backends:
+    for backend in enabled_backends():
         for mid in sorted(backend_models.get(backend["name"], set())):
             if mid not in seen:
                 seen.add(mid)
@@ -190,9 +201,10 @@ async def health():
         "status": "ok",
         "backends": {
             b["name"]: {
-                "healthy": backend_healthy.get(b["name"], False),
+                "enabled": is_enabled(b),
+                "healthy": is_enabled(b) and backend_healthy.get(b["name"], False),
                 "priority": b["priority"],
-                "models": sorted(backend_models.get(b["name"], set())),
+                "models": sorted(backend_models.get(b["name"], set())) if is_enabled(b) else [],
             }
             for b in backends
         },
