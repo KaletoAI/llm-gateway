@@ -10,6 +10,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 echo "==> Syncing files to ${HOST}:${DEST}"
 rsync -az --delete --human-readable --info=stats1,progress2 \
     --exclude='.git/' \
+    --exclude='.claude/' \
     --exclude='__pycache__/' \
     --exclude='*.pyc' \
     --exclude='.venv/' \
