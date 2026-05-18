@@ -27,24 +27,33 @@ virtual_models:
   "fast":       "Qwen3.5-9B-heretic"
 ```
 
-## Deploy (LXC)
+## Erst-Setup (LXC)
+
+Einmalig auf dem Prod-Host (`192.168.8.10`):
 
 ```bash
-# Auf dem LXC
-apt install -y python3-venv
-
+apt install -y python3-venv rsync
 mkdir -p /opt/llm-gateway
-cp -r . /opt/llm-gateway/
-cd /opt/llm-gateway
-
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-cp llm-gateway.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now llm-gateway
+# config.yaml manuell anlegen (wird vom deploy.sh nicht überschrieben)
 ```
+
+SSH-Key vom Dev-Rechner nach `root@192.168.8.10` deployen, dann einmal:
+
+```bash
+./deploy.sh
+```
+
+Beim ersten Lauf wird `venv` angelegt, Requirements installiert, Unit-File nach `/etc/systemd/system/` kopiert, enabled und gestartet.
+
+## Deploy (laufend)
+
+```bash
+./deploy.sh
+```
+
+Synct den Code (rsync + `--delete`), aktualisiert das `venv`, installiert das Unit-File neu falls geändert, und startet den Service neu. `config.yaml` und `.env` bleiben unangetastet.
+
+Anderer Host: `DEPLOY_HOST=root@10.0.0.5 ./deploy.sh`
 
 ## Endpoints
 
