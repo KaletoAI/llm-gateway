@@ -2,25 +2,55 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import httpx
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from watchfiles import awatch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-with open("config.yaml") as f:
-    config = yaml.safe_load(f)
+CONFIG_PATH = Path("config.yaml")
 
-backends: list[dict] = sorted(config["backends"], key=lambda b: b["priority"])
-virtual_models: dict[str, str] = config.get("virtual_models", {})
-health_check_interval: int = config.get("health_check_interval", 30)
-api_key: Optional[str] = config.get("api_key")
+def load_config() -> None:
+    """Read config.yaml and (re)bind module-level config values."""
+    global config, backends, virtual_models, health_check_interval, api_key
+    with open(CONFIG_PATH) as f:
+        config = yaml.safe_load(f)
+    backends = sorted(config["backends"], key=lambda b: b["priority"])
+    virtual_models = config.get("virtual_models", {})
+    health_check_interval = config.get("health_check_interval", 30)
+    api_key = config.get("api_key")
+
+
+def log_config_summary() -> None:
+    logger.info(f"Loaded {len(backends)} backend(s):")
+    for b in backends:
+        state = "ENABLED " if is_enabled(b) else "DISABLED"
+        logger.info(f"  [{state}] {b['name']:25} priority={b['priority']}  url={b['url']}")
+    logger.info(f"Loaded {len(virtual_models)} virtual alias(es):")
+    for alias, mapping in virtual_models.items():
+        if isinstance(mapping, dict):
+            for bname, real in mapping.items():
+                logger.info(f"  {alias:15} → [{bname}] {real}")
+        else:
+            logger.info(f"  {alias:15} → {mapping}  (all backends)")
+    logger.info(f"health_check_interval={health_check_interval}s  api_key={'set' if api_key else 'unset'}")
+
+
+# Initial load — populates module globals
+config: dict
+backends: list[dict]
+virtual_models: dict
+health_check_interval: int
+api_key: Optional[str]
+load_config()
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -62,17 +92,41 @@ async def health_loop() -> None:
             await asyncio.sleep(health_check_interval)
 
 
+def reload_config() -> None:
+    """Re-read config.yaml and apply. Keeps old config on parse error."""
+    old_names = {b["name"] for b in backends}
+    try:
+        load_config()
+    except Exception as e:
+        logger.error(f"Config reload FAILED, keeping previous config: {e}")
+        return
+    # Drop state for backends removed from config
+    new_names = {b["name"] for b in backends}
+    for stale in old_names - new_names:
+        backend_healthy.pop(stale, None)
+        backend_models.pop(stale, None)
+        logger.info(f"  removed backend [{stale}] — state cleared")
+    logger.info("Config reloaded.")
+    log_config_summary()
+
+
+async def watch_config_loop() -> None:
+    async for _ in awatch(CONFIG_PATH):
+        logger.info(f"Detected change in {CONFIG_PATH} — reloading")
+        reload_config()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    enabled = enabled_backends()
-    disabled = [b["name"] for b in backends if not is_enabled(b)]
-    logger.info(f"Starting LLM Gateway — discovering {len(enabled)} enabled backend(s)"
-                + (f"; disabled: {disabled}" if disabled else ""))
+    logger.info("Starting LLM Gateway")
+    log_config_summary()
     async with httpx.AsyncClient() as client:
-        await asyncio.gather(*[refresh_backend(b, client) for b in enabled])
-    task = asyncio.create_task(health_loop())
+        await asyncio.gather(*[refresh_backend(b, client) for b in enabled_backends()])
+    health_task = asyncio.create_task(health_loop())
+    watch_task = asyncio.create_task(watch_config_loop())
     yield
-    task.cancel()
+    health_task.cancel()
+    watch_task.cancel()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
