@@ -23,9 +23,14 @@ backends:
     priority: 2
 
 virtual_models:
-  "translator": "Aya-Expanse-8B"
-  "fast":       "Qwen3.5-9B-heretic"
+  "translator": "Aya-Expanse-8B"          # gleiches Modell auf allen Backends
+  "fast":                                  # pro Backend ein anderes
+    evo-x2:     "Qwen3.5-9B-heretic"
+    ubuntu-gpu: "gemma-3-9b-it"
 ```
+
+Beim Routing wird in Backend-Prioritaets-Reihenfolge geprueft, ob das Alias fuer dieses
+Backend gemappt ist und das Modell dort verfuegbar ist — erstes Match gewinnt, Rest ist Fallback.
 
 ## Erst-Setup (LXC)
 

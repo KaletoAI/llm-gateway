@@ -79,18 +79,35 @@ def check_auth(authorization: Optional[str]) -> None:
         raise HTTPException(401, "Invalid API key")
 
 
-def resolve_model(model: str) -> str:
-    """Resolve virtual alias → real model name."""
-    return virtual_models.get(model, model)
+def resolve_for_backend(alias: str, backend_name: str) -> Optional[str]:
+    """Real model name for this alias on this backend, or None if not mapped here.
+
+    - alias not in virtual_models → returns alias unchanged (pass-through)
+    - alias maps to string         → that string on every backend
+    - alias maps to dict           → looked up by backend name (may be absent)
+    """
+    mapping = virtual_models.get(alias)
+    if mapping is None:
+        return alias
+    if isinstance(mapping, str):
+        return mapping
+    if isinstance(mapping, dict):
+        return mapping.get(backend_name)
+    return None
 
 
-def get_backends_for_model(model: str) -> list[dict]:
-    """Healthy backends that serve this model, in priority order."""
-    return [
-        b for b in backends
-        if backend_healthy.get(b["name"])
-        and model in backend_models.get(b["name"], set())
-    ]
+def get_routes_for(alias: str) -> list[tuple[dict, str]]:
+    """(backend, real_model) pairs to try, in priority order."""
+    routes = []
+    for b in backends:
+        if not backend_healthy.get(b["name"]):
+            continue
+        real = resolve_for_backend(alias, b["name"])
+        if real is None:
+            continue
+        if real in backend_models.get(b["name"], set()):
+            routes.append((b, real))
+    return routes
 
 
 async def proxy(backend: dict, path: str, request: Request, body: dict):
@@ -116,18 +133,17 @@ async def proxy(backend: dict, path: str, request: Request, body: dict):
 async def route(path: str, request: Request, authorization: Optional[str]) -> JSONResponse | StreamingResponse:
     check_auth(authorization)
     body = await request.json()
+    alias = body.get("model", "")
 
-    real_model = resolve_model(body.get("model", ""))
-    body["model"] = real_model
-
-    candidates = get_backends_for_model(real_model)
+    candidates = get_routes_for(alias)
     if not candidates:
-        raise HTTPException(503, f"No healthy backend for model '{real_model}'")
+        raise HTTPException(503, f"No healthy backend for model '{alias}'")
 
     last_error: Exception = Exception("unknown")
-    for backend in candidates:
+    for backend, real_model in candidates:
+        body["model"] = real_model
         try:
-            logger.info(f"→ [{backend['name']}] {real_model}")
+            logger.info(f"→ [{backend['name']}] {alias} → {real_model}")
             return await proxy(backend, path, request, body)
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.warning(f"✗ [{backend['name']}] {e} — trying next")

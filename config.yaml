@@ -19,9 +19,14 @@ backends:
     priority: 2
 
 # Pseudo-Modelle: Alias → echtes Modell
-# Einfach austauschen ohne Clients anzupassen
+#   String  = gleiches Modell auf allen Backends
+#   Dict    = pro Backend ein anderes echtes Modell (Routing per backend-priority)
 virtual_models:
   "translator":  "Aya-Expanse-8B"
-  "vision":      "Qwen3-VL-8B-Abliterated-Caption"
-  "fast":        "Qwen3.5-9B-heretic"
   "caption":     "llama-joycaption-beta-one"
+  "vision":
+    evo-x2:      "Qwen3-VL-8B-Abliterated-Caption"
+    # ubuntu-gpu hat (noch) kein vision-Modell → wird übersprungen
+  "fast":
+    evo-x2:      "Qwen3.5-9B-heretic"
+    ubuntu-gpu:  "gemma-3-9b-it"
