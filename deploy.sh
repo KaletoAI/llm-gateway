@@ -17,6 +17,10 @@ rsync -az --delete --human-readable --info=stats1,progress2 \
     --exclude='venv/' \
     --exclude='.env' \
     --exclude='config.yaml' \
+    --exclude='config.yaml.bak*' \
+    --exclude='stats.db' \
+    --exclude='stats.db-wal' \
+    --exclude='stats.db-shm' \
     --exclude='deploy.sh' \
     ./ "${HOST}:${DEST}/"
 
