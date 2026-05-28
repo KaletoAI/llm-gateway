@@ -15,9 +15,14 @@ single OpenAI endpoint and the gateway handles the routing.
   add/remove backends in YAML without touching clients.
 - **Auto-discovery.** Each backend's `/v1/models` is polled; no manual model
   registry to maintain.
-- **Priority + failover.** Backend with `priority: 1` is preferred; the
-  gateway falls back to the next on connection errors or when a model
-  isn't available on the preferred backend.
+- **Strict priority routing across backends sharing the same alias.**
+  Unlike LiteLLM's `fallbacks` (which maps one *model name* to another
+  *model name* on failure), the gateway treats `priority` as a
+  first-class deployment ordering. One alias `fast` can route to a
+  local llama.cpp box first and a cloud provider as fallback — and
+  that ordering is exactly what runs, every time, with no routing-
+  strategy ceremony (rpm weights, latency routing, cooldowns) to
+  configure.
 - **Virtual models.** Aliases like `fast`, `vision`, `translator` map to
   different real model IDs per backend. Swap the underlying model without
   changing client code.
