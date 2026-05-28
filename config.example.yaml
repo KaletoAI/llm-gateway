@@ -10,6 +10,24 @@ api_key: "sk-change-me"
 # How often (seconds) each backend's /v1/models is polled for liveness + model discovery.
 health_check_interval: 30
 
+# Per-request log lines (→ attempt, ← result with backend + status + duration).
+# Set to false if you're using the stats DB and want a quieter log.
+log_per_call: true
+
+# Optional call-stats sink: SQLite DB + minimal HTML dashboard on a separate port.
+# Default disabled. When enabled, every call is recorded with backend, source,
+# alias, model, tokens, status, duration, and USD cost (for backends that
+# expose pricing in /v1/models — Together.ai does; local backends → 0).
+# Source defaults to the client IP and can be overridden per-call by sending
+# an `X-Source: my-workflow-name` header from the client.
+# Toggle takes effect on full restart; not picked up by hot-reload.
+stats:
+  enabled: false
+  port: 4001
+  bind: "0.0.0.0"
+  db_path: stats.db
+  retention_days: 0   # 0 = keep forever; otherwise prune older rows hourly
+
 # Backends, in priority order (1 = preferred).
 #   enabled: false  → fully out of rotation (no health-check, no routing)
 #   api_key         → sent as `Authorization: Bearer <key>` to this backend

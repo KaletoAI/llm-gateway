@@ -26,6 +26,10 @@ single OpenAI endpoint and the gateway handles the routing.
   DeepInfra, …) as just another backend with its own priority.
 - **Hot config reload.** `config.yaml` changes are picked up live; no
   restart needed.
+- **Optional call stats.** SQLite-backed per-call log + minimal HTML
+  dashboard on a separate port. Tracks backend, source, model, tokens,
+  duration, and USD cost (computed from each backend's published pricing
+  metadata where available). Off by default. Zero new dependencies.
 
 ## Quick start
 
@@ -97,6 +101,39 @@ Two optional boolean flags on a backend filter its model list at discovery time:
 | `serverless_only` | Keep only models with non-zero `pricing.input`/`pricing.output`. Designed for Together.ai, where dedicated-endpoint-only models have `0/0` pricing and would fail at request time. |
 
 Both default off. Most useful when bridging a cloud provider that returns a mixed catalog (chat + image + dedicated-only + …) and you only want chat-completions-routable models exposed.
+
+### Call stats + dashboard
+
+Opt-in SQLite call log + minimal HTML dashboard on a separate port (default
+4001). When enabled, every call is recorded with: timestamp, duration,
+backend, source, alias, real model, endpoint, HTTP status, input/output
+tokens, and USD cost.
+
+```yaml
+stats:
+  enabled: false        # default off
+  port: 4001
+  bind: "0.0.0.0"
+  db_path: stats.db
+  retention_days: 0     # 0 = unlimited; otherwise prune older rows hourly
+
+log_per_call: true      # set false when using stats to keep the log clean
+```
+
+- **Cost**: computed from each backend's pricing metadata. Together.ai's
+  `/v1/models` returns `pricing.input` / `pricing.output` per million tokens;
+  the gateway caches that at discovery time. Local backends (llama-swap,
+  llama.cpp, vLLM) don't expose pricing → cost = 0.
+- **Source**: defaults to the client IP. Override per-call by sending an
+  `X-Source: my-workflow-name` header to tag, e.g., individual N8N
+  workflows.
+- **Auth**: none. Bind to `127.0.0.1` and put behind a reverse proxy if
+  you need access control.
+- **Hot-reload**: stats `enabled` is read at startup only; toggling it
+  requires a full service restart.
+- **Streaming requests** are recorded but with `0` tokens (most backends
+  don't include `usage` in stream chunks). Use non-streaming if you want
+  accurate per-call cost.
 
 ### Per-backend `api_key`
 

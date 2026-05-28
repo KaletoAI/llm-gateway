@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+import uvicorn
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from watchfiles import awatch
+
+import stats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -22,12 +25,15 @@ CONFIG_PATH = Path("config.yaml")
 def load_config() -> None:
     """Read config.yaml and (re)bind module-level config values."""
     global config, backends, virtual_models, health_check_interval, api_key
+    global stats_cfg, log_per_call
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     backends = sorted(config["backends"], key=lambda b: b["priority"])
     virtual_models = config.get("virtual_models", {})
     health_check_interval = config.get("health_check_interval", 30)
     api_key = config.get("api_key")
+    stats_cfg = config.get("stats") or {}
+    log_per_call = config.get("log_per_call", True)
 
 
 def log_config_summary() -> None:
@@ -51,12 +57,15 @@ backends: list[dict]
 virtual_models: dict
 health_check_interval: int
 api_key: Optional[str]
+stats_cfg: dict
+log_per_call: bool
 load_config()
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-backend_models: dict[str, set[str]] = {}   # name → {model_id, ...}
-backend_healthy: dict[str, bool] = {}       # name → bool
+backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
+backend_healthy: dict[str, bool] = {}                          # name → bool
+backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
 
 # ── Health / Discovery ────────────────────────────────────────────────────────
 
@@ -71,6 +80,22 @@ def enabled_backends() -> list[dict]:
 def backend_auth_headers(backend: dict) -> dict:
     key = backend.get("api_key")
     return {"authorization": f"Bearer {key}"} if key else {}
+
+
+def extract_pricing(payload) -> dict[str, dict[str, float]]:
+    """Per-model pricing from a /v1/models response (only Together-style payloads
+    carry it; OpenAI/llama-swap return None → empty dict). Values are USD per
+    million tokens."""
+    data = payload["data"] if isinstance(payload, dict) else payload
+    out: dict[str, dict[str, float]] = {}
+    for m in data or []:
+        if "id" not in m:
+            continue
+        p = m.get("pricing") or {}
+        i, o = p.get("input") or 0, p.get("output") or 0
+        if i or o:
+            out[m["id"]] = {"input": float(i), "output": float(o)}
+    return out
 
 
 def extract_models(payload, backend: dict) -> set[str]:
@@ -99,16 +124,19 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     try:
         resp = await client.get(f"{url}/v1/models", headers=backend_auth_headers(backend), timeout=5.0)
         resp.raise_for_status()
-        models = extract_models(resp.json(), backend)
+        payload = resp.json()
+        models = extract_models(payload, backend)
         backend_models[name] = models
+        backend_pricing[name] = extract_pricing(payload)
         if not backend_healthy.get(name):
-            logger.info(f"[{name}] UP  — {len(models)} models: {sorted(models)}")
+            logger.info(f"[{name}] UP  — {len(models)} models, {len(backend_pricing[name])} priced")
         backend_healthy[name] = True
     except Exception as e:
         if backend_healthy.get(name, True):
             logger.warning(f"[{name}] DOWN — {e}")
         backend_healthy[name] = False
         backend_models[name] = set()
+        backend_pricing[name] = {}
 
 
 async def health_loop() -> None:
@@ -132,6 +160,7 @@ def reload_config() -> None:
     for stale in old_names - new_names:
         backend_healthy.pop(stale, None)
         backend_models.pop(stale, None)
+        backend_pricing.pop(stale, None)
         logger.info(f"  removed backend [{stale}] — state cleared")
     logger.info("Config reloaded.")
     log_config_summary()
@@ -151,9 +180,32 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*[refresh_backend(b, client) for b in enabled_backends()])
     health_task = asyncio.create_task(health_loop())
     watch_task = asyncio.create_task(watch_config_loop())
+
+    stats_server: Optional[uvicorn.Server] = None
+    stats_task: Optional[asyncio.Task] = None
+    prune_task: Optional[asyncio.Task] = None
+    if stats_cfg.get("enabled"):
+        stats.init(stats_cfg.get("db_path", "stats.db"))
+        scfg = uvicorn.Config(
+            stats.stats_app,
+            host=stats_cfg.get("bind", "0.0.0.0"),
+            port=stats_cfg.get("port", 4001),
+            log_level="warning",
+        )
+        stats_server = uvicorn.Server(scfg)
+        stats_task = asyncio.create_task(stats_server.serve())
+        logger.info(f"stats: dashboard on http://{scfg.host}:{scfg.port}/")
+        prune_task = asyncio.create_task(stats.prune_loop(stats_cfg.get("retention_days", 0)))
+
     yield
     health_task.cancel()
     watch_task.cancel()
+    if stats_server is not None:
+        stats_server.should_exit = True
+        if stats_task is not None:
+            await stats_task
+    if prune_task is not None:
+        prune_task.cancel()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -202,7 +254,19 @@ def get_routes_for(alias: str) -> list[tuple[dict, str]]:
     return routes
 
 
-async def proxy(backend: dict, path: str, request: Request, body: dict):
+def _source_of(request: Request) -> str:
+    return request.headers.get("x-source") or (request.client.host if request.client else "unknown")
+
+
+def _cost_usd(backend_name: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
+    """USD cost for a call from cached pricing (Together-style /v1/models). 0 if unknown."""
+    if not model_id:
+        return 0.0
+    p = backend_pricing.get(backend_name, {}).get(model_id, {})
+    return ((in_tok or 0) * p.get("input", 0.0) + (out_tok or 0) * p.get("output", 0.0)) / 1_000_000
+
+
+async def proxy(backend: dict, path: str, request: Request, body: dict, alias: str):
     url = f"{backend['url']}{path}"
     headers = {
         k: v for k, v in request.headers.items()
@@ -210,21 +274,48 @@ async def proxy(backend: dict, path: str, request: Request, body: dict):
     }
     headers.update(backend_auth_headers(backend))
     bname = backend["name"]
+    real_model = body.get("model")
+    source = _source_of(request)
     started = time.monotonic()
 
     if body.get("stream"):
         async def generate():
+            stream_status = 0
             async with httpx.AsyncClient() as client:
                 async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
-                    logger.info(f"← [{bname}] {path} HTTP {resp.status_code} (stream open, {(time.monotonic()-started):.2f}s)")
+                    stream_status = resp.status_code
+                    if log_per_call:
+                        logger.info(f"← [{bname}] {path} HTTP {stream_status} (stream open, {(time.monotonic()-started):.2f}s)")
                     async for chunk in resp.aiter_bytes():
                         yield chunk
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            asyncio.create_task(stats.record_call(
+                duration_ms=elapsed_ms, backend=bname, source=source,
+                alias=alias, model=real_model, endpoint=path,
+                status=stream_status, input_tokens=0, output_tokens=0, cost_usd=0.0,
+            ))
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=body, headers=headers, timeout=300.0)
-    logger.info(f"← [{bname}] {path} HTTP {resp.status_code} ({(time.monotonic()-started):.2f}s)")
-    return JSONResponse(resp.json(), status_code=resp.status_code)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if log_per_call:
+        logger.info(f"← [{bname}] {path} HTTP {resp.status_code} ({elapsed_ms} ms)")
+    try:
+        resp_json = resp.json()
+    except Exception:
+        resp_json = {}
+    usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
+    in_tok = int(usage.get("prompt_tokens") or 0)
+    out_tok = int(usage.get("completion_tokens") or 0)
+    asyncio.create_task(stats.record_call(
+        duration_ms=elapsed_ms, backend=bname, source=source,
+        alias=alias, model=real_model, endpoint=path,
+        status=resp.status_code,
+        input_tokens=in_tok, output_tokens=out_tok,
+        cost_usd=_cost_usd(bname, real_model, in_tok, out_tok),
+    ))
+    return JSONResponse(resp_json, status_code=resp.status_code)
 
 
 async def route(path: str, request: Request, authorization: Optional[str]) -> JSONResponse | StreamingResponse:
@@ -240,8 +331,9 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     for backend, real_model in candidates:
         body["model"] = real_model
         try:
-            logger.info(f"→ [{backend['name']}] {alias} → {real_model}")
-            return await proxy(backend, path, request, body)
+            if log_per_call:
+                logger.info(f"→ [{backend['name']}] {alias} → {real_model}")
+            return await proxy(backend, path, request, body, alias)
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.warning(f"✗ [{backend['name']}] {e} — trying next")
             last_error = e
@@ -463,26 +555,47 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     if not candidates:
         raise HTTPException(503, f"No healthy backend for model '{alias}'")
 
+    source = _source_of(request)
     last_error: Exception = Exception("unknown")
     for backend, real_model in candidates:
         chat_body["model"] = real_model
+        bname = backend["name"]
         url = f"{backend['url']}/v1/chat/completions"
         headers = {"content-type": "application/json"}
         headers.update(backend_auth_headers(backend))
         started = time.monotonic()
         try:
-            logger.info(f"→ [{backend['name']}] {alias} → {real_model}  (responses→chat)")
+            if log_per_call:
+                logger.info(f"→ [{bname}] {alias} → {real_model}  (responses→chat)")
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, json=chat_body, headers=headers, timeout=300.0)
-            elapsed = time.monotonic() - started
+            elapsed_ms = int((time.monotonic() - started) * 1000)
             if resp.status_code >= 400:
-                logger.warning(f"✗ [{backend['name']}] /v1/responses HTTP {resp.status_code} ({elapsed:.2f}s) — trying next")
+                if log_per_call:
+                    logger.warning(f"✗ [{bname}] /v1/responses HTTP {resp.status_code} ({elapsed_ms} ms) — trying next")
+                asyncio.create_task(stats.record_call(
+                    duration_ms=elapsed_ms, backend=bname, source=source,
+                    alias=alias, model=real_model, endpoint="/v1/responses",
+                    status=resp.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
+                ))
                 last_error = HTTPException(resp.status_code, resp.text[:500])
                 continue
-            logger.info(f"← [{backend['name']}] /v1/responses HTTP {resp.status_code} ({elapsed:.2f}s)")
-            return JSONResponse(chat_to_responses(resp.json()))
+            if log_per_call:
+                logger.info(f"← [{bname}] /v1/responses HTTP {resp.status_code} ({elapsed_ms} ms)")
+            chat_resp_json = resp.json()
+            usage = (chat_resp_json.get("usage") or {})
+            in_tok = int(usage.get("prompt_tokens") or 0)
+            out_tok = int(usage.get("completion_tokens") or 0)
+            asyncio.create_task(stats.record_call(
+                duration_ms=elapsed_ms, backend=bname, source=source,
+                alias=alias, model=real_model, endpoint="/v1/responses",
+                status=resp.status_code,
+                input_tokens=in_tok, output_tokens=out_tok,
+                cost_usd=_cost_usd(bname, real_model, in_tok, out_tok),
+            ))
+            return JSONResponse(chat_to_responses(chat_resp_json))
         except (httpx.ConnectError, httpx.TimeoutException) as e:
-            logger.warning(f"✗ [{backend['name']}] {e} — trying next")
+            logger.warning(f"✗ [{bname}] {e} — trying next")
             last_error = e
 
     if isinstance(last_error, HTTPException):
