@@ -62,6 +62,8 @@ backends:
     url: https://api.together.xyz
     priority: 99
     api_key: "tgp_v1_…"                 # injected as Bearer to this backend
+    chat_only: true                     # filter out image/video/embedding models
+    serverless_only: true               # filter out dedicated-endpoint-only models
 
 virtual_models:
   "translator":  "Aya-Expanse-8B"       # same model on every backend
@@ -84,6 +86,17 @@ takes the first one that:
 
 If that backend errors during the actual forward, the remaining matching
 backends are tried in order.
+
+### Per-backend model filters
+
+Two optional boolean flags on a backend filter its model list at discovery time:
+
+| Flag | Effect |
+|---|---|
+| `chat_only`       | Keep only models where `type == "chat"` (skips image/video/embedding/transcribe). Backends without a `type` field on their models (llama-swap, vLLM, …) are unaffected. |
+| `serverless_only` | Keep only models with non-zero `pricing.input`/`pricing.output`. Designed for Together.ai, where dedicated-endpoint-only models have `0/0` pricing and would fail at request time. |
+
+Both default off. Most useful when bridging a cloud provider that returns a mixed catalog (chat + image + dedicated-only + …) and you only want chat-completions-routable models exposed.
 
 ### Per-backend `api_key`
 

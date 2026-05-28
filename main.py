@@ -72,12 +72,33 @@ def backend_auth_headers(backend: dict) -> dict:
     return {"authorization": f"Bearer {key}"} if key else {}
 
 
+def extract_models(payload, backend: dict) -> set[str]:
+    """Return model IDs from a /v1/models response, applying per-backend filters.
+
+    Accepts both `{"data": [...]}` (OpenAI / llama-swap) and a bare `[...]`
+    (e.g. together.ai). Optional per-backend filters:
+      - chat_only:       keep only models with type=="chat" (skip image/video/embedding/…)
+      - serverless_only: keep only models with non-zero token pricing
+                         (excludes Together's dedicated-only endpoints)
+    Filters are skipped silently for backends that don't expose the relevant
+    metadata field — llama-swap etc. stay unaffected.
+    """
+    data = payload["data"] if isinstance(payload, dict) else payload
+    if backend.get("chat_only"):
+        data = [m for m in data if m.get("type", "chat") == "chat"]
+    if backend.get("serverless_only"):
+        data = [m for m in data
+                if (m.get("pricing") or {}).get("input", 0) > 0
+                or (m.get("pricing") or {}).get("output", 0) > 0]
+    return {m["id"] for m in data if "id" in m}
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     name, url = backend["name"], backend["url"]
     try:
         resp = await client.get(f"{url}/v1/models", headers=backend_auth_headers(backend), timeout=5.0)
         resp.raise_for_status()
-        models = {m["id"] for m in resp.json().get("data", [])}
+        models = extract_models(resp.json(), backend)
         backend_models[name] = models
         if not backend_healthy.get(name):
             logger.info(f"[{name}] UP  — {len(models)} models: {sorted(models)}")

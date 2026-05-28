@@ -28,6 +28,8 @@ backends:
   #   url: https://api.together.xyz
   #   priority: 99
   #   api_key: "tgp_v1_…"               # https://api.together.xyz/settings/api-keys
+  #   chat_only: true                   # skip image/video/embedding models
+  #   serverless_only: true             # skip dedicated-endpoint-only models
 
 # Virtual models — pseudo model names that map to real model IDs on backends.
 #   string  → same model on every backend
