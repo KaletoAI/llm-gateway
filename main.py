@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import yaml
@@ -208,17 +209,21 @@ async def proxy(backend: dict, path: str, request: Request, body: dict):
         if k.lower() not in ("host", "content-length", "authorization")
     }
     headers.update(backend_auth_headers(backend))
+    bname = backend["name"]
+    started = time.monotonic()
 
     if body.get("stream"):
         async def generate():
             async with httpx.AsyncClient() as client:
                 async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
+                    logger.info(f"← [{bname}] {path} HTTP {resp.status_code} (stream open, {(time.monotonic()-started):.2f}s)")
                     async for chunk in resp.aiter_bytes():
                         yield chunk
         return StreamingResponse(generate(), media_type="text/event-stream")
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=body, headers=headers, timeout=300.0)
+    logger.info(f"← [{bname}] {path} HTTP {resp.status_code} ({(time.monotonic()-started):.2f}s)")
     return JSONResponse(resp.json(), status_code=resp.status_code)
 
 
@@ -242,6 +247,164 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
             last_error = e
 
     raise HTTPException(503, f"All backends failed: {last_error}")
+
+
+# ── Responses API ↔ Chat Completions bridge ──────────────────────────────────
+# Translation layer that lets clients hitting OpenAI's newer /v1/responses
+# endpoint reach backends that only speak /v1/chat/completions (Together,
+# llama-swap, vLLM, etc.). Non-streaming only — stream=true is silently
+# downgraded to a non-streaming call; the response is returned in one shot.
+
+def _content_parts_to_text(content: Any) -> Any:
+    """Flatten a Responses-style content array to a chat-completions content value."""
+    if not isinstance(content, list):
+        return content
+    text_pieces: list[str] = []
+    image_parts: list[dict] = []
+    for part in content:
+        ptype = part.get("type")
+        if ptype in ("input_text", "output_text", "text"):
+            text_pieces.append(part.get("text", ""))
+        elif ptype == "input_image":
+            url = part.get("image_url") or part.get("url")
+            if url:
+                image_parts.append({"type": "image_url", "image_url": {"url": url}})
+    if not image_parts:
+        return "".join(text_pieces)
+    parts: list[dict] = []
+    if text_pieces:
+        parts.append({"type": "text", "text": "".join(text_pieces)})
+    parts.extend(image_parts)
+    return parts
+
+
+def responses_to_chat(body: dict) -> dict:
+    """Translate an OpenAI Responses API request body to Chat Completions."""
+    passthrough = {
+        "model", "temperature", "top_p", "stop", "seed", "user", "metadata",
+        "presence_penalty", "frequency_penalty", "logit_bias",
+        "parallel_tool_calls", "response_format",
+    }
+    chat: dict = {k: v for k, v in body.items() if k in passthrough}
+
+    if "max_output_tokens" in body:
+        chat["max_tokens"] = body["max_output_tokens"]
+    # stream: silently downgrade — translating SSE event streams isn't supported yet
+    chat["stream"] = False
+
+    # Tools: Responses uses flat {type, name, description, parameters};
+    #        Chat uses nested {type, function: {name, description, parameters}}.
+    if tools := body.get("tools"):
+        chat_tools = []
+        for t in tools:
+            if t.get("type") != "function":
+                continue  # skip built-in tools (web_search, code_interpreter, …)
+            fn = {k: t[k] for k in ("name", "description", "parameters", "strict") if k in t}
+            chat_tools.append({"type": "function", "function": fn})
+        if chat_tools:
+            chat["tools"] = chat_tools
+    if "tool_choice" in body:
+        chat["tool_choice"] = body["tool_choice"]
+
+    messages: list[dict] = []
+    if instructions := body.get("instructions"):
+        messages.append({"role": "system", "content": instructions})
+
+    inp = body.get("input")
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+    elif isinstance(inp, list):
+        for item in inp:
+            itype = item.get("type", "message")
+            if itype == "message":
+                role = item.get("role", "user")
+                if role == "developer":
+                    role = "system"
+                content = _content_parts_to_text(item.get("content", ""))
+                messages.append({"role": role, "content": content})
+            elif itype == "function_call":
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id") or item.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}"),
+                        },
+                    }],
+                })
+            elif itype == "function_call_output":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id"),
+                    "content": item.get("output", ""),
+                })
+    chat["messages"] = messages
+    return chat
+
+
+def chat_to_responses(chat_resp: dict) -> dict:
+    """Translate a Chat Completions response body to a Responses API body."""
+    choice = (chat_resp.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    finish = choice.get("finish_reason")
+
+    output: list[dict] = []
+
+    text_content = message.get("content")
+    if text_content:
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "role": message.get("role", "assistant"),
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text_content, "annotations": []}],
+        })
+
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        output.append({
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex[:24]}",
+            "call_id": tc.get("id"),
+            "name": fn.get("name", ""),
+            "arguments": fn.get("arguments", ""),
+            "status": "completed",
+        })
+
+    usage_in = chat_resp.get("usage") or {}
+    usage = {
+        "input_tokens": usage_in.get("prompt_tokens", 0),
+        "output_tokens": usage_in.get("completion_tokens", 0),
+        "total_tokens": usage_in.get("total_tokens", 0),
+    }
+
+    output_text = "".join(
+        p.get("text", "") for o in output if o.get("type") == "message"
+        for p in (o.get("content") or []) if p.get("type") == "output_text"
+    )
+
+    return {
+        "id": chat_resp.get("id") or f"resp_{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "created_at": chat_resp.get("created", int(time.time())),
+        "status": "completed",
+        "error": None,
+        "incomplete_details": None,
+        "model": chat_resp.get("model"),
+        "output": output,
+        "output_text": output_text,
+        "usage": usage,
+        "metadata": {},
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "_finish_reason": finish,
+    }
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -280,6 +443,51 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
     return await route("/v1/chat/completions", request, authorization)
+
+
+@app.post("/v1/responses")
+async def responses(request: Request, authorization: Optional[str] = Header(None)):
+    """OpenAI Responses API → Chat Completions bridge.
+
+    LangChain.js (N8N's AI Agent) calls this endpoint by default. Backends that
+    only speak Chat Completions still work — request and response are translated
+    transparently. Streaming is downgraded to non-streaming; SSE event-stream
+    translation isn't implemented.
+    """
+    check_auth(authorization)
+    raw_body = await request.json()
+    chat_body = responses_to_chat(raw_body)
+    alias = chat_body.get("model", "")
+
+    candidates = get_routes_for(alias)
+    if not candidates:
+        raise HTTPException(503, f"No healthy backend for model '{alias}'")
+
+    last_error: Exception = Exception("unknown")
+    for backend, real_model in candidates:
+        chat_body["model"] = real_model
+        url = f"{backend['url']}/v1/chat/completions"
+        headers = {"content-type": "application/json"}
+        headers.update(backend_auth_headers(backend))
+        started = time.monotonic()
+        try:
+            logger.info(f"→ [{backend['name']}] {alias} → {real_model}  (responses→chat)")
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, json=chat_body, headers=headers, timeout=300.0)
+            elapsed = time.monotonic() - started
+            if resp.status_code >= 400:
+                logger.warning(f"✗ [{backend['name']}] /v1/responses HTTP {resp.status_code} ({elapsed:.2f}s) — trying next")
+                last_error = HTTPException(resp.status_code, resp.text[:500])
+                continue
+            logger.info(f"← [{backend['name']}] /v1/responses HTTP {resp.status_code} ({elapsed:.2f}s)")
+            return JSONResponse(chat_to_responses(resp.json()))
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.warning(f"✗ [{backend['name']}] {e} — trying next")
+            last_error = e
+
+    if isinstance(last_error, HTTPException):
+        raise last_error
+    raise HTTPException(503, f"All backends failed: {last_error}")
 
 
 @app.post("/v1/completions")
