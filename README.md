@@ -121,7 +121,23 @@ The top-level `api_key` is the *client-facing* gateway auth. Clients send
 | `GET`  | `/v1/models/{id}` | Single-model lookup (some clients verify before calling) |
 | `POST` | `/v1/chat/completions` | OpenAI chat, routed by priority + failover; streaming supported |
 | `POST` | `/v1/completions` | OpenAI completions, same routing |
+| `POST` | `/v1/responses` | OpenAI Responses API, bridged to `/v1/chat/completions` on the backend (request + response translated transparently incl. tool-calls; non-streaming) |
 | `GET`  | `/health` | Per-backend health/model/priority snapshot + virtual_models dump |
+
+### Responses API bridge
+
+Clients using LangChain.js (N8N's AI Agent and similar) call `/v1/responses`
+by default. Most local backends (llama-swap / llama.cpp / vLLM) and even
+Together.ai only speak `/v1/chat/completions`. The gateway translates
+between the two transparently:
+
+- Request: `input` / `instructions` / `tools` / `function_call` items →
+  `messages` / system prompt / nested-tool schema / assistant `tool_calls` /
+  `tool` messages.
+- Response: `choices[0].message` → `output[type=message|function_call]`,
+  with `usage.prompt_tokens` etc. renamed to `input_tokens` / `output_tokens`.
+- `stream: true` is silently downgraded to a non-streaming call. SSE
+  event-stream translation isn't implemented yet.
 
 ## Try it
 
