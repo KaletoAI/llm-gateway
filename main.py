@@ -67,10 +67,15 @@ def enabled_backends() -> list[dict]:
     return [b for b in backends if is_enabled(b)]
 
 
+def backend_auth_headers(backend: dict) -> dict:
+    key = backend.get("api_key")
+    return {"authorization": f"Bearer {key}"} if key else {}
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     name, url = backend["name"], backend["url"]
     try:
-        resp = await client.get(f"{url}/v1/models", timeout=5.0)
+        resp = await client.get(f"{url}/v1/models", headers=backend_auth_headers(backend), timeout=5.0)
         resp.raise_for_status()
         models = {m["id"] for m in resp.json().get("data", [])}
         backend_models[name] = models
@@ -181,6 +186,7 @@ async def proxy(backend: dict, path: str, request: Request, body: dict):
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "authorization")
     }
+    headers.update(backend_auth_headers(backend))
 
     if body.get("stream"):
         async def generate():
@@ -237,6 +243,17 @@ async def list_models(authorization: Optional[str] = Header(None)):
             data.append({"id": alias, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway (virtual)"})
 
     return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
+    check_auth(authorization)
+    if model_id in virtual_models:
+        return {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway (virtual)"}
+    for backend in enabled_backends():
+        if model_id in backend_models.get(backend["name"], set()):
+            return {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway"}
+    raise HTTPException(404, f"Model '{model_id}' not found")
 
 
 @app.post("/v1/chat/completions")

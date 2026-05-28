@@ -10,6 +10,7 @@ health_check_interval: 30
 
 # Backends in Prioritätsreihenfolge (1 = bevorzugt)
 #   enabled: false  → komplett aus Rotation (kein health-check, kein routing)
+#   api_key         → wird als Authorization-Header an Backend gesendet (z.B. für together.ai)
 backends:
   - name: evo-x2
     url: http://192.168.8.XXX:8080   # llama-swap EVO X2
@@ -19,6 +20,11 @@ backends:
     url: http://192.168.8.XXX:8080   # llama-swap ubuntu-gpu
     priority: 2
     # enabled: false                 # auskommentieren um Backend temporär stillzulegen
+
+  # - name: together                  # Cloud-Fallback (OpenAI-kompatibel)
+  #   url: https://api.together.xyz
+  #   priority: 99
+  #   api_key: "tgp_v1_…"             # https://api.together.xyz/settings/api-keys
 
 # Pseudo-Modelle: Alias → echtes Modell
 #   String  = gleiches Modell auf allen Backends
@@ -32,3 +38,4 @@ virtual_models:
   "fast":
     evo-x2:      "Qwen3.5-9B-heretic"
     ubuntu-gpu:  "gemma-3-9b-it"
+    # together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
