@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="${DEPLOY_HOST:-root@192.168.8.10}"
+HOST="${DEPLOY_HOST:?Set DEPLOY_HOST=user@host (e.g. root@192.168.1.10)}"
 DEST="/opt/llm-gateway"
 SERVICE="llm-gateway"
 

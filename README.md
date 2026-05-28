@@ -1,87 +1,157 @@
-# LLM Gateway
+# llm-gateway
 
-Leichtgewichtiger OpenAI-kompatibler Proxy der mehrere llama-swap Instanzen zusammenfasst.
+A small OpenAI-compatible proxy that fans out across multiple local LLM
+backends (llama.cpp / llama-swap / vLLM / Ollama / …) and cloud APIs
+(together.ai, OpenAI, OpenRouter …), with auto-discovery, priority routing,
+virtual model aliases, and failover.
 
-## Features
+It sits between OpenAI-compatible clients (N8N AI Agent, LibreChat, Open
+WebUI, custom LangChain code, …) and a fleet of backends, so callers see a
+single OpenAI endpoint and the gateway handles the routing.
 
-- **Auto-Discovery** — fragt `/v1/models` von jedem Backend ab, kein manuelles Eintragen
-- **Priority Routing** — Backend mit `priority: 1` wird immer bevorzugt, Fallback auf `priority: 2` wenn down
-- **Virtual Models** — Pseudo-Modelle die auf echte Modelle zeigen, einfach austauschbar
-- **Health Checks** — Backends werden regelmäßig geprüft und automatisch aus dem Pool genommen
+## Why
 
-## Konfiguration
+- **One endpoint for many backends.** Point N8N / your tools at one URL;
+  add/remove backends in YAML without touching clients.
+- **Auto-discovery.** Each backend's `/v1/models` is polled; no manual model
+  registry to maintain.
+- **Priority + failover.** Backend with `priority: 1` is preferred; the
+  gateway falls back to the next on connection errors or when a model
+  isn't available on the preferred backend.
+- **Virtual models.** Aliases like `fast`, `vision`, `translator` map to
+  different real model IDs per backend. Swap the underlying model without
+  changing client code.
+- **Cloud-as-backend.** Per-backend `api_key` lets you wire in
+  OpenAI-compatible cloud providers (together.ai, OpenAI, OpenRouter,
+  DeepInfra, …) as just another backend with its own priority.
+- **Hot config reload.** `config.yaml` changes are picked up live; no
+  restart needed.
 
-`config.yaml` anpassen:
+## Quick start
+
+```bash
+git clone https://github.com/KaletoAI/llm-gateway.git
+cd llm-gateway
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+cp config.example.yaml config.yaml
+$EDITOR config.yaml                    # set backends + api_key
+venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000
+```
+
+Then point any OpenAI-compatible client at `http://<host>:4000/v1` using the
+`api_key` you set in `config.yaml`.
+
+## Configuration
+
+`config.example.yaml` is the documented template. Copy to `config.yaml`
+(which is gitignored) and edit. The file is hot-reloaded on save.
 
 ```yaml
+api_key: "sk-change-me"                # client-side gateway auth (optional)
+health_check_interval: 30
+
 backends:
-  - name: evo-x2
-    url: http://192.168.8.XXX:8080
+  - name: local-gpu
+    url: http://192.168.1.10:8080      # llama-swap / llama.cpp / vLLM / …
     priority: 1
-  - name: ubuntu-gpu
-    url: http://192.168.8.XXX:8080
+  - name: local-cpu
+    url: http://192.168.1.11:8080
     priority: 2
-    # enabled: false   # temporär stilllegen (kein health-check, kein routing); restart erforderlich
+    # enabled: false                    # take out of rotation
+  - name: together                      # cloud fallback
+    url: https://api.together.xyz
+    priority: 99
+    api_key: "tgp_v1_…"                 # injected as Bearer to this backend
 
 virtual_models:
-  "translator": "Aya-Expanse-8B"          # gleiches Modell auf allen Backends
-  "fast":                                  # pro Backend ein anderes
-    evo-x2:     "Qwen3.5-9B-heretic"
-    ubuntu-gpu: "gemma-3-9b-it"
+  "translator":  "Aya-Expanse-8B"       # same model on every backend
+  "fast":                                # per-backend mapping
+    local-gpu:   "Qwen3.5-9B"
+    local-cpu:   "gemma-3-9b-it"
+    together:    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
 ```
 
-Beim Routing wird in Backend-Prioritaets-Reihenfolge geprueft, ob das Alias fuer dieses
-Backend gemappt ist und das Modell dort verfuegbar ist — erstes Match gewinnt, Rest ist Fallback.
+### How routing picks a backend
 
-## Erst-Setup (LXC)
+For each incoming request, the gateway walks backends in priority order and
+takes the first one that:
 
-Einmalig auf dem Prod-Host (`192.168.8.10`):
+1. is enabled,
+2. is currently healthy (last poll of `/v1/models` succeeded),
+3. is mapped for this alias in `virtual_models` (or the model name is a
+   real model that backend exposes — direct, un-aliased requests work too),
+4. has the resolved real model in its model list.
 
-```bash
-apt install -y python3-venv rsync
-mkdir -p /opt/llm-gateway
-# config.yaml manuell anlegen (wird vom deploy.sh nicht überschrieben)
-```
+If that backend errors during the actual forward, the remaining matching
+backends are tried in order.
 
-SSH-Key vom Dev-Rechner nach `root@192.168.8.10` deployen, dann einmal:
+### Per-backend `api_key`
 
-```bash
-./deploy.sh
-```
+When a backend has `api_key`, the gateway sends `Authorization: Bearer
+<key>` on both the health-check poll and forwarded chat/completion
+requests. Anything OpenAI-compatible works — together.ai, OpenAI, OpenRouter,
+DeepInfra, Groq, Fireworks, and similar.
 
-Beim ersten Lauf wird `venv` angelegt, Requirements installiert, Unit-File nach `/etc/systemd/system/` kopiert, enabled und gestartet.
+This turns the gateway into a uniform OpenAI-style entrypoint for tools that
+otherwise can't talk to a given provider directly.
 
-## Deploy (laufend)
+### Client-side `api_key`
 
-```bash
-./deploy.sh
-```
-
-Synct den Code (rsync + `--delete`), aktualisiert das `venv`, installiert das Unit-File neu falls geändert, und startet den Service neu. `config.yaml` und `.env` bleiben unangetastet.
-
-Anderer Host: `DEPLOY_HOST=root@10.0.0.5 ./deploy.sh`
+The top-level `api_key` is the *client-facing* gateway auth. Clients send
+`Authorization: Bearer <that-key>`. Leave empty/unset to disable auth.
 
 ## Endpoints
 
-| Endpoint | Beschreibung |
-|---|---|
-| `GET /v1/models` | Alle Modelle aller gesunden Backends |
-| `POST /v1/chat/completions` | Chat, priority-routed |
-| `POST /v1/completions` | Completions, priority-routed |
-| `GET /health` | Status aller Backends + Modelle |
+| Method | Path | Description |
+|---|---|---|
+| `GET`  | `/v1/models` | All real models on healthy backends + virtual aliases |
+| `GET`  | `/v1/models/{id}` | Single-model lookup (some clients verify before calling) |
+| `POST` | `/v1/chat/completions` | OpenAI chat, routed by priority + failover; streaming supported |
+| `POST` | `/v1/completions` | OpenAI completions, same routing |
+| `GET`  | `/health` | Per-backend health/model/priority snapshot + virtual_models dump |
 
-## Testen
+## Try it
 
 ```bash
-# Welche Modelle sind verfügbar?
-curl http://lxc-ip:4000/v1/models -H "Authorization: Bearer sk-lokal-geheim"
+# List models
+curl http://localhost:4000/v1/models \
+  -H "Authorization: Bearer sk-change-me"
 
-# Health Check
-curl http://lxc-ip:4000/health
-
-# Request (landet auf EVO X2 wenn online)
-curl http://lxc-ip:4000/v1/chat/completions \
-  -H "Authorization: Bearer sk-lokal-geheim" \
+# Chat through an alias
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer sk-change-me" \
   -H "Content-Type: application/json" \
-  -d '{"model": "fast", "messages": [{"role": "user", "content": "test"}]}'
+  -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
+
+# Backend health snapshot
+curl http://localhost:4000/health
 ```
+
+## Running as a service
+
+`llm-gateway.service` is an example systemd unit assuming
+`/opt/llm-gateway` with a `venv/` next to `main.py`. Adapt to taste:
+
+```bash
+sudo install -m 0644 llm-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-gateway
+journalctl -u llm-gateway -f
+```
+
+## Deploy script (optional)
+
+`deploy.sh` is a small rsync-over-SSH deploy helper. It syncs code (excluding
+`config.yaml`, `.env`, `venv/`), pip-installs requirements in a remote venv,
+installs/updates the systemd unit if changed, and restarts the service.
+
+```bash
+DEPLOY_HOST=root@your-host ./deploy.sh
+```
+
+Use it if you like, ignore it if you don't — it's not required to run the
+gateway.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

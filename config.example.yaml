@@ -1,0 +1,48 @@
+# LLM Gateway — example config.
+# Copy to config.yaml and edit. config.yaml is gitignored.
+
+# Port (used by the systemd unit; uvicorn is launched separately, see llm-gateway.service)
+port: 4000
+
+# Client API key. Empty/missing = no auth (any caller accepted).
+api_key: "sk-change-me"
+
+# How often (seconds) each backend's /v1/models is polled for liveness + model discovery.
+health_check_interval: 30
+
+# Backends, in priority order (1 = preferred).
+#   enabled: false  → fully out of rotation (no health-check, no routing)
+#   api_key         → sent as `Authorization: Bearer <key>` to this backend
+#                     (use for cloud APIs like together.ai, OpenAI, OpenRouter, …)
+backends:
+  - name: local-gpu
+    url: http://192.168.1.10:8080      # e.g. llama-swap, llama.cpp server, vLLM, …
+    priority: 1
+
+  - name: local-cpu
+    url: http://192.168.1.11:8080
+    priority: 2
+    # enabled: false                    # set to take this backend out of rotation
+
+  # - name: together                    # Cloud fallback (OpenAI-compatible)
+  #   url: https://api.together.xyz
+  #   priority: 99
+  #   api_key: "tgp_v1_…"               # https://api.together.xyz/settings/api-keys
+
+# Virtual models — pseudo model names that map to real model IDs on backends.
+#   string  → same model on every backend
+#   dict    → per-backend mapping; backend keys without an entry are skipped
+#
+# Routing: when a request comes in for `model: "fast"`, the gateway walks backends in
+# priority order and picks the first one that (a) is healthy and (b) exposes the
+# mapped model. The remaining backends become fallback if the chosen one errors.
+virtual_models:
+  "translator":  "Aya-Expanse-8B"        # same model on every backend
+  "caption":     "llama-joycaption-beta-one"
+  "vision":
+    local-gpu:   "Qwen3-VL-8B"
+    # local-cpu has no vision model → skipped for this alias
+  "fast":
+    local-gpu:   "Qwen3.5-9B"
+    local-cpu:   "gemma-3-9b-it"
+    # together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
