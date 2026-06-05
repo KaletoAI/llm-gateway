@@ -73,6 +73,12 @@ backends:
     api_key: "tgp_v1_…"                 # injected as Bearer to this backend
     chat_only: true                     # filter out image/video/embedding models
     serverless_only: true               # filter out dedicated-endpoint-only models
+  - name: openrouter                    # another cloud fallback
+    url: https://openrouter.ai/api      # /api only — the gateway appends /v1/…
+    priority: 98
+    api_key: "sk-or-v1-…"
+    chat_only: true                     # drop image-/audio-output-only models
+    serverless_only: false              # keep :free models (true = paid-only)
 
 virtual_models:
   "translator":  "Aya-Expanse-8B"       # same model on every backend
