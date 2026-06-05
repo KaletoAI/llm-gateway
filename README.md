@@ -82,6 +82,21 @@ virtual_models:
     together:    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
 ```
 
+### Provider-prefixed model names
+
+With `model_prefix: true` (default), `/v1/models` lists every model prefixed
+with its backend name — `together/moonshotai/Kimi-K2.5-fp4`,
+`openrouter/nvidia/nemotron-3-ultra-550b-a55b`, `local-gpu/qwen3.5-9b` — so you
+can tell at a glance which provider a model comes from (handy once two cloud
+backends both expose overlapping catalogs). The prefix is stripped again before
+the request is forwarded upstream.
+
+Input is liberal: a prefixed id (`openrouter/…`) routes to exactly that
+backend; a bare id or a virtual alias (`fast`) still routes by priority across
+all backends as before. Backend names never collide with vendor prefixes
+(`moonshotai/`, `nvidia/`, …), so the leading path segment disambiguates
+cleanly. Set `model_prefix: false` for the legacy bare, de-duplicated listing.
+
 ### How routing picks a backend
 
 For each incoming request, the gateway walks backends in priority order and
@@ -103,7 +118,11 @@ Two optional boolean flags on a backend filter its model list at discovery time:
 | Flag | Effect |
 |---|---|
 | `chat_only`       | Keep only models where `type == "chat"` (skips image/video/embedding/transcribe). Backends without a `type` field on their models (llama-swap, vLLM, …) are unaffected. |
-| `serverless_only` | Keep only models with non-zero `pricing.input`/`pricing.output`. Designed for Together.ai, where dedicated-endpoint-only models have `0/0` pricing and would fail at request time. |
+| `serverless_only` | Keep only models with non-zero pricing. Designed for Together.ai, where dedicated-endpoint-only models have `0/0` pricing and would fail at request time. On OpenRouter this drops the `:free` catalog — leave it `false` if you want the free models. |
+
+`chat_only` understands both Together's `type` field and OpenRouter's
+`architecture.output_modalities` (dropping image-/audio-only-output models).
+Backends exposing neither (llama-swap, vLLM) are unaffected.
 
 Both default off. Most useful when bridging a cloud provider that returns a mixed catalog (chat + image + dedicated-only + …) and you only want chat-completions-routable models exposed.
 
@@ -125,9 +144,11 @@ stats:
 log_per_call: true      # set false when using stats to keep the log clean
 ```
 
-- **Cost**: computed from each backend's pricing metadata. Together.ai's
-  `/v1/models` returns `pricing.input` / `pricing.output` per million tokens;
-  the gateway caches that at discovery time. Local backends (llama-swap,
+- **Cost**: computed from each backend's pricing metadata, cached at discovery
+  time and normalized to USD per million tokens. Two upstream schemas are
+  understood: Together.ai's `pricing.input` / `pricing.output` (numbers, already
+  per-million) and OpenRouter's `pricing.prompt` / `pricing.completion`
+  (strings, per single token — scaled up ×1e6). Local backends (llama-swap,
   llama.cpp, vLLM) don't expose pricing → cost = 0.
 - **Source**: defaults to the client IP. Override per-call by sending an
   `X-Source: my-workflow-name` header to tag, e.g., individual N8N

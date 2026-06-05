@@ -7,22 +7,36 @@ SERVICE="llm-gateway"
 
 cd "$(dirname "$(readlink -f "$0")")"
 
-echo "==> Syncing files to ${HOST}:${DEST}"
-rsync -az --delete --human-readable --info=stats1,progress2 \
-    --exclude='.git/' \
-    --exclude='.claude/' \
-    --exclude='__pycache__/' \
-    --exclude='*.pyc' \
-    --exclude='.venv/' \
-    --exclude='venv/' \
-    --exclude='.env' \
-    --exclude='config.yaml' \
-    --exclude='config.yaml.bak*' \
-    --exclude='stats.db' \
-    --exclude='stats.db-wal' \
-    --exclude='stats.db-shm' \
-    --exclude='deploy.sh' \
-    ./ "${HOST}:${DEST}/"
+# Same exclude set for both transports. rsync wants trailing-slash dir
+# patterns; tar wants the in-archive path (./foo) — hence two lists.
+RSYNC_EXCLUDES=(
+    --exclude='.git/'        --exclude='.claude/'
+    --exclude='__pycache__/' --exclude='*.pyc'
+    --exclude='.venv/'       --exclude='venv/'        --exclude='.env'
+    --exclude='config.yaml'  --exclude='config.yaml.bak*'
+    --exclude='stats.db'     --exclude='stats.db-wal' --exclude='stats.db-shm'
+    --exclude='deploy.sh'
+)
+TAR_EXCLUDES=(
+    --exclude='./.git'        --exclude='./.claude'
+    --exclude='__pycache__'   --exclude='*.pyc'
+    --exclude='./.venv'       --exclude='./venv'        --exclude='./.env'
+    --exclude='./config.yaml' --exclude='./config.yaml.bak*'
+    --exclude='./stats.db'    --exclude='./stats.db-wal' --exclude='./stats.db-shm'
+    --exclude='./deploy.sh'
+)
+
+if command -v rsync >/dev/null 2>&1; then
+    echo "==> Syncing files to ${HOST}:${DEST} (rsync)"
+    rsync -az --delete --human-readable --info=stats1,progress2 \
+        "${RSYNC_EXCLUDES[@]}" ./ "${HOST}:${DEST}/"
+else
+    echo "==> rsync not found — falling back to tar-over-ssh (no --delete)"
+    ssh "${HOST}" "mkdir -p '${DEST}'"
+    tar czf - "${TAR_EXCLUDES[@]}" -C . . \
+        | ssh "${HOST}" "tar xzf - -C '${DEST}'"
+    echo "    synced (stale remote files are NOT removed without rsync)"
+fi
 
 echo "==> Ensuring venv + installing requirements + syncing systemd unit"
 ssh "${HOST}" bash -se <<EOF

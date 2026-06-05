@@ -14,6 +14,14 @@ health_check_interval: 30
 # Set to false if you're using the stats DB and want a quieter log.
 log_per_call: true
 
+# Expose models in /v1/models prefixed with their backend name, e.g.
+# `together/moonshotai/Kimi-K2.5-fp4` or `openrouter/nvidia/nemotron-3-ultra-…`.
+# This makes the provider visible when the same model id exists on several
+# backends. The prefix is stripped again before forwarding. Both forms are
+# always accepted on input — a prefixed id routes to exactly that backend, a
+# bare id/alias still routes by priority. Set false for legacy bare listing.
+model_prefix: true
+
 # Optional call-stats sink: SQLite DB + minimal HTML dashboard on a separate port.
 # Default disabled. When enabled, every call is recorded with backend, source,
 # alias, model, tokens, status, duration, and USD cost (for backends that
@@ -48,6 +56,14 @@ backends:
   #   api_key: "tgp_v1_…"               # https://api.together.xyz/settings/api-keys
   #   chat_only: true                   # skip image/video/embedding models
   #   serverless_only: true             # skip dedicated-endpoint-only models
+
+  # - name: openrouter                  # Cloud fallback (OpenAI-compatible)
+  #   url: https://openrouter.ai/api    # NOTE: /api only — the gateway appends /v1/…
+  #   priority: 98
+  #   api_key: "sk-or-v1-…"             # https://openrouter.ai/settings/keys
+  #   chat_only: true                   # drop image/audio-output-only models
+  #   serverless_only: false            # keep :free models; true = paid-only
+  #                                     # (paid models need account credits, else HTTP 402)
 
 # Virtual models — pseudo model names that map to real model IDs on backends.
 #   string  → same model on every backend

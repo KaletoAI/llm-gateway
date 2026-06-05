@@ -25,7 +25,7 @@ CONFIG_PATH = Path("config.yaml")
 def load_config() -> None:
     """Read config.yaml and (re)bind module-level config values."""
     global config, backends, virtual_models, health_check_interval, api_key
-    global stats_cfg, log_per_call
+    global stats_cfg, log_per_call, model_prefix
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     backends = sorted(config["backends"], key=lambda b: b["priority"])
@@ -34,6 +34,7 @@ def load_config() -> None:
     api_key = config.get("api_key")
     stats_cfg = config.get("stats") or {}
     log_per_call = config.get("log_per_call", True)
+    model_prefix = config.get("model_prefix", True)
 
 
 def log_config_summary() -> None:
@@ -59,6 +60,7 @@ health_check_interval: int
 api_key: Optional[str]
 stats_cfg: dict
 log_per_call: bool
+model_prefix: bool
 load_config()
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -82,19 +84,49 @@ def backend_auth_headers(backend: dict) -> dict:
     return {"authorization": f"Bearer {key}"} if key else {}
 
 
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def normalize_pricing(m: dict) -> Optional[dict[str, float]]:
+    """Per-model pricing normalized to USD per **million** tokens, or None.
+
+    Handles the two upstream schemas we see in the wild:
+      - Together:   pricing.input / pricing.output  — numbers, already per-million
+      - OpenRouter: pricing.prompt / pricing.completion — strings, per *single*
+                    token, so multiplied by 1e6 to match the per-million convention
+    Local backends (llama-swap / vLLM) carry no pricing → None.
+    """
+    p = m.get("pricing")
+    if not isinstance(p, dict):
+        return None
+    if "input" in p or "output" in p:            # Together-style (per-million)
+        return {"input": _to_float(p.get("input")), "output": _to_float(p.get("output"))}
+    if "prompt" in p or "completion" in p:        # OpenRouter-style (per-token)
+        return {"input": _to_float(p.get("prompt")) * 1_000_000,
+                "output": _to_float(p.get("completion")) * 1_000_000}
+    return None
+
+
+def _is_priced(m: dict) -> bool:
+    pr = normalize_pricing(m)
+    return bool(pr and (pr["input"] or pr["output"]))
+
+
 def extract_pricing(payload) -> dict[str, dict[str, float]]:
-    """Per-model pricing from a /v1/models response (only Together-style payloads
-    carry it; OpenAI/llama-swap return None → empty dict). Values are USD per
-    million tokens."""
+    """Per-model pricing from a /v1/models response, keyed by model id. Values
+    are USD per million tokens (see normalize_pricing). Together + OpenRouter
+    expose pricing; OpenAI/llama-swap don't → empty dict."""
     data = payload["data"] if isinstance(payload, dict) else payload
     out: dict[str, dict[str, float]] = {}
     for m in data or []:
         if "id" not in m:
             continue
-        p = m.get("pricing") or {}
-        i, o = p.get("input") or 0, p.get("output") or 0
-        if i or o:
-            out[m["id"]] = {"input": float(i), "output": float(o)}
+        if _is_priced(m):
+            out[m["id"]] = normalize_pricing(m)  # type: ignore[assignment]
     return out
 
 
@@ -111,12 +143,26 @@ def extract_models(payload, backend: dict) -> set[str]:
     """
     data = payload["data"] if isinstance(payload, dict) else payload
     if backend.get("chat_only"):
-        data = [m for m in data if m.get("type", "chat") == "chat"]
+        data = [m for m in data if _is_chat_model(m)]
     if backend.get("serverless_only"):
-        data = [m for m in data
-                if (m.get("pricing") or {}).get("input", 0) > 0
-                or (m.get("pricing") or {}).get("output", 0) > 0]
+        data = [m for m in data if _is_priced(m)]
     return {m["id"] for m in data if "id" in m}
+
+
+def _is_chat_model(m: dict) -> bool:
+    """True unless the model is clearly not chat-completions routable.
+
+    - Together tags models with `type`; keep only type=="chat".
+    - OpenRouter has no `type` but exposes architecture.output_modalities;
+      drop models that can't emit text (image-/audio-only output).
+    - Backends without either field (llama-swap, vLLM) always pass.
+    """
+    if m.get("type", "chat") != "chat":
+        return False
+    om = (m.get("architecture") or {}).get("output_modalities")
+    if om is not None and "text" not in om:
+        return False
+    return True
 
 
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
@@ -240,8 +286,38 @@ def resolve_for_backend(alias: str, backend_name: str) -> Optional[str]:
     return None
 
 
+def split_backend_prefix(model: str) -> tuple[Optional[str], str]:
+    """Split a '<backend-name>/<real-model>' id into (backend_name, real_model).
+
+    Returns (None, model) when the first path segment isn't a known backend
+    name — so bare aliases ('fast') and vendor-prefixed ids ('moonshotai/Kimi…')
+    are left untouched. Backend names (together, openrouter, dx-10-1, …) never
+    collide with vendor prefixes, so the first '/' disambiguates cleanly.
+    """
+    if "/" in model:
+        prefix, rest = model.split("/", 1)
+        if any(b["name"] == prefix for b in backends):
+            return prefix, rest
+    return None, model
+
+
 def get_routes_for(alias: str) -> list[tuple[dict, str]]:
-    """(backend, real_model) pairs to try, in priority order."""
+    """(backend, real_model) pairs to try, in priority order.
+
+    A '<backend>/<model>' alias routes explicitly to that one backend (prefix
+    stripped before forwarding). A bare alias falls back to priority routing
+    across every backend that exposes it.
+    """
+    bname, bare = split_backend_prefix(alias)
+    if bname is not None:
+        b = next((b for b in enabled_backends() if b["name"] == bname), None)
+        if b is None or not backend_healthy.get(bname):
+            return []
+        real = resolve_for_backend(bare, bname)
+        if real is not None and real in backend_models.get(bname, set()):
+            return [(b, real)]
+        return []
+
     routes = []
     for b in enabled_backends():
         if not backend_healthy.get(b["name"]):
@@ -504,19 +580,25 @@ def chat_to_responses(chat_resp: dict) -> dict:
 @app.get("/v1/models")
 async def list_models(authorization: Optional[str] = Header(None)):
     check_auth(authorization)
+    now = int(time.time())
     seen: set[str] = set()
     data = []
 
     for backend in enabled_backends():
-        for mid in sorted(backend_models.get(backend["name"], set())):
-            if mid not in seen:
-                seen.add(mid)
-                data.append({"id": mid, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway"})
+        bname = backend["name"]
+        for mid in sorted(backend_models.get(bname, set())):
+            # With model_prefix on, ids are '<backend>/<model>' so the same model
+            # on two backends stays distinct and the provider is visible. Off →
+            # legacy behaviour: bare ids, deduplicated across backends.
+            disp = f"{bname}/{mid}" if model_prefix else mid
+            if disp not in seen:
+                seen.add(disp)
+                data.append({"id": disp, "object": "model", "created": now, "owned_by": bname})
 
-    # Virtual models (if alias not already exposed by a backend)
+    # Virtual aliases are cross-backend → always listed bare (no prefix).
     for alias in virtual_models:
         if alias not in seen:
-            data.append({"id": alias, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway (virtual)"})
+            data.append({"id": alias, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"})
 
     return {"object": "list", "data": data}
 
@@ -524,11 +606,17 @@ async def list_models(authorization: Optional[str] = Header(None)):
 @app.get("/v1/models/{model_id:path}")
 async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     check_auth(authorization)
+    now = int(time.time())
     if model_id in virtual_models:
-        return {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway (virtual)"}
-    for backend in enabled_backends():
-        if model_id in backend_models.get(backend["name"], set()):
-            return {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "llm-gateway"}
+        return {"id": model_id, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"}
+    bname, bare = split_backend_prefix(model_id)
+    if bname is not None:
+        if bare in backend_models.get(bname, set()):
+            return {"id": model_id, "object": "model", "created": now, "owned_by": bname}
+    else:
+        for backend in enabled_backends():
+            if model_id in backend_models.get(backend["name"], set()):
+                return {"id": model_id, "object": "model", "created": now, "owned_by": backend["name"]}
     raise HTTPException(404, f"Model '{model_id}' not found")
 
 
