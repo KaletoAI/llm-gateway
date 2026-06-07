@@ -231,6 +231,8 @@ code { background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }
 .badge.warn { background: #fff4e5; color: #b35900; }
 .badge.err  { background: #fde8e8; color: #cf222e; }
 .badge.info { background: #e8eefc; color: #1a56c4; }
+.badge.off  { background: #eceef1; color: #888; }
+tr.off td { color: #aaa; }
 .prio { display: inline-block; min-width: 1.5rem; text-align: center; font-weight: 600;
         background: #eef0f4; border-radius: 5px; padding: 0 .35rem; }
 .dim { color: #aaa; }
@@ -406,15 +408,18 @@ def _render_routing(snap: dict) -> str:
             continue
         for i, r in enumerate(routes):
             label = f'<code>{_esc(name)}</code>' if i == 0 else '<span class="dim">↳</span>'
-            if r["routable"]:
+            if not r.get("enabled", True):
+                status = '<span class="badge off">disabled</span>'
+            elif r["routable"]:
                 status = '<span class="badge ok">routable</span>'
             elif not r["healthy"]:
                 status = '<span class="badge warn">backend down</span>'
             else:
                 status = '<span class="badge err">model missing</span>'
             ovr = ' <span class="badge info">override</span>' if r["overridden"] else ""
+            row_cls = "f off" if not r.get("enabled", True) else "f"
             arows.append(
-                f'<tr class="f" data-search="{_esc(name)}"><td>{label}</td>'
+                f'<tr class="{row_cls}" data-search="{_esc(name)}"><td>{label}</td>'
                 f'<td class="host">{_esc(r["backend"])}</td>'
                 f'<td><code>{_esc(r["model"])}</code></td>'
                 f'<td><span class="prio">{r["priority"]}</span>{ovr}</td>'

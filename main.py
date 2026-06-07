@@ -400,20 +400,22 @@ def routing_snapshot() -> dict:
     aliases = []
     for name in virtual_models:
         rows = []
-        for b in enabled:
+        for b in backends:                     # all backends, incl. disabled, so a
             real, prio = alias_entry(name, b["name"])
             if real is None:
                 continue                       # alias not mapped to this backend
-            healthy = backend_healthy.get(b["name"], False)
+            enbl = is_enabled(b)               # mapping doesn't silently vanish when
+            healthy = enbl and backend_healthy.get(b["name"], False)  # a host is off
             present = real in backend_models.get(b["name"], set())
             rows.append({
                 "backend": b["name"],
                 "model": real,
                 "priority": prio if prio is not None else b["priority"],
                 "overridden": prio is not None,
+                "enabled": enbl,
                 "healthy": healthy,
                 "present": present,
-                "routable": healthy and present,
+                "routable": enbl and healthy and present,
             })
         rows.sort(key=lambda r: r["priority"])
         aliases.append({"alias": name, "routes": rows})
