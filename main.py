@@ -45,8 +45,13 @@ def log_config_summary() -> None:
     logger.info(f"Loaded {len(virtual_models)} virtual alias(es):")
     for alias, mapping in virtual_models.items():
         if isinstance(mapping, dict):
-            for bname, real in mapping.items():
-                logger.info(f"  {alias:15} → [{bname}] {real}")
+            for bname, entry in mapping.items():
+                if isinstance(entry, dict):
+                    real, prio = entry.get("model"), entry.get("priority")
+                    suffix = f"  (priority={prio})" if prio is not None else ""
+                    logger.info(f"  {alias:15} → [{bname}] {real}{suffix}")
+                else:
+                    logger.info(f"  {alias:15} → [{bname}] {entry}")
         else:
             logger.info(f"  {alias:15} → {mapping}  (all backends)")
     logger.info(f"health_check_interval={health_check_interval}s  api_key={'set' if api_key else 'unset'}")
@@ -269,21 +274,34 @@ def check_auth(authorization: Optional[str]) -> None:
         raise HTTPException(401, "Invalid API key")
 
 
-def resolve_for_backend(alias: str, backend_name: str) -> Optional[str]:
-    """Real model name for this alias on this backend, or None if not mapped here.
+def alias_entry(alias: str, backend_name: str) -> tuple[Optional[str], Optional[int]]:
+    """(real_model, priority_override) for this alias on this backend.
 
-    - alias not in virtual_models → returns alias unchanged (pass-through)
-    - alias maps to string         → that string on every backend
-    - alias maps to dict           → looked up by backend name (may be absent)
+    real_model is None when the alias isn't mapped to this backend.
+    priority_override is None unless this alias sets one for this backend.
+
+    - alias not in virtual_models → (alias, None)         pass-through
+    - alias maps to string         → (string, None)        same model everywhere
+    - alias maps to dict, value …
+        … string                   → (string, None)        per-backend model
+        … object {model, priority} → (model, priority)     model + per-alias prio
     """
     mapping = virtual_models.get(alias)
     if mapping is None:
-        return alias
+        return alias, None
     if isinstance(mapping, str):
-        return mapping
+        return mapping, None
     if isinstance(mapping, dict):
-        return mapping.get(backend_name)
-    return None
+        entry = mapping.get(backend_name)
+        if isinstance(entry, dict):
+            return entry.get("model"), entry.get("priority")
+        return entry, None        # string value, or None if backend absent
+    return None, None
+
+
+def resolve_for_backend(alias: str, backend_name: str) -> Optional[str]:
+    """Real model name for this alias on this backend, or None if not mapped here."""
+    return alias_entry(alias, backend_name)[0]
 
 
 def split_backend_prefix(model: str) -> tuple[Optional[str], str]:
@@ -318,16 +336,108 @@ def get_routes_for(alias: str) -> list[tuple[dict, str]]:
             return [(b, real)]
         return []
 
+    # Bare alias → priority routing. The alias may override a backend's priority
+    # for this alias only; backends without an override keep their global prio.
+    # enabled_backends() is already in global-priority order, so a stable sort by
+    # effective priority keeps un-overridden ties in their global order.
     routes = []
     for b in enabled_backends():
         if not backend_healthy.get(b["name"]):
             continue
-        real = resolve_for_backend(alias, b["name"])
+        real, prio = alias_entry(alias, b["name"])
         if real is None:
             continue
         if real in backend_models.get(b["name"], set()):
-            routes.append((b, real))
-    return routes
+            eff_prio = prio if prio is not None else b["priority"]
+            routes.append((eff_prio, b, real))
+    routes.sort(key=lambda r: r[0])
+    return [(b, real) for _, b, real in routes]
+
+
+def alias_model_conflicts() -> list[dict]:
+    """Aliases whose name also exists as a real model id on some backend.
+
+    Setting an alias named like a real model *shadows* that model: a bare
+    request for the name routes only via the alias mapping (the pass-through
+    that would otherwise reach the real model is disabled), and even the
+    '<backend>/<name>' form fails on backends the alias doesn't map (because
+    resolve_for_backend returns None there). So any backend that actually hosts
+    a model of that exact id but is absent from the alias mapping becomes
+    unreachable by that name.
+
+    Returns one entry per colliding alias with the hosting backends split into
+    `covered` (in the mapping → still routable) and `shadowed` (hosting the real
+    model but not mapped → unreachable by that name). `shadowed` non-empty is the
+    actionable conflict; empty means the alias intentionally shadows a model it
+    fully covers (e.g. one id mapped across exactly the backends that serve it).
+    """
+    out = []
+    for name in virtual_models:
+        hosting = [b["name"] for b in enabled_backends()
+                   if name in backend_models.get(b["name"], set())]
+        if not hosting:
+            continue
+        covered = [bn for bn in hosting if alias_entry(name, bn)[0] is not None]
+        shadowed = [bn for bn in hosting if alias_entry(name, bn)[0] is None]
+        out.append({
+            "name": name,
+            "hosting_backends": hosting,
+            "covered": covered,
+            "shadowed": shadowed,
+        })
+    return out
+
+
+def routing_snapshot() -> dict:
+    """Diagnostic view of how every alias and discovered model resolves.
+
+    Unlike get_routes_for(), this keeps unhealthy backends and not-yet-discovered
+    models in the result (flagged), so the dashboard shows the full configured
+    picture rather than only what's routable right now.
+    """
+    enabled = enabled_backends()
+
+    aliases = []
+    for name in virtual_models:
+        rows = []
+        for b in enabled:
+            real, prio = alias_entry(name, b["name"])
+            if real is None:
+                continue                       # alias not mapped to this backend
+            healthy = backend_healthy.get(b["name"], False)
+            present = real in backend_models.get(b["name"], set())
+            rows.append({
+                "backend": b["name"],
+                "model": real,
+                "priority": prio if prio is not None else b["priority"],
+                "overridden": prio is not None,
+                "healthy": healthy,
+                "present": present,
+                "routable": healthy and present,
+            })
+        rows.sort(key=lambda r: r["priority"])
+        aliases.append({"alias": name, "routes": rows})
+    aliases.sort(key=lambda a: a["alias"].lower())
+
+    model_hosts: dict[str, list] = {}
+    for b in enabled:
+        healthy = backend_healthy.get(b["name"], False)
+        for mid in backend_models.get(b["name"], set()):
+            model_hosts.setdefault(mid, []).append({
+                "backend": b["name"],
+                "priority": b["priority"],
+                "healthy": healthy,
+            })
+    models = []
+    for mid, hosts in sorted(model_hosts.items(), key=lambda kv: kv[0].lower()):
+        hosts.sort(key=lambda h: h["priority"])
+        models.append({
+            "model": mid,
+            "hosts": hosts,
+            "shadowed_by_alias": mid in virtual_models,
+        })
+
+    return {"aliases": aliases, "models": models, "conflicts": alias_model_conflicts()}
 
 
 def _source_of(request: Request) -> str:
@@ -710,4 +820,7 @@ async def health():
             for b in backends
         },
         "virtual_models": virtual_models,
+        # Aliases that shadow a real model on a backend they don't map (→ that
+        # model is unreachable by its bare name). Empty list = no such conflict.
+        "alias_model_conflicts": [c for c in alias_model_conflicts() if c["shadowed"]],
     }

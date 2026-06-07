@@ -25,16 +25,20 @@ single OpenAI endpoint and the gateway handles the routing.
   configure.
 - **Virtual models.** Aliases like `fast`, `vision`, `translator` map to
   different real model IDs per backend. Swap the underlying model without
-  changing client code.
+  changing client code. An alias can also **override a backend's priority for
+  itself only** — so `cheap` can prefer the CPU box even though the GPU box is
+  globally #1.
 - **Cloud-as-backend.** Per-backend `api_key` lets you wire in
   OpenAI-compatible cloud providers (together.ai, OpenAI, OpenRouter,
   DeepInfra, …) as just another backend with its own priority.
 - **Hot config reload.** `config.yaml` changes are picked up live; no
   restart needed.
-- **Optional call stats.** SQLite-backed per-call log + minimal HTML
-  dashboard on a separate port. Tracks backend, source, model, tokens,
-  duration, and USD cost (computed from each backend's published pricing
-  metadata where available). Off by default. Zero new dependencies.
+- **Optional call stats + routing view.** SQLite-backed per-call log + minimal
+  HTML dashboard on a separate port, with two tabs: **Stats** (backend, source,
+  model, tokens, duration, USD cost from each backend's published pricing) and
+  **Routing** (a searchable live map of how every alias and discovered model
+  resolves, by priority, plus alias/model-name collision warnings). Off by
+  default. Zero new dependencies.
 
 ## Quick start
 
@@ -86,7 +90,20 @@ virtual_models:
     local-gpu:   "Qwen3.5-9B"
     local-cpu:   "gemma-3-9b-it"
     together:    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+  "cheap":                               # per-alias priority override
+    local-cpu:                           #   prefer the CPU box for this alias…
+      model:     "gemma-3-9b-it"
+      priority:  1
+    local-gpu:                           #   …even though local-gpu is global #1
+      model:     "Qwen3.5-9B"
+      priority:  2
 ```
+
+A backend's value under an alias is normally just the model name. Make it an
+object `{model, priority}` to override that backend's priority **for this alias
+only** — handy when the globally-preferred backend isn't the one you want for a
+specific alias. Backends without an override keep their global priority (same
+numeric scale), so you only need to annotate the ones you're reordering.
 
 ### Provider-prefixed model names
 
@@ -167,6 +184,27 @@ log_per_call: true      # set false when using stats to keep the log clean
   don't include `usage` in stream chunks). Use non-streaming if you want
   accurate per-call cost.
 
+The dashboard has two tabs:
+
+- **Stats** — the call log summaries above (auto-refreshes every 30 s).
+- **Routing** — a live map of how every alias and discovered model resolves:
+  each alias's backends in effective-priority order (with a badge when a
+  per-alias priority override applies, and whether each route is currently
+  routable / backend-down / model-missing), every discovered model id and the
+  hosts that serve it by priority, and a **collisions** panel. There's a search
+  box that filters aliases, models, and hosts client-side.
+
+**Alias / model-name collisions.** Naming an alias the same as a real model id
+*shadows* that model: a bare request for the name routes only via the alias
+mapping (the pass-through to the real model is disabled), and `<backend>/<name>`
+fails on any backend the alias doesn't map. The Routing tab (and `/health`'s
+`alias_model_conflicts`) flag every collision, splitting hosts into **covered**
+(in the mapping → still routable) and **shadowed** (host the real model but
+aren't mapped → unreachable by that name). Shadowed hosts are the actionable
+case — add them to the mapping or rename the alias. A collision with no shadowed
+hosts (e.g. one id mapped across exactly the backends that serve it) is
+intentional and harmless.
+
 ### Per-backend `api_key`
 
 When a backend has `api_key`, the gateway sends `Authorization: Bearer
@@ -191,7 +229,7 @@ The top-level `api_key` is the *client-facing* gateway auth. Clients send
 | `POST` | `/v1/chat/completions` | OpenAI chat, routed by priority + failover; streaming supported |
 | `POST` | `/v1/completions` | OpenAI completions, same routing |
 | `POST` | `/v1/responses` | OpenAI Responses API, bridged to `/v1/chat/completions` on the backend (request + response translated transparently incl. tool-calls; non-streaming) |
-| `GET`  | `/health` | Per-backend health/model/priority snapshot + virtual_models dump |
+| `GET`  | `/health` | Per-backend health/model/priority snapshot + virtual_models dump + alias/model-name conflicts |
 
 ### Responses API bridge
 

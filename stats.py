@@ -193,6 +193,99 @@ def _esc(s) -> str:
             .replace('"', "&quot;").replace("'", "&#39;"))
 
 
+# Shared chrome: CSS + nav tabs + optional search JS, wrapped by _doc(). Kept as
+# plain (non-f) strings so braces don't need escaping.
+_CSS = """
+* { box-sizing: border-box; }
+body { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+       margin: 1.5rem; color: #1c1c1c; background: #f4f5f7; }
+h1 { margin: 0 0 .5rem; }
+h2 { margin: 0 0 .75rem; font-size: 1.05rem; color: #555; }
+.muted { color: #888; font-size: .85rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+         gap: 1rem; margin: 1rem 0 2rem; }
+.card { background: #fff; border-radius: 8px; padding: 1rem 1.25rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+.metric { font-size: 1.6rem; font-weight: 600; margin-top: .25rem; }
+.panel { background: #fff; border-radius: 8px; padding: 1rem 1.25rem;
+         margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .4rem .5rem; text-align: left;
+         border-bottom: 1px solid #eee; vertical-align: top; }
+th { background: #fafafa; font-weight: 600; color: #555; }
+tr:hover td { background: #fcfcfc; }
+td.ok { color: #1a7f37; font-weight: 600; }
+td.err { color: #cf222e; font-weight: 600; }
+code { background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }
+.tabs { display: flex; gap: .25rem; margin: .25rem 0 0; border-bottom: 2px solid #e0e2e8; }
+.tabs a { padding: .45rem 1rem; border-radius: 6px 6px 0 0; text-decoration: none;
+          color: #555; background: #e7e9ee; font-weight: 600; }
+.tabs a.active { background: #fff; color: #1c1c1c; box-shadow: 0 -1px 3px rgba(0,0,0,.06); }
+.search { margin: 1rem 0 0; }
+.search input { width: 100%; max-width: 460px; padding: .55rem .75rem; font-size: 1rem;
+                border: 1px solid #ccc; border-radius: 6px; }
+.count { color: #888; font-size: .8rem; margin-left: .5rem; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: .75rem;
+         font-weight: 600; }
+.badge.ok   { background: #e6f4ea; color: #1a7f37; }
+.badge.warn { background: #fff4e5; color: #b35900; }
+.badge.err  { background: #fde8e8; color: #cf222e; }
+.badge.info { background: #e8eefc; color: #1a56c4; }
+.prio { display: inline-block; min-width: 1.5rem; text-align: center; font-weight: 600;
+        background: #eef0f4; border-radius: 5px; padding: 0 .35rem; }
+.dim { color: #aaa; }
+.host { white-space: nowrap; }
+.hidden { display: none; }
+"""
+
+# Vanilla filter for the routing tab. Matches each row's text plus its
+# data-search attribute (carries the alias name onto continuation rows), keeps
+# the query in the URL hash so it survives a reload.
+_SEARCH_JS = """
+<script>
+(function () {
+  var box = document.getElementById('q');
+  if (!box) return;
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tr.f'));
+  var counter = document.getElementById('count');
+  function apply(q) {
+    q = q.trim().toLowerCase();
+    var shown = 0;
+    rows.forEach(function (r) {
+      var hay = (r.textContent + ' ' + (r.dataset.search || '')).toLowerCase();
+      var match = !q || hay.indexOf(q) !== -1;
+      r.classList.toggle('hidden', !match);
+      if (match) shown++;
+    });
+    if (counter) counter.textContent = q ? (shown + ' match' + (shown === 1 ? '' : 'es')) : '';
+    history.replaceState(null, '', q ? '#' + encodeURIComponent(q) : location.pathname);
+  }
+  box.addEventListener('input', function () { apply(box.value); });
+  var initial = decodeURIComponent(location.hash.slice(1));
+  if (initial) box.value = initial;
+  apply(box.value);
+  box.focus();
+})();
+</script>
+"""
+
+
+def _nav(active: str) -> str:
+    def cls(name: str) -> str:
+        return ' class="active"' if name == active else ""
+    return (f'<div class="tabs"><a href="/"{cls("stats")}>Stats</a>'
+            f'<a href="/routing"{cls("routing")}>Routing</a></div>')
+
+
+def _doc(title: str, active: str, body: str, *, refresh: Optional[int] = None,
+         search: bool = False) -> str:
+    refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+    return (f'<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+            f'{refresh_tag}\n<title>{title}</title>\n<style>{_CSS}</style>\n</head>\n'
+            f'<body>\n<h1>llm-gateway</h1>\n{_nav(active)}\n{body}\n'
+            f'{_SEARCH_JS if search else ""}\n</body>\n</html>')
+
+
 def _render(total, h24, by_backend, by_model, by_source, recent) -> str:
     rows_backend = "".join(
         f"<tr><td>{_esc(b)}</td><td>{c:,}</td><td>{int(it):,}</td>"
@@ -220,39 +313,7 @@ def _render(total, h24, by_backend, by_model, by_source, recent) -> str:
         for (ts, dm, b, src, a, m, ep, st, it, ot, cu) in recent
     ) or '<tr><td colspan="10" class="muted">no calls recorded yet</td></tr>'
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="30">
-<title>llm-gateway stats</title>
-<style>
-* {{ box-sizing: border-box; }}
-body {{ font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
-        margin: 1.5rem; color: #1c1c1c; background: #f4f5f7; }}
-h1 {{ margin: 0 0 .25rem; }}
-h2 {{ margin: 0 0 .75rem; font-size: 1.05rem; color: #555; }}
-.muted {{ color: #888; font-size: .85rem; }}
-.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-          gap: 1rem; margin: 1rem 0 2rem; }}
-.card {{ background: #fff; border-radius: 8px; padding: 1rem 1.25rem;
-         box-shadow: 0 1px 3px rgba(0,0,0,.06); }}
-.metric {{ font-size: 1.6rem; font-weight: 600; margin-top: .25rem; }}
-.panel {{ background: #fff; border-radius: 8px; padding: 1rem 1.25rem;
-          margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,.06); }}
-table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ padding: .4rem .5rem; text-align: left;
-          border-bottom: 1px solid #eee; vertical-align: top; }}
-th {{ background: #fafafa; font-weight: 600; color: #555; }}
-tr:hover td {{ background: #fcfcfc; }}
-td.ok {{ color: #1a7f37; font-weight: 600; }}
-td.err {{ color: #cf222e; font-weight: 600; }}
-code {{ background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }}
-</style>
-</head>
-<body>
-<h1>llm-gateway stats</h1>
-<p class="muted">Auto-refreshes every 30 s. Source override: send header
+    body = f"""<p class="muted">Auto-refreshes every 30 s. Source override: send header
 <code>X-Source: my-workflow</code> from clients to tag calls.</p>
 
 <div class="cards">
@@ -288,7 +349,109 @@ code {{ background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }}
 <th>Model</th><th>Endpoint</th><th>Status</th><th>Duration</th>
 <th>In/Out</th><th>Cost</th></tr></thead>
 <tbody>{rows_recent}</tbody></table>
-</div>
+</div>"""
+    return _doc("llm-gateway stats", "stats", body, refresh=30)
 
-</body>
-</html>"""
+
+@stats_app.get("/routing", response_class=HTMLResponse)
+def routing() -> str:
+    import main  # lazy import: main imports stats at load, so defer to call time
+    return _render_routing(main.routing_snapshot())
+
+
+def _render_routing(snap: dict) -> str:
+    aliases = snap["aliases"]
+    models = snap["models"]
+    conflicts = snap["conflicts"]
+
+    # Collisions panel — only shown when an alias name equals a real model id.
+    conflict_html = ""
+    if conflicts:
+        crows = []
+        for c in conflicts:
+            shadow = ", ".join(_esc(b) for b in c["shadowed"])
+            covered = ", ".join(_esc(b) for b in c["covered"]) or "—"
+            if c["shadowed"]:
+                kind = '<span class="badge err">shadows real model</span>'
+                shadow_cell = f'<td class="err">{shadow}</td>'
+            else:
+                kind = '<span class="badge info">covered</span>'
+                shadow_cell = '<td class="dim">—</td>'
+            crows.append(
+                f'<tr class="f"><td><code>{_esc(c["name"])}</code></td>'
+                f"<td>{kind}</td><td>{covered}</td>{shadow_cell}</tr>"
+            )
+        has_actionable = any(c["shadowed"] for c in conflicts)
+        note = ('<p class="muted">⚠ <b>Shadowed</b> hosts serve a real model whose id '
+                "equals the alias but aren't in its mapping — that model is unreachable "
+                "by its bare name (the alias overrides the pass-through). Add them to the "
+                "alias mapping, or rename the alias.</p>") if has_actionable else (
+                '<p class="muted">These aliases intentionally shadow a real model id and '
+                "cover every host that serves it — no backend is left unreachable.</p>")
+        conflict_html = (
+            '<div class="panel"><h2>Alias / model-name collisions</h2>' + note +
+            "<table><thead><tr><th>Alias</th><th>Kind</th><th>Covered hosts</th>"
+            "<th>Shadowed hosts</th></tr></thead><tbody>" + "".join(crows) +
+            "</tbody></table></div>"
+        )
+
+    # Aliases — one row per route, in effective-priority order.
+    arows = []
+    for a in aliases:
+        name = a["alias"]
+        routes = a["routes"]
+        if not routes:
+            arows.append(f'<tr class="f"><td><code>{_esc(name)}</code></td>'
+                         '<td colspan="4" class="muted">no enabled backend maps this alias</td></tr>')
+            continue
+        for i, r in enumerate(routes):
+            label = f'<code>{_esc(name)}</code>' if i == 0 else '<span class="dim">↳</span>'
+            if r["routable"]:
+                status = '<span class="badge ok">routable</span>'
+            elif not r["healthy"]:
+                status = '<span class="badge warn">backend down</span>'
+            else:
+                status = '<span class="badge err">model missing</span>'
+            ovr = ' <span class="badge info">override</span>' if r["overridden"] else ""
+            arows.append(
+                f'<tr class="f" data-search="{_esc(name)}"><td>{label}</td>'
+                f'<td class="host">{_esc(r["backend"])}</td>'
+                f'<td><code>{_esc(r["model"])}</code></td>'
+                f'<td><span class="prio">{r["priority"]}</span>{ovr}</td>'
+                f"<td>{status}</td></tr>"
+            )
+    alias_html = (
+        '<div class="panel"><h2>Aliases <span class="muted">'
+        "(rows in resolution order = effective priority; lower wins)</span></h2>"
+        "<table><thead><tr><th>Alias</th><th>Host</th><th>Real model</th>"
+        "<th>Priority</th><th>Status</th></tr></thead><tbody>" +
+        ("".join(arows) or '<tr><td colspan="5" class="muted">no virtual_models configured</td></tr>') +
+        "</tbody></table></div>"
+    )
+
+    # Discovered models — how a bare/direct model id routes by backend priority.
+    mrows = []
+    for m in models:
+        parts = []
+        for h in m["hosts"]:
+            down = "" if h["healthy"] else ' <span class="badge warn">down</span>'
+            parts.append(f'<span class="host">{_esc(h["backend"])} '
+                         f'<span class="prio">{h["priority"]}</span>{down}</span>')
+        shadow = ' <span class="badge info">alias exists</span>' if m["shadowed_by_alias"] else ""
+        mrows.append(f'<tr class="f"><td><code>{_esc(m["model"])}</code>{shadow}</td>'
+                     f'<td>{" &nbsp; ".join(parts)}</td></tr>')
+    model_html = (
+        '<div class="panel"><h2>Discovered models <span class="muted">'
+        "(how a bare / direct model id routes, by backend priority)</span></h2>"
+        "<table><thead><tr><th>Model id</th><th>Hosts (priority)</th></tr></thead><tbody>" +
+        ("".join(mrows) or '<tr><td colspan="2" class="muted">nothing discovered yet</td></tr>') +
+        "</tbody></table></div>"
+    )
+
+    search = ('<div class="search"><input id="q" type="search" autocomplete="off" '
+              'placeholder="filter aliases, models, hosts…">'
+              '<span id="count" class="count"></span></div>'
+              '<p class="muted">Reflects live health &amp; discovery — reload to refresh.</p>')
+
+    body = search + conflict_html + alias_html + model_html
+    return _doc("llm-gateway routing", "routing", body, search=True)

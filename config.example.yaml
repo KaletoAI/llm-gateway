@@ -67,11 +67,18 @@ backends:
 
 # Virtual models — pseudo model names that map to real model IDs on backends.
 #   string  → same model on every backend
-#   dict    → per-backend mapping; backend keys without an entry are skipped
+#   dict    → per-backend mapping; backend keys without an entry are skipped.
+#             A backend's value is either:
+#               "model-id"                       → just the model name
+#               {model: "model-id", priority: N} → model name + a priority that
+#                                                   overrides the backend's global
+#                                                   priority *for this alias only*
 #
 # Routing: when a request comes in for `model: "fast"`, the gateway walks backends in
 # priority order and picks the first one that (a) is healthy and (b) exposes the
 # mapped model. The remaining backends become fallback if the chosen one errors.
+# A per-alias `priority` reorders that walk for this alias; backends without an
+# override keep their global priority (same numeric scale as the backends list).
 virtual_models:
   "translator":  "Aya-Expanse-8B"        # same model on every backend
   "caption":     "llama-joycaption-beta-one"
@@ -82,3 +89,12 @@ virtual_models:
     local-gpu:   "Qwen3.5-9B"
     local-cpu:   "gemma-3-9b-it"
     # together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+  # Per-alias priority override: prefer the CPU box for 'cheap', even though
+  # local-gpu has the higher global priority (1 vs 2) in the backends list.
+  "cheap":
+    local-cpu:
+      model:     "gemma-3-9b-it"
+      priority:  1
+    local-gpu:
+      model:     "Qwen3.5-9B"
+      priority:  2
