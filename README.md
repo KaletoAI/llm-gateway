@@ -97,6 +97,8 @@ virtual_models:
     local-gpu:                           #   …even though local-gpu is global #1
       model:     "Qwen3.5-9B"
       priority:  2
+  "embedding":                           # embedding alias → bge-m3 on one host
+    local-gpu:   "bge-m3"                #   (host must NOT set chat_only)
 ```
 
 A backend's value under an alias is normally just the model name. Make it an
@@ -228,6 +230,7 @@ The top-level `api_key` is the *client-facing* gateway auth. Clients send
 | `GET`  | `/v1/models/{id}` | Single-model lookup (some clients verify before calling) |
 | `POST` | `/v1/chat/completions` | OpenAI chat, routed by priority + failover; streaming supported |
 | `POST` | `/v1/completions` | OpenAI completions, same routing |
+| `POST` | `/v1/embeddings` | OpenAI embeddings, same priority routing + failover. Routes to whichever backend serves the requested model (set `chat_only: false` on that backend so its embedding models stay in discovery) |
 | `POST` | `/v1/responses` | OpenAI Responses API, bridged to `/v1/chat/completions` on the backend (request + response translated transparently incl. tool-calls; non-streaming) |
 | `GET`  | `/health` | Per-backend health/model/priority snapshot + virtual_models dump + alias/model-name conflicts |
 
@@ -246,6 +249,16 @@ between the two transparently:
 - `stream: true` is silently downgraded to a non-streaming call. SSE
   event-stream translation isn't implemented yet.
 
+### Embeddings
+
+`/v1/embeddings` uses the same priority routing + failover as chat: the
+request routes to whichever healthy backend serves `model` (bare id, virtual
+alias, or `<backend>/<model>`). Embedding responses report only
+`usage.prompt_tokens`, so cost falls out of the input-price path and
+`output_tokens` is logged as 0. For an embedding model to be routable the
+hosting backend must keep it in discovery — i.e. **not** set `chat_only: true`
+(that filter drops `type != "chat"` models, which includes embeddings).
+
 ## Try it
 
 ```bash
@@ -258,6 +271,12 @@ curl http://localhost:4000/v1/chat/completions \
   -H "Authorization: Bearer sk-change-me" \
   -H "Content-Type: application/json" \
   -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
+
+# Embeddings through an alias
+curl http://localhost:4000/v1/embeddings \
+  -H "Authorization: Bearer sk-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"embedding","input":["hallo welt","zweiter satz"]}'
 
 # Backend health snapshot
 curl http://localhost:4000/health

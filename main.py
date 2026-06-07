@@ -808,6 +808,16 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     return await route("/v1/completions", request, authorization)
 
 
+@app.post("/v1/embeddings")
+async def embeddings(request: Request, authorization: Optional[str] = Header(None)):
+    # Same priority routing as chat: body["model"] is the alias/model, picked up
+    # by get_routes_for(). Embedding responses carry usage.prompt_tokens only
+    # (no completion_tokens) → cost falls out of the input-price path for free.
+    # Backends that filter out embedding models (chat_only) simply won't be
+    # candidates here, so the request routes to a backend that actually serves it.
+    return await route("/v1/embeddings", request, authorization)
+
+
 @app.get("/health")
 async def health():
     return {
