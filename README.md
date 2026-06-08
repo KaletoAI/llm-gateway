@@ -129,12 +129,44 @@ takes the first one that:
 
 1. is enabled,
 2. is currently healthy (last poll of `/v1/models` succeeded),
-3. is mapped for this alias in `virtual_models` (or the model name is a
+3. is not **busy** (below its `max_concurrent` in-flight cap — see below),
+4. is mapped for this alias in `virtual_models` (or the model name is a
    real model that backend exposes — direct, un-aliased requests work too),
-4. has the resolved real model in its model list.
+5. has the resolved real model in its model list.
 
 If that backend errors during the actual forward, the remaining matching
 backends are tried in order.
+
+### Per-backend concurrency cap (`max_concurrent`)
+
+A backend can declare how many requests it can handle at once. The gateway
+keeps a live in-flight counter per backend; once it reaches `max_concurrent`
+the backend is **busy** and skipped in priority routing — the request spills to
+the next backend in the list instead of queueing on (or overloading) a slow
+one. When *every* matching backend is busy, the request gets the usual
+`503` (no backend available).
+
+```yaml
+max_concurrent: 1          # top-level: default cap for all backends
+
+backends:
+  - name: local-gpu
+    url: http://192.168.1.10:8080
+    priority: 1
+    max_concurrent: 1      # per-backend override of the global default
+  - name: together
+    url: https://api.together.xyz
+    priority: 99
+    # no cap → unlimited (cloud API handles its own concurrency)
+```
+
+Match the cap to the backend's real parallelism: `1` for a `llama.cpp` server
+started with `--parallel 1` (a single KV slot → one request at a time),
+high/unset for a cloud API. Missing/`0` = unlimited (legacy behaviour, fully
+backwards-compatible). Busy backends are flagged live on the **Routing** tab and
+in `/health` (`busy`, `inflight`, `max_concurrent` per backend). The counter is
+released when the response completes — including when a streamed (SSE) response
+finishes, not when its headers are sent.
 
 ### Per-backend model filters
 

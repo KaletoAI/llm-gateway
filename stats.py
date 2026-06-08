@@ -232,6 +232,7 @@ code { background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }
 .badge.err  { background: #fde8e8; color: #cf222e; }
 .badge.info { background: #e8eefc; color: #1a56c4; }
 .badge.off  { background: #eceef1; color: #888; }
+.badge.busy { background: #f3e8fd; color: #8250df; }
 tr.off td { color: #aaa; }
 .prio { display: inline-block; min-width: 1.5rem; text-align: center; font-weight: 600;
         background: #eef0f4; border-radius: 5px; padding: 0 .35rem; }
@@ -410,12 +411,14 @@ def _render_routing(snap: dict) -> str:
             label = f'<code>{_esc(name)}</code>' if i == 0 else '<span class="dim">↳</span>'
             if not r.get("enabled", True):
                 status = '<span class="badge off">disabled</span>'
-            elif r["routable"]:
-                status = '<span class="badge ok">routable</span>'
             elif not r["healthy"]:
                 status = '<span class="badge warn">backend down</span>'
-            else:
+            elif not r["present"]:
                 status = '<span class="badge err">model missing</span>'
+            elif r.get("busy"):
+                status = '<span class="badge busy">busy</span>'
+            else:
+                status = '<span class="badge ok">routable</span>'
             ovr = ' <span class="badge info">override</span>' if r["overridden"] else ""
             row_cls = "f off" if not r.get("enabled", True) else "f"
             arows.append(
@@ -440,8 +443,9 @@ def _render_routing(snap: dict) -> str:
         parts = []
         for h in m["hosts"]:
             down = "" if h["healthy"] else ' <span class="badge warn">down</span>'
+            busy = ' <span class="badge busy">busy</span>' if h.get("busy") else ""
             parts.append(f'<span class="host">{_esc(h["backend"])} '
-                         f'<span class="prio">{h["priority"]}</span>{down}</span>')
+                         f'<span class="prio">{h["priority"]}</span>{down}{busy}</span>')
         shadow = ' <span class="badge info">alias exists</span>' if m["shadowed_by_alias"] else ""
         mrows.append(f'<tr class="f"><td><code>{_esc(m["model"])}</code>{shadow}</td>'
                      f'<td>{" &nbsp; ".join(parts)}</td></tr>')

@@ -25,7 +25,7 @@ CONFIG_PATH = Path("config.yaml")
 def load_config() -> None:
     """Read config.yaml and (re)bind module-level config values."""
     global config, backends, virtual_models, health_check_interval, api_key
-    global stats_cfg, log_per_call, model_prefix
+    global stats_cfg, log_per_call, model_prefix, max_concurrent_default
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     backends = sorted(config["backends"], key=lambda b: b["priority"])
@@ -35,13 +35,18 @@ def load_config() -> None:
     stats_cfg = config.get("stats") or {}
     log_per_call = config.get("log_per_call", True)
     model_prefix = config.get("model_prefix", True)
+    # Global in-flight cap applied to every backend that doesn't set its own
+    # `max_concurrent`. None = unlimited (legacy behaviour).
+    max_concurrent_default = config.get("max_concurrent")
 
 
 def log_config_summary() -> None:
     logger.info(f"Loaded {len(backends)} backend(s):")
     for b in backends:
         state = "ENABLED " if is_enabled(b) else "DISABLED"
-        logger.info(f"  [{state}] {b['name']:25} priority={b['priority']}  url={b['url']}")
+        cap = backend_max_concurrent(b)
+        cap_s = f"  max_concurrent={cap}" if cap is not None else ""
+        logger.info(f"  [{state}] {b['name']:25} priority={b['priority']}  url={b['url']}{cap_s}")
     logger.info(f"Loaded {len(virtual_models)} virtual alias(es):")
     for alias, mapping in virtual_models.items():
         if isinstance(mapping, dict):
@@ -66,6 +71,7 @@ api_key: Optional[str]
 stats_cfg: dict
 log_per_call: bool
 model_prefix: bool
+max_concurrent_default: Optional[int]
 load_config()
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -73,6 +79,7 @@ load_config()
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
 backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
+backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
 
 # ── Health / Discovery ────────────────────────────────────────────────────────
 
@@ -87,6 +94,33 @@ def enabled_backends() -> list[dict]:
 def backend_auth_headers(backend: dict) -> dict:
     key = backend.get("api_key")
     return {"authorization": f"Bearer {key}"} if key else {}
+
+
+# ── In-flight cap / "busy" routing ─────────────────────────────────────────────
+# Per-backend live request counter. A backend at/above its `max_concurrent` cap is
+# "busy": priority routing skips it (spilling to the next backend) and the routing
+# dashboard flags it. Lets one slow llama.cpp box (--parallel 1) shed concurrent
+# load onto the rest of the fleet instead of queueing/overflowing.
+
+def backend_max_concurrent(backend: dict) -> Optional[int]:
+    """In-flight cap for this backend: its own `max_concurrent`, else the global
+    default, else None (unlimited)."""
+    v = backend.get("max_concurrent", max_concurrent_default)
+    return v if isinstance(v, int) and v > 0 else None
+
+
+def backend_busy(backend: dict) -> bool:
+    """True when the backend is at/above its in-flight cap → temporarily skipped."""
+    cap = backend_max_concurrent(backend)
+    return cap is not None and backend_inflight.get(backend["name"], 0) >= cap
+
+
+def _inflight_inc(name: str) -> None:
+    backend_inflight[name] = backend_inflight.get(name, 0) + 1
+
+
+def _inflight_dec(name: str) -> None:
+    backend_inflight[name] = max(0, backend_inflight.get(name, 0) - 1)
 
 
 def _to_float(v) -> float:
@@ -212,6 +246,7 @@ def reload_config() -> None:
         backend_healthy.pop(stale, None)
         backend_models.pop(stale, None)
         backend_pricing.pop(stale, None)
+        backend_inflight.pop(stale, None)
         logger.info(f"  removed backend [{stale}] — state cleared")
     logger.info("Config reloaded.")
     log_config_summary()
@@ -344,6 +379,8 @@ def get_routes_for(alias: str) -> list[tuple[dict, str]]:
     for b in enabled_backends():
         if not backend_healthy.get(b["name"]):
             continue
+        if backend_busy(b):              # at in-flight cap → spill to next backend
+            continue
         real, prio = alias_entry(alias, b["name"])
         if real is None:
             continue
@@ -407,6 +444,7 @@ def routing_snapshot() -> dict:
             enbl = is_enabled(b)               # mapping doesn't silently vanish when
             healthy = enbl and backend_healthy.get(b["name"], False)  # a host is off
             present = real in backend_models.get(b["name"], set())
+            busy = enbl and healthy and backend_busy(b)
             rows.append({
                 "backend": b["name"],
                 "model": real,
@@ -415,6 +453,7 @@ def routing_snapshot() -> dict:
                 "enabled": enbl,
                 "healthy": healthy,
                 "present": present,
+                "busy": busy,
                 "routable": enbl and healthy and present,
             })
         rows.sort(key=lambda r: r["priority"])
@@ -429,6 +468,7 @@ def routing_snapshot() -> dict:
                 "backend": b["name"],
                 "priority": b["priority"],
                 "healthy": healthy,
+                "busy": healthy and backend_busy(b),
             })
     models = []
     for mid, hosts in sorted(model_hosts.items(), key=lambda kv: kv[0].lower()):
@@ -462,6 +502,7 @@ async def proxy(backend: dict, path: str, request: Request, body: dict, alias: s
     }
     headers.update(backend_auth_headers(backend))
     bname = backend["name"]
+    _inflight_inc(bname)         # released on completion (stream close / return / error)
     real_model = body.get("model")
     source = _source_of(request)
     started = time.monotonic()
@@ -469,13 +510,16 @@ async def proxy(backend: dict, path: str, request: Request, body: dict, alias: s
     if body.get("stream"):
         async def generate():
             stream_status = 0
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
-                    stream_status = resp.status_code
-                    if log_per_call:
-                        logger.info(f"← [{bname}] {path} HTTP {stream_status} (stream open, {(time.monotonic()-started):.2f}s)")
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
+                        stream_status = resp.status_code
+                        if log_per_call:
+                            logger.info(f"← [{bname}] {path} HTTP {stream_status} (stream open, {(time.monotonic()-started):.2f}s)")
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+            finally:
+                _inflight_dec(bname)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             asyncio.create_task(stats.record_call(
                 duration_ms=elapsed_ms, backend=bname, source=source,
@@ -484,8 +528,11 @@ async def proxy(backend: dict, path: str, request: Request, body: dict, alias: s
             ))
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=body, headers=headers, timeout=300.0)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=body, headers=headers, timeout=300.0)
+    finally:
+        _inflight_dec(bname)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     if log_per_call:
         logger.info(f"← [{bname}] {path} HTTP {resp.status_code} ({elapsed_ms} ms)")
@@ -763,6 +810,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
         url = f"{backend['url']}/v1/chat/completions"
         headers = {"content-type": "application/json"}
         headers.update(backend_auth_headers(backend))
+        _inflight_inc(bname)         # released in finally (covers continue / return / error)
         started = time.monotonic()
         try:
             if log_per_call:
@@ -797,6 +845,8 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.warning(f"✗ [{bname}] {e} — trying next")
             last_error = e
+        finally:
+            _inflight_dec(bname)
 
     if isinstance(last_error, HTTPException):
         raise last_error
@@ -826,6 +876,9 @@ async def health():
             b["name"]: {
                 "enabled": is_enabled(b),
                 "healthy": is_enabled(b) and backend_healthy.get(b["name"], False),
+                "busy": is_enabled(b) and backend_busy(b),
+                "inflight": backend_inflight.get(b["name"], 0),
+                "max_concurrent": backend_max_concurrent(b),
                 "priority": b["priority"],
                 "models": sorted(backend_models.get(b["name"], set())) if is_enabled(b) else [],
             }

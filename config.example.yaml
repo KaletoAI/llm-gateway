@@ -22,6 +22,13 @@ log_per_call: true
 # bare id/alias still routes by priority. Set false for legacy bare listing.
 model_prefix: true
 
+# Max in-flight requests per backend before it's treated as "busy" and skipped
+# in priority routing — the request spills to the next backend in the list
+# instead of queueing/overloading a slow one. Missing/0 = unlimited (default).
+# This global value applies to every backend that doesn't set its own
+# `max_concurrent` (see below). Busy backends are flagged on the routing tab.
+# max_concurrent: 1
+
 # Optional call-stats sink: SQLite DB + minimal HTML dashboard on a separate port.
 # Default disabled. When enabled, every call is recorded with backend, source,
 # alias, model, tokens, status, duration, and USD cost (for backends that
@@ -40,14 +47,20 @@ stats:
 #   enabled: false  → fully out of rotation (no health-check, no routing)
 #   api_key         → sent as `Authorization: Bearer <key>` to this backend
 #                     (use for cloud APIs like together.ai, OpenAI, OpenRouter, …)
+#   max_concurrent  → per-backend in-flight cap; overrides the global one above.
+#                     Match it to the backend's real parallelism — e.g. 1 for a
+#                     llama.cpp server run with `--parallel 1`, high/unset for a
+#                     cloud API that handles concurrency itself.
 backends:
   - name: local-gpu
     url: http://192.168.1.10:8080      # e.g. llama-swap, llama.cpp server, vLLM, …
     priority: 1
+    max_concurrent: 1                   # single-slot llama.cpp → 1 request at a time
 
   - name: local-cpu
     url: http://192.168.1.11:8080
     priority: 2
+    max_concurrent: 1
     # enabled: false                    # set to take this backend out of rotation
 
   # - name: together                    # Cloud fallback (OpenAI-compatible)
