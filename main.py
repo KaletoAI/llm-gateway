@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -505,6 +506,7 @@ async def proxy(backend: dict, path: str, request: Request, body: dict, alias: s
     _inflight_inc(bname)         # released on completion (stream close / return / error)
     real_model = body.get("model")
     source = _source_of(request)
+    req_text = json.dumps(body, ensure_ascii=False)
     started = time.monotonic()
 
     if body.get("stream"):
@@ -525,6 +527,7 @@ async def proxy(backend: dict, path: str, request: Request, body: dict, alias: s
                 duration_ms=elapsed_ms, backend=bname, source=source,
                 alias=alias, model=real_model, endpoint=path,
                 status=stream_status, input_tokens=0, output_tokens=0, cost_usd=0.0,
+                request_text=req_text,
             ))
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -549,6 +552,7 @@ async def proxy(backend: dict, path: str, request: Request, body: dict, alias: s
         status=resp.status_code,
         input_tokens=in_tok, output_tokens=out_tok,
         cost_usd=_cost_usd(bname, real_model, in_tok, out_tok),
+        request_text=req_text,
     ))
     return JSONResponse(resp_json, status_code=resp.status_code)
 
@@ -811,6 +815,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
         headers = {"content-type": "application/json"}
         headers.update(backend_auth_headers(backend))
         _inflight_inc(bname)         # released in finally (covers continue / return / error)
+        req_text = json.dumps(chat_body, ensure_ascii=False)
         started = time.monotonic()
         try:
             if log_per_call:
@@ -825,6 +830,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
                     duration_ms=elapsed_ms, backend=bname, source=source,
                     alias=alias, model=real_model, endpoint="/v1/responses",
                     status=resp.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
+                    request_text=req_text,
                 ))
                 last_error = HTTPException(resp.status_code, resp.text[:500])
                 continue
@@ -840,6 +846,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
                 status=resp.status_code,
                 input_tokens=in_tok, output_tokens=out_tok,
                 cost_usd=_cost_usd(bname, real_model, in_tok, out_tok),
+                request_text=req_text,
             ))
             return JSONResponse(chat_to_responses(chat_resp_json))
         except (httpx.ConnectError, httpx.TimeoutException) as e:

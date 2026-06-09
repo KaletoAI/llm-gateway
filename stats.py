@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS calls (
     status        INTEGER,
     input_tokens  INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
-    cost_usd      REAL    DEFAULT 0
+    cost_usd      REAL    DEFAULT 0,
+    req_preview   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calls_ts      ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
@@ -50,6 +51,10 @@ def init(db_path: str) -> None:
     with _conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(_SCHEMA)
+        # Migrate older DBs that predate the req_preview column.
+        cols = {r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()}
+        if "req_preview" not in cols:
+            c.execute("ALTER TABLE calls ADD COLUMN req_preview TEXT")
     logger.info(f"stats: SQLite at {_DB_PATH} (WAL mode)")
 
 
@@ -66,10 +71,20 @@ def _record_sync(row: tuple) -> None:
     with _conn() as c:
         c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
-            "endpoint, status, input_tokens, output_tokens, cost_usd) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
+
+
+def _preview(text: Optional[str], head: int = 50, tail: int = 50) -> Optional[str]:
+    """First `head` + last `tail` chars of the request, ellipsis in between."""
+    if not text:
+        return None
+    text = " ".join(text.split())  # collapse whitespace/newlines for a compact preview
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]} … {text[-tail:]}"
 
 
 async def record_call(
@@ -84,6 +99,7 @@ async def record_call(
     input_tokens: int = 0,
     output_tokens: int = 0,
     cost_usd: float = 0.0,
+    request_text: Optional[str] = None,
 ) -> None:
     """Async-safe insert. Never raises into the request path."""
     if _DB_PATH is None:
@@ -100,6 +116,7 @@ async def record_call(
         input_tokens,
         output_tokens,
         cost_usd,
+        _preview(request_text),
     )
     try:
         await asyncio.to_thread(_record_sync, row)
@@ -171,7 +188,7 @@ def dashboard() -> str:
     )
     recent = _q(
         "SELECT ts, duration_ms, backend, source, alias, model, endpoint, "
-        "status, input_tokens, output_tokens, cost_usd "
+        "status, input_tokens, output_tokens, cost_usd, req_preview "
         "FROM calls ORDER BY id DESC LIMIT 50"
     )
     return _render(
@@ -183,6 +200,10 @@ def dashboard() -> str:
 
 def _fmt_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_time(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%H:%M:%S")
 
 
 def _esc(s) -> str:
@@ -308,13 +329,14 @@ def _render(total, h24, by_backend, by_model, by_source, recent) -> str:
     ) or '<tr><td colspan="3" class="muted">no data yet</td></tr>'
 
     rows_recent = "".join(
-        f"<tr><td>{_fmt_ts(ts)}</td><td>{_esc(b)}</td><td>{_esc(src)}</td>"
+        f"<tr><td>{_fmt_ts(ts - round((dm or 0) / 1000))}</td><td>{_fmt_time(ts)}</td>"
+        f"<td><code>{_esc(rp)}</code></td><td>{_esc(b)}</td><td>{_esc(src)}</td>"
         f"<td>{_esc(a)}</td><td>{_esc(m)}</td><td>{_esc(ep)}</td>"
         f"<td class='{ 'ok' if 200 <= (st or 0) < 400 else 'err' }'>{st}</td>"
         f"<td>{int(dm):,} ms</td><td>{int(it or 0)}/{int(ot or 0)}</td>"
         f"<td>${(cu or 0):.5f}</td></tr>"
-        for (ts, dm, b, src, a, m, ep, st, it, ot, cu) in recent
-    ) or '<tr><td colspan="10" class="muted">no calls recorded yet</td></tr>'
+        for (ts, dm, b, src, a, m, ep, st, it, ot, cu, rp) in recent
+    ) or '<tr><td colspan="12" class="muted">no calls recorded yet</td></tr>'
 
     body = f"""<p class="muted">Auto-refreshes every 30 s. Source override: send header
 <code>X-Source: my-workflow</code> from clients to tag calls.</p>
@@ -348,7 +370,7 @@ def _render(total, h24, by_backend, by_model, by_source, recent) -> str:
 
 <div class="panel">
 <h2>Recent calls (last 50)</h2>
-<table><thead><tr><th>Time</th><th>Backend</th><th>Source</th><th>Alias</th>
+<table><thead><tr><th>Start</th><th>End</th><th>Request</th><th>Backend</th><th>Source</th><th>Alias</th>
 <th>Model</th><th>Endpoint</th><th>Status</th><th>Duration</th>
 <th>In/Out</th><th>Cost</th></tr></thead>
 <tbody>{rows_recent}</tbody></table>
