@@ -51,6 +51,11 @@ stats:
 #                     Match it to the backend's real parallelism — e.g. 1 for a
 #                     llama.cpp server run with `--parallel 1`, high/unset for a
 #                     cloud API that handles concurrency itself.
+#   local           → ALSO list this backend's models bare (without the
+#                     `<backend>/` prefix), alongside the prefixed id. A bare
+#                     request then routes by priority across every `local` backend
+#                     that serves it — same failover as a virtual alias. Does not
+#                     affect model_prefix; the prefixed id stays listed too.
 backends:
   - name: local-gpu
     url: http://192.168.1.10:8080      # e.g. llama-swap, llama.cpp server, vLLM, …

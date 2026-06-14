@@ -122,6 +122,36 @@ all backends as before. Backend names never collide with vendor prefixes
 (`moonshotai/`, `nvidia/`, …), so the leading path segment disambiguates
 cleanly. Set `model_prefix: false` for the legacy bare, de-duplicated listing.
 
+#### Per-backend `local`: also list bare
+
+The `model_prefix` switch is global — all backends prefixed or none. To expose
+*specific* backends' models without the prefix while keeping the rest prefixed,
+set `local: true` on those backends:
+
+```yaml
+backends:
+  - name: local-gpu
+    url: http://192.168.1.10:8080
+    priority: 1
+    local: true        # lists local-gpu/qwen3.5-9b AND bare qwen3.5-9b
+  - name: local-cpu
+    url: http://192.168.1.11:8080
+    priority: 2
+    local: true        # same bare qwen3.5-9b → de-duplicated, routes by priority
+  - name: openrouter
+    url: https://openrouter.ai/api
+    priority: 98
+    api_key: "sk-or-v1-…"   # no local flag → stays openrouter/nvidia/… only
+```
+
+A `local` backend lists each model **twice** in `/v1/models`: the usual
+`<backend>/<model>` id *and* the bare `<model>` id. The bare id isn't tied to a
+backend, so a request for it routes by priority across *every* `local` backend
+that serves it — same failover and busy-spill as a virtual alias. When several
+`local` backends share a model id, the bare entry is de-duplicated to one. This
+is independent of `model_prefix` (the prefixed id stays listed regardless); it
+just adds the bare alias-style entry for the flagged backends.
+
 ### How routing picks a backend
 
 For each incoming request, the gateway walks backends in priority order and

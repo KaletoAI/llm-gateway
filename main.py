@@ -749,6 +749,7 @@ async def list_models(authorization: Optional[str] = Header(None)):
 
     for backend in enabled_backends():
         bname = backend["name"]
+        expose_bare = backend.get("local", False)
         for mid in sorted(backend_models.get(bname, set())):
             # With model_prefix on, ids are '<backend>/<model>' so the same model
             # on two backends stays distinct and the provider is visible. Off →
@@ -757,6 +758,13 @@ async def list_models(authorization: Optional[str] = Header(None)):
             if disp not in seen:
                 seen.add(disp)
                 data.append({"id": disp, "object": "model", "created": now, "owned_by": bname})
+            # `local: true` backends ADDITIONALLY list the bare id (alongside the
+            # prefixed one). A bare request routes by priority across every backend
+            # that exposes it — exactly like a virtual alias — so several `local`
+            # backends sharing a model id collapse to one entry and fail over.
+            if expose_bare and mid not in seen:
+                seen.add(mid)
+                data.append({"id": mid, "object": "model", "created": now, "owned_by": bname})
 
     # Virtual aliases are cross-backend → always listed bare (no prefix).
     for alias in virtual_models:
