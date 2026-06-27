@@ -1,0 +1,243 @@
+"""Generation job store — Phase 1 of the multimodal-gateway plan.
+
+Self-contained and dependency-free (stdlib `sqlite3` WAL + plain disk blobs),
+in the spirit of stats.py. Holds the lifecycle and results of image/video/audio
+generation jobs so a result stays retrievable by id for a while (TTL) even after
+a synchronous caller has its inline copy.
+
+Layout:
+- metadata  → SQLite `jobs` table (status, timing, owner, result manifest)
+- artifacts → `<blob_dir>/<job_id>/<n><ext>` on disk (never base64 in the DB)
+
+A job moves queued → running → done | failed, then is pruned once it is older
+than its `ttl_s`. `owner` is carried now (default "default") so Phase-3 multi-user
+job-ownership checks slot in without a migration.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+_DB_PATH = "jobs.db"
+_BLOB_DIR = "jobs"
+_DEFAULT_TTL = 86400
+_active = False
+
+_EXT_BY_MIME = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+    "image/gif": ".gif", "video/mp4": ".mp4", "video/webm": ".webm",
+    "audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/flac": ".flac",
+}
+
+
+def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 86400) -> None:
+    global _DB_PATH, _BLOB_DIR, _DEFAULT_TTL, _active
+    _DB_PATH, _BLOB_DIR, _DEFAULT_TTL, _active = db_path, blob_dir, default_ttl_s, True
+    os.makedirs(_BLOB_DIR, exist_ok=True)
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id           TEXT PRIMARY KEY,
+                created      INTEGER NOT NULL,
+                updated      INTEGER NOT NULL,
+                status       TEXT NOT NULL,
+                task         TEXT,
+                alias        TEXT,
+                backend      TEXT,
+                owner        TEXT,
+                ttl_s        INTEGER NOT NULL,
+                error        TEXT,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                results_json TEXT,
+                meta_json    TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)")
+    logger.info(f"jobs: store at {_DB_PATH}, blobs in {_BLOB_DIR}/ (default ttl {_DEFAULT_TTL}s)")
+
+
+@contextmanager
+def _conn():
+    conn = sqlite3.connect(_DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex
+
+
+def is_active() -> bool:
+    return _active
+
+
+def counts() -> dict:
+    """Job count per status, for the dashboard."""
+    if not _active:
+        return {}
+    with _conn() as c:
+        rows = c.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def recent(limit: int = 20) -> list:
+    """Most recent jobs (metadata only), newest first."""
+    if not _active:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, created, updated, status, task, alias, backend, owner, result_count, error "
+            "FROM jobs ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create(task: str, alias: str, backend: str, *,
+           owner: str = "default", ttl_s: Optional[int] = None,
+           job_id: Optional[str] = None) -> str:
+    """Insert a queued job and return its id."""
+    jid = job_id or new_id()
+    now = int(time.time())
+    ttl = ttl_s if (isinstance(ttl_s, int) and ttl_s > 0) else _DEFAULT_TTL
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO jobs (id, created, updated, status, task, alias, backend, owner, ttl_s) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (jid, now, now, "queued", task, alias, backend, owner, ttl),
+        )
+    return jid
+
+
+def set_status(job_id: str, status: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE jobs SET status=?, updated=? WHERE id=?",
+                  (status, int(time.time()), job_id))
+
+
+def fail(job_id: str, error: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE jobs SET status='failed', error=?, updated=? WHERE id=?",
+                  (str(error), int(time.time()), job_id))
+
+
+def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
+    """Write artifact bytes to disk and mark the job done. Returns the result
+    manifest (one entry per blob: n, mime, kind, filename).
+
+    Re-points the job's `backend` column to where it actually ran (`meta["backend"]`)
+    — after a failover that differs from the backend recorded at create() time."""
+    job_dir = os.path.join(_BLOB_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    manifest = []
+    for n, blob in enumerate(blobs):
+        ext = _EXT_BY_MIME.get(blob.mime, ".bin")
+        fname = f"{n}{ext}"
+        with open(os.path.join(job_dir, fname), "wb") as f:
+            f.write(blob.data)
+        manifest.append({"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname})
+    meta = meta or {}
+    ran_on = meta.get("backend")
+    with _conn() as c:
+        if ran_on:
+            c.execute(
+                "UPDATE jobs SET status='done', backend=?, updated=?, result_count=?, results_json=?, meta_json=? WHERE id=?",
+                (ran_on, int(time.time()), len(manifest), json.dumps(manifest), json.dumps(meta), job_id),
+            )
+        else:
+            c.execute(
+                "UPDATE jobs SET status='done', updated=?, result_count=?, results_json=?, meta_json=? WHERE id=?",
+                (int(time.time()), len(manifest), json.dumps(manifest), json.dumps(meta), job_id),
+            )
+    return manifest
+
+
+def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
+    """Mark a job done with an inline JSON result (e.g. a parked chat completion) —
+    no disk blob; the payload is retrievable via get()['results'][0]."""
+    meta = meta or {}
+    ran_on = meta.get("backend")
+    with _conn() as c:
+        if ran_on:
+            c.execute("UPDATE jobs SET status='done', backend=?, updated=?, result_count=1, "
+                      "results_json=?, meta_json=? WHERE id=?",
+                      (ran_on, int(time.time()), json.dumps([payload]), json.dumps(meta), job_id))
+        else:
+            c.execute("UPDATE jobs SET status='done', updated=?, result_count=1, "
+                      "results_json=?, meta_json=? WHERE id=?",
+                      (int(time.time()), json.dumps([payload]), json.dumps(meta), job_id))
+
+
+def get(job_id: str) -> Optional[dict]:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["results"] = json.loads(d.pop("results_json") or "[]")
+    d["meta"] = json.loads(d.pop("meta_json") or "{}")
+    d["expired"] = (d["created"] + d["ttl_s"]) < int(time.time())
+    return d
+
+
+def result_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
+    """(filesystem path, mime) for result `n` of a job, or None if absent."""
+    job = get(job_id)
+    if not job:
+        return None
+    for r in job["results"]:
+        if r["n"] == n:
+            path = os.path.join(_BLOB_DIR, job_id, r["filename"])
+            if os.path.exists(path):
+                return path, r["mime"]
+    return None
+
+
+def _delete(job_id: str) -> None:
+    job_dir = os.path.join(_BLOB_DIR, job_id)
+    if os.path.isdir(job_dir):
+        for f in os.listdir(job_dir):
+            try:
+                os.remove(os.path.join(job_dir, f))
+            except OSError:
+                pass
+        try:
+            os.rmdir(job_dir)
+        except OSError:
+            pass
+    with _conn() as c:
+        c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+
+def prune_once() -> int:
+    """Delete jobs (rows + blobs) past their ttl. Returns how many were removed."""
+    now = int(time.time())
+    with _conn() as c:
+        ids = [r["id"] for r in c.execute(
+            "SELECT id FROM jobs WHERE (created + ttl_s) < ?", (now,)).fetchall()]
+    for jid in ids:
+        _delete(jid)
+    if ids:
+        logger.info(f"jobs: pruned {len(ids)} expired job(s)")
+    return len(ids)
+
+
+async def prune_loop(interval_s: int = 3600) -> None:
+    import asyncio
+    while True:
+        try:
+            await asyncio.to_thread(prune_once)
+        except Exception as e:
+            logger.warning(f"jobs: prune failed: {e}")
+        await asyncio.sleep(interval_s)

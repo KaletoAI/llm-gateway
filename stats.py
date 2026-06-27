@@ -9,7 +9,9 @@ f-strings; no template engine, no JS, no chart libs. Auto-refresh via
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -23,6 +25,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 logger = logging.getLogger(__name__)
 
 _DB_PATH: Optional[Path] = None
+_BLOB_DIR: str = "calls"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,18 +47,87 @@ CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
 """
 
 
-def init(db_path: str) -> None:
-    """Open / create the stats DB, set WAL, ensure schema."""
-    global _DB_PATH
+def is_active() -> bool:
+    return _DB_PATH is not None
+
+
+def recent(limit: int = 15) -> list:
+    """Just the latest calls (one indexed query) — for the live dashboard."""
+    if _DB_PATH is None:
+        return []
+    return _q("SELECT ts, duration_ms, backend, source, alias, model, endpoint, status, "
+              "input_tokens, output_tokens, cost_usd FROM calls ORDER BY id DESC LIMIT ?", limit)
+
+
+def count_since(ts: int) -> int:
+    if _DB_PATH is None:
+        return 0
+    return _q("SELECT COUNT(*) FROM calls WHERE ts > ?", ts)[0][0]
+
+
+def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 20,
+            user: Optional[str] = None) -> dict:
+    """Aggregated call stats for the in-UI dashboard (data only, no HTML). If
+    `user` is given, every figure is scoped to that source (per-user drilldown);
+    `by_source` stays unscoped so it can drive the user picker."""
+    if _DB_PATH is None:
+        return {"active": False}
+    now = int(time.time())
+    flt = " WHERE source = ?" if user else ""
+    ua = [user] if user else []
+    total = _q(f"SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls{flt}", *ua)[0]
+    h24flt = " WHERE ts > ?" + (" AND source = ?" if user else "")
+    h24 = _q(f"SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls{h24flt}", now - 86400, *ua)[0]
+    return {
+        "active": True, "user": user,
+        "total_count": total[0], "total_cost": total[1],
+        "h24_count": h24[0], "h24_cost": h24[1],
+        "by_backend": _q(
+            f"SELECT backend, COUNT(*), COALESCE(SUM(input_tokens),0), "
+            f"COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0), COALESCE(AVG(duration_ms),0) "
+            f"FROM calls{flt} GROUP BY backend ORDER BY COUNT(*) DESC", *ua),
+        "by_model": _q(
+            f"SELECT COALESCE(alias,''), COALESCE(model,''), COUNT(*), "
+            f"COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0) "
+            f"FROM calls{flt} GROUP BY alias, model ORDER BY COUNT(*) DESC LIMIT ?", *ua, model_limit),
+        "by_source": _q(
+            "SELECT COALESCE(source,'unknown'), COUNT(*), COALESCE(SUM(cost_usd),0) "
+            "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", source_limit),
+        "recent": _q(
+            f"SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
+            f"input_tokens, output_tokens, cost_usd, req_preview, has_body "
+            f"FROM calls{flt} ORDER BY id DESC LIMIT ?", *ua, recent_limit),
+    }
+
+
+def month_cost(user: str, month_start_ts: int) -> float:
+    """Total cost_usd for a user since a UTC timestamp — drives the monthly
+    cost quota (E1). 0 when stats are off (quota simply can't bind then)."""
+    if _DB_PATH is None:
+        return 0.0
+    r = _q("SELECT COALESCE(SUM(cost_usd),0) FROM calls WHERE source = ? AND ts >= ?",
+           user, month_start_ts)
+    return float(r[0][0]) if r else 0.0
+
+
+def init(db_path: str, blob_dir: str = "calls") -> None:
+    """Open / create the stats DB, set WAL, ensure schema. Full call bodies
+    (request + response) live on disk under `blob_dir` (never in the DB), keyed
+    by call id, and are pruned together with their row."""
+    global _DB_PATH, _BLOB_DIR
     _DB_PATH = Path(db_path)
+    _BLOB_DIR = blob_dir
+    os.makedirs(_BLOB_DIR, exist_ok=True)
     with _conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(_SCHEMA)
-        # Migrate older DBs that predate the req_preview column.
+        # Migrate older DBs that predate later columns.
         cols = {r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()}
         if "req_preview" not in cols:
             c.execute("ALTER TABLE calls ADD COLUMN req_preview TEXT")
-    logger.info(f"stats: SQLite at {_DB_PATH} (WAL mode)")
+        if "has_body" not in cols:
+            c.execute("ALTER TABLE calls ADD COLUMN has_body INTEGER DEFAULT 0")
+    logger.info(f"stats: SQLite at {_DB_PATH} (WAL), call bodies in {_BLOB_DIR}/")
 
 
 @contextmanager
@@ -67,14 +139,45 @@ def _conn():
         conn.close()
 
 
-def _record_sync(row: tuple) -> None:
+def _body_path(call_id: int) -> str:
+    return os.path.join(_BLOB_DIR, f"{call_id}.json")
+
+
+def _as_obj(text):
+    """Parse a JSON string back to an object for tidy storage; keep raw if not JSON."""
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return text
+
+
+def get_body(call_id: int) -> Optional[dict]:
+    """Full {request, response} for a call from its on-disk blob (or None)."""
+    try:
+        with open(_body_path(int(call_id)), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _record_sync(row: tuple, request_text=None, response_text=None) -> None:
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
             "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
+        if request_text is not None or response_text is not None:
+            try:
+                with open(_body_path(cur.lastrowid), "w", encoding="utf-8") as f:
+                    json.dump({"request": _as_obj(request_text), "response": _as_obj(response_text)},
+                              f, ensure_ascii=False)
+                c.execute("UPDATE calls SET has_body=1 WHERE id=?", (cur.lastrowid,))
+            except Exception:
+                pass
 
 
 def _preview(text: Optional[str], head: int = 50, tail: int = 50) -> Optional[str]:
@@ -100,8 +203,10 @@ async def record_call(
     output_tokens: int = 0,
     cost_usd: float = 0.0,
     request_text: Optional[str] = None,
+    response_text: Optional[str] = None,
 ) -> None:
-    """Async-safe insert. Never raises into the request path."""
+    """Async-safe insert. Never raises into the request path. Full request/response
+    bodies (when given) are written to an on-disk blob, not the DB row."""
     if _DB_PATH is None:
         return
     row = (
@@ -119,7 +224,7 @@ async def record_call(
         _preview(request_text),
     )
     try:
-        await asyncio.to_thread(_record_sync, row)
+        await asyncio.to_thread(_record_sync, row, request_text, response_text)
     except Exception as e:
         logger.warning(f"stats: insert failed: {e}")
 
@@ -133,8 +238,14 @@ async def prune_loop(retention_days: int, interval_s: int = 3600) -> None:
             cutoff = int(time.time()) - retention_days * 86400
             def _prune():
                 with _conn() as c:
-                    cur = c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
-                    return cur.rowcount
+                    ids = [r[0] for r in c.execute("SELECT id FROM calls WHERE ts < ?", (cutoff,)).fetchall()]
+                    for cid in ids:
+                        try:
+                            os.remove(_body_path(cid))
+                        except OSError:
+                            pass
+                    c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
+                    return len(ids)
             n = await asyncio.to_thread(_prune)
             if n:
                 logger.info(f"stats: pruned {n} rows older than {retention_days} days")

@@ -29,17 +29,15 @@ model_prefix: true
 # `max_concurrent` (see below). Busy backends are flagged on the routing tab.
 # max_concurrent: 1
 
-# Optional call-stats sink: SQLite DB + minimal HTML dashboard on a separate port.
-# Default disabled. When enabled, every call is recorded with backend, source,
-# alias, model, tokens, status, duration, and USD cost (for backends that
-# expose pricing in /v1/models — Together.ai does; local backends → 0).
-# Source defaults to the client IP and can be overridden per-call by sending
-# an `X-Source: my-workflow-name` header from the client.
+# Optional call-stats sink: SQLite DB; the dashboard is built into the /ui console
+# (Statistic tab) — no separate server/port anymore. When enabled, every call is
+# recorded with backend, source (the authenticated user, else X-Source header / client
+# IP), alias, model, tokens, status, duration, and USD cost (for backends that expose
+# pricing in /v1/models — Together.ai does; local backends → 0).
 # Toggle takes effect on full restart; not picked up by hot-reload.
+# NOTE: optional — the Server tab in /ui manages these (stored, overriding config).
 stats:
   enabled: false
-  port: 4001
-  bind: "0.0.0.0"
   db_path: stats.db
   retention_days: 0   # 0 = keep forever; otherwise prune older rows hourly
 
@@ -116,3 +114,68 @@ virtual_models:
     local-gpu:
       model:     "Qwen3.5-9B"
       priority:  2
+
+# ── Generation (image / video / TTS) — Phase 1 ────────────────────────────────
+# A ComfyUI backend speaks a different protocol than OpenAI, so it declares
+# `type: comfyui`. Discovery uses /object_info (not /v1/models); dispatch submits
+# a parametrized workflow and polls /history. Optional per-backend knobs:
+#   poll_interval  → seconds between /history polls (default 1.0)
+#   max_wait       → max seconds to wait for a result (default 600)
+# (Backends still take `priority`, `enabled`, `max_concurrent` like any other.)
+#
+#   - name: ct452-comfy
+#     type: comfyui
+#     url: http://192.168.1.20:8188
+#     priority: 1
+#     max_concurrent: 1               # one generation at a time on this GPU
+#     poll_interval: 1.0
+#     max_wait: 600
+
+# Generation aliases: the `model` field of a POST /v1/generations request. Each
+# maps to an ORDERED list of candidates (first healthy + not-busy one is used;
+# cross-candidate failover + VRAM coordination come in later phases). A candidate
+# names the backend, the task, the workflow file (API-format JSON), and optionally
+# a model/checkpoint to inject into the workflow's loader node.
+# `mapping` binds logical params to concrete workflow nodes+fields, e.g.
+# "prompt → node 6, field text". This is convention-FREE: it works with any
+# workflow regardless of how its nodes are named. Omit `mapping` to let the
+# gateway auto-detect via naming heuristics (fine for templated workflows; the
+# explicit form always wins). Later a "register workflow" UI will author these.
+# image_models:
+#   "flux":
+#     - backend:  ct452-comfy
+#       task:     text2img
+#       workflow: /srv/workflows/text2img_workflow_flux1_api.json
+#       model:    flux1-dev-Q8_0.gguf        # optional — injected via the mapping
+#       mapping:
+#         prompt:          {node: "6",  field: "text"}
+#         negative_prompt: {node: "7",  field: "text"}
+#         width:           {node: "5",  field: "width"}
+#         height:          {node: "5",  field: "height"}
+#         steps:           {node: "3",  field: "steps"}
+#         cfg:             {node: "3",  field: "cfg"}
+#         seed:            {node: "3",  field: "seed"}
+#         model:           {node: "4",  field: "unet_name"}
+#   "sdxl":
+#     - backend:  ct452-comfy                # no `mapping` → auto-detected
+#       task:     text2img
+#       workflow: /srv/workflows/text2img_workflow_sd15_api.json
+
+# Job store for generations: SQLite metadata + on-disk artifacts, retrievable by
+# id (GET /v1/jobs/{id} + /result/{n}) until TTL. Auto-on when image_models are
+# set. Sync requests also get their result inline; the cached copy stays until TTL.
+# Optional in config — the Server tab in /ui manages these too (stored override).
+# jobs:
+#   db_path: jobs.db
+#   blob_dir: jobs               # artifact files live under jobs/<id>/<n>.<ext>
+#   default_ttl_s: 86400         # how long a result stays retrievable (24h)
+#   prune_interval_s: 3600       # how often expired jobs are swept
+#   store_path: store.db         # writable generation-alias store (UI source of truth)
+
+# Generation management UI: a plain server-rendered console mounted at /ui on the
+# main port. Register a ComfyUI workflow, wire its node mapping (auto-suggested,
+# then editable), and run a generation from a playground. Auto-on whenever the
+# generation store is (i.e. when image_models is set, or jobs.enabled: true). The
+# store is seeded once from image_models above, then becomes the source of truth.
+# NOTE: the UI is currently unauthenticated — keep it on a trusted network; admin
+# auth + multi-user are a later phase.

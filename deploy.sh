@@ -13,15 +13,17 @@ RSYNC_EXCLUDES=(
     --exclude='.git/'        --exclude='.claude/'
     --exclude='__pycache__/' --exclude='*.pyc'
     --exclude='.venv/'       --exclude='venv/'        --exclude='.env'
-    --exclude='config.yaml'  --exclude='config.yaml.bak*'
-    --exclude='stats.db'     --exclude='stats.db-wal' --exclude='stats.db-shm'
+    --exclude='config.yaml'  --exclude='config.yaml.bak*'  --exclude='config.prod.yaml'
+    --exclude='secret.key'   --exclude='store.db'      --exclude='store.db-wal' --exclude='store.db-shm'
+    --exclude='stats.db'     --exclude='stats.db-wal'  --exclude='stats.db-shm'
     --exclude='deploy.sh'
 )
 TAR_EXCLUDES=(
     --exclude='./.git'        --exclude='./.claude'
     --exclude='__pycache__'   --exclude='*.pyc'
     --exclude='./.venv'       --exclude='./venv'        --exclude='./.env'
-    --exclude='./config.yaml' --exclude='./config.yaml.bak*'
+    --exclude='./config.yaml' --exclude='./config.yaml.bak*' --exclude='./config.prod.yaml'
+    --exclude='./secret.key'  --exclude='./store.db'    --exclude='./store.db-wal' --exclude='./store.db-shm'
     --exclude='./stats.db'    --exclude='./stats.db-wal' --exclude='./stats.db-shm'
     --exclude='./deploy.sh'
 )
