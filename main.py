@@ -1224,6 +1224,12 @@ def _job_view(job_id: str, request: Request) -> dict:
         "n": r["n"], "mime": r["mime"], "kind": r["kind"],
         "url": f"{base}/v1/jobs/{job_id}/result/{r['n']}",
     } for r in job["results"]]
+    meta = job.get("meta") or {}
+    view["inputs"] = meta.get("inputs")
+    view["input_images"] = [{
+        "n": r["n"], "slot": r.get("slot"), "mime": r["mime"],
+        "url": f"{base}/v1/jobs/{job_id}/input/{r['n']}",
+    } for r in meta.get("input_images", [])]
     return view
 
 
@@ -1325,6 +1331,12 @@ async def run_generation(body: dict, request: Request,
     task = cand0.get("task", body.get("task", "text2img"))
     owner = getattr(request.state, "gw_user", None) or "default"
     job_id = jobs.create(task, alias, first["name"], owner=owner, ttl_s=ttl_s)
+    # persist the request inputs so the job stays inspectable in the UI within its TTL
+    ref_blobs = [(slot, data) for slot, data in (upload_images or {}).items() if data]
+    await asyncio.to_thread(jobs.set_inputs, job_id,
+                            {"prompt": inputs.get("prompt", ""),
+                             "negative_prompt": inputs.get("negative_prompt", ""),
+                             "params": params}, ref_blobs)
     if log_per_call:
         cands = ", ".join(b["name"] for b, _ in routes)
         logger.info(f"→ generation '{alias}' ({task}) job {job_id} mode={mode}"
@@ -1375,6 +1387,17 @@ async def get_job_result(job_id: str, n: int, request: Request, authorization: O
     if rp is None:
         raise HTTPException(404, f"result {n} of job '{job_id}' not found")
     path, mime = rp
+    return FileResponse(path, media_type=mime)
+
+
+@app.get("/v1/jobs/{job_id}/input/{n}")
+async def get_job_input(job_id: str, n: int, request: Request, authorization: Optional[str] = Header(None)):
+    """Reference image `n` that was submitted with a generation job (kept within TTL)."""
+    _require_job_owner(authorization, request, job_id)
+    ip = jobs.input_path(job_id, n)
+    if ip is None:
+        raise HTTPException(404, f"input {n} of job '{job_id}' not found")
+    path, mime = ip
     return FileResponse(path, media_type=mime)
 
 
@@ -1444,8 +1467,10 @@ async def _multipart_list(request: Request) -> dict:
 
 def _gen_image_slots(alias: str) -> list:
     """Ordered image-input param names of a generation alias (its workflow's image
-    loaders per the mapping) — reference images map onto these positionally."""
-    routes = get_gen_routes(alias)
+    loaders per the mapping) — reference images map onto these positionally. Includes
+    busy backends: slots are a workflow property, not gated on backend availability
+    (else a busy backend would silently drop the uploaded reference images)."""
+    routes = get_gen_routes(alias, include_busy=True)
     if not routes:
         return []
     _, cand = routes[0]

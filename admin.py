@@ -40,6 +40,7 @@ TABS = [
     ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
     ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
     ("chatplay", "Chat Playground"), ("playground", "Image Playground"),
+    ("jobs", "Image Jobs"),
     ("statistic", "Statistic"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
@@ -1884,6 +1885,116 @@ async def result(job_id: str, n: int):
     return FileResponse(path, media_type=mime)
 
 
+# ── Image Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
+
+_JOB_TICK = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
+             "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
+             "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
+             ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
+             "setInterval(_td,1000);_td();</script>")
+_JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
+
+
+async def jobs_page(request: Request):
+    """List of generation jobs (image/video/audio), newest first, each linking to its
+    detail page. Excludes parked-chat jobs (those live under Statistic)."""
+    if not jobs.is_active():
+        return _inactive()
+    rows = [j for j in jobs.recent(200) if j.get("task") != "chat"]
+    if not rows:
+        return HTMLResponse(_page("Image Jobs", "<h2>Image Jobs</h2><p class='hint'>No generation "
+            "jobs yet. Run one in the <a href='/ui/playground'>Image Playground</a>.</p>", "jobs"))
+    now = int(time.time())
+    tr = ""
+    for j in rows:
+        st = j["status"]
+        scls = _JOB_SCLS.get(st, "muted")
+        cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
+        if st in ("done", "failed") and upd >= cr:
+            dcell = f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
+        elif st == "running":
+            dcell = f"<td class='muted jdur' data-since='{cr}'>{_dur((now - cr) * 1000)}</td>"
+        else:
+            dcell = "<td class='muted'>—</td>"
+        jid = j["id"]
+        tr += (f"<tr><td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>"
+               f"<td>{_esc(j.get('task'))}</td><td>{_esc(j.get('alias'))}</td>"
+               f"<td>{_esc(j.get('backend'))}</td>"
+               f"<td><span class='badge {scls}'>{_esc(st)}</span></td>"
+               f"<td class='muted'>{j.get('result_count') or 0}</td>"
+               f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
+               f"<td class='muted'>{_esc(j.get('owner'))}</td>"
+               f"<td style='text-align:right;white-space:nowrap'>{_btn('view', '/ui/job/' + jid, 'secondary', sm=True)}</td></tr>")
+    tbl = (f"<table><tr><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
+           f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
+    refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
+    return HTMLResponse(_page("Image Jobs", f"<h2>Image Jobs</h2>{tbl}{_JOB_TICK}", "jobs", refresh=refresh))
+
+
+def _job_thumbs(jid: str, kind: str, entries: list) -> str:
+    """Gallery of <img> thumbnails linking to the full image (kind = 'input'|'result')."""
+    base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
+    cells = "".join(f"<a href='{base}{r['n']}' target='_blank'><img src='{base}{r['n']}' "
+                    f"style='max-width:240px;max-height:240px;border:1px solid #313a46;border-radius:8px'></a>"
+                    for r in entries)
+    return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
+
+
+async def job_detail_page(job_id: str, request: Request):
+    """Input (prompt/params/reference images) + output artifacts of one job."""
+    if not jobs.is_active():
+        return _inactive()
+    job = jobs.get(job_id)
+    back = _btn("← Back to Jobs", "/ui/jobs", "secondary")
+    if job is None:
+        return HTMLResponse(_page("Job", f"<div class='bar'><h2>Job</h2>{back}</div>"
+            f"<p class='bad'>job {_esc(job_id)} not found (or pruned past its TTL).</p>", "jobs"), status_code=404)
+    st = job["status"]
+    meta = job.get("meta") or {}
+    inp = meta.get("inputs") or {}
+    prompt, neg = inp.get("prompt") or "", inp.get("negative_prompt") or ""
+    params = inp.get("params") or {}
+    prows = "".join(f"<tr><td><code>{_esc(k)}</code></td><td>{_esc(str(v))}</td></tr>" for k, v in params.items())
+    in_imgs = meta.get("input_images", [])
+    inbox = ""
+    if prompt:
+        inbox += f"<h3>Prompt</h3><pre class='chatout'>{_esc(prompt)}</pre>"
+    if neg:
+        inbox += f"<h3>Negative</h3><pre class='chatout'>{_esc(neg)}</pre>"
+    if prows:
+        inbox += f"<h3>Params</h3><table>{prows}</table>"
+    if in_imgs:
+        inbox += f"<h3>Reference images</h3>{_job_thumbs(job_id, 'input', in_imgs)}"
+    if not inbox:
+        inbox = "<p class='muted'>No stored inputs (job predates this feature).</p>"
+    if st in ("queued", "running"):
+        outbox = f"<p>⏳ <b>{_esc(st)}</b> · this view auto-updates</p>"
+    elif st == "failed":
+        outbox = f"<p class='bad'>✗ failed</p><pre class='err'>{_esc(job.get('error'))}</pre>"
+    elif job.get("results"):
+        outbox = _job_thumbs(job_id, "result", job["results"])
+    else:
+        outbox = "<p class='muted'>No artifacts.</p>"
+    exp = " · <span class='bad'>expired</span>" if job.get("expired") else ""
+    info = (f"<p class='muted'>task {_esc(job['task'])} · alias {_esc(job['alias'])} · backend "
+            f"{_esc(job['backend'])} · owner {_esc(job['owner'])} · {_age(job['created'])}{exp}</p>")
+    page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
+            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>{back}</div>{info}"
+            f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
+            f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"
+            f"<div style='flex:1;min-width:320px'><h2>Output</h2>{outbox}</div></div>"
+            + (_JOB_TICK if st in ("queued", "running") else ""))
+    return HTMLResponse(_page("Job", page, "jobs", refresh=(2 if st in ("queued", "running") else None)))
+
+
+async def job_input(job_id: str, n: int):
+    ip = jobs.input_path(job_id, n)
+    if ip is None:
+        raise HTTPException(404, "input not found")
+    path, mime = ip
+    return FileResponse(path, media_type=mime)
+
+
 # ── Tabs: stubs ─────────────────────────────────────────────────────────────────
 
 def _cost(v) -> str:
@@ -1999,7 +2110,8 @@ async def dashboard_page(request: Request):
                 dcell = f"<td class='muted jdur' data-since='{cr}'>{_dur((int(time.time()) - cr) * 1000)}</td>"
             else:
                 dcell = "<td class='muted'>—</td>"
-            jr += (f"<tr><td><code>{_esc(j['id'][:8])}</code></td><td>{_esc(j.get('alias'))}</td>"
+            jr += (f"<tr><td><a href='/ui/job/{_esc(j['id'])}'><code>{_esc(j['id'][:8])}</code></a></td>"
+                   f"<td>{_esc(j.get('alias'))}</td>"
                    f"<td>{_esc(j.get('backend'))}</td><td><span class='badge {scls}'>{_esc(st)}</span></td>"
                    f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
                    f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
@@ -2398,6 +2510,9 @@ def register(app) -> None:
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
+    app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
+    app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
+    app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
     app.add_api_route("/ui/dashboard", dashboard_page, methods=["GET"])
     app.add_api_route("/ui/statistic", statistic_page, methods=["GET"])
     app.add_api_route("/ui/call/{call_id}", call_view, methods=["GET"])

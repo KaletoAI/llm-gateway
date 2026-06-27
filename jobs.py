@@ -150,7 +150,7 @@ def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
         with open(os.path.join(job_dir, fname), "wb") as f:
             f.write(blob.data)
         manifest.append({"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname})
-    meta = meta or {}
+    meta = {**_read_meta(job_id), **(meta or {})}   # keep inputs persisted at create time
     ran_on = meta.get("backend")
     with _conn() as c:
         if ran_on:
@@ -180,6 +180,67 @@ def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
             c.execute("UPDATE jobs SET status='done', updated=?, result_count=1, "
                       "results_json=?, meta_json=? WHERE id=?",
                       (int(time.time()), json.dumps([payload]), json.dumps(meta), job_id))
+
+
+def _read_meta(job_id: str) -> dict:
+    with _conn() as c:
+        row = c.execute("SELECT meta_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row and row[0]:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            pass
+    return {}
+
+
+def _img_mime(data: bytes) -> str:
+    """Sniff an image's mime from its magic bytes (reference uploads carry no name)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    return "image/png"
+
+
+def set_inputs(job_id: str, inputs: dict, ref_blobs: Optional[list] = None) -> None:
+    """Persist a job's request inputs for later inspection (within TTL): the prompt /
+    negative_prompt / params inline in `meta.inputs`, reference images as on-disk blobs
+    (`in_<n><ext>`) listed in `meta.input_images`. Merges into existing meta so a later
+    complete() keeps them."""
+    job_dir = os.path.join(_BLOB_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    manifest = []
+    for n, item in enumerate(ref_blobs or []):
+        slot, data = item
+        if not data:
+            continue
+        mime = _img_mime(bytes(data))
+        fname = f"in_{n}{_EXT_BY_MIME.get(mime, '.bin')}"
+        with open(os.path.join(job_dir, fname), "wb") as f:
+            f.write(bytes(data))
+        manifest.append({"n": n, "slot": slot, "mime": mime, "filename": fname})
+    meta = _read_meta(job_id)
+    meta["inputs"] = inputs
+    meta["input_images"] = manifest
+    with _conn() as c:
+        c.execute("UPDATE jobs SET meta_json=? WHERE id=?", (json.dumps(meta), job_id))
+
+
+def input_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
+    """(filesystem path, mime) for input reference image `n` of a job, or None."""
+    job = get(job_id)
+    if not job:
+        return None
+    for r in job["meta"].get("input_images", []):
+        if r["n"] == n:
+            path = os.path.join(_BLOB_DIR, job_id, r["filename"])
+            if os.path.exists(path):
+                return path, r["mime"]
+    return None
 
 
 def get(job_id: str) -> Optional[dict]:

@@ -7,6 +7,14 @@ in ausführbare Schritte — Aufwand (S/M/L), Risiko, Ziel-Datei, Verifikation.
 
 Reihenfolge-Empfehlung am Ende.
 
+> **Status 2026-06-27 — ERLEDIGT seit Planerstellung:** A1 · A2 · A3 · E1 · E2 · E3 ·
+> E4 · F0–F5 (Call-Parking sync+async) · C4 (OpenAI-Image-Endpoints + dynamische
+> Workflow-Params) · **G1 (Image-Job-Viewer im /ui)**. Zusätzlich: Generation-Parking
+> (busy→queue, sync+async), `jobs.reconcile_orphans()` beim Startup,
+> `docs/anima-versa-integration.md`. **Offene Spitze:** G2 (LoRA-Mapping-UI-Feinschliff,
+> dynamischer API-Pfad läuft schon) · C1 (img2img/inpaint-Workflows verdrahten) ·
+> B (VRAM-Koordinator, nur bei GPU-Co-Residency).
+
 ---
 
 ## A. Bestand härten (billig, kein neuer Host nötig)
@@ -197,17 +205,18 @@ ohne Job-Store), dann **F3** (Async/Job-Park). **Abhängig:** baut auf bestehend
 
 ## G. Image-UX & Workflow-Features (nach C4)
 
-### G1 — Image-Job-Viewer: Input + Output in der UI · M
+### G1 — Image-Job-Viewer: Input + Output in der UI · M · ✅ ERLEDIGT (2026-06-27)
 - **Wunsch (User):** gegenerierte Image-Jobs später — **innerhalb der Vorhaltezeit
   (Job-TTL)** — in der UI ansehen: **Input** (Prompt, negative_prompt, Params,
   **Referenzbilder**) **und Output** (die erzeugten Bilder).
-- **Stand:** `jobs.py` hält die Output-Artefakte schon on-disk + Metadaten + TTL.
-  Es fehlt: (a) die **Inputs** mitspeichern (Prompt/Params/Upload-Refs als
-  Job-Meta bzw. Blob), (b) eine **Job-Detailseite** im /ui (analog zum E3
-  Call-Viewer `/ui/call/{id}`), die Input + Output-Thumbnails zeigt, gefiltert auf
-  nicht-abgelaufene Jobs.
-- **Datei:** `jobs.py` (Inputs in meta/Blob), `admin.py` (Job-Liste + Detailseite,
-  z.B. Image-Playground-/Jobs-Tab), `main.py` (Job-View liefert Input-Refs).
+- **Umgesetzt:** `jobs.set_inputs()`/`input_path()` persistieren Prompt/Params inline
+  in `meta.inputs` + Referenzbilder als on-disk-Blobs (`in_<n>.<ext>`); `jobs.complete()`
+  **merged** Meta jetzt (Inputs überleben den Completion-Write). `main.py`:
+  `_job_view` liefert `inputs`+`input_images`, neuer Endpoint
+  `GET /v1/jobs/{id}/input/{n}`. `admin.py`: Tab **Image Jobs** (`/ui/jobs` Liste +
+  `/ui/job/{id}` Detail mit Input/Output-Thumbnails), Dashboard-Job-IDs verlinkt.
+  Bonus-Fix: `_gen_image_slots` nutzt `include_busy=True` (Slots sind Workflow-
+  Eigenschaft → Referenzbilder werden unter Last nicht mehr verworfen).
 - Reuse: dieselbe TTL-Prune-Mechanik wie bei den Artefakten löscht alles mit.
 
 ### G2 — LoRA-Support im Workflow-Mapping · M
