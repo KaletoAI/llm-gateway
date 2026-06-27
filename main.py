@@ -1160,7 +1160,7 @@ async def embeddings(request: Request, authorization: Optional[str] = Header(Non
 # by id (TTL) — sync mode also returns them inline. No VRAM coordinator yet
 # (Phase 2): candidates are filtered by health + the existing busy cap only.
 
-def get_gen_routes(alias: str) -> list[tuple[dict, dict]]:
+def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, dict]]:
     """(backend, candidate) pairs for a generation alias, ordered by **backend
     priority**, filtered to enabled + healthy + not-busy backends.
 
@@ -1180,7 +1180,9 @@ def get_gen_routes(alias: str) -> list[tuple[dict, dict]]:
     out = []
     for cand in candidates:
         b = next((b for b in comfy if b["name"] == cand.get("backend")), None)
-        if b is None or not backend_healthy.get(backend_id(b)) or backend_busy(b):
+        if b is None or not backend_healthy.get(backend_id(b)):
+            continue
+        if not include_busy and backend_busy(b):        # busy → skipped unless parking
             continue
         out.append((b, cand))
     out.sort(key=lambda bc: bc[0].get("priority", 100))     # backend priority decides order
@@ -1259,6 +1261,29 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
     jobs.fail(job_id, f"all candidate backends unreachable (connection): {last}")
 
 
+async def _run_gen_parked(job_id, alias, force, build_req):
+    """Hold a generation job until a backend frees (polls backend-busy), then run it —
+    so a busy backend queues instead of 503'ing (async/playground)."""
+    deadline = time.monotonic() + async_park_timeout_s
+    while True:
+        routes = get_gen_routes(alias)
+        if force:
+            routes = [r for r in routes if r[0].get("name") == force]
+        if routes:
+            await _run_job(job_id, routes, build_req)
+            return
+        allc = get_gen_routes(alias, include_busy=True)
+        if force:
+            allc = [r for r in allc if r[0].get("name") == force]
+        if not allc:
+            jobs.fail(job_id, f"no healthy backend for '{alias}'" + (f" on '{force}'" if force else ""))
+            return
+        if time.monotonic() > deadline:
+            jobs.fail(job_id, f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
+            return
+        await asyncio.sleep(2.0)
+
+
 async def run_generation(body: dict, request: Request,
                          upload_images: Optional[dict] = None) -> dict:
     """Resolve a generation alias, create a job, and run it (sync) or schedule it
@@ -1271,8 +1296,18 @@ async def run_generation(body: dict, request: Request,
     ttl_s = output.get("ttl_s") or body.get("ttl_s")
 
     routes = get_gen_routes(alias)
-    if not routes:
-        raise HTTPException(503, f"No healthy backend for generation model '{alias}'")
+    force = (body.get("backend") or "").strip()         # pin to one backend (playground testing)
+    if force:
+        routes = [r for r in routes if r[0].get("name") == force]
+    parked = False
+    if not routes:                                       # nothing ready → busy, or no backend at all?
+        busy = get_gen_routes(alias, include_busy=True)
+        if force:
+            busy = [r for r in busy if r[0].get("name") == force]
+        if not busy:
+            raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
+                                     + (f" on backend '{force}'" if force else ""))
+        parked, routes = True, busy                      # all busy → park (async: queue, sync: block)
 
     inputs, params = _gen_inputs_params(body)
 
@@ -1292,8 +1327,15 @@ async def run_generation(body: dict, request: Request,
     job_id = jobs.create(task, alias, first["name"], owner=owner, ttl_s=ttl_s)
     if log_per_call:
         cands = ", ".join(b["name"] for b, _ in routes)
-        logger.info(f"→ generation '{alias}' ({task}) job {job_id} mode={mode} candidates=[{cands}]")
+        logger.info(f"→ generation '{alias}' ({task}) job {job_id} mode={mode}"
+                    f"{' PARKED' if parked else ''} candidates=[{cands}]")
 
+    if parked:
+        if mode == "async":                              # queue and hand back a job id
+            asyncio.create_task(_run_gen_parked(job_id, alias, force, build_req))
+            return {"job_id": job_id, "status": "queued"}
+        await _run_gen_parked(job_id, alias, force, build_req)   # sync: block through the park
+        return _job_view(job_id, request)
     if mode == "async":
         asyncio.create_task(_run_job(job_id, routes, build_req))
         return {"job_id": job_id, "status": "queued"}

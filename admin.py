@@ -1190,8 +1190,8 @@ def _mapping_list(cedit: str, iedit: str) -> str:
                            sel=(alias == iedit))
     img_items = img_items or "<p class='muted'>No workflows — + Workflow.</p>"
     bar = ('<div class="bar"><h2>Mapping</h2>'
-           f'{_btn("+ Chat alias", "/ui/mapping?cnew=1", "secondary")}'
-           f'{_btn("+ Workflow", "/ui/mapping?new=1")}</div>')
+           f'<div style="display:flex;gap:8px">{_btn("+ Chat alias", "/ui/mapping?cnew=1", "secondary")}'
+           f'{_btn("+ Workflow", "/ui/mapping?new=1")}</div></div>')
     legend = ("<p class='hint' style='margin:2px 0 6px'>"
               + _badge("config") + " from config.yaml · "
               + _badge("ui", "ok") + " created/edited here (overrides config)</p>")
@@ -1288,10 +1288,12 @@ async def update_workflow(request: Request):
         return err(f"invalid workflow JSON: {e}")
     if not isinstance(wf, dict):
         return err("workflow JSON must be an object of nodes (API format)")
+    base_mapping = cands[0].get("mapping") or {}
     for c in cands:
-        c["workflow_json"] = wf                          # keep mapping / fixed / backend / task / retries
+        c["workflow_json"] = wf                          # workflow + mapping are backend-independent →
+        c["mapping"] = base_mapping                      # keep synced; `fixed` stays per-backend
     store.upsert(alias, cands)
-    mapping = cands[0].get("mapping") or {}
+    mapping = base_mapping
     stale = [p for p, m in mapping.items() if (m or {}).get("node") not in wf]
     logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}")
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
@@ -1398,23 +1400,79 @@ async def _alias_editor(alias: str) -> str:
     req_rows = req_rows or ("<tr><td colspan=6 class='muted'>none yet — promote a field "
                             "from Available fields below (→)</td></tr>")
 
-    # LEFT — pinned node values (value control + del)
-    pin_rows = ""
-    for b in fixed:
-        nid, fld = b["node"], b["field"]
-        cls = wf.get(nid, {}).get("class_type", "")
-        title = wf.get(nid, {}).get("_meta", {}).get("title", "")
-        head = f"<code>{_esc(nid)}</code> {_esc(cls)}" + (f" · {_esc(title)}" if title else "")
-        ctl = _value_control(f"fixed__{nid}__{fld}", nid, fld, b.get("value"), wf, oi)
-        pin_rows += (f"<tr><td>{head}<br><span class='muted'>{_esc(fld)}</span></td><td>{ctl}</td>"
-                     f"<td>{dl('node=' + _esc(nid) + '&field=' + _esc(fld))}</td></tr>")
-    pin_rows = pin_rows or "<tr><td colspan=3 class='muted'>none pinned — add from Available fields below</td></tr>"
+    # Pinned values as per-backend tabs — SAME layout in every tab (.ovrow). The
+    # PRIMARY (first backend) tab is the editor: value + ✕ delete per slot. Extra
+    # backends override only the VALUE (no delete; the slot set is shared). A value
+    # equal to the primary's is flagged "inherited" and dimmed; a differing one "override".
+    async def _pin_tab(c, is_primary, oi_bn):
+        rows = ""
+        for b in fixed:
+            nid, fld = str(b["node"]), str(b["field"])
+            cls = wf.get(nid, {}).get("class_type", "")
+            if is_primary:
+                cur, name, inherited = b.get("value"), f"fixed__{nid}__{fld}", False
+                acts = f"<span class='ovact'>{dl('node=' + _esc(nid) + '&field=' + _esc(fld))}</span>"
+            else:
+                cv = next((x.get("value") for x in (c.get("fixed") or [])
+                           if str(x.get("node")) == nid and str(x.get("field")) == fld), None)
+                inherited = cv is None or cv == b.get("value")
+                cur, name, acts = (cv if cv is not None else b.get("value")), \
+                    "ovr__" + str(c.get("backend")) + "__" + nid + "__" + fld, ""
+            ctl = _value_control(name, nid, fld, cur, wf, oi_bn)
+            tag = "" if is_primary else (" <span class='ovtag inh'>inherited</span>" if inherited
+                                         else " <span class='ovtag set'>override</span>")
+            rows += (f'<div class="ovrow{" inherited" if inherited else ""}">'
+                     f'<label><code>{_esc(nid)}</code> {_esc(cls)} '
+                     f'<span class="muted">· {_esc(fld)}</span>{tag}{acts}</label>{ctl}</div>')
+        return rows or "<p class='muted'>none pinned — add from Available fields below</p>"
+
+    primary_rows = await _pin_tab(cands[0], True, oi)
+    if len(cands) > 1:
+        bn0 = str(cands[0].get("backend"))
+        tabs = "".join(
+            f'<button type="button" class="ptab{" on" if i == 0 else ""}" '
+            f"onclick=\"pinTab(this,'{_esc(str(c.get('backend')))}')\">{_esc(str(c.get('backend')))}</button>"
+            for i, c in enumerate(cands))
+        panels = f'<div class="ppanel" data-pt="{_esc(bn0)}">{primary_rows}</div>'
+        for c in cands[1:]:
+            bn = str(c.get("backend"))
+            oi_bn = await _object_info(bn, wf) or oi      # override backend's own models; fall back to primary
+            rows = await _pin_tab(c, False, oi_bn)
+            panels += (f'<div class="ppanel" data-pt="{_esc(bn)}" style="display:none">'
+                       f"<p class='hint'>Models/values installed on <b>{_esc(bn)}</b> "
+                       f"(slots from primary <b>{_esc(bn0)}</b>; “inherited” = same as primary).</p>{rows}</div>")
+        pinned_block = (f"<h2>Pinned values <span class='muted' style='font-weight:normal'>— tab per backend</span></h2>"
+                        f'<div class="ptabs">{tabs}</div>{panels}')
+    else:
+        pinned_block = f"<h2>Pinned values</h2><div class='ppanel'>{primary_rows}</div>"
+    pin_extra = ("<style>.ptabs{display:flex;gap:4px;margin:10px 0 0;flex-wrap:wrap}"
+                 ".ptab{padding:6px 14px;background:#0c0e12;border:1px solid #242a33;border-bottom:none;"
+                 "border-radius:8px 8px 0 0;color:#8b97a4;cursor:pointer;font:inherit}"
+                 ".ptab.on{color:#dce4ec;background:#11151b;border-color:#3b82f6}"
+                 ".ppanel{border:1px solid #242a33;border-radius:0 8px 8px 8px;padding:10px 12px}"
+                 ".ovrow{margin:9px 0}.ovrow label{display:block;font-size:12px;color:#8b97a4;margin-bottom:3px}"
+                 ".ovrow input,.ovrow select{width:100%;max-width:560px;box-sizing:border-box}"
+                 ".ovrow.inherited{opacity:.5}.ovrow.inherited:focus-within{opacity:1}"
+                 ".ovact{float:right}.ovtag{font-size:10px;padding:1px 6px;border-radius:6px;margin-left:6px}"
+                 ".ovtag.inh{background:#1a1f27;color:#7e8b99}.ovtag.set{background:#15301f;color:#7fd6a0}</style>"
+                 "<script>function pinTab(b,p){var f=b.closest('form');"
+                 "f.querySelectorAll('.ptab').forEach(function(x){x.classList.toggle('on',x===b);});"
+                 "f.querySelectorAll('.ppanel').forEach(function(x){x.style.display="
+                 "x.getAttribute('data-pt')===p?'':'none';});}</script>")
 
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
-            f'<div class="formbar"><h2>Edit Alias</h2>{_btn("Save", submit=True)}'
-            f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
+            f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("new_alias", alias), short=True)
+            + '<h2 style="margin-top:18px">Update workflow</h2>'
+            + "<p class='hint'>Replace the ComfyUI API JSON — request fields + pinned values are kept; "
+              "bindings whose node vanished are flagged <span class='badge bad'>stale</span> in Request fields.</p>"
+            + _field("API JSON", '<input type="file" name="workflow_file" accept="application/json,.json">')
+            + _field("…or share path", _inp("workflow_path", "", placeholder="/mnt/share/flux_api.json"))
+            + '<div class="field"><label></label><div class="control">'
+              '<button class="btn secondary" formaction="/ui/mapping/update-workflow" '
+              'formenctype="multipart/form-data">Update workflow</button></div></div>'
             + "<h2>Backends</h2>"
             + "<p class='hint'>Allowed backends for this alias — tried in backend-priority order; "
               "on a connection error the next one is used.</p>"
@@ -1428,9 +1486,8 @@ async def _alias_editor(alias: str) -> str:
             f'<th>node</th><th>field</th>'
             f'<th title="workflow default value">=</th><th></th></tr></thead>'
             f'<tbody id="reqfields">{req_rows}</tbody></table>'
-            f"<h2>Pinned values</h2>"
-            f"<table class='pins'><tr><th>node / field</th><th>value</th><th></th></tr>{pin_rows}</table>"
-            f'</form>' + _reorder_js(alias))
+            + pinned_block
+            + '</form>' + pin_extra + _reorder_js(alias))
 
     # available scalar fields (not yet mapped) → Add — stacked below the form
     avail = ""
@@ -1454,17 +1511,7 @@ async def _alias_editor(alias: str) -> str:
                  f"<p class='hint'>Add a field to pin it (Switch boolean, reference image, …). "
                  f"Unmapped fields keep the workflow's value.</p>"
                  f"<table class='avail'>{avail or '<tr><td>all scalar fields mapped</td></tr>'}</table>")
-    upd = ('<h2 style="margin-top:24px">Update workflow</h2>'
-           "<p class='hint'>Replace the ComfyUI API JSON without redoing the mapping — the node/field "
-           "bindings (request fields + pinned values) are kept. Bindings whose node vanished are flagged "
-           "<span class='badge bad'>stale</span> in Request fields above; just re-point them.</p>"
-           '<form action="/ui/mapping/update-workflow" method="post" enctype="multipart/form-data">'
-           f'<input type="hidden" name="alias" value="{_esc(alias)}">'
-           + _field("API JSON", '<input type="file" name="workflow_file" accept="application/json,.json">')
-           + _field("…or share path", _inp("workflow_path", "", placeholder="/mnt/share/flux_api.json"))
-           + f'<div class="field"><label></label><div class="control">{_btn("Update workflow", submit=True)}</div></div>'
-           + '</form>')
-    return form + upd, available
+    return form, available
 
 
 async def edit_add(request: Request):
@@ -1601,7 +1648,23 @@ async def update(request: Request):
         if key.startswith("fixed__") and val != "":
             _, nid, fld = key.split("__", 2)
             fixed.append({"node": nid, "field": fld, "value": val})
-    cand["mapping"], cand["fixed"] = mapping, fixed
+    # per-backend overrides of pinned values: ovr__<backend>__<node>__<field>
+    ovr = {}
+    for key, val in f.items():
+        if key.startswith("ovr__") and (val or "").strip() != "":
+            parts = key.split("__", 3)
+            if len(parts) == 4:
+                ovr[(parts[1], parts[2], parts[3])] = val
+    # mapping is backend-independent → sync to every candidate. `fixed` (pinned model
+    # values) is per-backend: the primary holds the edited values; extra backends use
+    # the same slots with optional per-backend value overrides (blank = inherit).
+    for c in cands:
+        c["mapping"] = mapping
+    cands[0]["fixed"] = fixed
+    for c in cands[1:]:
+        bn = c.get("backend")
+        c["fixed"] = [{"node": b["node"], "field": b["field"],
+                       "value": ovr.get((bn, b["node"], b["field"]), b["value"])} for b in fixed]
     # retries is a per-alias setting (blank = try all) — keep it on every candidate so
     # it survives whichever backend is removed first.
     retries = (f.get("retries", "") or "").strip()
@@ -1639,6 +1702,12 @@ async def copy(request: Request):
 
 # ── Tab: Playground ─────────────────────────────────────────────────────────────
 
+# Reference images stick across generations: stashed in memory per (user, alias) so
+# the file-input (which the browser can't pre-fill) doesn't have to be re-picked each
+# time. A new upload replaces; the "clear" checkbox drops it. Lost on restart (fine).
+_pg_images: dict = {}
+
+
 def _alias_defaults(cand: dict) -> dict:
     """Default value per request param, read from the workflow at the mapped node."""
     wf = cand.get("workflow_json") or {}
@@ -1650,7 +1719,8 @@ def _alias_defaults(cand: dict) -> dict:
     return out
 
 
-def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None) -> str:
+def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
+                     kept: Optional[set] = None) -> str:
     v = lambda k: str(vals.get(k) if vals.get(k) is not None else "")
     # selecting an alias reloads with its workflow defaults pre-filled
     opts = "".join(f'<option value="{_esc(a)}"{" selected" if a == vals.get("model") else ""}>{_esc(a)}</option>'
@@ -1670,8 +1740,12 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     for p, m in mapping.items():
         label = (m or {}).get("label") or p
         if p in imgset:
-            rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*"> '
-                           '<span class="muted">empty → 8×8 placeholder</span>')
+            if kept and p in kept:
+                extra = (' <span class="badge ok">✓ kept</span> <label class="muted" '
+                         f'style="font-weight:normal"><input type="checkbox" name="clear__{_esc(p)}"> clear</label>')
+            else:
+                extra = ' <span class="muted">empty → 8×8 placeholder</span>'
+            rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*">{extra}')
         else:
             dv = defaults.get(p)
             node, field = (m or {}).get("node"), (m or {}).get("field")
@@ -1686,16 +1760,23 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 typ = "number" if isinstance(dv, (int, float)) and not isinstance(dv, bool) else "text"
                 rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
     rows = rows or "<p class='hint'>This alias has no request fields — add some in Mapping.</p>"
+    bk_list = [c.get("backend") for c in (store.get(vals.get("model")) or [])]
+    sel_bk = vals.get("backend", "")
+    bk_opts = ('<option value="">(auto · priority)</option>'
+               + "".join(f'<option value="{_esc(b)}"{" selected" if b == sel_bk else ""}>{_esc(b)}</option>'
+                         for b in bk_list))
+    backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Playground</h2>{_btn("Generate", submit=True)}</div>'
             + _field("alias", alias_select)
+            + backend_field
             + rows
             + '<p class="hint">synchronous; image backends ~1 min · each image reuses one slot</p></form>')
 
 
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None) -> str:
-    return (f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi)}</div>'
+                     oi: Optional[dict] = None, kept: Optional[set] = None) -> str:
+    return (f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
             f'<div class="col">{result_html}</div></div>')
 
 
@@ -1728,7 +1809,7 @@ async def playground_page(request: Request):
     cand = (store.get(model) or [None])[0]
     # values per request param, keyed by param name; query (p__<param>) overrides the
     # alias's workflow default. Params are dynamic — whatever Mapping configured.
-    vals = {"model": model}
+    vals = {"model": model, "backend": qp.get("backend", "")}
     defaults = _alias_defaults(cand) if cand else {}
     for p in ((cand.get("mapping") if cand else {}) or {}):
         q = qp.get(f"p__{p}", "")
@@ -1741,7 +1822,8 @@ async def playground_page(request: Request):
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the image here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
-    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html, oi),
+    kept = set(_pg_images.get((_session_user(request) or "default", model), {}).keys())
+    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html, oi, kept),
                               "playground", refresh=refresh))
 
 
@@ -1750,11 +1832,14 @@ async def generate(request: Request):
         raise HTTPException(503, "generation not wired")
     f = await _multipart(request)
     model = str(f.get("model", ""))
+    force_bk = str(f.get("backend", "")).strip()       # pin to one backend (testing per-backend)
     # dynamic request fields arrive as p__<param>. prompt/negative_prompt feed the
     # request's inputs; everything else goes into params (numeric-coerced when it
     # parses). The mapping in the alias decides which node each lands on.
     submitted = {k[len("p__"):]: str(f.get(k, "")) for k in f if k.startswith("p__")}
     body = {"model": model, "mode": "async", "params": {}}     # async → instant job id
+    if force_bk:
+        body["backend"] = force_bk
     for p, raw in submitted.items():
         if raw.strip() == "":
             continue
@@ -1764,22 +1849,29 @@ async def generate(request: Request):
             body["params"][p] = _num(raw)
     # per-field image uploads (img__<param>); empty inputs fall back to the 8×8
     # placeholder downstream, so they're simply omitted here.
-    images = {}
+    # reference images persist across generations (stash per user+alias); a new upload
+    # replaces, a checked clear__<param> drops the kept one.
+    user = _session_user(request) or "default"
+    stash = _pg_images.setdefault((user, model), {})
     for k in f:
         if k.startswith("img__"):
             val = f.get(k)
             if isinstance(val, (bytes, bytearray)) and val.strip():
-                images[k[len("img__"):]] = bytes(val)
+                stash[k[len("img__"):]] = bytes(val)
+        elif k.startswith("clear__"):
+            stash.pop(k[len("clear__"):], None)
+    images = dict(stash)
     cand = (store.get(model) or [None])[0]
-    vals = {"model": model, **submitted}
+    vals = {"model": model, "backend": force_bk, **submitted}
     try:
         view = await _run_generation(body, request, upload_images=images)
     except HTTPException as e:
         aliases = list(store.list_aliases().keys())
         result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
-        return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html), "playground"))
+        return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html,
+                                  kept=set(stash.keys())), "playground"))
     # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
-    q = urlencode({"model": model, "job": view.get("job_id", ""),
+    q = urlencode({"model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
 
@@ -1901,10 +1993,15 @@ async def dashboard_page(request: Request):
             st = j["status"]
             scls = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}.get(st, "muted")
             cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
-            dur = _dur((upd - cr) * 1000) if (st in ("done", "failed") and upd >= cr) else "—"
+            if st in ("done", "failed") and upd >= cr:
+                dcell = f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
+            elif st == "running":                       # live tick-up via JS (data-since)
+                dcell = f"<td class='muted jdur' data-since='{cr}'>{_dur((int(time.time()) - cr) * 1000)}</td>"
+            else:
+                dcell = "<td class='muted'>—</td>"
             jr += (f"<tr><td><code>{_esc(j['id'][:8])}</code></td><td>{_esc(j.get('alias'))}</td>"
                    f"<td>{_esc(j.get('backend'))}</td><td><span class='badge {scls}'>{_esc(st)}</span></td>"
-                   f"<td class='muted'>{_age(j.get('created'))}</td><td class='muted'>{dur}</td>"
+                   f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
                    f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
         jobs_html = (f"<h2>Image jobs {badges}</h2>"
                      + (f"<table><tr><th>id</th><th>alias</th><th>backend</th><th>status</th>"
@@ -1914,8 +2011,13 @@ async def dashboard_page(request: Request):
         jobs_html = "<h2>Image jobs</h2><p class='hint'>Image generation is off.</p>"
 
     # No "Recent calls" here — that lives in the Statistic tab (avoid duplication).
+    tick = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
+            "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
+            "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
+            ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
+            "setInterval(_td,1000);_td();</script>")
     body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
-            + cards + backends_tbl + jobs_html)
+            + cards + backends_tbl + jobs_html + tick)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
 
 

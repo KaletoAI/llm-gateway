@@ -62,6 +62,9 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
         """)
         c.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)")
     logger.info(f"jobs: store at {_DB_PATH}, blobs in {_BLOB_DIR}/ (default ttl {_DEFAULT_TTL}s)")
+    n = reconcile_orphans()
+    if n:
+        logger.info(f"jobs: reconciled {n} orphaned running/queued job(s) → failed (process restart)")
 
 
 @contextmanager
@@ -218,6 +221,17 @@ def _delete(job_id: str) -> None:
             pass
     with _conn() as c:
         c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+
+def reconcile_orphans() -> int:
+    """Mark jobs still in `running`/`queued` as failed. Called at startup: the async
+    tasks that owned them died with the previous process, so they can never finish —
+    otherwise they linger as forever-'running' rows (ticking duration) until TTL."""
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE jobs SET status='failed', error='interrupted by process restart', updated=? "
+            "WHERE status IN ('running','queued')", (int(time.time()),))
+        return cur.rowcount
 
 
 def prune_once() -> int:
