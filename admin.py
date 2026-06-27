@@ -1422,8 +1422,10 @@ async def _alias_editor(alias: str) -> str:
             ctl = _value_control(name, nid, fld, cur, wf, oi_bn)
             tag = "" if is_primary else (" <span class='ovtag inh'>inherited</span>" if inherited
                                          else " <span class='ovtag set'>override</span>")
+            title = wf.get(nid, {}).get("_meta", {}).get("title", "")
+            ttl_html = f' <span class="ntitle">“{_esc(title)}”</span>' if title else ""
             rows += (f'<div class="ovrow{" inherited" if inherited else ""}">'
-                     f'<label><code>{_esc(nid)}</code> {_esc(cls)} '
+                     f'<label><code>{_esc(nid)}</code> {_esc(cls)}{ttl_html} '
                      f'<span class="muted">· {_esc(fld)}</span>{tag}{acts}</label>{ctl}</div>')
         return rows or "<p class='muted'>none pinned — add from Available fields below</p>"
 
@@ -1455,7 +1457,8 @@ async def _alias_editor(alias: str) -> str:
                  ".ovrow input,.ovrow select{width:100%;max-width:560px;box-sizing:border-box}"
                  ".ovrow.inherited{opacity:.5}.ovrow.inherited:focus-within{opacity:1}"
                  ".ovact{float:right}.ovtag{font-size:10px;padding:1px 6px;border-radius:6px;margin-left:6px}"
-                 ".ovtag.inh{background:#1a1f27;color:#7e8b99}.ovtag.set{background:#15301f;color:#7fd6a0}</style>"
+                 ".ovtag.inh{background:#1a1f27;color:#7e8b99}.ovtag.set{background:#15301f;color:#7fd6a0}"
+                 ".ntitle{color:#cbd4de;font-style:italic}</style>"
                  "<script>function pinTab(b,p){var f=b.closest('form');"
                  "f.querySelectorAll('.ptab').forEach(function(x){x.classList.toggle('on',x===b);});"
                  "f.querySelectorAll('.ppanel').forEach(function(x){x.style.display="
@@ -2419,10 +2422,20 @@ _SRV_RESTART = [
     ("jobs_enabled", "bool", "enabled", "auto-on when image models exist"),
     ("jobs_db_path", "text", "db path", ""),
     ("jobs_blob_dir", "text", "blob dir", ""),
-    ("jobs_default_ttl_s", "int", "default TTL", "seconds"),
-    ("jobs_prune_interval_s", "int", "prune interval", "seconds"),
+    ("jobs_default_ttl_s", "int", "default TTL", "hours — how long a generation job + its images are kept before deletion"),
+    ("jobs_prune_interval_s", "int", "prune interval", "minutes — how often expired jobs are purged"),
 ]
 _SRV_RESTART_KEYS = [k for k, kind, *_ in _SRV_RESTART if kind]
+# These settings are stored (and used) in SECONDS but shown/edited in a friendlier unit.
+_SRV_UNITS = {"jobs_default_ttl_s": 3600, "jobs_prune_interval_s": 60}
+
+
+def _srv_disp(k, v):
+    """Seconds-stored setting → its display unit (TTL→hours, prune→minutes)."""
+    if k in _SRV_UNITS and isinstance(v, (int, float)) and v not in ("", None):
+        q = v / _SRV_UNITS[k]
+        return int(q) if q == int(q) else round(q, 2)
+    return v
 
 
 async def server_page(request: Request):
@@ -2468,7 +2481,7 @@ async def server_page(request: Request):
             restart_rows += _field(lbl, _checkbox(k, bool(eff.get(k)), "enabled", n) + mark(rdiff(k)))
         else:
             d = port_diff if k == "port" else rdiff(k)
-            restart_rows += _field(lbl, _inp(k, eff.get(k, ""), typ=("number" if kind == "int" else "text"))
+            restart_rows += _field(lbl, _inp(k, _srv_disp(k, eff.get(k, "")), typ=("number" if kind == "int" else "text"))
                                    + mark(d) + note(n))
     restart_form = (
         '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="restart">'
@@ -2498,7 +2511,10 @@ async def server_save(request: Request):
             vals[k] = bool(f.get(k))
         elif kind == "int":
             raw = (f.get(k, "") or "").strip()
-            vals[k] = int(raw) if raw.lstrip("-").isdigit() else ""
+            try:                                          # unit fields (TTL/prune) edited in hours/min → store seconds
+                vals[k] = int(round(float(raw) * _SRV_UNITS.get(k, 1)))
+            except ValueError:
+                vals[k] = ""
         else:
             vals[k] = (f.get(k, "") or "").strip()
     if which == "runtime":
