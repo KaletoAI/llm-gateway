@@ -219,7 +219,17 @@ ohne Job-Store), dann **F3** (Async/Job-Park). **Abhängig:** baut auf bestehend
   Eigenschaft → Referenzbilder werden unter Last nicht mehr verworfen).
 - Reuse: dieselbe TTL-Prune-Mechanik wie bei den Artefakten löscht alles mit.
 
-### G2 — LoRA-Support im Workflow-Mapping · M
+### G2 — LoRA-Support im Workflow-Mapping · M · ✅ KERN ERLEDIGT (2026-06-27)
+- **Stand:** Discovery-Dropdowns für LoRA-Namen sind über die generische Modell-Feld-
+  Maschinerie abgedeckt — real bestätigt: `LoraLoader.lora_name` = COMBO[98] →
+  `_value_control`/Playground rendern Dropdown + Stale-Flag (pinned, Override-Tabs,
+  dynamische Request-Params). `_LOADER_HINTS` enthält `"lora"`, `.safetensors` triggert
+  das Dropdown. Hart verdrahtet = `fixed`-Binding (nichts Neues), dynamisch = Feld
+  promoten (→), API-Pass-through verifiziert (`applied:[…,'lora_02','strength_02',…]`).
+  Neu (2026-06-27): „Available fields" flaggt Discovery-Felder mit `▾ N`-Badge.
+- **Optionaler Rest:** bounded number inputs (default/min/max/step aus `/object_info`)
+  für `strength_*`-Felder — heute nackte Zahlenfelder; descoped (berührt den aktiv
+  genutzten Mapping-Editor), opt-in.
 - **Bedarf (User):** ComfyUI-Workflow kann LoRAs — **eine hart verdrahtet**, weitere
   **dynamisch für User/Schnittstelle**.
 - **Hart verdrahtete LoRA:** braucht **nichts Neues** — ein `fixed`-Binding pinnt

@@ -1502,7 +1502,14 @@ async def _alias_editor(alias: str) -> str:
             req_btn = _btn("→", f"/ui/mapping/field-map?alias={_esc(alias)}&node={_esc(nid)}"
                            f"&field={_esc(f2)}", "secondary", sm=True, icon=True,
                            title="Add as request field")
-            arows += (f"<tr><td>{_esc(f2)} <span class='muted'>= {_esc(str(v2))[:22]}</span></td>"
+            fopts = oi.get(n.get("class_type", ""), {}).get(f2)   # discovery hint: dropdown? bool?
+            if isinstance(fopts, list) and _is_model_field(fopts, v2):
+                fhint = f" <span class='badge ok' title='becomes a discovery dropdown (e.g. LoRA / model) when pinned or promoted'>▾ {len(fopts)}</span>"
+            elif isinstance(v2, bool):
+                fhint = " <span class='muted'>bool</span>"
+            else:
+                fhint = ""
+            arows += (f"<tr><td>{_esc(f2)} <span class='muted'>= {_esc(str(v2))[:22]}</span>{fhint}</td>"
                       f"<td class='acts'>{add}{req_btn}</td></tr>")
         if arows:
             title = n.get("_meta", {}).get("title", "")
@@ -1775,10 +1782,22 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             + '<p class="hint">synchronous; image backends ~1 min · each image reuses one slot</p></form>')
 
 
+# Polls ONLY the result column (not a full-page meta-refresh), so the form stays
+# editable while a job runs — pick new params and Generate again without losing them.
+_PG_POLL_JS = ("<script>(function(){var rc=document.getElementById('resultcol');"
+               "if(!rc)return;var job=rc.getAttribute('data-poll-job');if(!job)return;"
+               "var t=setInterval(function(){"
+               "fetch('/ui/playground/status/'+encodeURIComponent(job),{cache:'no-store'})"
+               ".then(function(r){return r.text();}).then(function(h){rc.innerHTML=h;"
+               "if(h.indexOf('data-jobdone')>=0){clearInterval(t);}}).catch(function(){});"
+               "},2000);})();</script>")
+
+
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None, kept: Optional[set] = None) -> str:
+                     oi: Optional[dict] = None, kept: Optional[set] = None, poll_job: str = "") -> str:
+    pa = f' data-poll-job="{_esc(poll_job)}"' if poll_job else ""
     return (f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
-            f'<div class="col">{result_html}</div></div>')
+            f'<div class="col"><div id="resultcol"{pa}>{result_html}</div></div></div>{_PG_POLL_JS}')
 
 
 def _job_result_html(job_id: str, job: Optional[dict]):
@@ -1824,8 +1843,9 @@ async def playground_page(request: Request):
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
     kept = set(_pg_images.get((_session_user(request) or "default", model), {}).keys())
-    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html, oi, kept),
-                              "playground", refresh=refresh))
+    poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
+    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
+                              "playground"))
 
 
 async def generate(request: Request):
@@ -1883,6 +1903,14 @@ async def result(job_id: str, n: int):
         raise HTTPException(404, "result not found")
     path, mime = rp
     return FileResponse(path, media_type=mime)
+
+
+async def playground_status(job_id: str):
+    """Result-column fragment for the JS poller (so the form isn't reloaded mid-edit)."""
+    html, refresh = _job_result_html(job_id, jobs.get(job_id))
+    if not refresh:                              # done/failed → marker tells the poller to stop
+        html += "<span data-jobdone hidden></span>"
+    return HTMLResponse(html)
 
 
 # ── Image Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
@@ -1961,8 +1989,21 @@ async def job_detail_page(job_id: str, request: Request):
         inbox += f"<h3>Prompt</h3><pre class='chatout'>{_esc(prompt)}</pre>"
     if neg:
         inbox += f"<h3>Negative</h3><pre class='chatout'>{_esc(neg)}</pre>"
-    if prows:
-        inbox += f"<h3>Params</h3><table>{prows}</table>"
+    # request params + the alias's pinned values (for the backend this job ran on) side
+    # by side — quick overview of the full effective input.
+    pinned = []
+    if store.is_active():
+        cs = store.get(job["alias"]) or []
+        c = next((x for x in cs if x.get("backend") == job["backend"]), cs[0] if cs else None)
+        pinned = (c or {}).get("fixed") or []
+    frows = "".join(f"<tr><td><code>{_esc(b.get('field'))}</code></td>"
+                    f"<td>{_esc(str(b.get('value')))}</td></tr>" for b in pinned)
+    ptbl = f"<h3>Params</h3><table>{prows}</table>" if prows else ""
+    ftbl = (f"<h3>Pinned values <span class='muted' style='font-weight:normal'>· {_esc(job['backend'])}</span></h3>"
+            f"<table>{frows}</table>") if frows else ""
+    if ptbl or ftbl:
+        inbox += (f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
+                  f"<div>{ptbl}</div><div>{ftbl}</div></div>")
     if in_imgs:
         inbox += f"<h3>Reference images</h3>{_job_thumbs(job_id, 'input', in_imgs)}"
     if not inbox:
@@ -2510,6 +2551,7 @@ def register(app) -> None:
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
+    app.add_api_route("/ui/playground/status/{job_id}", playground_status, methods=["GET"])
     app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
