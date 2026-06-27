@@ -27,6 +27,23 @@ Der `model`-Wert ist ein vom Gateway-Admin angelegter Alias, hinter dem ein konk
 ComfyUI-Workflow + Mapping + Backend(s) stehen. anima-versa muss davon nichts wissen —
 es schickt `model: "<alias>"` und einen Prompt.
 
+### 1.1 Modell-Liste auf Image beschränken (gegen die 400+ Chat-Modelle)
+
+`GET /v1/models` ist der gemeinsame OpenAI-Katalog: ohne Beschränkung listet er **alle**
+Chat-/LLM-Modelle aller Backends (400+) **plus** die Image-Generierungs-Aliase
+(`owned_by: "llm-gateway (image)"`). Zwei Hebel, damit anima-versa nur das Relevante sieht:
+
+1. **Eigenen anima-versa-User mit Allow-List** (empfohlen). Im `/ui` → **Users** einen
+   User anlegen, dessen Häkchen **nur** die Image-Aliase (z.B. `Qwen`) — oder ein ganzes
+   **Backend** — umfassen. `GET /v1/models` mit diesem Key ist dann **gefiltert** und
+   liefert nur die erlaubten Einträge (verifiziert: `allow=[Qwen]` → genau 1 Eintrag).
+   Die Allow-List gated zugleich die **Nutzung** (fremdes Modell → `403`).
+2. **`GET /v1/models?type=image`** — liefert ausschließlich die Image-Aliase
+   (`?type=chat` = nur Chat). Praktisch zum direkten Testen.
+
+Beides kombinierbar: anima-versa nutzt seinen beschränkten Key, ruft `GET /v1/models`
+(oder `?type=image`) und bekommt eine kurze, saubere Alias-Liste statt 400+.
+
 ---
 
 ## 2. Endpoint A — `POST /v1/images/generations` (Text → Bild)

@@ -379,10 +379,12 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     allow = user.get("models") or []
     if not allow or not model:
         return True                              # empty allow-list = all models
-    if model in allow:
+    if model in allow:                           # exact id / chat alias / image alias
         return True
-    _, bare = split_backend_prefix(model)        # backend/model → check the model part
-    return bare in allow
+    bname, bare = split_backend_prefix(model)    # backend/model
+    if bname and bname in allow:                 # whole-backend grant (all its models)
+        return True
+    return bare in allow                         # bare model id
 
 
 def gate_request(authorization: Optional[str], request: Request, model: Optional[str]) -> Optional[dict]:
@@ -925,39 +927,53 @@ def chat_to_responses(chat_resp: dict) -> dict:
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
-async def list_models(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+async def list_models(request: Request, authorization: Optional[str] = Header(None)):
+    user = authenticate(authorization)
+    # Per-user allow-list FILTERS the catalog (empty = all). Entries may be a model id,
+    # a chat/image alias, or a backend name (grants all of that backend's models).
+    allow = (user.get("models") if user else None) or []
+    typ = (request.query_params.get("type") or "").lower()    # ""=both, "chat", "image"
     now = int(time.time())
     seen: set[str] = set()
     data = []
 
-    # OpenAI model catalog = LLM backends only (ComfyUI "models" are checkpoints, not
-    # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
-    for backend in enabled_backends():
-        if backend.get("type", "openai") == "comfyui":
-            continue
-        bname = backend["name"]
-        expose_bare = backend.get("local", False)
-        for mid in sorted(backend_models.get(backend_id(backend), set())):
-            # With model_prefix on, ids are '<backend>/<model>' so the same model
-            # on two backends stays distinct and the provider is visible. Off →
-            # legacy behaviour: bare ids, deduplicated across backends.
-            disp = f"{bname}/{mid}" if model_prefix else mid
-            if disp not in seen:
-                seen.add(disp)
-                data.append({"id": disp, "object": "model", "created": now, "owned_by": bname})
-            # `local: true` backends ADDITIONALLY list the bare id (alongside the
-            # prefixed one). A bare request routes by priority across every backend
-            # that exposes it — exactly like a virtual alias — so several `local`
-            # backends sharing a model id collapse to one entry and fail over.
-            if expose_bare and mid not in seen:
-                seen.add(mid)
-                data.append({"id": mid, "object": "model", "created": now, "owned_by": bname})
+    def visible(keys: set) -> bool:                           # any grant-key in the allow-list?
+        return (not allow) or any(k in allow for k in keys)
 
-    # Virtual aliases are cross-backend → always listed bare (no prefix).
-    for alias in virtual_models:
-        if alias not in seen:
-            data.append({"id": alias, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"})
+    # CHAT/LLM catalog = LLM backends only (ComfyUI "models" are checkpoints, not
+    # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
+    if typ != "image":
+        for backend in enabled_backends():
+            if backend.get("type", "openai") == "comfyui":
+                continue
+            bname = backend["name"]
+            expose_bare = backend.get("local", False)
+            for mid in sorted(backend_models.get(backend_id(backend), set())):
+                # model_prefix on → '<backend>/<model>' (provider visible, distinct across
+                # backends). off → legacy bare ids deduplicated across backends.
+                disp = f"{bname}/{mid}" if model_prefix else mid
+                if disp not in seen and visible({disp, mid, bname}):
+                    seen.add(disp)
+                    data.append({"id": disp, "object": "model", "created": now, "owned_by": bname})
+                # `local: true` backends ALSO list the bare id; a bare request routes by
+                # priority across every backend that exposes it (like a virtual alias).
+                if expose_bare and mid not in seen and visible({mid, bname}):
+                    seen.add(mid)
+                    data.append({"id": mid, "object": "model", "created": now, "owned_by": bname})
+        # Virtual chat aliases are cross-backend → always listed bare (no prefix).
+        for alias in virtual_models:
+            if alias not in seen and visible({alias}):
+                seen.add(alias)
+                data.append({"id": alias, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"})
+
+    # IMAGE generation aliases (separate namespace) — listed so image clients (anima-verse)
+    # can discover them; granted by alias name. `?type=image` returns only these.
+    if typ != "chat":
+        img_aliases = list(store.list_aliases().keys()) if store.is_active() else list(image_models.keys())
+        for alias in img_aliases:
+            if alias not in seen and visible({alias}):
+                seen.add(alias)
+                data.append({"id": alias, "object": "model", "created": now, "owned_by": "llm-gateway (image)"})
 
     return {"object": "list", "data": data}
 

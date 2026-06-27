@@ -2267,14 +2267,18 @@ def _user_form(u: Optional[dict]) -> str:
     allowed = set((u or {}).get("models") or [])
     chat_al = sorted(set(_gateway_info().get("virtual_models", [])))
     img_al = sorted(store.list_aliases().keys()) if store.is_active() else []
+    bk_al = sorted(b.get("name", "") for b in _gateway_info().get("backends", []) if b.get("name"))
     rows = ""
-    for a, kind in [(a, "chat") for a in chat_al] + [(a, "image") for a in img_al]:
+    # chat/image aliases granted by name; a backend grants ALL of its models (and filters
+    # what this user's key sees in /v1/models).
+    for a, kind in ([(a, "chat") for a in chat_al] + [(a, "image") for a in img_al]
+                    + [(b, "backend") for b in bk_al]):
         ck = " checked" if a in allowed else ""
         rows += (f'<tr><td><input type="checkbox" name="model" value="{_esc(a)}"{ck}></td>'
                  f'<td><code>{_esc(a)}</code></td><td class="muted">{kind}</td></tr>')
-    acc = (f'<div class="acctbl"><table><thead><tr><th title="allow this alias">✓</th>'
-           f'<th>alias</th><th>kind</th></tr></thead><tbody>{rows}</tbody></table></div>' if rows
-           else "<p class='muted'>no aliases yet</p>")
+    acc = (f'<div class="acctbl"><table><thead><tr><th title="allow this entry">✓</th>'
+           f'<th>name</th><th>kind</th></tr></thead><tbody>{rows}</tbody></table></div>' if rows
+           else "<p class='muted'>no aliases or backends yet</p>")
     return (f'<form action="/ui/users/save" method="post">{orig}'
             f'<div class="formbar"><h2>{"Edit User" if u else "Add User"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/users", "secondary")}</div>'
@@ -2288,8 +2292,10 @@ def _user_form(u: Optional[dict]) -> str:
             + _field("quota cost/month ($)", _inp("quota_cost_month", g("quota_cost_month"),
                                                   placeholder="blank = unlimited, e.g. 5.00"))
             + "<h2>Model access</h2>"
-            + "<p class='hint'>Leave <b>all unchecked</b> to allow every model (default). Check rows to "
-              "restrict this user to those aliases.</p>"
+            + "<p class='hint'>Leave <b>all unchecked</b> to allow every model (default). Checking rows "
+              "restricts this user to them <b>and</b> filters what their key sees in <code>/v1/models</code>. "
+              "A <b>backend</b> grants all of its models; an <b>image</b> alias is what an image client "
+              "(e.g. anima-verse) should be limited to.</p>"
             + acc
             + "</form>")
 
