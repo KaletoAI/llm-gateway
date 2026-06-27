@@ -464,20 +464,25 @@ def _apply_fixed(wf: dict, fixed: list) -> dict:
     return applied
 
 
-def _apply_mapping(wf: dict, mapping: dict, values: dict) -> dict:
+def _apply_mapping(wf: dict, mapping: dict, values: dict, protected: Optional[set] = None) -> dict:
     """The runtime injector: dumb and convention-free. For each logical param
     bound to `{node, field}`, set `workflow[node].inputs[field] = values[param]`.
 
     `mapping` is an explicit per-workflow binding table (authored in config or,
     later, in the registration UI). `values` is the merged logical params
     (prompt, negative_prompt, width, height, steps, cfg, seed, sampler, model, …
-    plus any `params.extra`). Missing values are skipped. Returns what was set."""
+    plus any `params.extra`). Missing values are skipped. Returns what was set.
+
+    `protected` is the set of admin-pinned `(node, field)` pairs: a request param
+    that maps onto a pinned node/field is **ignored** — a pin is authoritative and
+    the API must not override it."""
+    protected = protected or set()
     applied = {}
     for param, binding in mapping.items():
         if values.get(param) is None:
             continue
         node, field = binding.get("node"), binding.get("field")
-        if node in wf and field:
+        if node in wf and field and (node, field) not in protected:
             wf[node].setdefault("inputs", {})[field] = values[param]
             applied[param] = values[param]
     return applied
@@ -669,6 +674,8 @@ class ComfyUIAdapter(BackendAdapter):
         wf = self._workflow_for(req)
         fixed = await self._resolve_image_sentinels(list(req.fixed or []), req.upload_image)
         fixed_applied = _apply_fixed(wf, fixed)                # pin models / switches / ref-images
+        protected = {(b.get("node"), b.get("field")) for b in fixed   # pins the API cannot override
+                     if b.get("node") and b.get("field")}
         values = _gen_values(req)
         mapping = req.node_mapping or suggest_mapping(wf)      # explicit wins, convention is fallback
         if "seed" in mapping and values.get("seed") is None:
@@ -681,7 +688,7 @@ class ComfyUIAdapter(BackendAdapter):
             uploads[img_params[0]] = req.upload_image          # back-compat single upload
         for p in img_params:
             values.pop(p, None)
-        applied = _apply_mapping(wf, mapping, values)
+        applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
         autofilled = await self._autofill_empty_images(wf)
         summary = {"applied": sorted(applied.keys()), "seed": values.get("seed"),

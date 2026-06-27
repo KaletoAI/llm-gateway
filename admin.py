@@ -2362,8 +2362,11 @@ async def users_page(request: Request):
                   f"Statistic. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
                   + (f"<table><tr><th>IP</th><th>alias</th><th></th></tr>{iprows}</table>" if iprows
                      else "<p class='muted'>No caller IPs seen yet (calls are currently attributed to authenticated users).</p>"))
-    body = (warn + f'<div class="cols"><div class="col">{list_html}</div>'
-            f'<div class="col">{detail}</div></div>' + ip_section)
+    # Design convention (mirrors Mapping): the master-detail .cols is the SOLE full-height
+    # block — intro/extra sections live INSIDE a column, never as a sibling after it — so
+    # the detail form's sticky Save/Cancel bar stays visible while scrolling.
+    body = (warn + f'<div class="cols"><div class="col">{list_html}{ip_section}</div>'
+            f'<div class="col">{detail}</div></div>')
     return HTMLResponse(_page("Users", body, "users"))
 
 
@@ -2512,8 +2515,9 @@ async def server_page(request: Request):
     info = ("<h2>Server</h2><p class='hint'>These override <code>config.yaml</code> and are stored in "
             "the gateway (API key encrypted at rest), so config.yaml only needs backends, aliases and "
             "the launch port.</p>")
-    body = (info + banner
-            + f'<div class="cols"><div class="col">{runtime_form}</div>'
+    # intro/banner live inside the column (not as a sibling before .cols) so the sticky
+    # Save bars stay visible — see the Users design-convention note.
+    body = (f'<div class="cols"><div class="col">{info}{banner}{runtime_form}</div>'
             f'<div class="col">{restart_form}</div></div>')
     return HTMLResponse(_page("Server", body, "server"))
 
