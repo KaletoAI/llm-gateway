@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import random
+import re
 import struct
 import time
 import zlib
@@ -488,6 +489,48 @@ def _apply_mapping(wf: dict, mapping: dict, values: dict, protected: Optional[se
     return applied
 
 
+_LORA_SLOT_RE = re.compile(r"^lora_0*(\d+)$")          # rgthree stack: lora_01..lora_NN
+_STR_SLOT_RE = re.compile(r"^strength_0*(\d+)$")
+
+
+def _apply_lora_cascade(wf: dict, values: dict) -> list:
+    """Place client-supplied LoRAs into the next FREE stack slots, never overwriting an
+    occupied (pinned/baked) one.
+
+    A client numbers its loras from 1 and cannot know which physical slot is reserved,
+    so each client `lora_N` (with optional `strength_N`) is dropped onto the next slot
+    whose current value is empty/'None'; occupied slots are skipped. Consumes the
+    matched `lora_*`/`strength_*` keys from `values` so the normal mapping doesn't also
+    place them at fixed slots. Returns [(node, field, value)] placed."""
+    client, cstr = [], {}
+    for k in [k for k in values if _LORA_SLOT_RE.match(k)]:
+        idx, val = int(_LORA_SLOT_RE.match(k).group(1)), values.pop(k)
+        if val is not None and str(val) not in ("", "None"):
+            client.append((idx, val))
+    for k in [k for k in values if _STR_SLOT_RE.match(k)]:
+        cstr[int(_STR_SLOT_RE.match(k).group(1))] = values.pop(k)
+    if not client:
+        return []
+    client.sort(key=lambda t: t[0])
+    free = []                                          # (node, lora_field, strength_field) currently empty
+    for nid, n in wf.items():
+        inp = n.get("inputs") or {}
+        for f in sorted((f for f in inp if _LORA_SLOT_RE.match(f)),
+                        key=lambda f: int(_LORA_SLOT_RE.match(f).group(1))):
+            if inp.get(f) in (None, "", "None"):
+                idx = int(_LORA_SLOT_RE.match(f).group(1))
+                sf = next((s for s in (f"strength_{idx:02d}", f"strength_{idx}") if s in inp), None)
+                free.append((nid, f, sf))
+    placed = []
+    for (cidx, val), (nid, lf, sf) in zip(client, free):
+        inp = wf[nid].setdefault("inputs", {})
+        inp[lf] = val
+        if sf:
+            inp[sf] = cstr.get(cidx, 1.0)
+        placed.append((nid, lf, val))
+    return placed
+
+
 def suggest_mapping(wf: dict) -> dict:
     """Convention-based *suggestion* of a {param: {node, field}} binding table —
     the seed for a "register workflow" UI to pre-fill, NOT the runtime mechanism.
@@ -688,11 +731,13 @@ class ComfyUIAdapter(BackendAdapter):
             uploads[img_params[0]] = req.upload_image          # back-compat single upload
         for p in img_params:
             values.pop(p, None)
+        lora_placed = _apply_lora_cascade(wf, values)     # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
         autofilled = await self._autofill_empty_images(wf)
         summary = {"applied": sorted(applied.keys()), "seed": values.get("seed"),
                    "fixed": sorted(fixed_applied.keys()),
+                   "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
                    "images": sorted(img_applied), "autofilled_images": autofilled}
 
         poll_interval = float(b.get("poll_interval", 1.0))
