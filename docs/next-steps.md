@@ -195,6 +195,44 @@ ohne Job-Store), dann **F3** (Async/Job-Park). **Abhängig:** baut auf bestehend
 
 ---
 
+## G. Image-UX & Workflow-Features (nach C4)
+
+### G1 — Image-Job-Viewer: Input + Output in der UI · M
+- **Wunsch (User):** gegenerierte Image-Jobs später — **innerhalb der Vorhaltezeit
+  (Job-TTL)** — in der UI ansehen: **Input** (Prompt, negative_prompt, Params,
+  **Referenzbilder**) **und Output** (die erzeugten Bilder).
+- **Stand:** `jobs.py` hält die Output-Artefakte schon on-disk + Metadaten + TTL.
+  Es fehlt: (a) die **Inputs** mitspeichern (Prompt/Params/Upload-Refs als
+  Job-Meta bzw. Blob), (b) eine **Job-Detailseite** im /ui (analog zum E3
+  Call-Viewer `/ui/call/{id}`), die Input + Output-Thumbnails zeigt, gefiltert auf
+  nicht-abgelaufene Jobs.
+- **Datei:** `jobs.py` (Inputs in meta/Blob), `admin.py` (Job-Liste + Detailseite,
+  z.B. Image-Playground-/Jobs-Tab), `main.py` (Job-View liefert Input-Refs).
+- Reuse: dieselbe TTL-Prune-Mechanik wie bei den Artefakten löscht alles mit.
+
+### G2 — LoRA-Support im Workflow-Mapping · M
+- **Bedarf (User):** ComfyUI-Workflow kann LoRAs — **eine hart verdrahtet**, weitere
+  **dynamisch für User/Schnittstelle**.
+- **Hart verdrahtete LoRA:** braucht **nichts Neues** — ein `fixed`-Binding pinnt
+  den LoraLoader-Node (`{node, field:"lora_name", value:"x.safetensors"}` +
+  `strength_model`/`strength_clip`), exakt wie vae/gguf/clip im „test"-Alias.
+- **Dynamische User-LoRAs:** als **Mapping-Params** auf LoraLoader-Nodes exponieren,
+  z.B. `lora1`→{node, field:"lora_name"}, `lora1_strength`→{node, field:"strength"}.
+  Der Workflow braucht je dynamischem Slot einen LoraLoader (oder einen Lora-Stacker).
+- **Discovery/Validierung:** LoRA-Namen kommen aus ComfyUI `/object_info`
+  (LoraLoader `lora_name`-Enum) → die UI-Dropdowns (wie bei Modell-Feldern) bieten
+  sie an und flaggen veraltete.
+- **API-Übergabe (Design-Entscheidung):**
+  - **OpenAI-Pfad:** die Bild-API hat **kein** LoRA-Feld → sauberster Weg sind
+    **Alias-Presets** (je LoRA-Kombi ein Gen-Alias, Client wählt nur `model`). Optional
+    ein Extra-Feld (`lora`) durchreichen für Clients, die Extras erlauben.
+  - **Nativer `/v1/generations`-Pfad:** nimmt beliebige `params` → volle dynamische
+    LoRA-Kontrolle ohne OpenAI-Zwang.
+- **Datei:** Mapping-UI (`admin.py`) für LoRA-Param-Typ + Discovery-Dropdown; der
+  native Pfad trägt die Werte schon (`_apply_mapping`).
+
+---
+
 ## Empfohlene Reihenfolge
 
 1. **A1** — sofort, billig, schließt die Stats-/Kosten-Lücke für Streaming

@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import calendar
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -19,7 +21,7 @@ import admin
 import jobs
 import stats
 import store
-from adapters import AdapterContext, NormalizedRequest, make_adapter
+from adapters import AdapterContext, NormalizedRequest, image_params, make_adapter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -1332,6 +1334,180 @@ async def get_job_result(job_id: str, n: int, request: Request, authorization: O
         raise HTTPException(404, f"result {n} of job '{job_id}' not found")
     path, mime = rp
     return FileResponse(path, media_type=mime)
+
+
+# ── OpenAI-compatible image endpoints (C4) ───────────────────────────────────
+# Thin shims over the native job path so OpenAI image clients (anima-verse's image
+# provider, SDKs) reach the gateway's ComfyUI generation aliases.
+#  /v1/images/generations : JSON, text->image (+ bonus LocalAI-style ref_images)
+#  /v1/images/edits       : multipart, reference image(s) -> alias image-input slots
+
+# Known OpenAI image-request keys; everything else a client sends is forwarded as a
+# native workflow param (loras, seed, steps, cfg, …) → dynamic control, no presets.
+_OAI_IMG_KEYS = {"prompt", "model", "n", "size", "response_format", "negative_prompt",
+                 "ref_images", "quality", "style", "background", "output_format", "user",
+                 "mode", "ttl_s", "params", "stream"}
+_EDIT_KNOWN = {"model", "prompt", "negative_prompt", "size", "n", "response_format", "image", "mask"}
+
+
+def _coerce(s):
+    """'12'->12, '0.8'->0.8, else unchanged ('None' / 'x.safetensors' stay strings).
+    Multipart fields arrive as strings; the workflow wants real numbers for strengths."""
+    if not isinstance(s, str):
+        return s
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+
+def _parse_size(size: Optional[str]) -> tuple[int, int]:
+    """OpenAI `size` ('1024x1024' | 'auto' | None) -> (width, height)."""
+    if not size or str(size).lower() == "auto":
+        return 1024, 1024
+    try:
+        w, h = str(size).lower().split("x")
+        return int(w), int(h)
+    except (ValueError, AttributeError):
+        return 1024, 1024
+
+
+async def _multipart_list(request: Request) -> dict:
+    """multipart/form-data -> {name: [values]} (files->bytes, scalars->str),
+    repeated fields preserved; `image[]` normalised to `image`."""
+    ctype = request.headers.get("content-type", "")
+    m = re.search(r"boundary=([^;]+)", ctype)
+    if not m:
+        return {}
+    body = await request.body()
+    delim = b"--" + m.group(1).strip().strip('"').encode()
+    out: dict = {}
+    for part in body.split(delim):
+        part = part.strip(b"\r\n")
+        if not part or part == b"--" or b"\r\n\r\n" not in part:
+            continue
+        head, _, content = part.partition(b"\r\n\r\n")
+        head_s = head.decode("utf-8", "replace")
+        nm = re.search(r'name="([^"]*)"', head_s)
+        if not nm:
+            continue
+        val = content if 'filename="' in head_s else content.decode("utf-8", "replace")
+        out.setdefault(nm.group(1).rstrip("[]"), []).append(val)
+    return out
+
+
+def _gen_image_slots(alias: str) -> list:
+    """Ordered image-input param names of a generation alias (its workflow's image
+    loaders per the mapping) — reference images map onto these positionally."""
+    routes = get_gen_routes(alias)
+    if not routes:
+        return []
+    _, cand = routes[0]
+    return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
+
+
+async def _decode_ref_image(ref) -> Optional[bytes]:
+    """Reference image as base64 data-URI / raw base64 / http(s) URL -> bytes."""
+    if not isinstance(ref, str) or not ref:
+        return None
+    if ref.startswith("data:"):
+        ref = ref.split(",", 1)[-1]
+    if ref.startswith(("http://", "https://")):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as c:
+                r = await c.get(ref)
+                return r.content if r.status_code == 200 else None
+        except Exception:
+            return None
+    try:
+        return base64.b64decode(ref)
+    except Exception:
+        return None
+
+
+def _images_uploads(images: list, alias: str) -> dict:
+    """Map reference-image blobs positionally onto the alias's ordered image-input
+    slots. The cap is the alias's slot count (not a fixed number): extra images are
+    ignored, unfilled slots get the adapter's 8x8 placeholder."""
+    slots = _gen_image_slots(alias)
+    uploads: dict = {}
+    for i, slot in enumerate(slots):
+        if i < len(images) and images[i]:
+            uploads[slot] = bytes(images[i])
+    return uploads
+
+
+def _images_response(view: dict, response_format: str) -> dict:
+    """Native job view -> OpenAI images response {created, data:[{url|b64_json}]}."""
+    data = []
+    for r in view.get("results", []):
+        if response_format == "b64_json":
+            rp = jobs.result_path(view["job_id"], r["n"])
+            if rp:
+                with open(rp[0], "rb") as fh:
+                    data.append({"b64_json": base64.b64encode(fh.read()).decode()})
+        else:
+            data.append({"url": r["url"]})
+    return {"created": int(time.time()), "data": data}
+
+
+def _gen_done_or_502(view: dict) -> dict:
+    if view.get("status") != "done":
+        raise HTTPException(502, f"image generation {view.get('status')}: {view.get('error')}")
+    return view
+
+
+@app.post("/v1/images/generations")
+async def images_generations(request: Request, authorization: Optional[str] = Header(None)):
+    """OpenAI Images API (text->image). Bonus: LocalAI-style `ref_images`
+    (base64/URL list) are accepted and mapped onto the alias's image slots."""
+    body = await request.json()
+    alias = body.get("model", "")
+    gate_request(authorization, request, alias)
+    if not body.get("prompt"):
+        raise HTTPException(400, "`prompt` is required")
+    w, h = _parse_size(body.get("size"))
+    refs = body.get("ref_images") or []
+    uploads = _images_uploads([await _decode_ref_image(r) for r in refs], alias) if refs else None
+    extra = {k: v for k, v in body.items() if k not in _OAI_IMG_KEYS}   # dynamic workflow params
+    native = {
+        "model": alias, "mode": "sync",
+        "prompt": body.get("prompt", ""), "negative_prompt": body.get("negative_prompt", ""),
+        "params": {"width": w, "height": h, **(body.get("params") or {}), **extra},
+        "output": {"n": int(body.get("n") or 1), "mode": "sync"},
+    }
+    view = _gen_done_or_502(await run_generation(native, request, upload_images=uploads))
+    return JSONResponse(_images_response(view, body.get("response_format") or "url"))
+
+
+@app.post("/v1/images/edits")
+async def images_edits(request: Request, authorization: Optional[str] = Header(None)):
+    """OpenAI Images Edit API (multipart): `image` field(s) carry reference images,
+    mapped positionally onto the alias's declared image-input slots (cap = slot count;
+    OpenAI itself allows 1 for dall-e-2, up to 16 for gpt-image-1)."""
+    f = await _multipart_list(request)
+    one = lambda k, d="": (f.get(k) or [d])[0]
+    alias = (one("model") or "").strip()
+    gate_request(authorization, request, alias)
+    images = [v for v in (f.get("image") or []) if isinstance(v, (bytes, bytearray))]
+    if not images:
+        raise HTTPException(400, "at least one `image` file is required")
+    images = images[:16]                               # OpenAI gpt-image-1 max; workflow may use fewer
+    w, h = _parse_size(one("size") or None)
+    extra = {k: _coerce(one(k)) for k, vs in f.items()  # dynamic scalar params (loras, seed, …)
+             if k not in _EDIT_KNOWN and not isinstance((vs or [None])[0], (bytes, bytearray))}
+    native = {
+        "model": alias, "mode": "sync", "task": "img2img",
+        "prompt": one("prompt"), "negative_prompt": one("negative_prompt"),
+        "params": {"width": w, "height": h, **extra},
+        "output": {"n": int((one("n") or "1") or 1), "mode": "sync"},
+    }
+    view = _gen_done_or_502(await run_generation(native, request, upload_images=_images_uploads(images, alias)))
+    return JSONResponse(_images_response(view, one("response_format") or "url"))
 
 
 def dashboard_snapshot() -> dict:

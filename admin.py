@@ -1260,6 +1260,43 @@ async def register_post(request: Request):
     return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
 
 
+async def update_workflow(request: Request):
+    """Replace an existing alias's workflow_json, **keeping** mapping + fixed +
+    backends/retries. Lets the user re-export a tweaked ComfyUI workflow without
+    redoing the mapping — only bindings whose node id changed need re-pointing."""
+    f = await _multipart(request)
+    alias = str(f.get("alias", "")).strip()
+    cands = store.get(alias)
+
+    def err(msg):
+        return HTMLResponse(_page("Update workflow", f'<p class="bad">{_esc(msg)}</p>'
+                            f'<div class="actions" style="padding-left:0">'
+                            f'{_btn("← Back", f"/ui/mapping?edit={quote(alias)}", "secondary")}</div>', "mapping"))
+    if not cands:
+        return err(f"alias '{alias}' not found")
+    upload = f.get("workflow_file")
+    path = str(f.get("workflow_path", "")).strip()
+    try:
+        if isinstance(upload, (bytes, bytearray)) and upload.strip():
+            wf = json.loads(upload.decode("utf-8"))
+        elif path:
+            with open(path) as fh:
+                wf = json.load(fh)
+        else:
+            return err("upload an API JSON file or give a share path")
+    except Exception as e:
+        return err(f"invalid workflow JSON: {e}")
+    if not isinstance(wf, dict):
+        return err("workflow JSON must be an object of nodes (API format)")
+    for c in cands:
+        c["workflow_json"] = wf                          # keep mapping / fixed / backend / task / retries
+    store.upsert(alias, cands)
+    mapping = cands[0].get("mapping") or {}
+    stale = [p for p, m in mapping.items() if (m or {}).get("node") not in wf]
+    logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}")
+    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
+
+
 def _reorder_js(alias: str) -> str:
     """Vanilla drag-to-reorder for the request-fields rows. On drop, if the order
     changed, persist it via /ui/mapping/field-order (one ?order= per param) and the
@@ -1345,6 +1382,8 @@ async def _alias_editor(alias: str) -> str:
         cur_disp = ("image upload" if is_img else
                     "(linked)" if isinstance(cur, list) else ("" if cur is None else str(cur)))
         tag = " <span class='tag'>image</span>" if is_img else ""
+        if node and node not in wf:                      # node vanished after a workflow update
+            tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
         actions = ((_btn("∅", f"/ui/mapping/field-clear?alias={_esc(alias)}&param={_esc(p)}",
                          "secondary", sm=True, icon=True, title="Clear the workflow default")
                     if not is_img else "")
@@ -1415,7 +1454,17 @@ async def _alias_editor(alias: str) -> str:
                  f"<p class='hint'>Add a field to pin it (Switch boolean, reference image, …). "
                  f"Unmapped fields keep the workflow's value.</p>"
                  f"<table class='avail'>{avail or '<tr><td>all scalar fields mapped</td></tr>'}</table>")
-    return form, available
+    upd = ('<h2 style="margin-top:24px">Update workflow</h2>'
+           "<p class='hint'>Replace the ComfyUI API JSON without redoing the mapping — the node/field "
+           "bindings (request fields + pinned values) are kept. Bindings whose node vanished are flagged "
+           "<span class='badge bad'>stale</span> in Request fields above; just re-point them.</p>"
+           '<form action="/ui/mapping/update-workflow" method="post" enctype="multipart/form-data">'
+           f'<input type="hidden" name="alias" value="{_esc(alias)}">'
+           + _field("API JSON", '<input type="file" name="workflow_file" accept="application/json,.json">')
+           + _field("…or share path", _inp("workflow_path", "", placeholder="/mnt/share/flux_api.json"))
+           + f'<div class="field"><label></label><div class="control">{_btn("Update workflow", submit=True)}</div></div>'
+           + '</form>')
+    return form + upd, available
 
 
 async def edit_add(request: Request):
@@ -1601,7 +1650,7 @@ def _alias_defaults(cand: dict) -> dict:
     return out
 
 
-def _playground_form(aliases: list, vals: dict, cand: Optional[dict]) -> str:
+def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None) -> str:
     v = lambda k: str(vals.get(k) if vals.get(k) is not None else "")
     # selecting an alias reloads with its workflow defaults pre-filled
     opts = "".join(f'<option value="{_esc(a)}"{" selected" if a == vals.get("model") else ""}>{_esc(a)}</option>'
@@ -1625,8 +1674,17 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict]) -> str:
                            '<span class="muted">empty → 8×8 placeholder</span>')
         else:
             dv = defaults.get(p)
-            typ = "number" if isinstance(dv, (int, float)) and not isinstance(dv, bool) else "text"
-            rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
+            node, field = (m or {}).get("node"), (m or {}).get("field")
+            opts = (oi or {}).get((wf.get(node) or {}).get("class_type", ""), {}).get(field)
+            if opts and _is_model_field(opts, dv):       # combo/model field (lora_name, …) → dropdown
+                cur = v(p) or (str(dv) if dv is not None else "")
+                o = list(opts)
+                if cur and cur not in o:
+                    o = [cur] + o
+                rows += _field(label, _select(f"p__{p}", o, cur))
+            else:
+                typ = "number" if isinstance(dv, (int, float)) and not isinstance(dv, bool) else "text"
+                rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
     rows = rows or "<p class='hint'>This alias has no request fields — add some in Mapping.</p>"
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Playground</h2>{_btn("Generate", submit=True)}</div>'
@@ -1635,8 +1693,9 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict]) -> str:
             + '<p class="hint">synchronous; image backends ~1 min · each image reuses one slot</p></form>')
 
 
-def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str) -> str:
-    return (f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand)}</div>'
+def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
+                     oi: Optional[dict] = None) -> str:
+    return (f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi)}</div>'
             f'<div class="col">{result_html}</div></div>')
 
 
@@ -1680,7 +1739,10 @@ async def playground_page(request: Request):
         result_html, refresh = _job_result_html(job_id, jobs.get(job_id))
     else:
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the image here.</p>"
-    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html), "playground", refresh=refresh))
+    wf = (cand.get("workflow_json") if cand else {}) or {}
+    oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
+    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html, oi),
+                              "playground", refresh=refresh))
 
 
 async def generate(request: Request):
@@ -1838,12 +1900,15 @@ async def dashboard_page(request: Request):
         for j in d.get("jobs_recent", []):
             st = j["status"]
             scls = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}.get(st, "muted")
+            cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
+            dur = _dur((upd - cr) * 1000) if (st in ("done", "failed") and upd >= cr) else "—"
             jr += (f"<tr><td><code>{_esc(j['id'][:8])}</code></td><td>{_esc(j.get('alias'))}</td>"
                    f"<td>{_esc(j.get('backend'))}</td><td><span class='badge {scls}'>{_esc(st)}</span></td>"
-                   f"<td class='muted'>{_age(j.get('created'))}</td><td class='muted'>{_esc(j.get('owner'))}</td></tr>")
+                   f"<td class='muted'>{_age(j.get('created'))}</td><td class='muted'>{dur}</td>"
+                   f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
         jobs_html = (f"<h2>Image jobs {badges}</h2>"
                      + (f"<table><tr><th>id</th><th>alias</th><th>backend</th><th>status</th>"
-                        f"<th>age</th><th>owner</th></tr>{jr}</table>" if jr
+                        f"<th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
                         else "<p class='muted'>no jobs yet</p>"))
     else:
         jobs_html = "<h2>Image jobs</h2><p class='hint'>Image generation is off.</p>"
@@ -2217,6 +2282,7 @@ def register(app) -> None:
     app.add_api_route("/ui/chatplay/send", chatplay_send, methods=["POST"])
     app.add_api_route("/ui/mapping", mapping_page, methods=["GET"])
     app.add_api_route("/ui/mapping/register", register_post, methods=["POST"])
+    app.add_api_route("/ui/mapping/update-workflow", update_workflow, methods=["POST"])
     app.add_api_route("/ui/mapping/field-add", edit_add, methods=["GET"])
     app.add_api_route("/ui/mapping/field-map", field_map, methods=["GET"])
     app.add_api_route("/ui/mapping/field-clear", field_clear, methods=["GET"])
