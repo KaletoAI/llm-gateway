@@ -531,38 +531,6 @@ def _apply_lora_cascade(wf: dict, values: dict) -> list:
     return placed
 
 
-def _apply_auto_color_match(wf: dict, mapping: dict, img_params: list, uploads: dict):
-    """Turn a workflow's colour-match control OFF when no real reference image was
-    supplied. ColorMatch against the blank 8×8 placeholder tints the result toward
-    grey; this neutralises it generically.
-
-    Convention: a control named `input_color_match` — a node so titled (e.g. a
-    PrimitiveFloat feeding `ColorMatch.strength`, or a boolean feeding a switch), or a
-    mapped param of that name. When the PRIMARY reference slot (`img_params[0]`, i.e.
-    reference image 1) got only the placeholder, the control is set to 0 / False. With a
-    real reference present it is left untouched (the workflow/client value stands).
-    Returns `(node, field, value)` if it acted, else None."""
-    ctrl = None
-    if "input_color_match" in (mapping or {}):
-        b = mapping["input_color_match"]
-        ctrl = (b.get("node"), b.get("field"))
-    else:
-        for nid, n in wf.items():
-            if (n.get("_meta") or {}).get("title") == "input_color_match":
-                inp = n.get("inputs") or {}
-                f = "value" if "value" in inp else next((k for k, v in inp.items() if not isinstance(v, list)), None)
-                ctrl = (nid, f)
-                break
-    if not ctrl or not ctrl[0] or not ctrl[1] or ctrl[0] not in wf:
-        return None
-    primary = img_params[0] if img_params else None
-    if primary and uploads.get(primary):                  # real reference 1 → leave control as-is
-        return None
-    inp = wf[ctrl[0]].setdefault("inputs", {})
-    inp[ctrl[1]] = False if isinstance(inp.get(ctrl[1]), bool) else 0
-    return (ctrl[0], ctrl[1], inp[ctrl[1]])
-
-
 def suggest_mapping(wf: dict) -> dict:
     """Convention-based *suggestion* of a {param: {node, field}} binding table —
     the seed for a "register workflow" UI to pre-fill, NOT the runtime mechanism.
@@ -767,11 +735,9 @@ class ComfyUIAdapter(BackendAdapter):
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
         autofilled = await self._autofill_empty_images(wf)
-        cmatch = _apply_auto_color_match(wf, mapping, img_params, uploads)   # off when no reference 1
         summary = {"applied": sorted(applied.keys()), "seed": values.get("seed"),
                    "fixed": sorted(fixed_applied.keys()),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
-                   "color_match_off": bool(cmatch),
                    "images": sorted(img_applied), "autofilled_images": autofilled}
 
         poll_interval = float(b.get("poll_interval", 1.0))
