@@ -1573,8 +1573,11 @@ async def field_map(request: Request):
 
 
 async def field_clear(request: Request):
-    """Clear the workflow default of a mapped request field (sets the gateway-owned
-    JSON's node.field to empty, so the param defaults to blank in the playground)."""
+    """Clear the workflow default of a mapped request field so the playground field
+    starts blank. For a combo field whose valid options include "None" (e.g. a LoRA
+    loader), clear to "None" — an empty lora_name makes ComfyUI error; "None" is the
+    valid 'off' value. Text fields still clear to "". Applied to every candidate so no
+    backend keeps the bad value."""
     alias, param = _qp(request, "alias"), _qp(request, "param")
     cands = store.get(alias)
     if cands and param:
@@ -1582,7 +1585,18 @@ async def field_clear(request: Request):
         m = (cand.get("mapping") or {}).get(param)
         wf = cand.get("workflow_json")
         if m and wf and m.get("node") in wf:
-            wf[m["node"]].setdefault("inputs", {})[m["field"]] = ""
+            node, field = m["node"], m["field"]
+            cls = wf.get(node, {}).get("class_type", "")
+            opts = (await _object_info(cand.get("backend", ""), wf)).get(cls, {}).get(field)
+            if isinstance(opts, list):                   # authoritative: does the combo offer "None"?
+                none_ok = "None" in opts
+            else:                                        # oi unreachable → fall back to a lora name/class hint
+                none_ok = "lora" in (field + cls).lower()
+            blank = "None" if none_ok else ""
+            for c in cands:                              # keep it consistent across backends
+                w = c.get("workflow_json")
+                if w and node in w:
+                    w[node].setdefault("inputs", {})[field] = blank
             store.upsert(alias, cands)
     return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
 
