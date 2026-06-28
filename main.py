@@ -125,6 +125,7 @@ def rebuild_virtual_models() -> None:
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
 backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
+backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
 
@@ -215,6 +216,7 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         caps = await adapter.discover(client)
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
+        backend_loras[bid] = getattr(caps, "loras", set()) or set()
         if not backend_healthy.get(bid):
             logger.info(f"[{label}] UP  — {len(caps.models)} models, {len(caps.pricing)} priced")
         backend_healthy[bid] = True
@@ -224,6 +226,7 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         backend_healthy[bid] = False
         backend_models[bid] = set()
         backend_pricing[bid] = {}
+        backend_loras[bid] = set()
 
 
 async def health_loop() -> None:
@@ -252,6 +255,7 @@ def reload_config() -> None:
         backend_healthy.pop(stale, None)
         backend_models.pop(stale, None)
         backend_pricing.pop(stale, None)
+        backend_loras.pop(stale, None)
         backend_inflight.pop(stale, None)
         logger.info(f"  removed backend [{stale}] — state cleared")
     build_backend_adapters()       # rebind adapters to the new backend dicts
@@ -1338,6 +1342,17 @@ async def _run_gen_parked(job_id, alias, force, build_req):
         await asyncio.sleep(2.0)
 
 
+def _requested_loras(body: dict) -> set:
+    """LoRA filenames a request asks for (lora_* params, top-level or in `params`),
+    excluding None/blank — used for LoRA-aware backend preference."""
+    out = set()
+    merged = {**body, **(body.get("params") or {})}
+    for k, v in merged.items():
+        if isinstance(v, str) and v and v != "None" and re.match(r"^lora_0*\d+$", str(k)):
+            out.add(v)
+    return out
+
+
 async def run_generation(body: dict, request: Request,
                          upload_images: Optional[dict] = None) -> dict:
     """Resolve a generation alias, create a job, and run it (sync) or schedule it
@@ -1349,15 +1364,41 @@ async def run_generation(body: dict, request: Request,
     mode = output.get("mode") or body.get("mode") or "sync"
     ttl_s = output.get("ttl_s") or body.get("ttl_s")
 
-    routes = get_gen_routes(alias)
     force = (body.get("backend") or "").strip()         # pin to one backend (playground testing)
+    all_cands = get_gen_routes(alias, include_busy=True)
     if force:
-        routes = [r for r in routes if r[0].get("name") == force]
-    parked = False
-    if not routes:                                       # nothing ready → busy, or no backend at all?
-        busy = get_gen_routes(alias, include_busy=True)
+        all_cands = [r for r in all_cands if r[0].get("name") == force]
+    if not all_cands:
+        raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
+                                 + (f" on backend '{force}'" if force else ""))
+
+    # LoRA-aware backend eligibility (skipped when a backend is force-pinned): a backend
+    # that lacks a requested LoRA is dropped — but only for LoRAs installed on SOME
+    # candidate; a LoRA installed nowhere is ignored so priority still decides (per spec).
+    # Decided over ALL candidates (incl. busy), so the eligible backend is parked-for
+    # rather than spilling to a backend that doesn't have the LoRA.
+    eligible_names = None
+    req_loras = _requested_loras(body)
+    if req_loras and not force:
+        avail = set().union(*(backend_loras.get(backend_id(b), set()) for b, _ in all_cands))
+        need = req_loras & avail
+        if need:
+            elig = [r for r in all_cands if need <= backend_loras.get(backend_id(r[0]), set())]
+            if elig:                                      # else loras split across backends → no constraint
+                eligible_names = {r[0].get("name") for r in elig}
+
+    def _pick(include_busy: bool) -> list:
+        rs = get_gen_routes(alias, include_busy=include_busy)
         if force:
-            busy = [r for r in busy if r[0].get("name") == force]
+            rs = [r for r in rs if r[0].get("name") == force]
+        if eligible_names is not None:
+            rs = [r for r in rs if r[0].get("name") in eligible_names]
+        return rs
+
+    routes = _pick(False)                                # ready (not busy) + lora-eligible
+    parked = False
+    if not routes:                                       # nothing ready → busy-eligible, or none at all?
+        busy = _pick(True)
         if not busy:
             raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
                                      + (f" on backend '{force}'" if force else ""))
@@ -1411,6 +1452,19 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
     view = await run_generation(body, request)
     code = {"queued": 202, "done": 200}.get(view.get("status"), 502)
     return JSONResponse(view, status_code=code)
+
+
+@app.get("/v1/generations/{alias}/loras")
+async def gen_alias_loras(alias: str, request: Request, authorization: Optional[str] = Header(None)):
+    """LoRA filenames valid for a generation alias — the union of what's installed on
+    the alias's backends. Lets a client present a valid LoRA picker per alias."""
+    gate_request(authorization, request, alias)                # auth + allow-list
+    if not ((store.get(alias) if store.is_active() else None) or image_models.get(alias)):
+        raise HTTPException(404, f"generation alias '{alias}' not found")
+    loras: set = set()
+    for b, _ in get_gen_routes(alias, include_busy=True):
+        loras |= backend_loras.get(backend_id(b), set())
+    return {"object": "list", "alias": alias, "loras": sorted(loras)}
 
 
 def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:

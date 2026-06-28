@@ -127,6 +127,7 @@ class Capabilities:
     OpenAI shape (models + pricing); later phases add tasks/workflows."""
     models: set[str]
     pricing: dict[str, dict[str, float]]
+    loras: set = field(default_factory=set)         # ComfyUI: installed LoRA filenames
 
 
 @dataclass
@@ -611,6 +612,22 @@ def _comfy_models(object_info: dict) -> set[str]:
     return out
 
 
+def _comfy_loras(object_info: dict) -> set[str]:
+    """Installed LoRA filenames from /object_info — the combo options of any LoRA
+    loader's `lora_name` / `lora_NN` field ('None' sentinel excluded)."""
+    out: set[str] = set()
+    for cls, spec in (object_info or {}).items():
+        if "lora" not in str(cls).lower():
+            continue
+        inp = spec.get("input", {}) or {}
+        for fn, fspec in {**(inp.get("required") or {}), **(inp.get("optional") or {})}.items():
+            if not (fn == "lora_name" or _LORA_SLOT_RE.match(fn)):
+                continue
+            if isinstance(fspec, list) and fspec and isinstance(fspec[0], list):
+                out.update(str(x) for x in fspec[0] if x and x != "None")
+    return out
+
+
 def _gen_values(req: NormalizedRequest) -> dict:
     """Flatten a request's logical generation values into one {param: value} dict
     the mapping can draw from: inputs (prompt/negative), params (width/steps/…),
@@ -635,7 +652,8 @@ class ComfyUIAdapter(BackendAdapter):
         url = self.backend["url"].rstrip("/")
         resp = await client.get(f"{url}/object_info", timeout=8.0)
         resp.raise_for_status()
-        return Capabilities(models=_comfy_models(resp.json()), pricing={})
+        oi = resp.json()
+        return Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
 
     def _load_workflow(self, path: Optional[str]) -> dict:
         if not path:
