@@ -1405,6 +1405,13 @@ async def _alias_editor(alias: str) -> str:
         cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
         cur_disp = ("image upload" if is_img else
                     "(linked)" if isinstance(cur, list) else ("" if cur is None else str(cur)))
+        if is_img:
+            cur_cell = ('image upload <label class="muted" style="font-weight:normal" '
+                        'title="require an upload; do not substitute the 8×8 placeholder">'
+                        f'<input type="checkbox" name="noph__{_esc(p)}"'
+                        f'{" checked" if m.get("no_placeholder") else ""}> no 8×8</label>')
+        else:
+            cur_cell = _esc(cur_disp[:60])
         tag = " <span class='tag'>image</span>" if is_img else ""
         if node and node not in wf:                      # node vanished after a workflow update
             tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
@@ -1417,7 +1424,7 @@ async def _alias_editor(alias: str) -> str:
                      f"<td>{_inp('label__' + p, m.get('label', ''), placeholder=p)}</td>"
                      f"<td>{_inp('node__' + p, node)}</td>"
                      f"<td>{_inp('field__' + p, fld)}</td>"
-                     f"<td class='muted'>{_esc(cur_disp[:60])}</td>"
+                     f"<td class='muted'>{cur_cell}</td>"
                      f"<td class='acts'>{actions}</td></tr>")
     req_rows = req_rows or ("<tr><td colspan=6 class='muted'>none yet — promote a field "
                             "from Available fields below (→)</td></tr>")
@@ -1690,6 +1697,8 @@ async def update(request: Request):
                 lbl = (f.get(f"label__{p}", "") or "").strip()
                 if lbl:                       # label overrides Playground label / API field name
                     entry["label"] = lbl
+                if f.get(f"noph__{p}"):       # image slot: require upload, no 8×8 placeholder fallback
+                    entry["no_placeholder"] = True
                 mapping[p] = entry
     fixed = []
     for key, val in f.items():

@@ -392,7 +392,7 @@ def _clip_nodes(wf: dict, want: str) -> Optional[str]:
     return found[1] if len(found) > 1 else None
 
 
-_IMG_LOADER_CLASSES = ("LoadImage", "LoadAndResizeImage")
+_IMG_LOADER_CLASSES = ("LoadImage", "LoadAndResizeImage", "LoadImageMask")
 PLACEHOLDER_SENTINEL = "__gw_placeholder__"          # fixed-binding value → upload + use an 8×8 image
 UPLOAD_SENTINEL = "__gw_upload__"                    # fixed-binding value → use the playground upload
 
@@ -689,8 +689,13 @@ class ComfyUIAdapter(BackendAdapter):
                 if not (nid and fld):
                     continue
                 data = uploads.get(p)
-                name = (await self._upload_image(c, bytes(data), _img_slug(p)) if data
-                        else await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png"))
+                if data:
+                    name = await self._upload_image(c, bytes(data), _img_slug(p))
+                elif m.get("no_placeholder"):
+                    continue                  # required slot (e.g. inpaint image/mask): no 8×8 fallback,
+                                              # keep the workflow's own value
+                else:
+                    name = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png")
                 wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = name
                 applied.append(p)
         return applied
