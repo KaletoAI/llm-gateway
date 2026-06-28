@@ -489,6 +489,21 @@ def _apply_mapping(wf: dict, mapping: dict, values: dict, protected: Optional[se
     return applied
 
 
+def _format_comfy_error(messages) -> str:
+    """Readable one-liner from ComfyUI /history error `messages` (a list of
+    [type, data] pairs): the failing node + exception, else a trimmed raw fallback."""
+    for m in (messages or []):
+        if isinstance(m, (list, tuple)) and len(m) == 2 and m[0] == "execution_error":
+            d = m[1] or {}
+            where = " ".join(str(x) for x in (d.get("node_id"), d.get("node_type")) if x)
+            msg = d.get("exception_message") or "execution error"
+            return f"node {where}: {msg}" if where else msg
+    try:
+        return json.dumps(messages)[:600]
+    except Exception:
+        return str(messages)[:600]
+
+
 _LORA_SLOT_RE = re.compile(r"^lora_0*(\d+)$")          # rgthree stack: lora_01..lora_NN
 _STR_SLOT_RE = re.compile(r"^strength_0*(\d+)$")
 
@@ -751,7 +766,10 @@ class ComfyUIAdapter(BackendAdapter):
         started = time.monotonic()
         log_on = self.ctx.log_enabled()
         try:
-            timeout = httpx.Timeout(30.0, read=max_wait)
+            # short per-request read timeout (NOT max_wait): a hung /history or /view read
+            # then fails fast → the disconnect-grace/failover logic kicks in instead of
+            # blocking the whole job for max_wait. The overall budget is the poll deadline.
+            timeout = httpx.Timeout(30.0, read=float(b.get("read_timeout", 60)))
             async with httpx.AsyncClient(timeout=timeout) as client:
                 pr = await client.post(f"{url}/prompt", json={"prompt": wf})
                 if pr.status_code != 200:
@@ -797,7 +815,7 @@ class ComfyUIAdapter(BackendAdapter):
                 entry = hist[prompt_id]
                 status = entry.get("status", {})
                 if status.get("status_str") == "error":
-                    raise RuntimeError(f"ComfyUI execution error: {json.dumps(status.get('messages'))}")
+                    raise RuntimeError(f"ComfyUI: {_format_comfy_error(status.get('messages'))}")
                 return entry.get("outputs", {})
             except RuntimeError:
                 raise
@@ -808,6 +826,10 @@ class ComfyUIAdapter(BackendAdapter):
                         f"ComfyUI unreachable for >{grace:.0f}s during execution "
                         f"(likely crashed/restarting): {type(e).__name__}: {e}")
                 continue
+        try:                                    # free the GPU: stop the still-running prompt
+            await client.post(f"{url}/interrupt")
+        except Exception:
+            pass
         raise TimeoutError(f"ComfyUI timeout after {max_wait:.0f}s (prompt {prompt_id}); "
                            f"last poll error: {last_exc}")
 

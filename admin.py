@@ -66,6 +66,7 @@ def _num(s: str):
 _comfy_backends: Callable[[], list] = lambda: []
 _gateway_info: Callable[[], dict] = lambda: {}
 _run_generation = None
+_cancel_gen = None
 _apply_backends: Callable[[], None] = lambda: None
 _llm_backends: Callable[[], list] = lambda: []
 _config_chat_aliases: Callable[[], dict] = lambda: {}
@@ -90,12 +91,13 @@ def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Calla
          apply_users: Callable[[], None] = lambda: None,
          resolve_admin: Callable = lambda key: None,
          ui_locked: Callable[[], bool] = lambda: False,
-         dashboard_snapshot: Callable[[], dict] = lambda: {}) -> None:
+         dashboard_snapshot: Callable[[], dict] = lambda: {}, cancel_generation=None) -> None:
     global _comfy_backends, _run_generation, _gateway_info, _apply_backends
     global _llm_backends, _config_chat_aliases, _apply_chat_aliases, _run_chat, _routing_snapshot
     global _server_info, _apply_server_settings, _apply_users, _resolve_admin, _ui_locked
-    global _dashboard_snapshot
+    global _dashboard_snapshot, _cancel_gen
     _dashboard_snapshot = dashboard_snapshot
+    _cancel_gen = cancel_generation
     _comfy_backends, _run_generation = comfy_backends, run_generation
     _gateway_info, _apply_backends = gateway_info, apply_backends
     _llm_backends, _config_chat_aliases = llm_backends, config_chat_aliases
@@ -2004,7 +2006,10 @@ async def jobs_page(request: Request):
                f"<td class='muted'>{j.get('result_count') or 0}</td>"
                f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
                f"<td class='muted'>{_esc(j.get('owner'))}</td>"
-               f"<td style='text-align:right;white-space:nowrap'>{_btn('view', '/ui/job/' + jid, 'secondary', sm=True)}</td></tr>")
+               f"<td style='text-align:right;white-space:nowrap'>"
+               + ((_btn('✕', '/ui/job/' + jid + '/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
+                   if st in ('queued', 'running') else '')
+                  + _btn('view', '/ui/job/' + jid, 'secondary', sm=True)) + "</td></tr>")
     tbl = (f"<table><tr><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
            f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
@@ -2071,8 +2076,10 @@ async def job_detail_page(job_id: str, request: Request):
     exp = " · <span class='bad'>expired</span>" if job.get("expired") else ""
     info = (f"<p class='muted'>task {_esc(job['task'])} · alias {_esc(job['alias'])} · backend "
             f"{_esc(job['backend'])} · owner {_esc(job['owner'])} · {_age(job['created'])}{exp}</p>")
+    cancel_btn = (_btn("✕ Cancel", f"/ui/job/{_esc(job_id)}/cancel", "danger", confirm="Cancel this job?")
+                  if st in ("queued", "running") else "")
     page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
-            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>{back}</div>{info}"
+            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>{cancel_btn}{back}</div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
             f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"
             f"<div style='flex:1;min-width:320px'><h2>Output</h2>{outbox}</div></div>"
@@ -2086,6 +2093,12 @@ async def job_input(job_id: str, n: int):
         raise HTTPException(404, "input not found")
     path, mime = ip
     return FileResponse(path, media_type=mime)
+
+
+async def job_cancel(job_id: str):
+    if _cancel_gen:
+        await _cancel_gen(job_id)
+    return RedirectResponse(f"/ui/job/{job_id}", status_code=303)
 
 
 # ── Tabs: stubs ─────────────────────────────────────────────────────────────────
@@ -2654,6 +2667,7 @@ def register(app) -> None:
     app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
+    app.add_api_route("/ui/job/{job_id}/cancel", job_cancel, methods=["GET"])
     app.add_api_route("/ui/dashboard", dashboard_page, methods=["GET"])
     app.add_api_route("/ui/statistic", statistic_page, methods=["GET"])
     app.add_api_route("/ui/call/{call_id}", call_view, methods=["GET"])

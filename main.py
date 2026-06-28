@@ -1283,6 +1283,38 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
     jobs.fail(job_id, f"all candidate backends unreachable (connection): {last}")
 
 
+_gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
+
+
+def _spawn_gen(job_id: str, coro) -> None:
+    """Run a generation coroutine as a tracked background task so it can be cancelled."""
+    t = asyncio.create_task(coro)
+    _gen_tasks[job_id] = t
+    t.add_done_callback(lambda _: _gen_tasks.pop(job_id, None))
+
+
+async def cancel_generation(job_id: str) -> bool:
+    """Cancel a queued/running generation job: best-effort interrupt the ComfyUI prompt
+    (free the GPU), cancel the worker task, mark the job failed. Returns False if the job
+    is already finished/unknown."""
+    job = jobs.get(job_id)
+    if not job or job.get("status") not in ("queued", "running"):
+        return False
+    b = next((x for x in backends if x.get("name") == job.get("backend")
+              and x.get("type") == "comfyui"), None)
+    if b and b.get("url"):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as c:
+                await c.post(f"{b['url'].rstrip('/')}/interrupt")
+        except Exception:
+            pass
+    t = _gen_tasks.get(job_id)
+    if t and not t.done():
+        t.cancel()
+    jobs.fail(job_id, "cancelled by user")
+    return True
+
+
 async def _run_gen_parked(job_id, alias, force, build_req):
     """Hold a generation job until a backend frees (polls backend-busy), then run it —
     so a busy backend queues instead of 503'ing (async/playground)."""
@@ -1360,12 +1392,12 @@ async def run_generation(body: dict, request: Request,
 
     if parked:
         if mode == "async":                              # queue and hand back a job id
-            asyncio.create_task(_run_gen_parked(job_id, alias, force, build_req))
+            _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req))
             return {"job_id": job_id, "status": "queued"}
         await _run_gen_parked(job_id, alias, force, build_req)   # sync: block through the park
         return _job_view(job_id, request)
     if mode == "async":
-        asyncio.create_task(_run_job(job_id, routes, build_req))
+        _spawn_gen(job_id, _run_job(job_id, routes, build_req))
         return {"job_id": job_id, "status": "queued"}
 
     await _run_job(job_id, routes, build_req)      # sync: block until done/failed
@@ -1415,6 +1447,15 @@ async def get_job_input(job_id: str, n: int, request: Request, authorization: Op
         raise HTTPException(404, f"input {n} of job '{job_id}' not found")
     path, mime = ip
     return FileResponse(path, media_type=mime)
+
+
+@app.post("/v1/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request, authorization: Optional[str] = Header(None)):
+    """Cancel a queued/running generation job (interrupts the backend, frees the GPU)."""
+    _require_job_owner(authorization, request, job_id)
+    if not await cancel_generation(job_id):
+        raise HTTPException(409, f"job '{job_id}' is not cancellable (already done/failed/unknown)")
+    return {"job_id": job_id, "status": "failed", "cancelled": True}
 
 
 # ── OpenAI-compatible image endpoints (C4) ───────────────────────────────────
@@ -1772,7 +1813,7 @@ admin.bind(lambda: [b for b in backends if b.get("type") == "comfyui"],
            apply_server_settings=apply_server_settings_hook,
            apply_users=apply_users,
            resolve_admin=resolve_admin, ui_locked=ui_locked,
-           dashboard_snapshot=dashboard_snapshot)
+           dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation)
 
 
 @app.get("/health")
