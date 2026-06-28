@@ -517,9 +517,7 @@ def _num_input(name: str, value, spec: dict) -> str:
     steps, cfg). Falls back to the field's default when no value is set."""
     cur = value if value not in (None, "") else spec.get("default")
     attrs = "".join(f' {k}="{_esc(spec[k])}"' for k in ("min", "max", "step") if spec.get(k) is not None)
-    lo, hi = spec.get("min"), spec.get("max")
-    hint = f' <span class="muted">{_esc(lo)}…{_esc(hi)}</span>' if (lo is not None and hi is not None) else ""
-    return f'<input type="number" name="{_esc(name)}" value="{_esc("" if cur is None else cur)}"{attrs}>{hint}'
+    return f'<input type="number" name="{_esc(name)}" value="{_esc("" if cur is None else cur)}"{attrs}>'
 
 
 def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) -> str:
@@ -1411,7 +1409,7 @@ async def _alias_editor(alias: str) -> str:
             cur_cell = ('image upload <label class="muted" style="font-weight:normal" '
                         'title="require an upload; do not substitute the 8×8 placeholder">'
                         f'<input type="checkbox" name="noph__{_esc(p)}"'
-                        f'{" checked" if m.get("no_placeholder") else ""}> no 8×8</label>')
+                        f'{" checked" if m.get("no_placeholder") else ""}> required</label>')
         else:
             cur_cell = _esc(cur_disp[:60])
         tag = " <span class='tag'>image</span>" if is_img else ""
@@ -1802,6 +1800,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             if kept and p in kept:
                 extra = (' <span class="badge ok">✓ kept</span> <label class="muted" '
                          f'style="font-weight:normal"><input type="checkbox" name="clear__{_esc(p)}"> clear</label>')
+            elif (m or {}).get("no_placeholder"):
+                extra = ' <span class="muted">required — no placeholder</span>'
             else:
                 extra = ' <span class="muted">empty → 8×8 placeholder</span>'
             rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*">{extra}')
