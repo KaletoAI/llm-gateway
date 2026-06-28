@@ -1596,8 +1596,12 @@ async def images_generations(request: Request, authorization: Optional[str] = He
         raise HTTPException(400, "`prompt` is required")
     w, h = _parse_size(body.get("size"))
     refs = body.get("ref_images") or []
-    uploads = _images_uploads([await _decode_ref_image(r) for r in refs], alias) if refs else None
+    decoded = [await _decode_ref_image(r) for r in refs]
+    uploads = _images_uploads(decoded, alias) if refs else None
     extra = {k: v for k, v in body.items() if k not in _OAI_IMG_KEYS}   # dynamic workflow params
+    logger.info(f"images/generations '{alias}': ref_images={len(refs)} "   # where client images land
+                f"decoded_ok={sum(1 for d in decoded if d)} slots={_gen_image_slots(alias)} "
+                f"filled={sorted((uploads or {}).keys())} extra_keys={sorted(extra)}")
     native = {
         "model": alias, "mode": "sync",
         "prompt": body.get("prompt", ""), "negative_prompt": body.get("negative_prompt", ""),
@@ -1620,7 +1624,13 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     images = [v for v in (f.get("image") or []) if isinstance(v, (bytes, bytearray))]
     if not images:
         raise HTTPException(400, "at least one `image` file is required")
-    images = images[:16]                               # OpenAI gpt-image-1 max; workflow may use fewer
+    masks = [v for v in (f.get("mask") or []) if isinstance(v, (bytes, bytearray))]
+    logger.info(f"images/edits '{alias}': image_files={len(images)} mask_files={len(masks)} "  # where they land
+                f"slots={_gen_image_slots(alias)} "
+                f"scalar_keys={sorted(k for k, vs in f.items() if not isinstance((vs or [None])[0], (bytes, bytearray)))}")
+    # OpenAI `mask` field → the next positional slot (the mask slot is normally last in
+    # the mapping order, after the reference image[s]).
+    images = (images + masks)[:16]                      # OpenAI gpt-image-1 max; workflow may use fewer
     w, h = _parse_size(one("size") or None)
     extra = {k: _coerce(one(k)) for k, vs in f.items()  # dynamic scalar params (loras, seed, …)
              if k not in _EDIT_KNOWN and not isinstance((vs or [None])[0], (bytes, bytearray))}

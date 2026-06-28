@@ -715,13 +715,18 @@ class ComfyUIAdapter(BackendAdapter):
                 applied.append(p)
         return applied
 
-    async def _autofill_empty_images(self, wf: dict) -> list:
+    async def _autofill_empty_images(self, wf: dict, mapping: dict) -> list:
         """Any image-loader node still left with an empty `image` (not a mapped
         request field) → fill it with the 8×8 placeholder, so ComfyUI never tries to
-        open the input/ directory. Mapped image fields are handled per-field above."""
+        open the input/ directory. Mapped image fields are handled per-field above.
+
+        Slots a `no_placeholder` request-field maps to are REQUIRED uploads — never
+        auto-filled; left empty so ComfyUI errors clearly when one is missing."""
+        skip = {(m or {}).get("node") for m in (mapping or {}).values() if (m or {}).get("no_placeholder")}
         empty = [nid for nid, n in wf.items()
                  if n.get("class_type") in _IMG_LOADER_CLASSES
-                 and not (n.get("inputs") or {}).get("image")]
+                 and not (n.get("inputs") or {}).get("image")
+                 and nid not in skip]
         if not empty:
             return []
         async with httpx.AsyncClient(timeout=20.0) as c:
@@ -754,7 +759,7 @@ class ComfyUIAdapter(BackendAdapter):
         lora_placed = _apply_lora_cascade(wf, values)     # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
-        autofilled = await self._autofill_empty_images(wf)
+        autofilled = await self._autofill_empty_images(wf, mapping)
         summary = {"applied": sorted(applied.keys()), "seed": values.get("seed"),
                    "fixed": sorted(fixed_applied.keys()),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
