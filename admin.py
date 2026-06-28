@@ -146,6 +146,7 @@ p.hint{color:#9aa7b4;margin:0 0 14px;max-width:62ch;line-height:1.5}
 .field{display:flex;align-items:center;gap:14px;margin:10px 0}
 .field>label{flex:0 0 140px;text-align:left;color:#9aa7b4;font-size:13px}
 .field>.control{flex:1;min-width:0;max-width:480px;display:flex;gap:8px;align-items:center}
+.field>.control.wide{max-width:none}
 .control.short input,.control.short select{max-width:150px}
 input,select,textarea{width:100%;background:#0c0e12;color:#dce4ec;border:1px solid #313a46;border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
 input:focus,select:focus,textarea:focus{border-color:#3b82f6}
@@ -247,8 +248,8 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
             f"<style>{_CSS}</style></head><body>{head}<main>{body}</main>{_SCROLL_JS}</body></html>")
 
 
-def _field(label: str, control: str, short: bool = False) -> str:
-    cls = "control short" if short else "control"
+def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
+    cls = "control short" if short else ("control wide" if wide else "control")
     return f'<div class="field"><label>{_esc(label)}</label><div class="{cls}">{control}</div></div>'
 
 
@@ -719,7 +720,7 @@ async def input_page(request: Request):
 
     def chips(items):
         inner = " ".join(f"<code>{_esc(i)}</code>" for i in items) or '<span class="muted">none</span>'
-        return f'<div style="white-space:nowrap;overflow-x:auto">{inner}</div>'
+        return f'<div style="flex:1;min-width:0;white-space:nowrap;overflow-x:auto">{inner}</div>'
     # Pass-through: every discovered model is callable WITHOUT an alias — bare (routed
     # by priority across backends that expose it) or as backend/model. Grouped per
     # backend so the backend/model form is obvious.
@@ -748,9 +749,9 @@ async def input_page(request: Request):
             f"shortcuts; every discovered model is <b>also callable without an alias</b> — bare "
             f"(routed by priority across its backends, with failover) or pinned as "
             f"<code>backend/model</code>.</p>"
-            + _field("Chat aliases", chips(info.get("virtual_models", [])))
-            + _field("Generation models", chips(gen))
-            + _field("Endpoints", chips(info.get("endpoints", [])))
+            + _field("Chat aliases", chips(info.get("virtual_models", [])), wide=True)
+            + _field("Generation models", chips(gen), wide=True)
+            + _field("Endpoints", chips(info.get("endpoints", [])), wide=True)
             + "<h2>Chat models · bare or backend/model</h2>"
             + models_tbl)
     return HTMLResponse(_page("Input", body, "input"))
