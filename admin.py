@@ -436,7 +436,9 @@ def _backend_url(name: str):
     return None
 
 
-def _is_model_field(options: list, current) -> bool:
+def _is_model_field(options, current) -> bool:
+    if not isinstance(options, list):                # numeric specs are dicts, not combos
+        return False
     sample = [str(o) for o in (options[:8] if options else [])] + [str(current or "")]
     return any(s.lower().endswith(_MODEL_EXTS) for s in sample)
 
@@ -455,8 +457,14 @@ async def _fetch_oi_class(client, url: str, cls: str):
         fields = {}
         for section in ("required", "optional"):
             for fn, fspec in (spec.get(section) or {}).items():
-                if isinstance(fspec, list) and fspec and isinstance(fspec[0], list):
+                if not (isinstance(fspec, list) and fspec):
+                    continue
+                if isinstance(fspec[0], list):                      # combo → options list
                     fields[fn] = fspec[0]
+                elif fspec[0] in ("FLOAT", "INT") and len(fspec) > 1 and isinstance(fspec[1], dict):
+                    c = fspec[1]                                    # numeric → discovery constraints
+                    fields[fn] = {"_num": fspec[0], "default": c.get("default"),
+                                  "min": c.get("min"), "max": c.get("max"), "step": c.get("step")}
         return cls, fields
     except Exception:
         return cls, None
@@ -502,13 +510,25 @@ def _detect_model_bindings(wf: dict, oi: dict) -> list:
     return out
 
 
+def _num_input(name: str, value, spec: dict) -> str:
+    """<input type=number> with discovery default/min/max/step (e.g. LoRA strength,
+    steps, cfg). Falls back to the field's default when no value is set."""
+    cur = value if value not in (None, "") else spec.get("default")
+    attrs = "".join(f' {k}="{_esc(spec[k])}"' for k in ("min", "max", "step") if spec.get(k) is not None)
+    lo, hi = spec.get("min"), spec.get("max")
+    hint = f' <span class="muted">{_esc(lo)}…{_esc(hi)}</span>' if (lo is not None and hi is not None) else ""
+    return f'<input type="number" name="{_esc(name)}" value="{_esc("" if cur is None else cur)}"{attrs}>{hint}'
+
+
 def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) -> str:
-    """Render the right input widget for a pinned node field: model dropdown,
-    true/false, image (placeholder/upload), or a plain text box."""
+    """Render the right input widget for a pinned node field: model dropdown, bounded
+    number, true/false, image (placeholder/upload), or a plain text box."""
     cls = wf.get(node, {}).get("class_type", "")
     file_val = (wf.get(node, {}).get("inputs") or {}).get(field)
     cur = value if value is not None else file_val
     opts = oi.get(cls, {}).get(field)
+    if isinstance(opts, dict) and opts.get("_num"):       # FLOAT/INT with discovery bounds
+        return _num_input(name, cur, opts)
     if opts and _is_model_field(opts, cur):
         o = list(opts)
         stale = cur not in o and o
@@ -698,7 +718,8 @@ async def input_page(request: Request):
     llm = _llm_backends()
 
     def chips(items):
-        return " ".join(f"<code>{_esc(i)}</code>" for i in items) or '<span class="muted">none</span>'
+        inner = " ".join(f"<code>{_esc(i)}</code>" for i in items) or '<span class="muted">none</span>'
+        return f'<div style="white-space:nowrap;overflow-x:auto">{inner}</div>'
     # Pass-through: every discovered model is callable WITHOUT an alias — bare (routed
     # by priority across backends that expose it) or as backend/model. Grouped per
     # backend so the backend/model form is obvious.
@@ -1508,6 +1529,8 @@ async def _alias_editor(alias: str) -> str:
             fopts = oi.get(n.get("class_type", ""), {}).get(f2)   # discovery hint: dropdown? bool?
             if isinstance(fopts, list) and _is_model_field(fopts, v2):
                 fhint = f" <span class='badge ok' title='becomes a discovery dropdown (e.g. LoRA / model) when pinned or promoted'>▾ {len(fopts)}</span>"
+            elif isinstance(fopts, dict) and fopts.get("_num"):
+                fhint = f" <span class='muted'>{fopts['_num'].lower()}</span>"
             elif isinstance(v2, bool):
                 fhint = " <span class='muted'>bool</span>"
             else:
@@ -1781,6 +1804,9 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 if cur and cur not in o:
                     o = [cur] + o
                 rows += _field(label, _select(f"p__{p}", o, cur))
+            elif isinstance(opts, dict) and opts.get("_num"):    # FLOAT/INT → bounded number input
+                cur = v(p) or (str(dv) if dv is not None else "")
+                rows += _field(label, _num_input(f"p__{p}", cur, opts))
             else:
                 typ = "number" if isinstance(dv, (int, float)) and not isinstance(dv, bool) else "text"
                 rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
@@ -2282,16 +2308,24 @@ def _user_form(u: Optional[dict]) -> str:
     chat_al = sorted(set(_gateway_info().get("virtual_models", [])))
     img_al = sorted(store.list_aliases().keys()) if store.is_active() else []
     bk_al = sorted(b.get("name", "") for b in _gateway_info().get("backends", []) if b.get("name"))
-    rows = ""
     # chat/image aliases granted by name; a backend grants ALL of its models (and filters
-    # what this user's key sees in /v1/models).
-    for a, kind in ([(a, "chat") for a in chat_al] + [(a, "image") for a in img_al]
-                    + [(b, "backend") for b in bk_al]):
-        ck = " checked" if a in allowed else ""
-        rows += (f'<tr><td><input type="checkbox" name="model" value="{_esc(a)}"{ck}></td>'
-                 f'<td><code>{_esc(a)}</code></td><td class="muted">{kind}</td></tr>')
-    acc = (f'<div class="acctbl"><table><thead><tr><th title="allow this entry">✓</th>'
-           f'<th>name</th><th>kind</th></tr></thead><tbody>{rows}</tbody></table></div>' if rows
+    # what this user's key sees in /v1/models). Each kind gets a "select all" header row.
+    rows = ""
+    for kind, items in (("chat", chat_al), ("image", img_al), ("backend", bk_al)):
+        if not items:
+            continue
+        all_ck = " checked" if all(a in allowed for a in items) else ""
+        rows += (f'<tr style="background:#13161c"><td><input type="checkbox"{all_ck} '
+                 f'onclick="gwTogAll(this,\'{kind}\')" title="select all {kind}"></td>'
+                 f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)})</span></td></tr>')
+        for a in items:
+            ck = " checked" if a in allowed else ""
+            rows += (f'<tr><td><input type="checkbox" name="model" value="{_esc(a)}" data-grp="{kind}"{ck}></td>'
+                     f'<td><code>{_esc(a)}</code></td><td class="muted">{kind}</td></tr>')
+    acc = ((f'<div class="acctbl"><table><thead><tr><th title="allow this entry">✓</th>'
+            f'<th>name</th><th>kind</th></tr></thead><tbody>{rows}</tbody></table></div>'
+            "<script>function gwTogAll(c,g){var s='input[name=model][data-grp=\"'+g+'\"]';"
+            "document.querySelectorAll(s).forEach(function(x){x.checked=c.checked;});}</script>") if rows
            else "<p class='muted'>no aliases or backends yet</p>")
     return (f'<form action="/ui/users/save" method="post">{orig}'
             f'<div class="formbar"><h2>{"Edit User" if u else "Add User"}</h2>'
@@ -2302,12 +2336,19 @@ def _user_form(u: Optional[dict]) -> str:
                                                       else "the user's bearer token"))
                      + ' <button type="button" class="btn secondary sm" onclick="gwGenKey(this)" '
                        'title="generate a random key">🔑 Generate</button>'
+                     + ' <button type="button" class="btn secondary sm" onclick="gwCopyKey(this)" '
+                       'title="copy to clipboard">📋 Copy</button>'
                      + "<p class='hint' style='margin:4px 0 0'>The key is shown once here — copy it now; "
                        "after Save it is stored encrypted and no longer displayed.</p>"
-                     + "<script>function gwGenKey(b){var a=new Uint8Array(24);crypto.getRandomValues(a);"
+                     + "<script>function _gwKeyInp(b){return b.closest('.control').querySelector('input[name=api_key]');}"
+                       "function gwGenKey(b){var a=new Uint8Array(24);crypto.getRandomValues(a);"
                        "var k='sk-'+Array.from(a).map(function(x){return ('0'+x.toString(16)).slice(-2);}).join('');"
-                       "var i=b.closest('.control').querySelector('input[name=api_key]');"
-                       "i.type='text';i.value=k;i.focus();i.select();}</script>")
+                       "var i=_gwKeyInp(b);i.type='text';i.value=k;i.focus();i.select();}"
+                       "function gwCopyKey(b){var i=_gwKeyInp(b);i.type='text';i.focus();i.select();"
+                       "var d=function(){b.textContent='✓ Copied';setTimeout(function(){b.textContent='📋 Copy';},1200);};"
+                       "if(navigator.clipboard&&navigator.clipboard.writeText){"
+                       "navigator.clipboard.writeText(i.value).then(d,function(){document.execCommand('copy');d();});}"
+                       "else{document.execCommand('copy');d();}}</script>")
             + _field("role", _select("role", ["user", "admin"], g("role", "user")))
             + _field("enabled", _checkbox("enabled", (u or {}).get("enabled", True), "enabled"))
             + _field("quota req/day", _inp("quota_req_day", g("quota_req_day"),
