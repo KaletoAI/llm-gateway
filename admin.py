@@ -2297,8 +2297,17 @@ def _user_form(u: Optional[dict]) -> str:
             f'<div class="formbar"><h2>{"Edit User" if u else "Add User"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/users", "secondary")}</div>'
             + _field("name", _inp("name", g("name"), placeholder="alice"))
-            + _field("API key", _inp("api_key", "", placeholder=("•••• set — blank keeps it" if has_key
-                                                                 else "the user's bearer token")))
+            + _field("API key",
+                     _inp("api_key", "", placeholder=("•••• set — blank keeps it" if has_key
+                                                      else "the user's bearer token"))
+                     + ' <button type="button" class="btn secondary sm" onclick="gwGenKey(this)" '
+                       'title="generate a random key">🔑 Generate</button>'
+                     + "<p class='hint' style='margin:4px 0 0'>The key is shown once here — copy it now; "
+                       "after Save it is stored encrypted and no longer displayed.</p>"
+                     + "<script>function gwGenKey(b){var a=new Uint8Array(24);crypto.getRandomValues(a);"
+                       "var k='sk-'+Array.from(a).map(function(x){return ('0'+x.toString(16)).slice(-2);}).join('');"
+                       "var i=b.closest('.control').querySelector('input[name=api_key]');"
+                       "i.type='text';i.value=k;i.focus();i.select();}</script>")
             + _field("role", _select("role", ["user", "admin"], g("role", "user")))
             + _field("enabled", _checkbox("enabled", (u or {}).get("enabled", True), "enabled"))
             + _field("quota req/day", _inp("quota_req_day", g("quota_req_day"),
