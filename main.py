@@ -399,9 +399,15 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     if model in allow:                           # exact id / chat alias / image alias
         return True
     bname, bare = split_backend_prefix(model)    # backend/model
-    if bname and bname in allow:                 # whole-backend grant (all its models)
+    if bname and bname in allow:                 # whole-backend grant (prefixed request)
         return True
-    return bare in allow                         # bare model id
+    if bare in allow:                            # bare model id explicitly granted
+        return True
+    # bare request, no prefix: allow if a GRANTED backend hosts this model — so a backend
+    # grant covers bare ids too. Routing then decides availability (e.g. 503 when the host
+    # is offline) instead of a misleading 403. Disabled backends keep their last model set.
+    return any(b.get("name") in allow and bare in backend_models.get(backend_id(b), set())
+               for b in backends if b.get("type", "openai") != "comfyui")
 
 
 def gate_request(authorization: Optional[str], request: Request, model: Optional[str]) -> Optional[dict]:
