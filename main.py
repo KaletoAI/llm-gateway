@@ -227,6 +227,8 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         return
     try:
         caps = await adapter.discover(client)
+        if store.is_active() and caps.models != backend_models.get(bid):
+            store.save_backend_models(bid, caps.models)   # persist on change (survives restart)
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
@@ -237,9 +239,10 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         if backend_healthy.get(bid, True):
             logger.warning(f"[{label}] DOWN — {e}")
         backend_healthy[bid] = False
-        backend_models[bid] = set()
         backend_pricing[bid] = {}
         backend_loras[bid] = set()
+        # backend_models is intentionally NOT cleared — keep the last-known (persisted)
+        # set so a bare model id still resolves to this offline backend → 503, not 403.
 
 
 async def health_loop() -> None:
@@ -292,6 +295,7 @@ async def lifespan(app: FastAPI):
     # discovered too.
     store.init(jobs_cfg.get("store_path", "store.db"))
     store.bootstrap(image_models)
+    backend_models.update(store.load_backend_models())   # seed last-known models (offline → 503, not 403)
     apply_server_settings()            # overlay UI-managed server settings onto config
     rebuild_users()                    # load multi-user identities from the store
     rebuild_backends()                 # merge UI-added backends from the store
@@ -968,8 +972,9 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
     if typ != "image":
         for backend in enabled_backends():
-            if backend.get("type", "openai") == "comfyui" or is_draining(backend):
-                continue                          # draining → not routable, so not offered either
+            if (backend.get("type", "openai") == "comfyui" or is_draining(backend)
+                    or not backend_healthy.get(backend_id(backend))):
+                continue                          # comfy / draining / down → not offered
             bname = backend["name"]
             expose_bare = backend.get("local", False)
             for mid in sorted(backend_models.get(backend_id(backend), set())):

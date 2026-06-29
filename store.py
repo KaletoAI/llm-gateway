@@ -160,6 +160,13 @@ def init(db_path: str = "store.db") -> None:
                 updated INTEGER NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS backend_models (
+                bid         TEXT PRIMARY KEY,
+                models_json TEXT NOT NULL,
+                updated     INTEGER NOT NULL
+            )
+        """)
     _active = True
     logger.info(f"store: generation aliases at {_DB_PATH}")
 
@@ -285,6 +292,26 @@ def rename_backend_references(old: str, new: str) -> int:
 # Secret-valued keys (api_key) are encrypted at rest like backend keys.
 
 _SECRET_SETTINGS = {"api_key"}
+
+
+def save_backend_models(bid: str, models) -> None:
+    """Persist a backend's discovered model ids so they survive a restart — lets the
+    gateway still resolve a bare model id to its (now offline) backend, returning a
+    truthful 503 instead of 403, even if the backend isn't reachable at startup."""
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO backend_models (bid, models_json, updated) VALUES (?,?,?) "
+            "ON CONFLICT(bid) DO UPDATE SET models_json=excluded.models_json, updated=excluded.updated",
+            (bid, json.dumps(sorted(models)), int(time.time())))
+
+
+def load_backend_models() -> dict:
+    """{bid: set(model_ids)} from each backend's last successful discovery."""
+    if not _active:
+        return {}
+    with _conn() as c:
+        rows = c.execute("SELECT bid, models_json FROM backend_models").fetchall()
+    return {r["bid"]: set(json.loads(r["models_json"] or "[]")) for r in rows}
 
 
 def get_settings() -> dict:
