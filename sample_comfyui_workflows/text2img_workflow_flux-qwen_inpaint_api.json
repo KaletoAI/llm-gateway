@@ -1,0 +1,285 @@
+{
+  "10": {
+    "inputs": {
+      "images": [
+        "123",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  },
+  "60": {
+    "inputs": {
+      "prompt": [
+        "61",
+        0
+      ],
+      "clip": [
+        "147",
+        1
+      ],
+      "vae": [
+        "116",
+        0
+      ],
+      "image1": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlus Input Prompt"
+    }
+  },
+  "61": {
+    "inputs": {
+      "value": "complement the gray masked areas and make a seamless map, matching the surrounding terrain, colors and hand-painted style with no visible seams, border or frame\n\n"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_positiv"
+    }
+  },
+  "62": {
+    "inputs": {
+      "prompt": [
+        "63",
+        0
+      ],
+      "clip": [
+        "147",
+        1
+      ],
+      "vae": [
+        "116",
+        0
+      ],
+      "image1": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlus Input Prompt"
+    }
+  },
+  "63": {
+    "inputs": {
+      "value": "people, person, characters, faces, text, words, watermark, signature, logo, frame, border, visible seam, hard edge, mismatched terrain, color shift, blurry, low quality\n"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_negativ"
+    }
+  },
+  "68": {
+    "inputs": {
+      "seed": [
+        "69",
+        0
+      ],
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": [
+        "147",
+        0
+      ],
+      "positive": [
+        "145",
+        0
+      ],
+      "negative": [
+        "145",
+        1
+      ],
+      "latent_image": [
+        "145",
+        2
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "69": {
+    "inputs": {
+      "value": 0
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_seed"
+    }
+  },
+  "82": {
+    "inputs": {
+      "samples": [
+        "68",
+        0
+      ],
+      "vae": [
+        "116",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "116": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "input_vae"
+    }
+  },
+  "119": {
+    "inputs": {
+      "unet_name": "Qwen-Edit-NSFW-v16-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "120": {
+    "inputs": {
+      "gguf_name": "flux-2-klein-9b-Q8_0.gguf"
+    },
+    "class_type": "LoaderGGUF",
+    "_meta": {
+      "title": "input_gguf"
+    }
+  },
+  "121": {
+    "inputs": {
+      "clip_name": "Qwen3-8B-Q8_0.gguf",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "ClipLoaderGGUF",
+    "_meta": {
+      "title": "input_clip"
+    }
+  },
+  "123": {
+    "inputs": {
+      "method": "mkl",
+      "strength": 0.5,
+      "multithread": true,
+      "image_target": [
+        "82",
+        0
+      ],
+      "image_ref": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "ColorMatchV2",
+    "_meta": {
+      "title": "ColorMatchV2"
+    }
+  },
+  "135": {
+    "inputs": {
+      "image": "last_mask (6).png",
+      "channel": "red"
+    },
+    "class_type": "LoadImageMask",
+    "_meta": {
+      "title": "input_mask"
+    }
+  },
+  "136": {
+    "inputs": {
+      "image": "last_canvas (15).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image"
+    }
+  },
+  "145": {
+    "inputs": {
+      "noise_mask": true,
+      "positive": [
+        "60",
+        0
+      ],
+      "negative": [
+        "62",
+        0
+      ],
+      "vae": [
+        "116",
+        0
+      ],
+      "pixels": [
+        "136",
+        0
+      ],
+      "mask": [
+        "135",
+        0
+      ]
+    },
+    "class_type": "InpaintModelConditioning",
+    "_meta": {
+      "title": "InpaintModelConditioning"
+    }
+  },
+  "147": {
+    "inputs": {
+      "lora_01": "None",
+      "strength_01": 1,
+      "lora_02": "None",
+      "strength_02": 1,
+      "lora_03": "None",
+      "strength_03": 1,
+      "lora_04": "None",
+      "strength_04": 1,
+      "model": [
+        "148",
+        0
+      ],
+      "clip": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "Lora Loader Stack (rgthree)",
+    "_meta": {
+      "title": "input_lora"
+    }
+  },
+  "148": {
+    "inputs": {
+      "boolean": false,
+      "on_true": [
+        "119",
+        0
+      ],
+      "on_false": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "Switch any [Crystools]",
+    "_meta": {
+      "title": "true-diffusion_false-gguf"
+    }
+  }
+}

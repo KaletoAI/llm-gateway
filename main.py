@@ -962,8 +962,8 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
     if typ != "image":
         for backend in enabled_backends():
-            if backend.get("type", "openai") == "comfyui":
-                continue
+            if backend.get("type", "openai") == "comfyui" or is_draining(backend):
+                continue                          # draining → not routable, so not offered either
             bname = backend["name"]
             expose_bare = backend.get("local", False)
             for mid in sorted(backend_models.get(backend_id(backend), set())):

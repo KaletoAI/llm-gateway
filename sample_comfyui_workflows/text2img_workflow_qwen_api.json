@@ -1,0 +1,319 @@
+{
+  "3": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "input_size"
+    }
+  },
+  "10": {
+    "inputs": {
+      "images": [
+        "123",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  },
+  "60": {
+    "inputs": {
+      "prompt": [
+        "61",
+        0
+      ],
+      "clip": [
+        "130",
+        1
+      ],
+      "vae": [
+        "116",
+        0
+      ],
+      "image1": [
+        "126",
+        0
+      ],
+      "image2": [
+        "127",
+        0
+      ],
+      "image3": [
+        "128",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlus Input Prompt"
+    }
+  },
+  "61": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_positiv"
+    }
+  },
+  "62": {
+    "inputs": {
+      "prompt": [
+        "63",
+        0
+      ],
+      "clip": [
+        "130",
+        1
+      ],
+      "vae": [
+        "116",
+        0
+      ],
+      "image1": [
+        "126",
+        0
+      ],
+      "image2": [
+        "127",
+        0
+      ],
+      "image3": [
+        "128",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "TextEncodeQwenImageEditPlus Input Prompt"
+    }
+  },
+  "63": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_negativ"
+    }
+  },
+  "68": {
+    "inputs": {
+      "seed": [
+        "69",
+        0
+      ],
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": [
+        "130",
+        0
+      ],
+      "positive": [
+        "60",
+        0
+      ],
+      "negative": [
+        "62",
+        0
+      ],
+      "latent_image": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "69": {
+    "inputs": {
+      "value": 0
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_seed"
+    }
+  },
+  "82": {
+    "inputs": {
+      "samples": [
+        "68",
+        0
+      ],
+      "vae": [
+        "116",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "116": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "input_vae"
+    }
+  },
+  "119": {
+    "inputs": {
+      "unet_name": "Qwen-Edit-NSFW-v16-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "120": {
+    "inputs": {
+      "gguf_name": "Qwen-Edit-NSFW-v23_Q5_K.gguf"
+    },
+    "class_type": "LoaderGGUF",
+    "_meta": {
+      "title": "input_gguf"
+    }
+  },
+  "121": {
+    "inputs": {
+      "clip_name": "Qwen2.5-VL-7B-Instruct-abliterated_merged.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "ClipLoaderGGUF",
+    "_meta": {
+      "title": "input_clip"
+    }
+  },
+  "123": {
+    "inputs": {
+      "method": "mkl",
+      "strength": [
+        "141",
+        0
+      ],
+      "multithread": true,
+      "image_target": [
+        "82",
+        0
+      ],
+      "image_ref": [
+        "126",
+        0
+      ]
+    },
+    "class_type": "ColorMatchV2",
+    "_meta": {
+      "title": "ColorMatchV2"
+    }
+  },
+  "126": {
+    "inputs": {
+      "image": "1771970645.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image_1"
+    }
+  },
+  "127": {
+    "inputs": {
+      "image": "1781011414.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image_2"
+    }
+  },
+  "128": {
+    "inputs": {
+      "image": "1781011414.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image_3"
+    }
+  },
+  "130": {
+    "inputs": {
+      "lora_01": "Qwen-Image-Lightning-8steps-V2.0-bf16.safetensors",
+      "strength_01": 1,
+      "lora_02": "None",
+      "strength_02": 1,
+      "lora_03": "None",
+      "strength_03": 1,
+      "lora_04": "None",
+      "strength_04": 1,
+      "model": [
+        "138",
+        0
+      ],
+      "clip": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "Lora Loader Stack (rgthree)",
+    "_meta": {
+      "title": "input_lora"
+    }
+  },
+  "138": {
+    "inputs": {
+      "boolean": true,
+      "on_true": [
+        "119",
+        0
+      ],
+      "on_false": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "Switch any [Crystools]",
+    "_meta": {
+      "title": "true-diffusion_false-gguf"
+    }
+  },
+  "140": {
+    "inputs": {
+      "image": [
+        "126",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "141": {
+    "inputs": {
+      "expression": "(a > 64) * 0.5",
+      "values.a": [
+        "140",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "Math Expression"
+    }
+  }
+}

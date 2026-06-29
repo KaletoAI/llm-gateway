@@ -1,0 +1,253 @@
+{
+  "10": {
+    "inputs": {
+      "images": [
+        "124",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  },
+  "61": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_positiv"
+    }
+  },
+  "69": {
+    "inputs": {
+      "value": 4545435351
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_seed"
+    }
+  },
+  "124": {
+    "inputs": {
+      "samples": [
+        "313",
+        0
+      ],
+      "vae": [
+        "138",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "125": {
+    "inputs": {
+      "noise_seed": [
+        "69",
+        0
+      ]
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "132": {
+    "inputs": {
+      "text": [
+        "61",
+        0
+      ],
+      "clip": [
+        "316",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "input_prompt_positive"
+    }
+  },
+  "135": {
+    "inputs": {
+      "steps": 20,
+      "width": [
+        "146",
+        0
+      ],
+      "height": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "138": {
+    "inputs": {
+      "vae_name": "flux1-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "input_vae"
+    }
+  },
+  "146": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_width"
+    }
+  },
+  "147": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_height"
+    }
+  },
+  "309": {
+    "inputs": {
+      "unet_name": "Flux1-dev.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "311": {
+    "inputs": {
+      "conditioning": [
+        "132",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    }
+  },
+  "312": {
+    "inputs": {
+      "width": [
+        "146",
+        0
+      ],
+      "height": [
+        "147",
+        0
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptySD3LatentImage",
+    "_meta": {
+      "title": "EmptySD3LatentImage"
+    }
+  },
+  "313": {
+    "inputs": {
+      "seed": [
+        "69",
+        0
+      ],
+      "steps": 20,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "316",
+        0
+      ],
+      "positive": [
+        "132",
+        0
+      ],
+      "negative": [
+        "311",
+        0
+      ],
+      "latent_image": [
+        "312",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "314": {
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "Kaoru8-t5xxl-unchained-Q4_0.gguf",
+      "type": "flux"
+    },
+    "class_type": "DualCLIPLoaderGGUF",
+    "_meta": {
+      "title": "DualCLIPLoader (GGUF)"
+    }
+  },
+  "315": {
+    "inputs": {
+      "gguf_name": "flux1-dev-Q8_0.gguf"
+    },
+    "class_type": "LoaderGGUF",
+    "_meta": {
+      "title": "input_gguf"
+    }
+  },
+  "316": {
+    "inputs": {
+      "lora_01": "None",
+      "strength_01": 1,
+      "lora_02": "None",
+      "strength_02": 1,
+      "lora_03": "None",
+      "strength_03": 1,
+      "lora_04": "None",
+      "strength_04": 1,
+      "model": [
+        "309",
+        0
+      ],
+      "clip": [
+        "314",
+        0
+      ]
+    },
+    "class_type": "Lora Loader Stack (rgthree)",
+    "_meta": {
+      "title": "input_lora"
+    }
+  },
+  "317": {
+    "inputs": {
+      "boolean": false,
+      "on_true": [
+        "309",
+        0
+      ],
+      "on_false": [
+        "315",
+        0
+      ]
+    },
+    "class_type": "Switch any [Crystools]",
+    "_meta": {
+      "title": "true-diffusion_false-gguf"
+    }
+  }
+}

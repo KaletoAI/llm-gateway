@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, quote, urlencode
 
 import httpx
 from fastapi import HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 import adapters
 import jobs
@@ -1260,7 +1260,9 @@ def _mapping_list(cedit: str, iedit: str) -> str:
                            sel=(alias == iedit))
     img_items = img_items or "<p class='muted'>No workflows — + Workflow.</p>"
     bar = ('<div class="bar"><h2>Mapping</h2>'
-           f'<div style="display:flex;gap:8px">{_btn("+ Chat alias", "/ui/mapping?cnew=1", "secondary")}'
+           f'<div style="display:flex;gap:8px">'
+           f'{_btn("⬇ Export all", "/ui/mapping/export-all", "secondary", title="Download all cleaned workflows as a zip")}'
+           f'{_btn("+ Chat alias", "/ui/mapping?cnew=1", "secondary")}'
            f'{_btn("+ Workflow", "/ui/mapping?new=1")}</div></div>')
     legend = ("<p class='hint' style='margin:2px 0 6px'>"
               + _badge("config") + " from config.yaml · "
@@ -1543,7 +1545,8 @@ async def _alias_editor(alias: str) -> str:
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
-            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}'
+            f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}</div>'
             + _field("alias name", _inp("new_alias", alias), short=True)
             + '<h2 style="margin-top:18px">Update workflow</h2>'
             + "<p class='hint'>Replace the ComfyUI API JSON — request fields + pinned values are kept; "
@@ -2682,6 +2685,44 @@ async def server_save(request: Request):
 
 # ── Registration ────────────────────────────────────────────────────────────────
 
+def _wf_filename(s: str) -> str:
+    """Filesystem-safe name for a workflow download."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "workflow"
+
+
+async def mapping_export(request: Request):
+    """Download an alias's gateway-owned (Mapping-cleaned) workflow JSON — the
+    request-field defaults you cleared in Mapping are already gone from it."""
+    alias = _qp(request, "alias")
+    cands = store.get(alias) if store.is_active() else None
+    wf = cands[0].get("workflow_json") if cands else None
+    if not wf:
+        raise HTTPException(404, f"no stored workflow for alias '{alias}'")
+    body = json.dumps(wf, indent=2, ensure_ascii=False)
+    return Response(body, media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{_wf_filename(alias)}.json"'})
+
+
+async def mapping_export_all(request: Request):
+    """Download every generation alias's cleaned workflow as one zip (bundle)."""
+    if not store.is_active():
+        raise HTTPException(404, "generation store inactive")
+    import io
+    import zipfile
+    buf, n = io.BytesIO(), 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for alias in store.list_aliases():
+            cands = store.get(alias) or []
+            wf = cands[0].get("workflow_json") if cands else None
+            if wf:
+                z.writestr(f"{_wf_filename(alias)}.json", json.dumps(wf, indent=2, ensure_ascii=False))
+                n += 1
+    if not n:
+        raise HTTPException(404, "no workflows to export")
+    return Response(buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="comfyui_workflows.zip"'})
+
+
 def register(app) -> None:
     app.middleware("http")(_ui_guard)          # admin-login guard for /ui
     app.add_api_route("/", root_redirect, methods=["GET"], include_in_schema=False)
@@ -2715,6 +2756,8 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/cand-del", cand_del, methods=["GET"])
     app.add_api_route("/ui/mapping/field-order", field_order, methods=["GET"])
     app.add_api_route("/ui/mapping/update", update, methods=["POST"])
+    app.add_api_route("/ui/mapping/export", mapping_export, methods=["GET"])
+    app.add_api_route("/ui/mapping/export-all", mapping_export_all, methods=["GET"])
     app.add_api_route("/ui/mapping/copy", copy, methods=["GET"])
     app.add_api_route("/ui/mapping/delete", delete, methods=["GET"])
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
