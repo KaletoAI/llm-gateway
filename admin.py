@@ -67,6 +67,9 @@ _comfy_backends: Callable[[], list] = lambda: []
 _gateway_info: Callable[[], dict] = lambda: {}
 _run_generation = None
 _cancel_gen = None
+_drain_backend = None
+_cancel_drain = None
+_set_backend_enabled = None
 _apply_backends: Callable[[], None] = lambda: None
 _llm_backends: Callable[[], list] = lambda: []
 _config_chat_aliases: Callable[[], dict] = lambda: {}
@@ -91,13 +94,16 @@ def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Calla
          apply_users: Callable[[], None] = lambda: None,
          resolve_admin: Callable = lambda key: None,
          ui_locked: Callable[[], bool] = lambda: False,
-         dashboard_snapshot: Callable[[], dict] = lambda: {}, cancel_generation=None) -> None:
+         dashboard_snapshot: Callable[[], dict] = lambda: {}, cancel_generation=None,
+         drain_backend=None, cancel_drain=None, set_backend_enabled=None) -> None:
     global _comfy_backends, _run_generation, _gateway_info, _apply_backends
     global _llm_backends, _config_chat_aliases, _apply_chat_aliases, _run_chat, _routing_snapshot
     global _server_info, _apply_server_settings, _apply_users, _resolve_admin, _ui_locked
-    global _dashboard_snapshot, _cancel_gen
+    global _dashboard_snapshot, _cancel_gen, _drain_backend, _cancel_drain, _set_backend_enabled
     _dashboard_snapshot = dashboard_snapshot
     _cancel_gen = cancel_generation
+    _drain_backend, _cancel_drain = drain_backend, cancel_drain
+    _set_backend_enabled = set_backend_enabled
     _comfy_backends, _run_generation = comfy_backends, run_generation
     _gateway_info, _apply_backends = gateway_info, apply_backends
     _llm_backends, _config_chat_aliases = llm_backends, config_chat_aliases
@@ -625,14 +631,28 @@ async def backends_page(request: Request):
                    or next((b for b in binfo if _bid(b) == edit_id), None))
     def render(b):
         bid = _bid(b)
-        badge = (_badge("healthy", "ok") if b["healthy"]
-                 else (_badge("disabled") if not b["enabled"] else _badge("down", "bad")))
-        edit_a = ("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")
-        if b.get("source", "config") == "ui":
-            acts = _icon_acts(edit_a, ("✕", f"/ui/backends/delete?id={quote(bid)}", "danger",
-                                       "Delete", f"Remove backend {b['name']} ({b['type']})?"))
+        draining, inflight = b.get("draining"), b.get("inflight", 0)
+        if draining:
+            badge = _badge(f"draining · {inflight} in-flight", "warn")
         else:
-            acts = _icon_acts(edit_a)
+            badge = (_badge("healthy", "ok") if b["healthy"]
+                     else (_badge("disabled") if not b["enabled"] else _badge("down", "bad")))
+        acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
+        if draining:
+            acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
+                              "Cancel drain — put back in rotation"))
+        elif b["enabled"]:
+            acts_list.append(("⏻", f"/ui/backends/drain?id={quote(bid)}", "secondary",
+                              "Take offline when idle (drain: stop new requests, finish in-flight)",
+                              f"Take {b['name']} offline once idle? New requests stop now; "
+                              "in-flight requests finish first."))
+        else:
+            acts_list.append(("⏼", f"/ui/backends/enable?id={quote(bid)}", "secondary",
+                              "Bring online (enable)"))
+        if b.get("source", "config") == "ui":
+            acts_list.append(("✕", f"/ui/backends/delete?id={quote(bid)}", "danger",
+                              "Delete", f"Remove backend {b['name']} ({b['type']})?"))
+        acts = _icon_acts(*acts_list)
         src = "" if b.get("source") == "ui" else " · config"
         flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local") if b.get(fl))
         sub = f"{b['type']} · {b['url']} · prio {b['priority']} · {b['models']} models{flags}{src}"
@@ -657,7 +677,8 @@ async def backends_page(request: Request):
                   "or <b>+ New</b> to add one.</p>")
     body = (f'<div class="cols"><div class="col">{list_html}</div>'
             f'<div class="col">{detail}</div></div>')
-    return HTMLResponse(_page("Backends", body, "backends"))
+    draining_now = any(b.get("draining") for b in binfo)      # watch the count drain → offline
+    return HTMLResponse(_page("Backends", body, "backends", refresh=4 if draining_now else None))
 
 
 async def backend_save(request: Request):
@@ -708,6 +729,29 @@ async def backend_del(request: Request):
         name, typ = _parse_bid(bid)
         store.delete_backend(name, typ)
         _apply_backends()
+    return RedirectResponse("/ui/backends", status_code=303)
+
+
+async def backend_drain(request: Request):
+    """Graceful offline: stop new requests now, disable once in-flight drains to 0."""
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _drain_backend and bid:
+        _drain_backend(bid)
+    return RedirectResponse("/ui/backends", status_code=303)
+
+
+async def backend_undrain(request: Request):
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _cancel_drain and bid:
+        _cancel_drain(bid)
+    return RedirectResponse("/ui/backends", status_code=303)
+
+
+async def backend_enable(request: Request):
+    """Bring a disabled backend back online (counterpart to drain)."""
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _set_backend_enabled and bid:
+        _set_backend_enabled(bid, True)
     return RedirectResponse("/ui/backends", status_code=303)
 
 
@@ -2639,6 +2683,9 @@ def register(app) -> None:
     app.add_api_route("/ui/backends", backends_page, methods=["GET"])
     app.add_api_route("/ui/backends/save", backend_save, methods=["POST"])
     app.add_api_route("/ui/backends/delete", backend_del, methods=["GET"])
+    app.add_api_route("/ui/backends/drain", backend_drain, methods=["GET"])
+    app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["GET"])
+    app.add_api_route("/ui/backends/enable", backend_enable, methods=["GET"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])

@@ -170,12 +170,25 @@ def backend_busy(backend: dict) -> bool:
     return cap is not None and backend_inflight.get(backend_id(backend), 0) >= cap
 
 
+# ── Graceful drain (take a backend offline once idle) ─────────────────────────
+# A draining backend takes NO new requests (excluded from routing) but lets its
+# in-flight requests finish; once in-flight hits 0 it is disabled (persisted) — so a
+# backend can be pulled for maintenance without aborting running requests.
+_draining: set = set()                  # backend ids currently draining
+
+
+def is_draining(backend: dict) -> bool:
+    return backend_id(backend) in _draining
+
+
 def _inflight_inc(name: str) -> None:
     backend_inflight[name] = backend_inflight.get(name, 0) + 1
 
 
 def _inflight_dec(name: str) -> None:
     backend_inflight[name] = max(0, backend_inflight.get(name, 0) - 1)
+    if name in _draining and backend_inflight.get(name, 0) <= 0:
+        _finalize_drain(name)            # last in-flight request finished → go offline
     _notify_slot_free()
 
 
@@ -490,7 +503,8 @@ def resolve_routes(alias: str) -> tuple[list, list]:
     """
     # chat routing only considers LLM (non-ComfyUI) backends, so a name shared with a
     # ComfyUI backend is unambiguous here.
-    llm = [b for b in enabled_backends() if b.get("type", "openai") != "comfyui"]
+    llm = [b for b in enabled_backends()
+           if b.get("type", "openai") != "comfyui" and not is_draining(b)]
     bname, bare = split_backend_prefix(alias)
     if bname is not None:
         b = next((b for b in llm if b["name"] == bname), None)
@@ -1196,7 +1210,8 @@ def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, d
         candidates = image_models.get(alias, [])
     # generation routes only to ComfyUI backends, so a name shared with an LLM backend
     # resolves to the right one.
-    comfy = [b for b in enabled_backends() if b.get("type") == "comfyui"]
+    comfy = [b for b in enabled_backends()
+             if b.get("type") == "comfyui" and not is_draining(b)]
     out = []
     for cand in candidates:
         b = next((b for b in comfy if b["name"] == cand.get("backend")), None)
@@ -1732,6 +1747,7 @@ def gateway_info() -> dict:
         "backends": [{
             "name": b["name"], "type": b.get("type", "openai"), "priority": b["priority"],
             "enabled": is_enabled(b), "healthy": backend_healthy.get(backend_id(b), False),
+            "inflight": backend_inflight.get(backend_id(b), 0), "draining": is_draining(b),
             "models": len(backend_models.get(backend_id(b), set())), "url": b["url"],
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
@@ -1757,6 +1773,52 @@ def apply_backend_change() -> None:
         asyncio.get_running_loop().create_task(_discover())
     except RuntimeError:
         pass
+
+
+def begin_drain(bid: str) -> bool:
+    """Take a backend offline gracefully: stop routing new requests to it now, and
+    disable it once its in-flight requests finish. False if unknown/already disabled."""
+    b = next((x for x in backends if backend_id(x) == bid), None)
+    if b is None or not is_enabled(b):
+        return False
+    _draining.add(bid)
+    n = backend_inflight.get(bid, 0)
+    logger.info(f"[{b['name']}] draining — {n} in-flight; goes offline when idle")
+    if n <= 0:
+        _finalize_drain(bid)
+    return True
+
+
+def cancel_drain(bid: str) -> bool:
+    """Abort a drain → the backend rejoins rotation. False if it wasn't draining."""
+    if bid not in _draining:
+        return False
+    _draining.discard(bid)
+    nm = next((x["name"] for x in backends if backend_id(x) == bid), bid)
+    logger.info(f"[{nm}] drain cancelled — back in rotation")
+    return True
+
+
+def set_backend_enabled(bid: str, on: bool) -> bool:
+    """Persist a backend's `enabled` flag (store) and rebuild. Backs the drain-finalize
+    and the UI take-offline / bring-online actions. False if the backend is unknown."""
+    b = next((x for x in backends if backend_id(x) == bid), None)
+    if b is None:
+        return False
+    entry = dict(store.get_backend(b["name"], b.get("type", "openai")) or
+                 {k: b[k] for k in ("name", "type", "url", "priority", "max_concurrent",
+                                    "api_key", "chat_only", "serverless_only", "local") if k in b})
+    entry.update({"name": b["name"], "type": b.get("type", "openai"), "enabled": bool(on)})
+    store.upsert_backend(entry)
+    logger.info(f"[{b['name']}] {'enabled' if on else 'disabled'} via console")
+    apply_backend_change()
+    return True
+
+
+def _finalize_drain(bid: str) -> None:
+    """Backend is idle → take it offline (persist enabled=false) and rebuild."""
+    _draining.discard(bid)
+    set_backend_enabled(bid, False)
     logger.info(f"backends changed → {len(backends)} effective")
 
 
@@ -1877,7 +1939,9 @@ admin.bind(lambda: [b for b in backends if b.get("type") == "comfyui"],
            apply_server_settings=apply_server_settings_hook,
            apply_users=apply_users,
            resolve_admin=resolve_admin, ui_locked=ui_locked,
-           dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation)
+           dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
+           drain_backend=begin_drain, cancel_drain=cancel_drain,
+           set_backend_enabled=set_backend_enabled)
 
 
 @app.get("/health")
