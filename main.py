@@ -1723,6 +1723,7 @@ def dashboard_snapshot() -> dict:
             "name": b["name"], "type": b.get("type", "openai"), "priority": b["priority"],
             "enabled": en, "healthy": en and backend_healthy.get(bid, False),
             "busy": en and backend_busy(b), "inflight": backend_inflight.get(bid, 0),
+            "draining": is_draining(b),
             "max_concurrent": backend_max_concurrent(b),
             "models": len(backend_models.get(bid, set())),
         })

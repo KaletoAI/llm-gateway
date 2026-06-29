@@ -633,10 +633,13 @@ async def backends_page(request: Request):
         bid = _bid(b)
         draining, inflight = b.get("draining"), b.get("inflight", 0)
         if draining:
-            badge = _badge(f"draining · {inflight} in-flight", "warn")
+            badge = _badge(f"⏳ draining · {inflight} in-flight", "warn")
+        elif not b["enabled"]:
+            badge = _badge("⏻ offline", "warn", "taken offline — use ⏼ bring-online to re-enable")
+        elif b["healthy"]:
+            badge = _badge("healthy", "ok")
         else:
-            badge = (_badge("healthy", "ok") if b["healthy"]
-                     else (_badge("disabled") if not b["enabled"] else _badge("down", "bad")))
+            badge = _badge("down", "bad")
         acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
         if draining:
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
@@ -2232,8 +2235,10 @@ async def dashboard_page(request: Request):
         return 1 if b.get("busy") else 0
 
     def bstatus(b):
+        if b.get("draining"):
+            return _badge(f"⏳ draining · {b.get('inflight', 0)} in-flight", "warn")
         if not b.get("enabled"):
-            return _badge("disabled")
+            return _badge("⏻ offline", "warn")
         if not b.get("healthy"):
             return _badge("off", "bad")
         return _badge("busy", "warn") if b.get("busy") else _badge("ready", "ok")
