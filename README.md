@@ -1,44 +1,62 @@
 # llm-gateway
 
-A small OpenAI-compatible proxy that fans out across multiple local LLM
-backends (llama.cpp / llama-swap / vLLM / Ollama / …) and cloud APIs
-(together.ai, OpenAI, OpenRouter …), with auto-discovery, priority routing,
-virtual model aliases, and failover.
+An OpenAI-compatible reverse proxy that fans one endpoint out across many
+backends — local LLM servers (llama.cpp / llama-swap / vLLM / Ollama …), cloud
+APIs (together.ai, OpenAI, OpenRouter …), **and ComfyUI image-generation
+servers**. Callers see a single OpenAI endpoint; the gateway handles discovery,
+priority routing, failover, virtual aliases, per-backend concurrency, an
+optional multi-user layer, call parking, and a built-in management console.
 
-It sits between OpenAI-compatible clients (N8N AI Agent, LibreChat, Open
-WebUI, custom LangChain code, …) and a fleet of backends, so callers see a
-single OpenAI endpoint and the gateway handles the routing.
+It sits between OpenAI-compatible clients (N8N, LibreChat, Open WebUI, LangChain
+code, image clients like anima-verse, …) and a fleet of backends.
+
+---
+
+## Contents
+
+- [Why](#why)
+- [Quick start](#quick-start)
+- [Configuration](#configuration) — backends, aliases, knobs
+- [Authentication & multi-user](#authentication--multi-user) — keys, allow-lists, quotas
+- [Routing](#routing) — priority, prefixing, `local`, concurrency, parking
+- [Call parking](#call-parking) — queue instead of `503` when busy
+- [Image / multimodal generation](#image--multimodal-generation) — ComfyUI, aliases, mapping, LoRA, jobs
+- [The `/ui` console](#the-ui-console)
+- [Stats & routing dashboard](#stats--routing-dashboard)
+- [Endpoint reference](#endpoint-reference)
+- [Try it](#try-it)
+- [Running & deploying](#running--deploying)
+
+---
 
 ## Why
 
-- **One endpoint for many backends.** Point N8N / your tools at one URL;
-  add/remove backends in YAML without touching clients.
-- **Auto-discovery.** Each backend's `/v1/models` is polled; no manual model
-  registry to maintain.
-- **Strict priority routing across backends sharing the same alias.**
-  Unlike LiteLLM's `fallbacks` (which maps one *model name* to another
-  *model name* on failure), the gateway treats `priority` as a
-  first-class deployment ordering. One alias `fast` can route to a
-  local llama.cpp box first and a cloud provider as fallback — and
-  that ordering is exactly what runs, every time, with no routing-
-  strategy ceremony (rpm weights, latency routing, cooldowns) to
-  configure.
-- **Virtual models.** Aliases like `fast`, `vision`, `translator` map to
-  different real model IDs per backend. Swap the underlying model without
-  changing client code. An alias can also **override a backend's priority for
-  itself only** — so `cheap` can prefer the CPU box even though the GPU box is
-  globally #1.
-- **Cloud-as-backend.** Per-backend `api_key` lets you wire in
-  OpenAI-compatible cloud providers (together.ai, OpenAI, OpenRouter,
-  DeepInfra, …) as just another backend with its own priority.
-- **Hot config reload.** `config.yaml` changes are picked up live; no
-  restart needed.
-- **Optional call stats + routing view.** SQLite-backed per-call log + minimal
-  HTML dashboard on a separate port, with two tabs: **Stats** (backend, source,
-  model, tokens, duration, USD cost from each backend's published pricing) and
-  **Routing** (a searchable live map of how every alias and discovered model
-  resolves, by priority, plus alias/model-name collision warnings). Off by
-  default. Zero new dependencies.
+- **One endpoint for many backends.** Point your tools at one URL; add/remove
+  backends without touching clients. Chat, embeddings, the Responses API, *and*
+  image generation all go through the same gateway.
+- **Auto-discovery.** Each backend's catalog is polled — `/v1/models` for LLMs,
+  `/object_info` for ComfyUI (models + installed LoRAs). No manual registry.
+- **Strict priority routing + failover.** `priority` is a first-class deployment
+  ordering: alias `fast` routes to a local box first, a cloud provider as
+  fallback — exactly that, every time, no routing-strategy ceremony.
+- **Virtual aliases.** `fast`, `vision`, `translator` map to different real model
+  IDs per backend; an alias can even override a backend's priority for itself.
+- **Cloud-as-backend.** A per-backend `api_key` wires in any OpenAI-compatible
+  provider as just another prioritised backend.
+- **Multi-user.** Optional per-user API keys with model/alias/backend allow-lists
+  (which also filter what each key sees in `/v1/models`) and monthly cost quotas.
+- **Call parking.** When every matching backend is busy, queue the call (sync or
+  async job) instead of returning `503`.
+- **Image generation.** ComfyUI workflows exposed as OpenAI image endpoints +
+  a native job API, with a convention-free node mapping, dynamic LoRAs, and
+  LoRA-aware backend routing.
+- **Built-in console at `/ui`.** Manage backends, aliases, workflow mappings,
+  users, server settings; run a chat/image playground; watch jobs, stats, and
+  the live routing map. Server-rendered, zero JS framework.
+- **Hot config reload.** `config.yaml` changes apply live; most management also
+  lives in a writable store edited from the console.
+
+---
 
 ## Quick start
 
@@ -48,306 +66,404 @@ cd llm-gateway
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 cp config.example.yaml config.yaml
 $EDITOR config.yaml                    # set backends + api_key
-venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000
+venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 ```
 
-Then point any OpenAI-compatible client at `http://<host>:4000/v1` using the
-`api_key` you set in `config.yaml`.
+Point any OpenAI-compatible client at `http://<host>:4000/v1` with the `api_key`
+you set. Open `http://<host>:4000/ui` for the management console.
+
+> `requirements.txt` omits `watchfiles`; it ships transitively with
+> `uvicorn[standard]` and powers the hot-reload of `config.yaml`. Keep that extra.
+
+---
 
 ## Configuration
 
 `config.example.yaml` is the documented template. Copy to `config.yaml`
-(which is gitignored) and edit. The file is hot-reloaded on save.
+(gitignored, hot-reloaded on save). Two things read **only at startup**:
+`stats.enabled` and the jobs/stats DB paths.
+
+**Config vs. store.** `config.yaml` is the bootstrap source. Once the console is
+used, most state (backends, chat aliases, generation aliases + mappings, users,
+server settings) lives in a writable SQLite **store** (`store.db`) which then
+becomes the source of truth. The store is seeded once from config and merged
+over it; you can run almost entirely from config or almost entirely from the
+console — both work.
 
 ```yaml
-api_key: "sk-change-me"                # client-side gateway auth (optional)
-health_check_interval: 30
+api_key: "sk-change-me"                # master/admin key (see Authentication)
+health_check_interval: 30              # seconds between backend liveness polls
+log_per_call: true                     # one log line per forwarded request
+model_prefix: true                     # list models as <backend>/<model>
+# max_concurrent: 1                    # global default in-flight cap per backend
 
 backends:
   - name: local-gpu
     url: http://192.168.1.10:8080      # llama-swap / llama.cpp / vLLM / …
-    priority: 1
-  - name: local-cpu
-    url: http://192.168.1.11:8080
-    priority: 2
-    # enabled: false                    # take out of rotation
-  - name: together                      # cloud fallback
+    priority: 1                        # 1 = preferred
+    max_concurrent: 1                  # single-slot llama.cpp → one at a time
+    # local: true                      # ALSO list its models bare (see below)
+  - name: together                     # cloud fallback (OpenAI-compatible)
     url: https://api.together.xyz
     priority: 99
-    api_key: "tgp_v1_…"                 # injected as Bearer to this backend
-    chat_only: true                     # filter out image/video/embedding models
-    serverless_only: true               # filter out dedicated-endpoint-only models
-  - name: openrouter                    # another cloud fallback
-    url: https://openrouter.ai/api      # /api only — the gateway appends /v1/…
-    priority: 98
-    api_key: "sk-or-v1-…"
-    chat_only: true                     # drop image-/audio-output-only models
-    serverless_only: false              # keep :free models (true = paid-only)
+    api_key: "tgp_v1_…"                # sent as Bearer to this backend
+    chat_only: true                    # drop non-chat models at discovery
+    serverless_only: true              # drop dedicated-endpoint-only models
 
-virtual_models:
-  "translator":  "Aya-Expanse-8B"       # same model on every backend
-  "fast":                                # per-backend mapping
-    local-gpu:   "Qwen3.5-9B"
-    local-cpu:   "gemma-3-9b-it"
-    together:    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
-  "cheap":                               # per-alias priority override
-    local-cpu:                           #   prefer the CPU box for this alias…
-      model:     "gemma-3-9b-it"
-      priority:  1
-    local-gpu:                           #   …even though local-gpu is global #1
-      model:     "Qwen3.5-9B"
-      priority:  2
-  "embedding":                           # embedding alias → bge-m3 on one host
-    local-gpu:   "bge-m3"                #   (host must NOT set chat_only)
+virtual_models:                        # chat aliases
+  "translator": "Aya-Expanse-8B"       # same model on every backend
+  "fast":                              # per-backend mapping
+    local-gpu: "Qwen3.5-9B"
+    together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+  "cheap":                             # per-alias priority override
+    local-cpu: { model: "gemma-3-9b-it", priority: 1 }
+    local-gpu: { model: "Qwen3.5-9B",    priority: 2 }
 ```
 
-A backend's value under an alias is normally just the model name. Make it an
-object `{model, priority}` to override that backend's priority **for this alias
-only** — handy when the globally-preferred backend isn't the one you want for a
-specific alias. Backends without an override keep their global priority (same
-numeric scale), so you only need to annotate the ones you're reordering.
+A backend's value under an alias is normally just the model name; make it
+`{model, priority}` to override that backend's priority **for this alias only**.
+
+---
+
+## Authentication & multi-user
+
+Two layers, both optional:
+
+- **Master key** — the top-level `api_key`. Clients send
+  `Authorization: Bearer <key>`. Also unlocks the `/ui` console (sign in with an
+  admin key). Leave empty to run fully open (bootstrap mode).
+- **Per-user keys** — created in the **Users** tab. Each user has its own API
+  key (generate one in the form, or paste your own), a role (`user` / `admin`),
+  an enabled flag, an optional model **allow-list**, and an optional **monthly
+  cost quota**. Calls are attributed to the user (stats source, job owner).
+
+**Bootstrap-open → locked.** With no users *and* no master key, the gateway and
+console are fully open. Add an admin user (or set a master key) to lock it down.
+
+### Allow-list (what a key may use — and see)
+
+A user's allow-list can contain any mix of:
+
+| Entry kind | Grants |
+|---|---|
+| **chat alias** (`fast`) | that chat alias |
+| **image alias** (`Qwen`) | that generation alias |
+| **backend name** (`together`) | **all** of that backend's models |
+| model id (`together/llama-3…` or bare) | that specific model |
+
+An **empty** allow-list = everything allowed (the default). A non-empty list both
+**restricts usage** (a disallowed model → `403`) **and filters `/v1/models`** so
+the key only sees what it's allowed. This is how you point an image client at the
+gateway and have it see just the image aliases instead of the whole 400-model
+catalog: give it a key whose allow-list is the image alias(es) (or the ComfyUI
+backend), and `GET /v1/models` returns only those. `?type=image` / `?type=chat`
+narrows by namespace too.
+
+### Quotas
+
+- **`quota_req_day`** — requests per day (in-memory counter) → `429` when exceeded.
+- **`quota_cost_month`** — summed USD cost for the month (from the stats log) →
+  blocked when exceeded. Needs stats enabled and priced backends; streaming calls
+  count as `0` (no `usage` in stream chunks).
+
+---
+
+## Routing
+
+For each request the gateway walks backends in **priority order** (1 = first) and
+takes the first that is (1) enabled, (2) healthy (last discovery poll ok), (3)
+**not busy** (below its `max_concurrent` in-flight cap), (4) mapped for the alias
+(or exposes the bare/real model), and (5) actually has the resolved model. If
+that backend errors on the forward, the remaining matching backends are tried in
+order. When every match is busy you get a `503` — or the call **parks** (below).
 
 ### Provider-prefixed model names
 
-With `model_prefix: true` (default), `/v1/models` lists every model prefixed
-with its backend name — `together/moonshotai/Kimi-K2.5-fp4`,
-`openrouter/nvidia/nemotron-3-ultra-550b-a55b`, `local-gpu/qwen3.5-9b` — so you
-can tell at a glance which provider a model comes from (handy once two cloud
-backends both expose overlapping catalogs). The prefix is stripped again before
-the request is forwarded upstream.
+With `model_prefix: true` (default), `/v1/models` lists every model as
+`<backend>/<model>` so the provider is visible. Input is liberal: a prefixed id
+routes to exactly that backend; a bare id or an alias routes by priority. Backend
+names never collide with vendor prefixes (`moonshotai/…`), so the leading segment
+disambiguates. `model_prefix: false` → legacy bare, de-duplicated listing.
 
-Input is liberal: a prefixed id (`openrouter/…`) routes to exactly that
-backend; a bare id or a virtual alias (`fast`) still routes by priority across
-all backends as before. Backend names never collide with vendor prefixes
-(`moonshotai/`, `nvidia/`, …), so the leading path segment disambiguates
-cleanly. Set `model_prefix: false` for the legacy bare, de-duplicated listing.
-
-#### Per-backend `local`: also list bare
-
-The `model_prefix` switch is global — all backends prefixed or none. To expose
-*specific* backends' models without the prefix while keeping the rest prefixed,
-set `local: true` on those backends:
-
-```yaml
-backends:
-  - name: local-gpu
-    url: http://192.168.1.10:8080
-    priority: 1
-    local: true        # lists local-gpu/qwen3.5-9b AND bare qwen3.5-9b
-  - name: local-cpu
-    url: http://192.168.1.11:8080
-    priority: 2
-    local: true        # same bare qwen3.5-9b → de-duplicated, routes by priority
-  - name: openrouter
-    url: https://openrouter.ai/api
-    priority: 98
-    api_key: "sk-or-v1-…"   # no local flag → stays openrouter/nvidia/… only
-```
-
-A `local` backend lists each model **twice** in `/v1/models`: the usual
-`<backend>/<model>` id *and* the bare `<model>` id. The bare id isn't tied to a
-backend, so a request for it routes by priority across *every* `local` backend
-that serves it — same failover and busy-spill as a virtual alias. When several
-`local` backends share a model id, the bare entry is de-duplicated to one. This
-is independent of `model_prefix` (the prefixed id stays listed regardless); it
-just adds the bare alias-style entry for the flagged backends.
-
-### How routing picks a backend
-
-For each incoming request, the gateway walks backends in priority order and
-takes the first one that:
-
-1. is enabled,
-2. is currently healthy (last poll of `/v1/models` succeeded),
-3. is not **busy** (below its `max_concurrent` in-flight cap — see below),
-4. is mapped for this alias in `virtual_models` (or the model name is a
-   real model that backend exposes — direct, un-aliased requests work too),
-5. has the resolved real model in its model list.
-
-If that backend errors during the actual forward, the remaining matching
-backends are tried in order.
+**`local: true`** on a backend *additionally* lists its models bare (alongside
+the prefixed id). A bare request then routes by priority across every `local`
+backend that serves it — same failover/busy-spill as a virtual alias; shared ids
+collapse to one entry. Independent of `model_prefix`.
 
 ### Per-backend concurrency cap (`max_concurrent`)
 
-A backend can declare how many requests it can handle at once. The gateway
-keeps a live in-flight counter per backend; once it reaches `max_concurrent`
-the backend is **busy** and skipped in priority routing — the request spills to
-the next backend in the list instead of queueing on (or overloading) a slow
-one. When *every* matching backend is busy, the request gets the usual
-`503` (no backend available).
-
-```yaml
-max_concurrent: 1          # top-level: default cap for all backends
-
-backends:
-  - name: local-gpu
-    url: http://192.168.1.10:8080
-    priority: 1
-    max_concurrent: 1      # per-backend override of the global default
-  - name: together
-    url: https://api.together.xyz
-    priority: 99
-    # no cap → unlimited (cloud API handles its own concurrency)
-```
-
-Match the cap to the backend's real parallelism: `1` for a `llama.cpp` server
-started with `--parallel 1` (a single KV slot → one request at a time),
-high/unset for a cloud API. Missing/`0` = unlimited (legacy behaviour, fully
-backwards-compatible). Busy backends are flagged live on the **Routing** tab and
-in `/health` (`busy`, `inflight`, `max_concurrent` per backend). The counter is
-released when the response completes — including when a streamed (SSE) response
-finishes, not when its headers are sent.
+A live per-backend in-flight counter; at/above the cap the backend is **busy** and
+skipped, so the request spills to the next backend instead of overloading a slow
+one. Match it to real parallelism (`1` for `llama.cpp --parallel 1`; unset for a
+cloud API). Missing/`0` = unlimited. The counter is released when the response
+**completes** — including when a streamed response finishes, not when headers are
+sent. Busy state shows in `/health` and the Routing tab.
 
 ### Per-backend model filters
 
-Two optional boolean flags on a backend filter its model list at discovery time:
-
-| Flag | Effect |
+| Flag | Effect (at discovery) |
 |---|---|
-| `chat_only`       | Keep only models where `type == "chat"` (skips image/video/embedding/transcribe). Backends without a `type` field on their models (llama-swap, vLLM, …) are unaffected. |
-| `serverless_only` | Keep only models with non-zero pricing. Designed for Together.ai, where dedicated-endpoint-only models have `0/0` pricing and would fail at request time. On OpenRouter this drops the `:free` catalog — leave it `false` if you want the free models. |
+| `chat_only` | keep only `type == "chat"` models (drops image/video/embedding). Understands Together's `type` and OpenRouter's `architecture.output_modalities`. Backends without those fields (llama-swap, vLLM) are unaffected — so **don't** set it on a backend whose embedding models you want routable. |
+| `serverless_only` | keep only models with non-zero pricing (Together's dedicated-only models are `0/0`; on OpenRouter this also drops `:free`). |
 
-`chat_only` understands both Together's `type` field and OpenRouter's
-`architecture.output_modalities` (dropping image-/audio-only-output models).
-Backends exposing neither (llama-swap, vLLM) are unaffected.
+### Alias / model-name collisions
 
-Both default off. Most useful when bridging a cloud provider that returns a mixed catalog (chat + image + dedicated-only + …) and you only want chat-completions-routable models exposed.
+Naming an alias the same as a real model id *shadows* that model. `/health`'s
+`alias_model_conflicts` and the Routing tab flag every collision, split into
+**covered** (in the mapping → still routable) and **shadowed** (hosts the model
+but isn't mapped → unreachable by that name) — the latter is the actionable case.
 
-### Call stats + dashboard
+---
 
-Opt-in SQLite call log + minimal HTML dashboard on a separate port (default
-4001). When enabled, every call is recorded with: timestamp, duration,
-backend, source, alias, real model, endpoint, HTTP status, input/output
-tokens, and USD cost.
+## Call parking
+
+When **all** backends that map an alias are busy (at their in-flight cap), the
+default is an immediate `503`. Parking queues the call until a slot frees instead:
+
+- **sync** — the HTTP request blocks until a backend frees, then dispatches
+  normally (up to a park timeout, then `504`).
+- **async** — returns `202 {job_id}` immediately; the result is fetched later via
+  the job API (reuses the generation job store, task type `chat`).
+
+Parking applies to `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+and the generation path (where a busy ComfyUI backend queues the job rather than
+`503`-ing). The distinction "all busy" vs. "no backend at all" is explicit — a
+genuine no-backend still `503`s.
+
+---
+
+## Image / multimodal generation
+
+A ComfyUI backend speaks a different protocol, so it declares `type: comfyui`.
+Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
+dispatch submits a parametrised workflow and polls `/history`.
+
+```yaml
+backends:
+  - name: gpu-3090
+    type: comfyui
+    url: http://192.168.1.20:8188
+    priority: 1
+    max_concurrent: 1        # one generation at a time on this GPU
+    # poll_interval: 1.0     # seconds between /history polls
+    # max_wait: 600          # hard cap for a single generation
+    # read_timeout: 60       # per-HTTP-request read timeout (hung read → failover)
+    # disconnect_grace: 30   # tolerated unreachability before failing over
+```
+
+### Generation aliases + mapping
+
+A **generation alias** (the `model` of a generation request) maps to an ordered
+list of candidate backends. Each candidate carries the **workflow** (a ComfyUI
+**API-format JSON**) and a **mapping** that binds logical params to concrete
+workflow nodes+fields:
+
+```yaml
+image_models:
+  "flux":
+    - backend: gpu-3090
+      task: text2img
+      workflow_json: { … }          # the ComfyUI API JSON (owned by the gateway)
+      mapping:
+        prompt:          { node: "6", field: "text" }
+        width:           { node: "5", field: "width" }
+        seed:            { node: "3", field: "seed" }
+      fixed:                          # pinned node values (models, switches, …)
+        - { node: "4", field: "unet_name", value: "flux1-dev.safetensors" }
+```
+
+The mapping is **convention-free** — it works with any workflow regardless of node
+naming. (An auto-detect heuristic pre-fills it for templated workflows; the
+explicit mapping always wins.) In practice you author all this in the **Mapping**
+tab of the console rather than by hand: paste the ComfyUI API JSON, the gateway
+owns it, auto-suggests the mapping, and gives you discovery-fed dropdowns.
+
+Key mapping concepts:
+
+- **Workflow + mapping are backend-independent** (shared across an alias's
+  candidates). Only **Pinned values** are per-backend (one tab per backend), so
+  the same alias can use a different checkpoint on each GPU while looking
+  identical from outside. A request param that targets a pinned node/field is
+  **ignored** — a pin is authoritative; the API can't override it.
+- **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
+  request fields. By default an unfilled slot gets an 8×8 placeholder; mark a slot
+  **`required`** (Mapping checkbox) to leave it empty instead so ComfyUI errors
+  clearly when a needed image/mask is missing (inpaint).
+- **Numeric fields** (strength, steps, cfg) render with `min`/`max`/`step` pulled
+  live from `/object_info`.
+
+### LoRAs
+
+LoRAs are first-class:
+
+- **Pinned LoRA** — a `fixed` binding on a LoRA-loader slot; the API can't change it.
+- **Dynamic LoRAs** — the client sends `lora_1`, `lora_2`, … (+ optional
+  `strength_N`). The gateway **cascades** them into the next *free* slots of the
+  workflow's LoRA stack, never overwriting a pinned/occupied slot — so a client
+  needn't know which slot is reserved.
+- **LoRA-aware routing** — a backend that lacks a requested LoRA is dropped from
+  the candidate set (decided over all candidates incl. busy, so the request parks
+  for the backend that has it rather than spilling to one that doesn't). A LoRA
+  installed on no backend is ignored (priority decides). An explicit `backend`
+  pin is never overridden.
+- **`GET /v1/generations/{alias}/loras`** returns the LoRA filenames valid for an
+  alias (the union installed across its backends) — for building a correct picker.
+
+### Jobs & TTL
+
+Every generation is a **job**: SQLite metadata + on-disk artifacts under
+`jobs/<id>/<n>.<ext>`, lifecycle `queued → running → done|failed`, retrievable by
+id until its TTL (default 24 h), then pruned. The job also keeps its **inputs**
+(prompt, params, reference images) so it stays inspectable in the **Image Jobs**
+tab. A running job can be cancelled (`POST /v1/jobs/{id}/cancel` or the ✕ button),
+which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
+`running`/`queued` is reconciled to `failed`.
+
+### Two ways to call it
+
+- **OpenAI Images API** (for OpenAI image clients):
+  - `POST /v1/images/generations` — JSON, text→image. Bonus: LocalAI-style
+    `ref_images` (base64/URL list). Extra keys pass through as workflow params.
+  - `POST /v1/images/edits` — multipart; `image` file(s) + the OpenAI `mask` field
+    map positionally onto the workflow's image slots. `response_format` = `url`
+    (job-result URL, needs the Bearer key to fetch) or `b64_json` (inline).
+  These are **synchronous** and block until the image is ready (and **park** if
+  the backend is busy rather than `503`-ing).
+- **Native job API** — `POST /v1/generations` with `{model, prompt, mode, params}`.
+  `mode: "async"` returns `202 {job_id}`; poll `GET /v1/jobs/{id}` and fetch
+  `GET /v1/jobs/{id}/result/{n}`. `mode: "sync"` blocks and returns inline.
+
+See [docs/anima-versa-integration.md](docs/anima-versa-integration.md) for a full
+client-integration walkthrough.
+
+---
+
+## The `/ui` console
+
+A server-rendered console mounted at `/ui` (sign in with an admin key once
+locked). Tabs:
+
+| Tab | What |
+|---|---|
+| **Dashboard** | live per-backend status + in-flight, image-job counts/recent, activity |
+| **Server** | runtime + restart-required settings (API key, caps, stats/jobs, TTL/prune) |
+| **Backends** | add/edit/remove backends (LLM + ComfyUI) |
+| **Input** | what clients can call — chat aliases, generation models, endpoints |
+| **Routing Overview** | the live alias→backend map + collisions (searchable) |
+| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values |
+| **Chat Playground** | send a chat completion through an alias |
+| **Image Playground** | run a generation (pick alias/backend, upload refs, set params) |
+| **Image Jobs** | list + detail of generation jobs (inputs + outputs, within TTL) |
+| **Statistic** | the call-stats dashboard (search, per-call body, drilldown) |
+| **Users** | multi-user keys, allow-lists, quotas, IP aliases |
+
+---
+
+## Stats & routing dashboard
+
+Opt-in SQLite call log, surfaced in the **Statistic** and **Routing** tabs of the
+console (no separate port — the old standalone dashboard was folded into `/ui`).
+Every call records timestamp, duration, backend, source, alias, model, endpoint,
+HTTP status, tokens, and USD cost.
 
 ```yaml
 stats:
-  enabled: false        # default off
-  port: 4001
-  bind: "0.0.0.0"
+  enabled: false        # read at startup only — toggling needs a restart
   db_path: stats.db
-  retention_days: 0     # 0 = unlimited; otherwise prune older rows hourly
-
-log_per_call: true      # set false when using stats to keep the log clean
+  retention_days: 0     # 0 = keep forever; else prune older rows hourly
 ```
 
-- **Cost**: computed from each backend's pricing metadata, cached at discovery
-  time and normalized to USD per million tokens. Two upstream schemas are
-  understood: Together.ai's `pricing.input` / `pricing.output` (numbers, already
-  per-million) and OpenRouter's `pricing.prompt` / `pricing.completion`
-  (strings, per single token — scaled up ×1e6). Local backends (llama-swap,
-  llama.cpp, vLLM) don't expose pricing → cost = 0.
-- **Source**: defaults to the client IP. Override per-call by sending an
-  `X-Source: my-workflow-name` header to tag, e.g., individual N8N
-  workflows.
-- **Auth**: none. Bind to `127.0.0.1` and put behind a reverse proxy if
-  you need access control.
-- **Hot-reload**: stats `enabled` is read at startup only; toggling it
-  requires a full service restart.
-- **Streaming requests** are recorded but with `0` tokens (most backends
-  don't include `usage` in stream chunks). Use non-streaming if you want
-  accurate per-call cost.
+- **Cost** comes from each backend's pricing (cached at discovery, normalised to
+  USD/million tokens — Together's per-million and OpenRouter's per-token schemas).
+  Local backends → 0.
+- **Source** is the authenticated user, else the `X-Source` header, else client IP
+  (IP aliases give those friendly names; reverse-DNS is auto-resolved).
+- **Streaming** calls record `0` tokens (no `usage` in stream chunks).
+- Recent calls store the full request/response body (large/binary bodies on disk),
+  viewable per-call, pruned with the same retention.
 
-The dashboard has two tabs:
+---
 
-- **Stats** — the call log summaries above (auto-refreshes every 30 s).
-- **Routing** — a live map of how every alias and discovered model resolves:
-  each alias's backends in effective-priority order (with a badge when a
-  per-alias priority override applies, and whether each route is currently
-  routable / backend-down / model-missing), every discovered model id and the
-  hosts that serve it by priority, and a **collisions** panel. There's a search
-  box that filters aliases, models, and hosts client-side.
+## Endpoint reference
 
-**Alias / model-name collisions.** Naming an alias the same as a real model id
-*shadows* that model: a bare request for the name routes only via the alias
-mapping (the pass-through to the real model is disabled), and `<backend>/<name>`
-fails on any backend the alias doesn't map. The Routing tab (and `/health`'s
-`alias_model_conflicts`) flag every collision, splitting hosts into **covered**
-(in the mapping → still routable) and **shadowed** (host the real model but
-aren't mapped → unreachable by that name). Shadowed hosts are the actionable
-case — add them to the mapping or rename the alias. A collision with no shadowed
-hosts (e.g. one id mapped across exactly the backends that serve it) is
-intentional and harmless.
+### OpenAI-compatible
 
-### Per-backend `api_key`
-
-When a backend has `api_key`, the gateway sends `Authorization: Bearer
-<key>` on both the health-check poll and forwarded chat/completion
-requests. Anything OpenAI-compatible works — together.ai, OpenAI, OpenRouter,
-DeepInfra, Groq, Fireworks, and similar.
-
-This turns the gateway into a uniform OpenAI-style entrypoint for tools that
-otherwise can't talk to a given provider directly.
-
-### Client-side `api_key`
-
-The top-level `api_key` is the *client-facing* gateway auth. Clients send
-`Authorization: Bearer <that-key>`. Leave empty/unset to disable auth.
-
-## Endpoints
-
-| Method | Path | Description |
+| Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/v1/models` | All real models on healthy backends + virtual aliases |
-| `GET`  | `/v1/models/{id}` | Single-model lookup (some clients verify before calling) |
-| `POST` | `/v1/chat/completions` | OpenAI chat, routed by priority + failover; streaming supported |
-| `POST` | `/v1/completions` | OpenAI completions, same routing |
-| `POST` | `/v1/embeddings` | OpenAI embeddings, same priority routing + failover. Routes to whichever backend serves the requested model (set `chat_only: false` on that backend so its embedding models stay in discovery) |
-| `POST` | `/v1/responses` | OpenAI Responses API, bridged to `/v1/chat/completions` on the backend (request + response translated transparently incl. tool-calls; non-streaming) |
-| `GET`  | `/health` | Per-backend health/model/priority snapshot + virtual_models dump + alias/model-name conflicts |
+| `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|image` |
+| `GET` | `/v1/models/{id}` | single-model lookup |
+| `POST` | `/v1/chat/completions` | chat; priority + failover; streaming; parking |
+| `POST` | `/v1/completions` | completions; same routing |
+| `POST` | `/v1/embeddings` | embeddings; same routing |
+| `POST` | `/v1/responses` | Responses API ↔ chat bridge (non-streaming) |
+| `POST` | `/v1/images/generations` | text→image (sync) |
+| `POST` | `/v1/images/edits` | multipart image+mask edit (sync) |
+
+### Native generation + jobs
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`) |
+| `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias |
+| `GET` | `/v1/jobs/{id}` | job status + results |
+| `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |
+| `GET` | `/v1/jobs/{id}/input/{n}` | a stored reference image (owner-gated) |
+| `POST` | `/v1/jobs/{id}/cancel` | cancel a queued/running job (interrupts ComfyUI) |
+
+### Other
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/health` | per-backend health/model/priority + busy/inflight + conflicts |
+| `*` | `/ui/**` | the management console |
 
 ### Responses API bridge
 
-Clients using LangChain.js (N8N's AI Agent and similar) call `/v1/responses`
-by default. Most local backends (llama-swap / llama.cpp / vLLM) and even
-Together.ai only speak `/v1/chat/completions`. The gateway translates
-between the two transparently:
+Clients on LangChain.js (N8N's AI Agent, …) call `/v1/responses`; most backends
+only speak `/v1/chat/completions`. The gateway translates request
+(`input`/`instructions`/`tools` → `messages`/system/tool schema) and response
+(`choices[0].message` → `output[…]`, token field renames) transparently.
+`stream: true` is silently downgraded to non-streaming (SSE translation not
+implemented).
 
-- Request: `input` / `instructions` / `tools` / `function_call` items →
-  `messages` / system prompt / nested-tool schema / assistant `tool_calls` /
-  `tool` messages.
-- Response: `choices[0].message` → `output[type=message|function_call]`,
-  with `usage.prompt_tokens` etc. renamed to `input_tokens` / `output_tokens`.
-- `stream: true` is silently downgraded to a non-streaming call. SSE
-  event-stream translation isn't implemented yet.
-
-### Embeddings
-
-`/v1/embeddings` uses the same priority routing + failover as chat: the
-request routes to whichever healthy backend serves `model` (bare id, virtual
-alias, or `<backend>/<model>`). Embedding responses report only
-`usage.prompt_tokens`, so cost falls out of the input-price path and
-`output_tokens` is logged as 0. For an embedding model to be routable the
-hosting backend must keep it in discovery — i.e. **not** set `chat_only: true`
-(that filter drops `type != "chat"` models, which includes embeddings).
+---
 
 ## Try it
 
 ```bash
-# List models
-curl http://localhost:4000/v1/models \
-  -H "Authorization: Bearer sk-change-me"
+KEY=sk-change-me ; B=http://localhost:4000
+
+# List models (filtered by your key's allow-list)
+curl $B/v1/models -H "Authorization: Bearer $KEY"
 
 # Chat through an alias
-curl http://localhost:4000/v1/chat/completions \
-  -H "Authorization: Bearer sk-change-me" \
+curl $B/v1/chat/completions -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
 
-# Embeddings through an alias
-curl http://localhost:4000/v1/embeddings \
-  -H "Authorization: Bearer sk-change-me" \
+# Embeddings
+curl $B/v1/embeddings -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"embedding","input":["hallo welt","zweiter satz"]}'
+  -d '{"model":"embedding","input":["hallo welt"]}'
+
+# Text→image (sync, inline base64)
+curl $B/v1/images/generations -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"flux","prompt":"a red apple","size":"1024x1024","response_format":"b64_json"}'
+
+# LoRAs valid for an alias
+curl $B/v1/generations/flux/loras -H "Authorization: Bearer $KEY"
 
 # Backend health snapshot
-curl http://localhost:4000/health
+curl $B/health
 ```
 
-## Running as a service
+---
 
-`llm-gateway.service` is an example systemd unit assuming
-`/opt/llm-gateway` with a `venv/` next to `main.py`. Adapt to taste:
+## Running & deploying
+
+`llm-gateway.service` is an example systemd unit (assumes `/opt/llm-gateway` with
+`venv/` next to `main.py`):
 
 ```bash
 sudo install -m 0644 llm-gateway.service /etc/systemd/system/
@@ -356,18 +472,13 @@ sudo systemctl enable --now llm-gateway
 journalctl -u llm-gateway -f
 ```
 
-## Deploy script (optional)
+`deploy.sh` is an rsync-over-SSH helper (`DEPLOY_HOST=root@host ./deploy.sh`):
+syncs code (excluding `config.yaml`, `venv/`), installs requirements in a remote
+venv, syncs the systemd unit, restarts.
 
-`deploy.sh` is a small rsync-over-SSH deploy helper. It syncs code (excluding
-`config.yaml`, `.env`, `venv/`), pip-installs requirements in a remote venv,
-installs/updates the systemd unit if changed, and restarts the service.
-
-```bash
-DEPLOY_HOST=root@your-host ./deploy.sh
-```
-
-Use it if you like, ignore it if you don't — it's not required to run the
-gateway.
+> **Secrets & data never to commit:** `config.yaml`, `store.db` (+ `secret.key` —
+> they travel together, keys encrypted at rest), `stats.db*`, `jobs.db*`,
+> `jobs/`, `*.key`. All gitignored.
 
 ## License
 

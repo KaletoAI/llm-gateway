@@ -7,13 +7,21 @@ in ausführbare Schritte — Aufwand (S/M/L), Risiko, Ziel-Datei, Verifikation.
 
 Reihenfolge-Empfehlung am Ende.
 
-> **Status 2026-06-27 — ERLEDIGT seit Planerstellung:** A1 · A2 · A3 · E1 · E2 · E3 ·
-> E4 · F0–F5 (Call-Parking sync+async) · C4 (OpenAI-Image-Endpoints + dynamische
-> Workflow-Params) · **G1 (Image-Job-Viewer im /ui)**. Zusätzlich: Generation-Parking
-> (busy→queue, sync+async), `jobs.reconcile_orphans()` beim Startup,
-> `docs/anima-versa-integration.md`. **Offene Spitze:** G2 (LoRA-Mapping-UI-Feinschliff,
-> dynamischer API-Pfad läuft schon) · C1 (img2img/inpaint-Workflows verdrahten) ·
-> B (VRAM-Koordinator, nur bei GPU-Co-Residency).
+> **Status 2026-06-28 — ERLEDIGT seit Planerstellung:** A1 · A2 · A3 · E1 · E2 · E3 ·
+> E4 · F0–F5 (Call-Parking sync+async) · C4 (OpenAI-Image-Endpoints) · G1 (Image-Job-
+> Viewer) · **G2** (LoRA-Discovery-Dropdowns + bounded number inputs). Generation-
+> Parking (busy→queue), `reconcile_orphans()`. **Multi-User** scharf: /v1/models nach
+> Allow-List gefiltert, Allow-List inkl. ganzer Backends, `?type=` Filter, Key-Generator.
+> **LoRA**: Cascade in freie Slots, **LoRA-bewusstes Backend-Routing**, Discovery von
+> installierten LoRAs, `GET /v1/generations/{alias}/loras`. **Inpaint**: `LoadImageMask`
+> als Upload, per-Slot `required` (kein 8×8), OpenAI-`mask`-Feld. **Bild-Pipeline-
+> Härtung** (war „D"): Job-Cancel + ComfyUI-Interrupt, kurzer Read-Timeout, lesbare
+> ComfyUI-Fehler. Pin-Schutz (API kann gepinnte Nodes nicht überschreiben).
+> Doku komplett überarbeitet (README/CLAUDE/config/anima-versa).
+>
+> **Offene Spitze:** C1 (weitere img2img/inpaint-Aliase verdrahten — Mechanismus steht) ·
+> C2/C3 (img2video / TTS — neue Modalität) · B (VRAM-Koordinator, nur bei GPU-Co-
+> Residency) · D4 (Audit-Log, Master-Key-Rotation).
 
 ---
 

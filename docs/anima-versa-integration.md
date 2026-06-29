@@ -110,7 +110,8 @@ curl -s -m 240 http://192.168.8.10:4000/v1/images/generations \
 
 | Feld | Typ | Bedeutung |
 |---|---|---|
-| `image` | Datei(en) | **PFLICHT.** 1..16 Bilddateien. Werden **positionsweise** auf die Bild-Input-Slots des Workflows gemappt (Slot-Anzahl = Workflow; überzählige werden ignoriert, leere Slots bekommen einen 8×8-Platzhalter). Mehrfach `image=@...` für mehrere. |
+| `image` | Datei(en) | **PFLICHT.** 1..16 Bilddateien → **positionsweise** auf die Bild-Slots des Workflows (in **Mapping-Reihenfolge**). Leere Slots bekommen einen 8×8-Platzhalter — **außer** der Slot ist im Mapping als **`required`** markiert (z.B. Inpaint-Bild/Maske): dann bleibt er leer und ComfyUI failt klar, wenn nichts kommt. Mehrfach `image=@...`. |
+| `mask` | Datei | optional (OpenAI-Inpaint). Wird **nach** den `image`-Dateien als nächster positionaler Slot angehängt — der Mask-Slot (`LoadImageMask`) ist normal der letzte in der Mapping-Reihenfolge. |
 | `model` | Text | **PFLICHT.** gen-alias. |
 | `prompt` | Text | optional |
 | `negative_prompt` | Text | optional |
@@ -120,6 +121,9 @@ curl -s -m 240 http://192.168.8.10:4000/v1/images/generations \
 | *alles andere* | Text | dynamische Scalar-Params (loras, seed, …) — Strings werden auto-gecastet (`"0.8"`→0.8) |
 
 Response identisch zu §2 (`{created, data:[…]}`). Task ist intern `img2img`.
+**Reihenfolge:** `image[0]` → erster Bild-Slot, `image[1]`/`mask` → nächster. Welcher
+Slot was ist, steuert die Mapping-Reihenfolge im Gateway (per Drag sortierbar). Für
+Inpaint also: Referenzbild als erstes `image`, Maske als `mask` (oder zweites `image`).
 
 ### curl
 
@@ -152,6 +156,22 @@ anima-versa muss diese Parameter nur **als zusätzliche Felder im Request mitsch
 `steps`, `cfg`, …), ergibt sich aus dem konkreten Alias-Workflow — das ist Konfiguration
 auf Gateway-Seite, nicht in anima-versa hartzucodieren. Ein anima-versa-UI-Feld
 „Extra-Params (JSON)" oder ein generischer Key/Value-Block reicht.
+
+### 4.1 LoRAs — gültige Liste, Kaskade, Routing
+
+- **Gültige LoRAs pro Alias abfragen:** `GET /v1/generations/{alias}/loras` →
+  `{"alias": "...", "loras": ["a.safetensors", …]}` (die Vereinigung der auf den
+  Alias-Backends installierten LoRAs). Damit baust du in anima-versa einen **korrekten
+  LoRA-Picker pro Alias**, statt Namen zu raten.
+- **Kaskade (Slot-frei):** Schick deine LoRAs als `lora_1`, `lora_2`, … (+ optional
+  `strength_N`). Die Gateway legt sie in die nächsten **freien** Slots des LoRA-Stacks —
+  reservierte (gepinnte) Slots werden übersprungen. Du musst also **nicht** wissen,
+  welcher physische Slot belegt ist; `lora_1` landet automatisch im ersten freien.
+- **LoRA-bewusstes Routing:** Fragt ein Request eine LoRA an, die nur auf bestimmten
+  Backends installiert ist, routet die Gateway **automatisch dorthin** (bzw. parkt
+  darauf), statt auf ein Backend ohne die LoRA auszuweichen. Eine LoRA, die es nirgends
+  gibt, wird ignoriert (Priorität entscheidet). Du brauchst also **kein** Backend
+  vorzugeben — die Verfügbarkeit der LoRA steuert die Auswahl.
 
 ---
 

@@ -4,7 +4,10 @@
 # Port (used by the systemd unit; uvicorn is launched separately, see llm-gateway.service)
 port: 4000
 
-# Client API key. Empty/missing = no auth (any caller accepted).
+# Master/admin API key. Clients send it as `Authorization: Bearer <key>`; it also
+# unlocks the /ui console (sign in with an admin key). Empty/missing = bootstrap-open
+# (any caller accepted) UNTIL you add a user. Per-user keys with allow-lists + quotas
+# are managed in the /ui Users tab (stored encrypted in store.db), not here.
 api_key: "sk-change-me"
 
 # How often (seconds) each backend's /v1/models is polled for liveness + model discovery.
@@ -119,8 +122,12 @@ virtual_models:
 # A ComfyUI backend speaks a different protocol than OpenAI, so it declares
 # `type: comfyui`. Discovery uses /object_info (not /v1/models); dispatch submits
 # a parametrized workflow and polls /history. Optional per-backend knobs:
-#   poll_interval  → seconds between /history polls (default 1.0)
-#   max_wait       → max seconds to wait for a result (default 600)
+#   poll_interval     → seconds between /history polls (default 1.0)
+#   max_wait          → max seconds to wait for a result (default 600)
+#   read_timeout      → per-HTTP-request read timeout (default 60); a hung /history
+#                       or /view read fails fast → failover, not a max_wait stall
+#   disconnect_grace  → seconds of continuous unreachability tolerated mid-run before
+#                       failing over to the next candidate (default 30)
 # (Backends still take `priority`, `enabled`, `max_concurrent` like any other.)
 #
 #   - name: ct452-comfy
@@ -172,10 +179,15 @@ virtual_models:
 #   prune_interval_s: 3600       # how often expired jobs are swept
 #   store_path: store.db         # writable generation-alias store (UI source of truth)
 
-# Generation management UI: a plain server-rendered console mounted at /ui on the
-# main port. Register a ComfyUI workflow, wire its node mapping (auto-suggested,
-# then editable), and run a generation from a playground. Auto-on whenever the
-# generation store is (i.e. when image_models is set, or jobs.enabled: true). The
-# store is seeded once from image_models above, then becomes the source of truth.
-# NOTE: the UI is currently unauthenticated — keep it on a trusted network; admin
-# auth + multi-user are a later phase.
+# Management console: a server-rendered UI mounted at /ui on the main port. Manage
+# backends, chat + generation aliases, workflow mappings, users, and server settings;
+# run a chat/image playground; watch jobs, stats, and the live routing map. Auto-on
+# whenever the store is (image_models set, or jobs.enabled: true, or any user exists).
+# The store (store.db) is seeded once from this config, then becomes the source of
+# truth — so you can run mostly from config OR mostly from the console.
+#
+# AUTH: the console is gated by an admin session once the gateway is "locked" (a
+# master api_key above OR at least one user in the Users tab). With neither, it's
+# bootstrap-open. Per-user keys carry an allow-list (chat/image aliases, model ids,
+# or whole backends — which also filters what each key sees in /v1/models) and an
+# optional monthly cost quota. Keep the console on a trusted network regardless.
