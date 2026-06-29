@@ -2374,7 +2374,11 @@ def _user_form(u: Optional[dict]) -> str:
     allowed = set((u or {}).get("models") or [])
     chat_al = sorted(set(_gateway_info().get("virtual_models", [])))
     img_al = sorted(store.list_aliases().keys()) if store.is_active() else []
-    bk_al = sorted(b.get("name", "") for b in _gateway_info().get("backends", []) if b.get("name"))
+    # Backend grants apply to LLM backends only (ComfyUI backends aren't in /v1/models;
+    # image access is granted via image aliases). Filtering them out also removes the
+    # confusing duplicate when an LLM and a ComfyUI backend share a name (e.g. gpu-3090).
+    bk_al = sorted({b["name"] for b in _gateway_info().get("backends", [])
+                    if b.get("name") and b.get("type", "openai") != "comfyui"})
     # chat/image aliases granted by name; a backend grants ALL of its models (and filters
     # what this user's key sees in /v1/models). Each kind gets a "select all" header row.
     rows = ""
