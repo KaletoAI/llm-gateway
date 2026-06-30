@@ -2258,7 +2258,12 @@ async def _autoresolve_ips() -> None:
 
 async def dashboard_page(request: Request):
     d = _dashboard_snapshot()
-    bes = d.get("backends", [])
+    bes_all = d.get("backends", [])
+    # Backends taken offline (disabled) are intentionally out of rotation — hide them
+    # from the live view (they stay manageable in the Backends tab). Draining ones stay
+    # enabled until idle, so they remain visible while finishing in-flight work.
+    offline = [b for b in bes_all if not b.get("enabled")]
+    bes = [b for b in bes_all if b.get("enabled")]
     up = sum(1 for b in bes if b.get("healthy"))
     jc = d.get("jobs_counts", {})
     active_jobs = (jc.get("queued", 0) or 0) + (jc.get("running", 0) or 0)
@@ -2297,8 +2302,9 @@ async def dashboard_page(request: Request):
         brows += (f"<tr><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td><td>{b.get('models', 0)}</td>"
                   f"<td>{b.get('priority')}</td></tr>")
+    off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
     backends_tbl = (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
-                    f"· click a header to sort</span></h2>"
+                    f"· click a header to sort{off_hint}</span></h2>"
                     f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
                     f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
                     f"<th>models</th><th>prio</th></tr>{brows}</table>")
