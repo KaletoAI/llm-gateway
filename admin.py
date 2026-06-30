@@ -227,6 +227,9 @@ textarea{height:auto;min-height:60px;padding:8px 10px;line-height:1.5}
 .card .cnum{font-size:22px;font-weight:600;color:#e8edf2}
 .card .clbl{font-size:12px;color:#8b97a4;margin-top:2px}
 table.recent{font-size:12px}
+table.sortable th{cursor:pointer;user-select:none}
+table.sortable th:hover{color:#dfe6ee}
+table.sortable th .sind{margin-left:4px;color:#5fb8c8;font-size:10px}
 """
 
 
@@ -247,12 +250,42 @@ _SCROLL_JS = ("<script>(function(){"
               "})();</script>")
 
 
+# Click-a-header to sort any `table.sortable` (numeric-aware: a cell that is a plain
+# number sorts numerically, otherwise lexically). The choice persists per table in
+# sessionStorage and is re-applied on load — so it survives the dashboard's 4s
+# auto-refresh. Tables with `data-sk` get a stable key; others key off path+index.
+_SORT_JS = ("<script>(function(){"
+            "function num(td){var t=(td.textContent||'').trim().replace(/[$,\\s]/g,'');"
+            "return /^-?\\d+(\\.\\d+)?$/.test(t)?parseFloat(t):null;}"
+            "function ind(th,a){var s=th.querySelector('.sind');"
+            "if(!s){s=document.createElement('span');s.className='sind';th.appendChild(s);}"
+            "s.textContent=a||'';}"
+            "function sortIt(tbl,idx,dir){var hdr=tbl.rows[0];"
+            "var rows=[].slice.call(tbl.rows).filter(function(r){return r!==hdr&&!r.querySelector('th');});"
+            "rows.sort(function(a,b){var x=a.cells[idx],y=b.cells[idx];if(!x||!y)return 0;"
+            "var nx=num(x),ny=num(y),r;if(nx!==null&&ny!==null)r=nx-ny;"
+            "else r=(x.textContent||'').trim().toLowerCase().localeCompare((y.textContent||'').trim().toLowerCase());"
+            "return dir<0?-r:r;});"
+            "var tb=tbl.tBodies[0]||tbl;rows.forEach(function(r){tb.appendChild(r);});"
+            "var hs=hdr.cells;for(var i=0;i<hs.length;i++)ind(hs[i],i===idx?(dir<0?'\\u25bc':'\\u25b2'):'');}"
+            "function key(tbl,i){return tbl.getAttribute('data-sk')||(location.pathname+'#'+i);}"
+            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
+            "var hdr=tbl.rows[0];if(!hdr)return;var k='sort:'+key(tbl,i);"
+            "[].forEach.call(hdr.cells,function(th,idx){th.addEventListener('click',function(){var c={};"
+            "try{c=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
+            "var dir=(c.idx===idx&&c.dir>0)?-1:1;sortIt(tbl,idx,dir);"
+            "try{sessionStorage.setItem(k,JSON.stringify({idx:idx,dir:dir}));}catch(e){}});});"
+            "var s={};try{s=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
+            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});"
+            "})();</script>")
+
+
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
           nologin: bool = False) -> str:
     meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
     head = "" if nologin else _nav(active)        # login page renders without the nav
     return (f'<!doctype html><html><head><meta charset="utf-8">{meta}<title>{_esc(title)} · Gateway</title>'
-            f"<style>{_CSS}</style></head><body>{head}<main>{body}</main>{_SCROLL_JS}</body></html>")
+            f"<style>{_CSS}</style></head><body>{head}<main>{body}</main>{_SCROLL_JS}{_SORT_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
@@ -2264,7 +2297,9 @@ async def dashboard_page(request: Request):
         brows += (f"<tr><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td><td>{b.get('models', 0)}</td>"
                   f"<td>{b.get('priority')}</td></tr>")
-    backends_tbl = (f"<h2>Backends</h2><table><tr><th>backend</th><th>type</th><th>status</th>"
+    backends_tbl = (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
+                    f"· click a header to sort</span></h2>"
+                    f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
                     f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
                     f"<th>models</th><th>prio</th></tr>{brows}</table>")
 
@@ -2293,8 +2328,8 @@ async def dashboard_page(request: Request):
                    f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
         jobs_html = (f"<h2>Image jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
                      f"{badges}</h2>"
-                     + (f"<table><tr><th>id</th><th>alias</th><th>backend</th><th>status</th>"
-                        f"<th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
+                     + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>id</th><th>alias</th>"
+                        f"<th>backend</th><th>status</th><th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
                         else "<p class='muted'>nothing running or recently finished</p>"))
     else:
         jobs_html = "<h2>Image jobs</h2><p class='hint'>Image generation is off.</p>"
@@ -2328,9 +2363,9 @@ async def dashboard_page(request: Request):
     llm_head = (f"<h2>Recent LLM calls <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
                 f"{runbadge}</h2>")
     if lr:
-        llm_html = (llm_head + f"<table class='recent'><tr><th>time</th><th>source</th><th>backend</th>"
-                    f"<th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th><th>req</th></tr>"
-                    f"{lr}</table>")
+        llm_html = (llm_head + f"<table class='recent sortable' data-sk='dash-llm'><tr><th>time</th>"
+                    f"<th>source</th><th>backend</th><th>alias→model</th><th>endpoint</th><th>status</th>"
+                    f"<th>dur</th><th>tok i/o</th><th>req</th></tr>{lr}</table>")
     elif not d.get("stats_active") and not nrun:
         llm_html = (llm_head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
                     "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
@@ -2368,9 +2403,9 @@ def _recent_calls_table(rows, aliases) -> str:
                 f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td><td>{view}</td></tr>")
     if not rec:
         return "<p class='muted'>no calls yet</p>"
-    return (f"<table class='recent filterable'><tr><th>time</th><th>source</th><th>backend</th>"
-            f"<th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th><th>cost</th><th>req</th></tr>"
-            f"{rec}</table>")
+    return (f"<table class='recent filterable sortable' data-sk='llm-calls'><tr><th>time</th><th>source</th>"
+            f"<th>backend</th><th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th>"
+            f"<th>cost</th><th>req</th></tr>{rec}</table>")
 
 
 async def llmcalls_page(request: Request):
@@ -2432,15 +2467,18 @@ async def statistic_page(request: Request):
              f"</div>")
     be = "".join(f"<tr><td>{_esc(r[0])}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td>"
                  f"<td>{_cost(r[4])}</td><td>{_dur(r[5])}</td></tr>" for r in s["by_backend"])
-    by_backend = (f"<h2>By backend</h2><table class='filterable'><tr><th>backend</th><th>calls</th><th>in tok</th>"
+    by_backend = (f"<h2>By backend</h2><table class='filterable sortable' data-sk='stat-backend'>"
+                  f"<tr><th>backend</th><th>calls</th><th>in tok</th>"
                   f"<th>out tok</th><th>cost</th><th>avg</th></tr>{be}</table>" if be
                   else "<h2>By backend</h2><p class='muted'>no calls yet</p>")
     mo = "".join(f"<tr><td>{_esc(r[0]) or '—'}</td><td><code>{_esc(r[1])}</code></td><td>{r[2]}</td>"
                  f"<td>{r[3]}</td><td>{r[4]}</td><td>{_cost(r[5])}</td></tr>" for r in s["by_model"])
-    by_model = (f"<h2>By alias / model</h2><table class='filterable'><tr><th>alias</th><th>model</th><th>calls</th>"
+    by_model = (f"<h2>By alias / model</h2><table class='filterable sortable' data-sk='stat-model'>"
+                f"<tr><th>alias</th><th>model</th><th>calls</th>"
                 f"<th>in</th><th>out</th><th>cost</th></tr>{mo}</table>" if mo else "")
     so = "".join(f"<tr><td>{_esc(_src_name(r[0], aliases))}</td><td>{r[1]}</td><td>{_cost(r[2])}</td></tr>" for r in s["by_source"])
-    by_source = (f"<h2>By user / source</h2><table class='filterable'><tr><th>source</th><th>calls</th><th>cost</th></tr>"
+    by_source = (f"<h2>By user / source</h2><table class='filterable sortable' data-sk='stat-source'>"
+                 f"<tr><th>source</th><th>calls</th><th>cost</th></tr>"
                  f"{so}</table>" if so else "")
     # Per-call history lives in its own tab now (the LLM Calls list) — keep Statistic
     # to the aggregates. Point there so the link is discoverable.
