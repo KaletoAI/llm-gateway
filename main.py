@@ -407,11 +407,20 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
         return True
     if bare in allow:                            # bare model id explicitly granted
         return True
-    # bare request, no prefix: allow if a GRANTED backend hosts this model — so a backend
-    # grant covers bare ids too. Routing then decides availability (e.g. 503 when the host
+    # Otherwise allow if a GRANTED backend either HOSTS this model (a bare real id) or
+    # MAPS it as a virtual alias — so a whole-backend grant also covers the bare ids and
+    # the aliases that route to it. Routing then decides availability (503 when the host
     # is offline) instead of a misleading 403. Disabled backends keep their last model set.
-    return any(b.get("name") in allow and bare in backend_models.get(backend_id(b), set())
-               for b in backends if b.get("type", "openai") != "comfyui")
+    is_alias = model in virtual_models
+    for b in backends:
+        if b.get("type", "openai") == "comfyui" or b.get("name") not in allow:
+            continue
+        served = backend_models.get(backend_id(b), set())
+        if bare in served:                                       # real model on a granted backend
+            return True
+        if is_alias and alias_entry(model, b["name"])[0] in served:   # alias → granted backend's model
+            return True
+    return False
 
 
 def gate_request(authorization: Optional[str], request: Request, model: Optional[str]) -> Optional[dict]:
