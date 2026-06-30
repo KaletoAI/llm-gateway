@@ -2312,10 +2312,13 @@ async def dashboard_page(request: Request):
     now = int(time.time())
     if d.get("jobs_active"):
         order = (("running", "warn"), ("queued", "warn"), ("done", "ok"), ("failed", "bad"))
-        badges = " ".join(_badge(f"{k} {jc.get(k, 0)}", kind) for k, kind in order if jc.get(k))
         # Running/queued now, plus anything that finished within the last 5 min.
         recent_jobs = [j for j in d.get("jobs_recent", [])
                        if j.get("status") in ("running", "queued") or int(j.get("updated") or 0) > now - 300]
+        # Badges count this same window — not lifetime totals — so they can't claim
+        # "done 12" while the list shows nothing recent (lifetime is in the Image Jobs tab).
+        wc = {k: sum(1 for j in recent_jobs if j.get("status") == k) for k, _ in order}
+        badges = " ".join(_badge(f"{k} {wc[k]}", kind) for k, kind in order if wc[k])
         jr = ""
         for j in recent_jobs:
             st = j["status"]
