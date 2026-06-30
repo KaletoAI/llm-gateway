@@ -186,6 +186,11 @@ class AdapterContext:
     source_of: Callable[[Request], str]
     record_call: Callable[..., Any]
     log_enabled: Callable[[], bool]
+    # Live LLM-call registry (dashboard "running calls"). Same lifecycle as the
+    # in-flight counter — register at dispatch start, drop on completion incl. the
+    # streamed-finally. Default no-ops so non-main constructions stay valid.
+    active_register: Callable[[dict], Any] = lambda meta: None
+    active_done: Callable[[Any], None] = lambda token: None
 
 
 class BackendAdapter(ABC):
@@ -276,6 +281,10 @@ class OpenAIAdapter(BackendAdapter):
         req_text = json.dumps(req.body, ensure_ascii=False)
         started = time.monotonic()
         log_on = ctx.log_enabled()
+        act = ctx.active_register({                # dropped on completion (both finally paths)
+            "alias": req.alias, "model": real_model, "backend": bname, "source": source,
+            "endpoint": (req.stats_endpoint or req.path), "stream": bool(req.body.get("stream")),
+        })
 
         if req.body.get("stream"):
             path, alias = req.path, req.alias
@@ -305,6 +314,7 @@ class OpenAIAdapter(BackendAdapter):
                                         in_tok, out_tok = got
                 finally:
                     ctx.inflight_dec(self.bid)
+                    ctx.active_done(act)
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 cost = ctx.cost_usd(self.bid, real_model, in_tok, out_tok) if (in_tok or out_tok) else 0.0
                 asyncio.create_task(ctx.record_call(
@@ -321,6 +331,7 @@ class OpenAIAdapter(BackendAdapter):
                 resp = await client.post(url, json=req.body, headers=headers, timeout=300.0)
         finally:
             ctx.inflight_dec(self.bid)
+            ctx.active_done(act)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if log_on:
             logger.info(f"← [{bname}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")

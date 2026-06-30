@@ -59,6 +59,17 @@ def recent(limit: int = 15) -> list:
               "input_tokens, output_tokens, cost_usd FROM calls ORDER BY id DESC LIMIT ?", limit)
 
 
+def recent_since(ts: int, limit: int = 100) -> list:
+    """Calls completed since `ts` (unix secs), newest first — the dashboard's
+    'last N minutes' window. Same column shape as summary()['recent'] so it
+    renders with the identical row template."""
+    if _DB_PATH is None:
+        return []
+    return _q("SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
+              "input_tokens, output_tokens, cost_usd, req_preview, has_body "
+              "FROM calls WHERE ts > ? ORDER BY id DESC LIMIT ?", ts, limit)
+
+
 def count_since(ts: int) -> int:
     if _DB_PATH is None:
         return 0

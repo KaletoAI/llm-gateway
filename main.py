@@ -192,6 +192,27 @@ def _inflight_dec(name: str) -> None:
     _notify_slot_free()
 
 
+# ── Live LLM-call registry (dashboard "running calls") ────────────────────────
+# Currently-running chat/completions/embeddings forwards, so the console can show
+# what's in flight right now. Registered when dispatch starts, dropped on
+# completion (incl. the streamed-finally) — same lifecycle as the in-flight
+# counter. Once finished, the call lands in stats; the dashboard's 5-minute
+# "recently ended" view reads from there, so this holds only the live set.
+_active_calls: dict = {}                 # token → {alias, model, backend, source, endpoint, stream, started}
+_active_seq: list = [0]
+
+
+def _active_register(meta: dict) -> int:
+    _active_seq[0] += 1
+    token = _active_seq[0]
+    _active_calls[token] = {**meta, "started": time.time()}
+    return token
+
+
+def _active_done(token) -> None:
+    _active_calls.pop(token, None)
+
+
 # ── Call parking (queue instead of immediate busy/503) ────────────────────────
 # When every backend mapping an alias is at its in-flight cap, hold the request
 # until a slot frees (sync) instead of returning 503. One global FIFO of waiter
@@ -678,6 +699,8 @@ adapter_ctx = AdapterContext(
     source_of=_source_of,
     record_call=stats.record_call,
     log_enabled=lambda: log_per_call,
+    active_register=_active_register,
+    active_done=_active_done,
 )
 
 
@@ -1758,6 +1781,9 @@ def dashboard_snapshot() -> dict:
         "jobs_recent": jobs.recent(15),
         "stats_active": stats.is_active(),
         "calls_24h": stats.count_since(int(time.time()) - 86400),
+        # Recent LLM calls = currently running (live registry) + ended in the last 5 min (stats).
+        "llm_running": sorted(_active_calls.values(), key=lambda c: c.get("started", 0)),
+        "llm_recent": stats.recent_since(int(time.time()) - 300) if stats.is_active() else [],
     }
 
 

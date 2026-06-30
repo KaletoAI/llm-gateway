@@ -40,7 +40,7 @@ TABS = [
     ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
     ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
     ("chatplay", "Chat Playground"), ("playground", "Image Playground"),
-    ("jobs", "Image Jobs"),
+    ("jobs", "Image Jobs"), ("llmcalls", "LLM Calls"),
     ("statistic", "Statistic"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
@@ -2255,11 +2255,15 @@ async def dashboard_page(request: Request):
     backends_tbl = (f"<h2>Backends</h2><table><tr><th>backend</th><th>type</th><th>status</th>"
                     f"<th>in flight</th><th>models</th><th>prio</th></tr>{brows}</table>")
 
+    now = int(time.time())
     if d.get("jobs_active"):
         order = (("running", "warn"), ("queued", "warn"), ("done", "ok"), ("failed", "bad"))
         badges = " ".join(_badge(f"{k} {jc.get(k, 0)}", kind) for k, kind in order if jc.get(k))
+        # Running/queued now, plus anything that finished within the last 5 min.
+        recent_jobs = [j for j in d.get("jobs_recent", [])
+                       if j.get("status") in ("running", "queued") or int(j.get("updated") or 0) > now - 300]
         jr = ""
-        for j in d.get("jobs_recent", []):
+        for j in recent_jobs:
             st = j["status"]
             scls = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}.get(st, "muted")
             cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
@@ -2274,22 +2278,118 @@ async def dashboard_page(request: Request):
                    f"<td>{_esc(j.get('backend'))}</td><td><span class='badge {scls}'>{_esc(st)}</span></td>"
                    f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
                    f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
-        jobs_html = (f"<h2>Image jobs {badges}</h2>"
+        jobs_html = (f"<h2>Image jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
+                     f"{badges}</h2>"
                      + (f"<table><tr><th>id</th><th>alias</th><th>backend</th><th>status</th>"
                         f"<th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
-                        else "<p class='muted'>no jobs yet</p>"))
+                        else "<p class='muted'>nothing running or recently finished</p>"))
     else:
         jobs_html = "<h2>Image jobs</h2><p class='hint'>Image generation is off.</p>"
 
-    # No "Recent calls" here — that lives in the Statistic tab (avoid duplication).
+    # Recent LLM calls: currently running (live registry) + finished within the last
+    # 5 min (stats). The full per-call history lives in the LLM Calls tab.
+    aliases = store.get_ip_aliases()
+    lr = ""
+    for c in d.get("llm_running", []):
+        started = int(c.get("started") or 0)
+        model, alias = c.get("model"), c.get("alias")
+        am = (_esc(alias) or "") + (("→" + _esc(model)) if model else "")
+        lr += (f"<tr><td class='muted'>now</td><td>{_esc(_src_name(c.get('source', ''), aliases))}</td>"
+               f"<td>{_esc(c.get('backend'))}</td><td>{am}</td>"
+               f"<td class='muted'>{_esc((c.get('endpoint') or '').replace('/v1/', ''))}</td>"
+               f"<td><span class='badge warn'>running</span></td>"
+               f"<td class='muted jdur' data-since='{started}'>{_dur((now - started) * 1000)}</td>"
+               f"<td class='muted'>—</td><td class='muted'>—</td></tr>")
+    for r in d.get("llm_recent", []):
+        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body = r
+        scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
+        am = (_esc(alias) or "") + (("→" + _esc(model)) if model else "")
+        view = f"<a href='/ui/call/{cid}'>view</a>" if has_body else "<span class='muted'>—</span>"
+        lr += (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td>"
+               f"<td>{_esc(backend)}</td><td>{am}</td>"
+               f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
+               f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
+               f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{view}</td></tr>")
+    nrun = len(d.get("llm_running", []))
+    runbadge = _badge(f"running {nrun}", "warn") if nrun else ""
+    llm_head = (f"<h2>Recent LLM calls <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
+                f"{runbadge}</h2>")
+    if lr:
+        llm_html = (llm_head + f"<table class='recent'><tr><th>time</th><th>source</th><th>backend</th>"
+                    f"<th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th><th>req</th></tr>"
+                    f"{lr}</table>")
+    elif not d.get("stats_active") and not nrun:
+        llm_html = (llm_head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
+                    "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
+                    "and the full <a href='/ui/llmcalls'>LLM Calls</a> log.</p>")
+    else:
+        llm_html = llm_head + "<p class='muted'>nothing running or in the last 5 min</p>"
+
     tick = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
             "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
             "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
             ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
             "setInterval(_td,1000);_td();</script>")
     body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
-            + cards + backends_tbl + jobs_html + tick)
+            + cards + backends_tbl + llm_html + jobs_html + tick)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
+
+
+def _recent_calls_table(rows, aliases) -> str:
+    """The per-call history table (time/source/backend/alias→model/…/req body link).
+    Shared row template — also reused by the dashboard's running+5min LLM view."""
+    rec = ""
+    for r in rows:
+        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body = r
+        scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
+        if has_body:
+            view = f"<a href='/ui/call/{cid}' title='{_esc(prev or '')}'>view</a>"
+        elif prev:
+            view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
+        else:
+            view = "<span class='muted'>—</span>"
+        rec += (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
+                f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
+                f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
+                f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
+                f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td><td>{view}</td></tr>")
+    if not rec:
+        return "<p class='muted'>no calls yet</p>"
+    return (f"<table class='recent filterable'><tr><th>time</th><th>source</th><th>backend</th>"
+            f"<th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th><th>cost</th><th>req</th></tr>"
+            f"{rec}</table>")
+
+
+async def llmcalls_page(request: Request):
+    """Per-call LLM history — the analogue of the Image Jobs tab. A filterable list
+    of recent chat/completions/embeddings forwards; each row links to its stored
+    request/response body (/ui/call/{id})."""
+    if not stats.is_active():
+        return HTMLResponse(_page("LLM Calls", "<h2>LLM Calls</h2><p class='hint'>Call recording is off. "
+            "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to log "
+            "per-call history here.</p>", "llmcalls"))
+    user = (request.query_params.get("user") or "").strip() or None
+    s = stats.summary(recent_limit=300, user=user)
+    aliases = store.get_ip_aliases()
+    _box = ("padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0")
+    opts = "<option value=''>all users</option>" + "".join(
+        f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
+        for r in s["by_source"])
+    picker = (f"<select style=\"width:auto;{_box}\" onchange=\"location.href='/ui/llmcalls'+"
+              f"(this.value?('?user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
+    search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
+              f"placeholder='filter rows: backend / alias / model / user…' "
+              f"style=\"flex:1;min-width:220px;max-width:420px;{_box}\">")
+    scope = (f" · <span class='muted' style='font-weight:normal'>user <b>{_esc(user)}</b> · "
+             f"<a href='/ui/llmcalls'>clear</a></span>") if user else ""
+    sfjs = ("<script>function sfRun(){var q=(document.getElementById('sf').value||'').toLowerCase();"
+            "document.querySelectorAll('.filterable tr').forEach(function(r){"
+            "if(r.getElementsByTagName('th').length)return;"
+            "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}</script>")
+    head = (f"<h2>LLM Calls{scope} <span class='muted' style='font-weight:normal'>· last {len(s['recent'])}</span></h2>"
+            f"<div style='display:flex;gap:10px;align-items:center;margin:6px 0 10px'>{picker}{search}</div>")
+    body = head + _recent_calls_table(s["recent"], aliases) + sfjs
+    return HTMLResponse(_page("LLM Calls", body, "llmcalls"))
 
 
 async def statistic_page(request: Request):
@@ -2329,24 +2429,10 @@ async def statistic_page(request: Request):
     so = "".join(f"<tr><td>{_esc(_src_name(r[0], aliases))}</td><td>{r[1]}</td><td>{_cost(r[2])}</td></tr>" for r in s["by_source"])
     by_source = (f"<h2>By user / source</h2><table class='filterable'><tr><th>source</th><th>calls</th><th>cost</th></tr>"
                  f"{so}</table>" if so else "")
-    rec = ""
-    for r in s["recent"]:
-        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body = r
-        scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
-        if has_body:
-            view = f"<a href='/ui/call/{cid}' title='{_esc(prev or '')}'>view</a>"
-        elif prev:
-            view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
-        else:
-            view = "<span class='muted'>—</span>"
-        rec += (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
-                f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
-                f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
-                f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
-                f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td><td>{view}</td></tr>")
-    recent = (f"<h2>Recent calls</h2><table class='recent filterable'><tr><th>time</th><th>source</th><th>backend</th>"
-              f"<th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th><th>cost</th><th>req</th></tr>"
-              f"{rec}</table>" if rec else "<h2>Recent calls</h2><p class='muted'>no calls yet</p>")
+    # Per-call history lives in its own tab now (the LLM Calls list) — keep Statistic
+    # to the aggregates. Point there so the link is discoverable.
+    recent = ("<p class='hint' style='margin-top:18px'>Per-call history (with request/response bodies) "
+              "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
     sfjs = ("<script>function sfRun(){var q=(document.getElementById('sf').value||'').toLowerCase();"
             "document.querySelectorAll('.filterable tr').forEach(function(r){"
             "if(r.getElementsByTagName('th').length)return;"
@@ -2368,8 +2454,8 @@ async def call_view(call_id: int, request: Request):
         inner = (f"<h3>Request</h3><pre class='chatout'>{_esc(req)}</pre>"
                  f"<h3>Response</h3><pre class='chatout'>{_esc(resp)}</pre>")
     page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
-            f"{_btn('← Back to Statistic', '/ui/statistic', 'secondary')}</div>{inner}")
-    return HTMLResponse(_page("Call", page, "statistic"))
+            f"{_btn('← Back to LLM Calls', '/ui/llmcalls', 'secondary')}</div>{inner}")
+    return HTMLResponse(_page("Call", page, "llmcalls"))
 
 
 def _user_form(u: Optional[dict]) -> str:
@@ -2769,6 +2855,7 @@ def register(app) -> None:
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/cancel", job_cancel, methods=["GET"])
     app.add_api_route("/ui/dashboard", dashboard_page, methods=["GET"])
+    app.add_api_route("/ui/llmcalls", llmcalls_page, methods=["GET"])
     app.add_api_route("/ui/statistic", statistic_page, methods=["GET"])
     app.add_api_route("/ui/call/{call_id}", call_view, methods=["GET"])
     app.add_api_route("/ui/users", users_page, methods=["GET"])
