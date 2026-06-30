@@ -1759,9 +1759,15 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
 def dashboard_snapshot() -> dict:
     """Live 'what's happening now' for the dashboard: per-backend status + in-flight,
     LLM/image activity totals, image-job counts + recent, and recent calls."""
+    hour_ago = int(time.time()) - 3600
+    calls_1h = stats.count_by_backend_since(hour_ago) if stats.is_active() else {}
+    jobs_1h = jobs.count_by_backend_since(hour_ago) if jobs.is_active() else {}
     bes = []
     for b in backends:
         bid, en = backend_id(b), is_enabled(b)
+        # requests handled in the last hour: LLM calls from stats, image jobs from the
+        # job store (an LLM and a ComfyUI backend may share a name → pick by type).
+        src_1h = jobs_1h if b.get("type") == "comfyui" else calls_1h
         bes.append({
             "name": b["name"], "type": b.get("type", "openai"), "priority": b["priority"],
             "enabled": en, "healthy": en and backend_healthy.get(bid, False),
@@ -1769,6 +1775,7 @@ def dashboard_snapshot() -> dict:
             "draining": is_draining(b),
             "max_concurrent": backend_max_concurrent(b),
             "models": len(backend_models.get(bid, set())),
+            "reqs_1h": src_1h.get(b["name"], 0),
         })
     is_comfy = lambda b: b.get("type") == "comfyui"
     return {

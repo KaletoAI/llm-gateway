@@ -199,6 +199,7 @@ tr.sel td{background:#19222e}
 .badge{font-size:11px;font-weight:500;padding:1px 7px;border-radius:10px;margin-left:7px;white-space:nowrap}
 .badge.ok{background:#16361f;color:#5cb87f}.badge.bad{background:#3a1b1b;color:#e06c6c}.badge.muted{background:#23262d;color:#7e8b99}
 .badge.warn{background:#3a2f12;color:#d8b35a}
+.badge.llm{background:#13303a;color:#5fb8c8}.badge.img{background:#2a1d3a;color:#bb8ce6}
 tr.grp td{background:#13161c;font-weight:600}
 .grouphdr{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#8b97a4;font-weight:600;margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid #242a33}
 .grouphdr:first-child{margin-top:4px}
@@ -316,6 +317,15 @@ def _item(title: str, sub: str, acts: str, sel: bool = False) -> str:
 def _badge(text: str, kind: str = "muted", title: str = "") -> str:
     t = f' title="{_esc(title)}"' if title else ""
     return f'<span class="badge {kind}"{t}>{_esc(text)}</span>'
+
+
+def _type_badge(t: str) -> str:
+    """Color-coded chip for a backend's protocol type, so the two kinds stand out at
+    a glance in mixed lists (LLM and image-generation backends share these tables)."""
+    t = (t or "openai").lower()
+    if t == "comfyui":
+        return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
+    return _badge(f"💬 {t}", "llm", "LLM backend (OpenAI-compatible)")
 
 
 def _qp(request: Request, key: str, default: str = "") -> str:
@@ -658,8 +668,8 @@ async def backends_page(request: Request):
         acts = _icon_acts(*acts_list)
         src = "" if b.get("source") == "ui" else " · config"
         flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local") if b.get(fl))
-        sub = f"{b['type']} · {b['url']} · prio {b['priority']} · {b['models']} models{flags}{src}"
-        return _item(f"{_esc(b['name'])}{badge}", sub, acts, sel=(bid == edit_id))
+        sub = f"{b['url']} · prio {b['priority']} · {b['models']} models{flags}{src}"
+        return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Image (comfyui), alphabetical within each
     binfo = sorted(binfo, key=lambda b: b["name"].lower())
@@ -2249,11 +2259,14 @@ async def dashboard_page(request: Request):
     for b in sorted(bes, key=lambda x: (_srank(x), x.get("name", "").lower())):
         cap = b.get("max_concurrent")
         inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
-        brows += (f"<tr><td>{_esc(b['name'])}</td><td class='muted'>{_esc(b.get('type'))}</td>"
-                  f"<td>{bstatus(b)}</td><td>{inf}</td><td>{b.get('models', 0)}</td>"
+        r1h = b.get("reqs_1h", 0)
+        r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
+        brows += (f"<tr><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
+                  f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td><td>{b.get('models', 0)}</td>"
                   f"<td>{b.get('priority')}</td></tr>")
     backends_tbl = (f"<h2>Backends</h2><table><tr><th>backend</th><th>type</th><th>status</th>"
-                    f"<th>in flight</th><th>models</th><th>prio</th></tr>{brows}</table>")
+                    f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
+                    f"<th>models</th><th>prio</th></tr>{brows}</table>")
 
     now = int(time.time())
     if d.get("jobs_active"):

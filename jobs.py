@@ -96,6 +96,17 @@ def counts() -> dict:
     return {r[0]: r[1] for r in rows}
 
 
+def count_by_backend_since(ts: int) -> dict:
+    """Jobs created per backend since `ts` — the dashboard's per-backend request
+    rate for image-generation backends. Empty if the job store is off."""
+    if not _active:
+        return {}
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT backend, COUNT(*) FROM jobs WHERE created > ? GROUP BY backend", (ts,)).fetchall()
+    return {r[0]: r[1] for r in rows if r[0]}
+
+
 def recent(limit: int = 20) -> list:
     """Most recent jobs (metadata only), newest first."""
     if not _active:

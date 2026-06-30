@@ -76,6 +76,15 @@ def count_since(ts: int) -> int:
     return _q("SELECT COUNT(*) FROM calls WHERE ts > ?", ts)[0][0]
 
 
+def count_by_backend_since(ts: int) -> dict:
+    """Calls per backend (display name) completed since `ts` — the dashboard's
+    per-backend request rate. Empty if stats are off."""
+    if _DB_PATH is None:
+        return {}
+    return {r[0]: r[1] for r in
+            _q("SELECT backend, COUNT(*) FROM calls WHERE ts > ? GROUP BY backend", ts)}
+
+
 def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 20,
             user: Optional[str] = None) -> dict:
     """Aggregated call stats for the in-UI dashboard (data only, no HTML). If
