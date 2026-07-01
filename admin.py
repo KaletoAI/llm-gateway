@@ -39,8 +39,8 @@ _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", 
 TABS = [
     ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
     ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
-    ("chatplay", "Chat Playground"), ("playground", "Image Playground"),
-    ("jobs", "Image Jobs"), ("llmcalls", "LLM Calls"),
+    ("chatplay", "Chat Playground"), ("playground", "Media Playground"),
+    ("jobs", "Media Jobs"), ("llmcalls", "LLM Calls"),
     ("statistic", "Statistic"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
@@ -1952,7 +1952,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                          for b in bk_list))
     backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
-            f'<div class="formbar"><h2>Playground</h2>{_btn("Generate", submit=True)}</div>'
+            f'<div class="formbar"><h2>Media Playground</h2>{_btn("Generate", submit=True)}</div>'
             + _field("alias", alias_select)
             + backend_field
             + rows
@@ -2002,7 +2002,7 @@ async def playground_page(request: Request):
         return _inactive()
     aliases = list(store.list_aliases().keys())
     if not aliases:
-        return HTMLResponse(_page("Playground", "<h2>Playground</h2><p class='hint'>Register an alias in "
+        return HTMLResponse(_page("Media Playground", "<h2>Media Playground</h2><p class='hint'>Register an alias in "
             "the <a href='/ui/mapping'>Mapping</a> tab first.</p>", "playground"))
     qp = request.query_params
     model = qp.get("model", "") or aliases[0]   # first load: pick the first alias
@@ -2019,12 +2019,12 @@ async def playground_page(request: Request):
     if job_id:
         result_html, refresh = _job_result_html(job_id, jobs.get(job_id))
     else:
-        result_html = "<h2>Result</h2><p class='hint'>Generate to see the image here.</p>"
+        result_html = "<h2>Result</h2><p class='hint'>Generate to see the result here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
     kept = set(_pg_images.get((_session_user(request) or "default", model), {}).keys())
     poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
-    return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
+    return HTMLResponse(_page("Media Playground", _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
                               "playground"))
 
 
@@ -2069,7 +2069,7 @@ async def generate(request: Request):
     except HTTPException as e:
         aliases = list(store.list_aliases().keys())
         result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
-        return HTMLResponse(_page("Playground", _playground_body(aliases, vals, cand, result_html,
+        return HTMLResponse(_page("Media Playground", _playground_body(aliases, vals, cand, result_html,
                                   kept=set(stash.keys())), "playground"))
     # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
     q = urlencode({"model": model, "backend": force_bk, "job": view.get("job_id", ""),
@@ -2093,7 +2093,7 @@ async def playground_status(job_id: str):
     return HTMLResponse(html)
 
 
-# ── Image Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
+# ── Media Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
 
 _JOB_TICK = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
              "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
@@ -2110,8 +2110,8 @@ async def jobs_page(request: Request):
         return _inactive()
     rows = [j for j in jobs.recent(200) if j.get("task") != "chat"]
     if not rows:
-        return HTMLResponse(_page("Image Jobs", "<h2>Image Jobs</h2><p class='hint'>No generation "
-            "jobs yet. Run one in the <a href='/ui/playground'>Image Playground</a>.</p>", "jobs"))
+        return HTMLResponse(_page("Media Jobs", "<h2>Media Jobs</h2><p class='hint'>No generation "
+            "jobs yet. Run one in the <a href='/ui/playground'>Media Playground</a>.</p>", "jobs"))
     now = int(time.time())
     tr = ""
     for j in rows:
@@ -2139,7 +2139,7 @@ async def jobs_page(request: Request):
     tbl = (f"<table><tr><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
            f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
-    return HTMLResponse(_page("Image Jobs", f"<h2>Image Jobs</h2>{tbl}{_JOB_TICK}", "jobs", refresh=refresh))
+    return HTMLResponse(_page("Media Jobs", f"<h2>Media Jobs</h2>{tbl}{_JOB_TICK}", "jobs", refresh=refresh))
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
@@ -2164,7 +2164,7 @@ async def job_detail_page(job_id: str, request: Request):
     if not jobs.is_active():
         return _inactive()
     job = jobs.get(job_id)
-    back = _btn("← Back to Jobs", "/ui/jobs", "secondary")
+    back = _btn("← Back to Media Jobs", "/ui/jobs", "secondary")
     if job is None:
         return HTMLResponse(_page("Job", f"<div class='bar'><h2>Job</h2>{back}</div>"
             f"<p class='bad'>job {_esc(job_id)} not found (or pruned past its TTL).</p>", "jobs"), status_code=404)
@@ -2313,7 +2313,7 @@ async def dashboard_page(request: Request):
     cards = ("<div class='cards'>"
              + card(d.get("llm_inflight", 0), "LLM in flight")
              + card(d.get("parked", 0), "calls parked")
-             + card(active_jobs, "image jobs active")
+             + card(active_jobs, "media jobs active")
              + card(f"{up}/{len(bes)}", "backends up")
              + (card(d.get("calls_24h", 0), "calls · 24h") if d.get("stats_active") else "")
              + "</div>")
@@ -2356,7 +2356,7 @@ async def dashboard_page(request: Request):
         recent_jobs = [j for j in d.get("jobs_recent", [])
                        if j.get("status") in ("running", "queued") or int(j.get("updated") or 0) > now - 300]
         # Badges count this same window — not lifetime totals — so they can't claim
-        # "done 12" while the list shows nothing recent (lifetime is in the Image Jobs tab).
+        # "done 12" while the list shows nothing recent (lifetime is in the Media Jobs tab).
         wc = {k: sum(1 for j in recent_jobs if j.get("status") == k) for k, _ in order}
         badges = " ".join(_badge(f"{k} {wc[k]}", kind) for k, kind in order if wc[k])
         jr = ""
@@ -2375,13 +2375,13 @@ async def dashboard_page(request: Request):
                    f"<td>{_esc(j.get('backend'))}</td><td><span class='badge {scls}'>{_esc(st)}</span></td>"
                    f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
                    f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
-        jobs_html = (f"<h2>Image jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
+        jobs_html = (f"<h2>Media jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
                      f"{badges}</h2>"
                      + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>id</th><th>alias</th>"
                         f"<th>backend</th><th>status</th><th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
                         else "<p class='muted'>nothing running or recently finished</p>"))
     else:
-        jobs_html = "<h2>Image jobs</h2><p class='hint'>Image generation is off.</p>"
+        jobs_html = "<h2>Media jobs</h2><p class='hint'>Media generation is off.</p>"
 
     # Recent LLM calls: currently running (live registry) + finished within the last
     # 5 min (stats). The full per-call history lives in the LLM Calls tab.
@@ -2473,7 +2473,7 @@ def _recent_calls_table(rows, aliases) -> str:
 
 
 async def llmcalls_page(request: Request):
-    """Per-call LLM history — the analogue of the Image Jobs tab. A filterable list
+    """Per-call LLM history — the analogue of the Media Jobs tab. A filterable list
     of recent chat/completions/embeddings forwards; each row links to its stored
     request/response body (/ui/call/{id})."""
     if not stats.is_active():
