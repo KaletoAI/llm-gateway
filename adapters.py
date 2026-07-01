@@ -272,7 +272,7 @@ class OpenAIAdapter(BackendAdapter):
         url = f"{b['url']}{req.path}"
         headers = {
             k: v for k, v in req.raw.headers.items()
-            if k.lower() not in ("host", "content-length", "authorization")
+            if k.lower() not in ("host", "content-length", "authorization", "x-park-mode")
         }
         headers.update(ctx.auth_headers(b))
         ctx.inflight_inc(self.bid)        # released on completion (stream close / return / error)

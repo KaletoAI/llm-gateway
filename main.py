@@ -739,17 +739,26 @@ def build_backend_adapters() -> None:
 build_backend_adapters()
 
 
-def _park_mode(body: dict, request: Request) -> Optional[str]:
-    """Optional client override of the parking mode: body `park` ("sync"|"async"|true)
-    or the `X-Park-Mode` header. None → the default (sync park). Only "async" changes
-    behaviour now — sync parking is the default and needs no client field."""
-    v = body.get("park")
-    if v is True:
-        return "sync"
-    if isinstance(v, str) and v.strip().lower() in ("sync", "async"):
-        return v.strip().lower()
-    h = (request.headers.get("x-park-mode") or "").strip().lower()
-    return h if h in ("sync", "async") else None
+async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, deadline=None):
+    """Forward to a ready backend; if all mapping backends are busy, hold the call in
+    the park queue until one frees (then dispatch) or 503. Park window = the alias's
+    park time, or an explicit `deadline` (background responses use the longer async
+    window). Shared by chat routing, the Responses bridge, and background responses."""
+    ready, busy = resolve_routes(alias)
+    if ready:
+        return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
+    if not busy:
+        raise HTTPException(503, f"No healthy backend for model '{alias}'")
+    if deadline is None:
+        ptime = _park_time_for(alias)
+        if ptime <= 0:                                 # parking disabled for this alias → 503 now
+            raise HTTPException(503, f"all backends for '{alias}' are busy (parking disabled)",
+                                headers={"Retry-After": "1"})
+        deadline = time.monotonic() + ptime
+    if len(_parked) >= max_parked:
+        raise HTTPException(503, f"park queue full ({max_parked}) — retry later", headers={"Retry-After": "2"})
+    return await _park_and_dispatch(alias, path, body, request, deadline,
+                                    source=_source_of(request), stats_endpoint=stats_endpoint)
 
 
 async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=None):
@@ -778,7 +787,7 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
     raise HTTPException(503, f"All backends failed: {last_error}")
 
 
-async def _park_and_dispatch(alias, path, body, request, deadline, source="?"):
+async def _park_and_dispatch(alias, path, body, request, deadline, source="?", stats_endpoint=None):
     """Hold a request in the park queue until a mapping backend frees (then dispatch),
     or until `deadline` (→ 503). The entry stays in `_parked` for the whole wait so it
     keeps its FIFO position and shows in the console; `_notify_slot_free` wakes it."""
@@ -790,7 +799,7 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?"):
             entry["event"].clear()                     # arm before checking → no lost wakeup
             ready, busy = resolve_routes(alias)
             if ready:
-                return await _dispatch_over(ready, path, alias, body, request)
+                return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
             if not busy:
                 raise HTTPException(503, f"No healthy backend for model '{alias}'")
             remaining = deadline - time.monotonic()
@@ -809,56 +818,15 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?"):
             pass
 
 
-async def _run_parked_job(job_id, alias, path, body, request):
-    """Background worker for async-parked chat calls: park until a slot frees,
-    dispatch, then store the completion JSON on the job (else mark it failed).
-    Non-streaming — the result is fetched via GET /v1/jobs/{id}, not streamed."""
-    try:
-        resp = await _park_and_dispatch(alias, path, body, request,
-                                        time.monotonic() + async_park_timeout_s,
-                                        source=_source_of(request))
-        data = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
-        jobs.complete_json(job_id, data, meta={"model": data.get("model")})
-    except HTTPException as e:
-        jobs.fail(job_id, f"{e.status_code}: {e.detail}")
-    except Exception as e:                              # never let a background task vanish silently
-        logger.warning(f"parked job {job_id} failed: {e}")
-        jobs.fail(job_id, str(e))
-
-
 async def route(path: str, request: Request, authorization: Optional[str]) -> JSONResponse | StreamingResponse:
     body = await request.json()
     alias = body.get("model", "")
     gate_request(authorization, request, alias)        # auth + model allow-list + quota
-    park = _park_mode(body, request)
-    body.pop("park", None)                              # control field — never forward to backends
-
-    ready, busy = resolve_routes(alias)
-    if ready:
-        return await _dispatch_over(ready, path, alias, body, request)
-    if not busy:
-        raise HTTPException(503, f"No healthy backend for model '{alias}'")
-    # All mapping backends are busy. Parking is the DEFAULT (no client field needed):
-    # the call queues until a backend frees or its park time elapses (→ 503). `async`
-    # is an explicit opt-in that hands back a job id instead of blocking.
-    if park == "async":
-        if not jobs.is_active():
-            raise HTTPException(503, "async parking unavailable (job store off)")
-        if len(_parked) >= max_parked:
-            raise HTTPException(503, f"park queue full ({max_parked}) — retry later", headers={"Retry-After": "2"})
-        owner = getattr(request.state, "gw_user", None) or "default"
-        job_id = jobs.create("chat", alias, "(parked)", owner=owner)
-        body["stream"] = False                         # async result is fetched, not streamed
-        asyncio.create_task(_run_parked_job(job_id, alias, path, dict(body), request))
-        return JSONResponse({"job_id": job_id, "status": "queued", "task": "chat"}, status_code=202)
-    ptime = _park_time_for(alias)
-    if ptime <= 0:                                      # parking disabled for this alias → 503 now
-        raise HTTPException(503, f"all backends for '{alias}' are busy (parking disabled)",
-                            headers={"Retry-After": "1"})
-    if len(_parked) >= max_parked:
-        raise HTTPException(503, f"park queue full ({max_parked}) — retry later", headers={"Retry-After": "2"})
-    return await _park_and_dispatch(alias, path, body, request,
-                                    time.monotonic() + ptime, source=_source_of(request))
+    body.pop("park", None)                              # legacy control field — parking is automatic; never forward
+    # Sync park is the default: a ready backend dispatches now; all busy → queue until one
+    # frees (per-alias park time) or 503. Async is not on chat/completions — it lives on the
+    # standard /v1/responses background mode.
+    return await _dispatch_or_park(alias, path, body, request)
 
 
 # ── Responses API ↔ Chat Completions bridge ──────────────────────────────────
@@ -1208,46 +1176,155 @@ async def _responses_stream(chat_resp, raw_body: dict, alias: str):
     yield ev("response.completed", {"response": shell("completed", [final_item], u)})
 
 
+# ── Responses background mode (official async) ────────────────────────────────
+# `POST /v1/responses` with `background: true` returns immediately with a queued
+# response object; the worker parks/dispatches in the same queue and stores the
+# result. Poll `GET /v1/responses/{id}`; cancel `POST /v1/responses/{id}/cancel`.
+_bg_tasks: dict = {}                        # response_id → asyncio.Task (for cancellation)
+
+
+def _resp_shell(rid, status, model, created, output=None, usage=None, error=None) -> dict:
+    """A minimal Responses object for the non-terminal / error states of a background
+    response (the completed one is the full chat_to_responses body, stored verbatim)."""
+    txt = "".join(p.get("text", "") for o in (output or []) if o.get("type") == "message"
+                  for p in (o.get("content") or []) if p.get("type") == "output_text")
+    return {"id": rid, "object": "response", "created_at": created, "status": status,
+            "background": True, "model": model, "output": output or [],
+            "output_text": txt, "error": error, "usage": usage, "incomplete_details": None}
+
+
+async def _run_bg_response(job_id, rid, alias, chat_body, request, created):
+    """Worker for a background response: dispatch (parking in the shared queue up to the
+    async window), translate the chat completion → Responses object, store it on the job."""
+    try:
+        resp = await _dispatch_or_park(alias, "/v1/chat/completions", chat_body, request,
+                                       stats_endpoint="/v1/responses",
+                                       deadline=time.monotonic() + async_park_timeout_s)
+        chat_json = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
+        if getattr(resp, "status_code", 200) >= 400:
+            jobs.fail(job_id, f"{resp.status_code}: {(json.dumps(chat_json) or '')[:300]}")
+            return
+        obj = chat_to_responses(chat_json)
+        obj["id"], obj["background"], obj["created_at"] = rid, True, created
+        jobs.complete_json(job_id, obj, meta={"model": chat_json.get("model")})
+    except asyncio.CancelledError:
+        jobs.fail(job_id, "cancelled")                 # GET maps this back to status "cancelled"
+        raise
+    except HTTPException as e:
+        jobs.fail(job_id, f"{e.status_code}: {e.detail}")
+    except Exception as e:                              # never let a background task vanish silently
+        logger.warning(f"background response {rid} failed: {e}")
+        jobs.fail(job_id, str(e))
+
+
+async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
+    if not jobs.is_active():
+        raise HTTPException(503, "background responses unavailable (job store off)")
+    if len(_parked) >= max_parked:
+        raise HTTPException(503, f"too many queued ({max_parked}) — retry later", headers={"Retry-After": "2"})
+    owner = getattr(request.state, "gw_user", None) or "default"
+    job_id = jobs.create("response", alias, "(background)", owner=owner)
+    rid, created = f"resp_{job_id}", int(time.time())
+    body = dict(chat_body); body["stream"] = False     # background result is fetched, not streamed
+    t = asyncio.create_task(_run_bg_response(job_id, rid, alias, body, request, created))
+    _bg_tasks[rid] = t
+    t.add_done_callback(lambda _: _bg_tasks.pop(rid, None))
+    if log_per_call:
+        logger.info(f"→ background response {rid} (alias '{alias}') queued")
+    return JSONResponse(_resp_shell(rid, "queued", alias, created), status_code=200)
+
+
+def _bg_job_for(response_id: str) -> dict:
+    if not response_id.startswith("resp_") or not jobs.is_active():
+        raise HTTPException(404, f"response '{response_id}' not found")
+    job = jobs.get(response_id[len("resp_"):])
+    if job is None or job.get("task") != "response":
+        raise HTTPException(404, f"response '{response_id}' not found")
+    return job
+
+
+def _bg_owner_check(job: dict, user: Optional[dict]) -> None:
+    # non-admin users can only touch their own responses; hide others as 404 (no leak).
+    if user and user is not _MASTER_ADMIN and user.get("role") != "admin":
+        if job.get("owner") not in (user.get("name"), "default"):
+            raise HTTPException(404, "response not found")
+
+
+def _bg_view(response_id: str, job: dict) -> dict:
+    status = job["status"]
+    created = int(job.get("created") or time.time())
+    model = (job.get("meta") or {}).get("model") or job.get("alias")
+    if status == "done":
+        return (job.get("results") or [None])[0] or _resp_shell(response_id, "completed", model, created)
+    if status == "failed":
+        err = job.get("error") or "failed"
+        if err == "cancelled":
+            return _resp_shell(response_id, "cancelled", model, created)
+        return _resp_shell(response_id, "failed", model, created, error={"message": err})
+    return _resp_shell(response_id, "in_progress" if status == "running" else "queued", model, created)
+
+
 @app.post("/v1/responses")
 async def responses(request: Request, authorization: Optional[str] = Header(None)):
     """OpenAI Responses API → Chat Completions bridge.
 
     LangChain.js (N8N's AI Agent) calls this endpoint by default. Backends that
     only speak Chat Completions still work — request and response are translated
-    transparently. `stream:true` is supported: the backend's chat SSE is
-    translated into Responses API SSE events (A3).
+    transparently. `stream:true` translates the backend's chat SSE into Responses
+    SSE (A3); `background:true` runs it async (queued → poll GET /v1/responses/{id}).
+    Like chat, a busy backend parks instead of 503.
     """
     raw_body = await request.json()
     chat_body = responses_to_chat(raw_body)
     alias = chat_body.get("model", "")
     gate_request(authorization, request, alias)        # auth + model allow-list + quota
 
-    wants_stream = bool(raw_body.get("stream"))
-    ready, busy = resolve_routes(alias)
-    if not ready:
-        if busy:
-            raise HTTPException(503, f"all backends for '{alias}' are busy — retry or set \"park\"")
-        raise HTTPException(503, f"No healthy backend for model '{alias}'")
+    if raw_body.get("background") is True:             # official async: immediate queued object
+        return await _create_bg_response(alias, chat_body, request)
 
-    # A2: route through the shared dispatch path (failover + in-flight + stats);
-    # stats keep the /v1/responses label via stats_endpoint.
+    wants_stream = bool(raw_body.get("stream"))
+    chat_body["stream"] = wants_stream
+    # Shared dispatch/park path (failover + in-flight + stats, labelled /v1/responses).
+    resp = await _dispatch_or_park(alias, "/v1/chat/completions", chat_body, request,
+                                   stats_endpoint="/v1/responses")
     if wants_stream:                                   # A3: translate chat SSE → Responses SSE
-        chat_body["stream"] = True
-        resp = await _dispatch_over(ready, "/v1/chat/completions", alias, chat_body, request,
-                                    stats_endpoint="/v1/responses")
         if isinstance(resp, StreamingResponse):
             return StreamingResponse(_responses_stream(resp, raw_body, alias),
                                      media_type="text/event-stream")
         err = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
         raise HTTPException(resp.status_code, (json.dumps(err) or "")[:500])
-
-    chat_body["stream"] = False
-    resp = await _dispatch_over(ready, "/v1/chat/completions", alias, chat_body, request,
-                                stats_endpoint="/v1/responses")
     chat_resp_json = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, (json.dumps(chat_resp_json) or "")[:500])
     return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code)
+
+
+@app.get("/v1/responses/{response_id}")
+async def get_response(response_id: str, request: Request, authorization: Optional[str] = Header(None)):
+    """Poll a background response: queued → in_progress → completed | failed | cancelled."""
+    user = authenticate(authorization)
+    job = _bg_job_for(response_id)
+    _bg_owner_check(job, user)
+    return JSONResponse(_bg_view(response_id, job))
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def cancel_response(response_id: str, request: Request, authorization: Optional[str] = Header(None)):
+    """Cancel a background response (no-op if already terminal)."""
+    user = authenticate(authorization)
+    job = _bg_job_for(response_id)
+    _bg_owner_check(job, user)
+    if job["status"] in ("queued", "running"):
+        t = _bg_tasks.get(response_id)
+        if t and not t.done():
+            t.cancel()                                 # stop a parked/in-flight worker at its next await
+        # Mark cancelled synchronously so the response reflects it now — but only if it
+        # hasn't just reached a terminal state (cancel racing completion).
+        cur = jobs.get(response_id[len("resp_"):])
+        if cur and cur.get("status") in ("queued", "running"):
+            jobs.fail(response_id[len("resp_"):], "cancelled")
+        job = _bg_job_for(response_id)                 # re-read post-cancel
+    return JSONResponse(_bg_view(response_id, job))
 
 
 @app.post("/v1/completions")
