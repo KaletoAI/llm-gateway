@@ -871,17 +871,36 @@ class ComfyUIAdapter(BackendAdapter):
         final = _node_by_title(wf, "output_final")
         targets = {final: outputs[final]} if (final and final in outputs) else outputs
         blobs: list[GenBlob] = []
+        seen: set = set()
         for _nid, out in targets.items():
-            for item in (out.get("images", []) + out.get("gifs", [])):
-                fn = item.get("filename")
-                if not fn:
+            # Scan every list-valued output key (images / gifs / videos / audio / …),
+            # not just images+gifs, so core SaveVideo/SaveAudio artifacts are caught
+            # regardless of which key ComfyUI files them under. Only items that name a
+            # file (a /view-able artifact) are fetched; deduped by (filename, subfolder).
+            for _key, items in out.items():
+                if not isinstance(items, list):
                     continue
-                view = {"filename": fn, "type": item.get("type", "output")}
-                if item.get("subfolder"):
-                    view["subfolder"] = item["subfolder"]
-                r = await client.get(f"{url}/view", params=view)
-                if r.status_code == 200:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    fn = item.get("filename")
+                    if not fn or (fn, item.get("subfolder", "")) in seen:
+                        continue
+                    seen.add((fn, item.get("subfolder", "")))
+                    view = {"filename": fn, "type": item.get("type", "output")}
+                    if item.get("subfolder"):
+                        view["subfolder"] = item["subfolder"]
+                    r = await client.get(f"{url}/view", params=view)
+                    if r.status_code != 200:
+                        continue
                     mime, kind = _mime_and_kind(fn)
+                    if mime == "application/octet-stream":     # unknown ext → trust ComfyUI's format hint
+                        fmt = item.get("format")
+                        if isinstance(fmt, str) and "/" in fmt:
+                            top = fmt.split("/", 1)[0].lower()
+                            if top in ("video", "audio"):
+                                kind = top
+                                mime = {"video": "video/mp4", "audio": "audio/mpeg"}[top]
                     blobs.append(GenBlob(data=r.content, mime=mime, kind=kind))
         return blobs
 

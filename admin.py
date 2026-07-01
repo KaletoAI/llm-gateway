@@ -177,7 +177,8 @@ td input,td select{height:30px}
 .muted{color:#6b7682}.ok{color:#5cb87f}.bad{color:#e06c6c}
 code{background:#1b1f27;padding:2px 6px;border-radius:4px;font-size:12px}
 .stub{color:#7e8b99;border:1px dashed #313a46;border-radius:8px;padding:22px;margin-top:8px;line-height:1.8}
-img.result{max-width:512px;border:1px solid #313a46;border-radius:8px;margin:8px 0}
+img.result,video.result{max-width:512px;border:1px solid #313a46;border-radius:8px;margin:8px 0}
+audio.result{width:512px;max-width:100%;margin:8px 0}
 pre.err{white-space:pre-wrap;word-break:break-word;background:#1a1113;border:1px solid #5a2a2a;color:#f0b6b6;border-radius:8px;padding:12px 14px;margin:8px 0;max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;user-select:text}
 .cols{display:flex;gap:24px;align-items:flex-start}
 .col{flex:1;min-width:0}
@@ -350,6 +351,22 @@ def _item(title: str, sub: str, acts: str, sel: bool = False) -> str:
 def _badge(text: str, kind: str = "muted", title: str = "") -> str:
     t = f' title="{_esc(title)}"' if title else ""
     return f'<span class="badge {kind}"{t}>{_esc(text)}</span>'
+
+
+def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
+               style: str = "", autoplay: bool = False) -> str:
+    """Right media element for a generation artifact: <video> for video, <audio>
+    for audio, else <img>. The serving route sets the real content-type; mime/kind
+    here only pick the tag (unknown → <img>). `src` must already be escaped."""
+    m, k = (mime or "").lower(), (kind or "").lower()
+    c = f' class="{cls}"' if cls else ""
+    s = f' style="{style}"' if style else ""
+    if k == "video" or m.startswith("video/"):
+        ap = " autoplay" if autoplay else ""
+        return f'<video{c}{s} src="{src}" controls loop muted playsinline preload="metadata"{ap}></video>'
+    if k == "audio" or m.startswith("audio/"):
+        return f'<audio{c}{s} src="{src}" controls preload="metadata"></audio>'
+    return f'<img{c}{s} src="{src}">'
 
 
 def _type_badge(t: str) -> str:
@@ -1959,8 +1976,11 @@ def _job_result_html(job_id: str, job: Optional[dict]):
     if st == "failed":
         return (f"<h2>Result</h2><p class='bad'>✗ failed · job {_esc(job_id)}</p>"
                 f"<pre class='err'>{_esc(job.get('error'))}</pre>"), None
-    imgs = "".join(f'<div><img class="result" src="/ui/playground/result/{_esc(job_id)}/{r["n"]}"></div>'
-                   for r in job.get("results", []))
+    cells = []
+    for r in job.get("results", []):
+        src = f"/ui/playground/result/{_esc(job_id)}/{r['n']}"
+        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True)}</div>")
+    imgs = "".join(cells)
     return (f"<h2>Result</h2><p>✓ done · job {_esc(job_id)} · "
             f"backend {_esc(job.get('backend'))}</p>{imgs or '<p class=muted>No artifacts.</p>'}"), None
 
@@ -2111,11 +2131,19 @@ async def jobs_page(request: Request):
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
-    """Gallery of <img> thumbnails linking to the full image (kind = 'input'|'result')."""
+    """Gallery of artifact thumbnails (kind = 'input'|'result'). Images link to the
+    full file; video/audio render an inline player (not wrapped in a link so their
+    controls stay clickable)."""
     base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
-    cells = "".join(f"<a href='{base}{r['n']}' target='_blank'><img src='{base}{r['n']}' "
-                    f"style='max-width:240px;max-height:240px;border:1px solid #313a46;border-radius:8px'></a>"
-                    for r in entries)
+    style = "max-width:260px;max-height:260px;border:1px solid #313a46;border-radius:8px"
+    cells = ""
+    for r in entries:
+        src = f"{base}{r['n']}"
+        m, mk = (r.get("mime") or "").lower(), (r.get("kind") or "").lower()
+        if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
+            cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
+        else:
+            cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
     return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
 
 

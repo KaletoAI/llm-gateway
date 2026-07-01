@@ -1678,16 +1678,22 @@ def _images_uploads(images: list, alias: str) -> dict:
 
 
 def _images_response(view: dict, response_format: str) -> dict:
-    """Native job view -> OpenAI images response {created, data:[{url|b64_json}]}."""
+    """Native job view -> OpenAI images response {created, data:[{url|b64_json}]}.
+    Each entry also carries `mime` so a client can tell a video/audio artifact from
+    an image (video aliases are better consumed via the native /v1/generations,
+    which returns per-result kind+mime)."""
     data = []
     for r in view.get("results", []):
+        entry = {"mime": r.get("mime")}
         if response_format == "b64_json":
             rp = jobs.result_path(view["job_id"], r["n"])
-            if rp:
-                with open(rp[0], "rb") as fh:
-                    data.append({"b64_json": base64.b64encode(fh.read()).decode()})
+            if not rp:
+                continue
+            with open(rp[0], "rb") as fh:
+                entry["b64_json"] = base64.b64encode(fh.read()).decode()
         else:
-            data.append({"url": r["url"]})
+            entry["url"] = r["url"]
+        data.append(entry)
     return {"created": int(time.time()), "data": data}
 
 
