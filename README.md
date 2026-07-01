@@ -20,7 +20,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Authentication & multi-user](#authentication--multi-user) — keys, allow-lists, quotas
 - [Routing](#routing) — priority, prefixing, `local`, concurrency, parking
 - [Call parking](#call-parking) — queue instead of `503` when busy
-- [Image / multimodal generation](#image--multimodal-generation) — ComfyUI, aliases, mapping, LoRA, jobs
+- [Media generation](#media-generation) — ComfyUI image/video/audio, aliases, mapping, LoRA, jobs
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
 - [Endpoint reference](#endpoint-reference)
@@ -45,14 +45,15 @@ code, image clients like anima-verse, …) and a fleet of backends.
   provider as just another prioritised backend.
 - **Multi-user.** Optional per-user API keys with model/alias/backend allow-lists
   (which also filter what each key sees in `/v1/models`) and monthly cost quotas.
-- **Call parking.** When every matching backend is busy, queue the call (sync or
-  async job) instead of returning `503`.
-- **Image generation.** ComfyUI workflows exposed as OpenAI image endpoints +
-  a native job API, with a convention-free node mapping, dynamic LoRAs, and
-  LoRA-aware backend routing.
+- **Call parking (default).** When every matching backend is busy, the call
+  queues until one frees instead of returning `503` — no client change needed.
+  Park time is per-alias; async is the standard Responses background mode.
+- **Media generation.** ComfyUI workflows exposed as OpenAI image endpoints + a
+  native job API — **image, video, and audio** outputs — with a convention-free
+  node mapping, dynamic LoRAs, and LoRA-aware backend routing.
 - **Built-in console at `/ui`.** Manage backends, aliases, workflow mappings,
-  users, server settings; run a chat/image playground; watch jobs, stats, and
-  the live routing map. Server-rendered, zero JS framework.
+  users, server settings; run a chat/media playground; watch jobs, stats, parked
+  calls, and the live routing map. Server-rendered, zero JS framework.
 - **Hot config reload.** `config.yaml` changes apply live; most management also
   lives in a writable store edited from the console.
 
@@ -175,7 +176,8 @@ takes the first that is (1) enabled, (2) healthy (last discovery poll ok), (3)
 **not busy** (below its `max_concurrent` in-flight cap), (4) mapped for the alias
 (or exposes the bare/real model), and (5) actually has the resolved model. If
 that backend errors on the forward, the remaining matching backends are tried in
-order. When every match is busy you get a `503` — or the call **parks** (below).
+order. When every match is busy the call **parks** (queues) by default until a
+backend frees, and only `503`s if the park time runs out (below).
 
 ### Provider-prefixed model names
 
@@ -218,25 +220,40 @@ but isn't mapped → unreachable by that name) — the latter is the actionable 
 ## Call parking
 
 When **all** backends that map an alias are busy (at their in-flight cap), the
-default is an immediate `503`. Parking queues the call until a slot frees instead:
+call is **held in a FIFO queue** until a mapping backend frees (then dispatched)
+instead of returning `503`. This is the **default** — no client field needed, so
+callers stay plain-OpenAI. A standard request just sees a slightly slower `200`,
+or a `503` (with `Retry-After`) if the wait runs out.
 
-- **sync** — the HTTP request blocks until a backend frees, then dispatches
-  normally (up to a park timeout, then `504`).
-- **async** — returns `202 {job_id}` immediately; the result is fetched later via
-  the job API (reuses the generation job store, task type `chat`).
+- **Park time is per-alias** (`park_s` in the chat-alias editor, or config
+  `alias_park`): blank = the global default (`park_timeout_s`, **60 s**, Server
+  tab), `0` = parking off for that alias (immediate `503` when busy). `max_parked`
+  caps the queue.
+- **Fair:** when a slot frees, the oldest waiting call whose alias can use that
+  backend is dispatched first (no head-of-line blocking across aliases). Live
+  queue is visible in the **Parked calls** panel on the Dashboard.
+- **On timeout** the call leaves the queue with a `503` + `Retry-After`.
 
-Parking applies to `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
-and the generation path (where a busy ComfyUI backend queues the job rather than
-`503`-ing). The distinction "all busy" vs. "no backend at all" is explicit — a
-genuine no-backend still `503`s.
+Applies to `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/responses`, and the generation path (a busy ComfyUI backend queues the job
+rather than `503`-ing). The distinction "all busy" vs. "no backend at all" is
+explicit — a genuine no-backend still `503`s.
+
+**Async LLM requests** don't use a custom field: they follow the official OpenAI
+**Responses background mode** — `POST /v1/responses` with `background:true`
+returns immediately with `{id, status:"queued"}`; poll `GET /v1/responses/{id}`
+(→ `in_progress`/`completed`/`failed`/`cancelled`) and cancel via
+`POST /v1/responses/{id}/cancel`. The background worker parks in the same queue.
 
 ---
 
-## Image / multimodal generation
+## Media generation
 
 A ComfyUI backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
-dispatch submits a parametrised workflow and polls `/history`.
+dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
+artifacts it produced — **image, video (e.g. SaveVideo), or audio** — with each
+artifact's kind/mime carried through the API and rendered in the console.
 
 ```yaml
 backends:
@@ -312,10 +329,11 @@ LoRAs are first-class:
 ### Jobs & TTL
 
 Every generation is a **job**: SQLite metadata + on-disk artifacts under
-`jobs/<id>/<n>.<ext>`, lifecycle `queued → running → done|failed`, retrievable by
-id until its TTL (default 24 h), then pruned. The job also keeps its **inputs**
-(prompt, params, reference images) so it stays inspectable in the **Image Jobs**
-tab. A running job can be cancelled (`POST /v1/jobs/{id}/cancel` or the ✕ button),
+`jobs/<id>/<n>.<ext>` (**image, video, or audio** — the artifact's kind/mime flow
+through the API and the console), lifecycle `queued → running → done|failed`,
+retrievable by id until its TTL (default 24 h), then pruned. The job also keeps
+its **inputs** (prompt, params, reference images) so it stays inspectable in the
+**Media Jobs** tab. A running job can be cancelled (`POST /v1/jobs/{id}/cancel` or the ✕ button),
 which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
 `running`/`queued` is reconciled to `failed`.
 
@@ -345,16 +363,17 @@ locked). Tabs:
 
 | Tab | What |
 |---|---|
-| **Dashboard** | live per-backend status + in-flight, image-job counts/recent, activity |
-| **Server** | runtime + restart-required settings (API key, caps, stats/jobs, TTL/prune) |
+| **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
+| **Server** | runtime + restart-required settings (API key, caps, park time/queue, stats/jobs, TTL/prune) |
 | **Backends** | add/edit/remove backends (LLM + ComfyUI) |
 | **Input** | what clients can call — chat aliases, generation models, endpoints |
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
-| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values |
+| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s`) |
 | **Chat Playground** | send a chat completion through an alias |
-| **Image Playground** | run a generation (pick alias/backend, upload refs, set params) |
-| **Image Jobs** | list + detail of generation jobs (inputs + outputs, within TTL) |
-| **Statistic** | the call-stats dashboard (search, per-call body, drilldown) |
+| **Media Playground** | run a generation (pick alias/backend, upload refs, set params) — image/video/audio |
+| **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL) |
+| **LLM Calls** | per-call history with stored request/response bodies |
+| **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
 ---
@@ -395,8 +414,10 @@ stats:
 | `POST` | `/v1/chat/completions` | chat; priority + failover; streaming; parking |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
-| `POST` | `/v1/responses` | Responses API ↔ chat bridge (non-streaming) |
-| `POST` | `/v1/images/generations` | text→image (sync) |
+| `POST` | `/v1/responses` | Responses API ↔ chat bridge; streaming; parking; `background:true` (async) |
+| `GET` | `/v1/responses/{id}` | poll a background response (queued→…→completed/failed/cancelled) |
+| `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
+| `POST` | `/v1/images/generations` | text→image (sync); may return a video/audio URL for such aliases |
 | `POST` | `/v1/images/edits` | multipart image+mask edit (sync) |
 
 ### Native generation + jobs
@@ -422,9 +443,14 @@ stats:
 Clients on LangChain.js (N8N's AI Agent, …) call `/v1/responses`; most backends
 only speak `/v1/chat/completions`. The gateway translates request
 (`input`/`instructions`/`tools` → `messages`/system/tool schema) and response
-(`choices[0].message` → `output[…]`, token field renames) transparently.
-`stream: true` is silently downgraded to non-streaming (SSE translation not
-implemented).
+(`choices[0].message` → `output[…]`, token field renames) transparently, and
+routes through the same dispatch/parking path as chat. `stream: true` is
+supported (chat SSE → Responses SSE events). **`background: true`** runs the
+request asynchronously per the official OpenAI pattern: it returns immediately
+with a `queued` response object; poll `GET /v1/responses/{id}` until a terminal
+state and cancel via `POST /v1/responses/{id}/cancel`. The background worker
+parks in the shared queue (longer async window) — so long-running or busy
+requests never time out the client connection.
 
 ---
 

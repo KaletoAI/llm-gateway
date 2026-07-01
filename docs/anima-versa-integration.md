@@ -186,6 +186,13 @@ auf Gateway-Seite, nicht in anima-versa hartzucodieren. Ein anima-versa-UI-Feld
 
 Die Result-URLs bleiben bis zum TTL des Jobs abrufbar (Default 24 h).
 
+**Video/Audio-Ausgabe:** Manche Aliase erzeugen kein Bild, sondern **Video/Audio**
+(z.B. img2video). Beim Images-Shim trägt jeder `data[]`-Eintrag dann ein `mime`
+(z.B. `video/mp4`) — die `url` liefert die Datei mit korrektem Content-Type. Für
+solche Aliase ist der **native `/v1/generations`** sauberer: `results[]` trägt pro
+Artefakt `kind` (`image`/`video`/`audio`) + `mime` + `url`. Consumer sollten am
+`mime`/`kind` entscheiden, nicht Bild annehmen.
+
 ---
 
 ## 6. Fehler- & Lastverhalten

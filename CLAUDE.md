@@ -9,9 +9,10 @@ backends: local LLM servers (llama.cpp / llama-swap / vLLM / Ollama), cloud APIs
 (Together.ai / OpenAI / OpenRouter), **and ComfyUI image-generation servers**. It
 does per-backend auto-discovery, priority routing with failover, virtual aliases,
 per-backend concurrency caps, an optional multi-user auth layer, **call parking**
-(queue instead of 503 when busy), a full **image-generation subsystem** (workflow
-mapping, LoRAs, jobs), and a server-rendered `/ui` console. Read `README.md`
-first — it documents every config knob, endpoint, and routing rule.
+(a default FIFO queue instead of 503 when busy; per-alias park time; async via the
+Responses background mode), a full **media-generation subsystem** (image/video/
+audio; workflow mapping, LoRAs, jobs), and a server-rendered `/ui` console. Read
+`README.md` first — it documents every config knob, endpoint, and routing rule.
 
 ## Run / develop
 
@@ -59,10 +60,11 @@ receive what they need via injected callables, staying hot-reload-safe.
   into free stack slots; `_apply_fixed` applies admin pins (the API can't override
   a pinned `(node,field)`); `suggest_mapping()` is only an auto-detect pre-fill.
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
-  `jobs/<id>/<n>.<ext>`, lifecycle `queued→running→done|failed`, TTL pruning. Also
-  persists job **inputs** (`set_inputs`: prompt/params/reference images) and
-  `reconcile_orphans()` (startup: mark interrupted `running`/`queued` as failed).
-  Carries `owner`. Reused for parked **chat** jobs (task type `chat`).
+  `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
+  lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
+  (`set_inputs`: prompt/params/reference images) and `reconcile_orphans()` (startup:
+  mark interrupted `running`/`queued` as failed). Carries `owner`. Reused for
+  **background Responses** jobs (task type `response`, result via `complete_json`).
 - **`store.py`** — writable SQLite store, the console's source of truth: backends,
   chat aliases, generation aliases (+ workflow_json/mapping/fixed), users (api keys
   **encrypted** via `secret.key`), IP aliases, server settings. Seeded once from
@@ -80,11 +82,13 @@ receive what they need via injected callables, staying hot-reload-safe.
 ### Request flow
 
 - **Chat/LLM** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` via
-  `route()`): `resolve_routes()`/`get_routes_for(alias)` → ready vs busy candidate
-  split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the first, failing
-  over only on connection/timeout errors (HTTP error status returned as-is). All
-  busy → **park** (sync block or async job) instead of 503. `/v1/responses` has its
-  own loop (translates bodies) but shares `get_routes_for()`.
+  `route()`): all funnel through **`_dispatch_or_park()`** — `resolve_routes()` →
+  ready vs busy split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the
+  first ready, failing over only on connection/timeout errors (HTTP error status
+  returned as-is). All busy → **park by default** (FIFO queue, per-alias `park_s`)
+  until a backend frees, else 503; no client field. `/v1/responses` translates
+  bodies and shares `_dispatch_or_park()` too (also parks); `background:true` runs
+  it async via the official Responses background mode (see below).
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   the alias via the **separate** generation store (`image_models`/store), filtered
@@ -107,7 +111,16 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 - **Concurrency/busy** (`backend_inflight`, `backend_busy`): incremented in
   `dispatch()`/`generate()`, decremented on completion incl. the streamed `finally`.
 - **Parking** vs 503: "all busy" is distinguished from "no backend" — only the
-  former parks.
+  former parks (the default). The queue is `_parked` (rich entries: alias, source,
+  deadline, `asyncio.Event`); `_inflight_dec`→`_notify_slot_free` wakes all in FIFO
+  order so the oldest eligible claims the freed slot (the invariant: dispatch's
+  `inflight_inc` runs with no `await` between it and `resolve_routes`). Park time
+  per alias via `alias_park_s` (store `alias_park` + config), else `park_timeout_s`
+  (default 60); `0` disables. Timeout → 503 + `Retry-After`. "Parked calls" panel
+  on the Dashboard. **Async chat has no OpenAI spec** — async lives on the Responses
+  background mode: `POST /v1/responses {background:true}` → `resp_<jobid>` queued →
+  `GET /v1/responses/{id}` poll → `POST …/cancel`; the worker (`_run_bg_response`)
+  parks in the same queue (jobs.py task `response`).
 - **LoRA-aware generation routing**: a backend lacking a requested LoRA is dropped
   from candidates (decided over all candidates incl. busy → parks for the
   LoRA-backend rather than spilling); a LoRA on no backend is ignored (priority
@@ -139,8 +152,9 @@ per-token). Streaming records `0` tokens.
 - Two pricing schemas and two `/v1/models` payload shapes (`{"data":[…]}` vs bare
   list) are handled defensively in discovery (`extract_models`/`extract_pricing`/
   `_is_chat_model`). Preserve that.
-- The Responses↔Chat bridge is non-streaming only; `stream:true` is downgraded
-  (no SSE translation).
+- The Responses↔Chat bridge supports `stream:true` (chat SSE → Responses SSE) and
+  `background:true` (async). What's **not** built yet: streaming-reconnect for a
+  background response (poll-only). Keep in sync when touching `/v1/responses`.
 - Keep `stats.py`/`jobs.py`/`store.py` dependency-free and hot-reload-safe (no
   caching config values at import time).
 - Generation: workflow + mapping are **backend-independent** (shared across an

@@ -32,6 +32,24 @@ model_prefix: true
 # `max_concurrent` (see below). Busy backends are flagged on the routing tab.
 # max_concurrent: 1
 
+# Call parking (default): when EVERY backend that maps an alias is busy, the call
+# is held in a FIFO queue until one frees, instead of returning 503. No client
+# field is needed — a standard request just waits, then gets a 200 (or a 503 +
+# Retry-After if the wait runs out). All tunable live in the /ui Server tab too.
+# park_timeout_s: 60      # global default seconds a call may wait for a free backend
+# max_parked: 100         # queue cap; a busy call beyond this gets 503
+# Per-alias override (blank/absent = the global default above; 0 = parking off for
+# that alias). Also editable per chat alias in the /ui Mapping editor (`park_s`).
+# alias_park:
+#   fast: 10              # this alias waits at most 10s
+#   bulk: 0               # never parks — 503 immediately when busy
+#
+# Async LLM requests use the official OpenAI Responses background mode (no custom
+# field): POST /v1/responses {background:true} -> queued id -> poll GET
+# /v1/responses/{id} -> cancel POST /v1/responses/{id}/cancel. The background
+# worker parks in the same queue, up to:
+# async_park_timeout_s: 600
+
 # Optional call-stats sink: SQLite DB; the dashboard is built into the /ui console
 # (Statistic tab) — no separate server/port anymore. When enabled, every call is
 # recorded with backend, source (the authenticated user, else X-Source header / client

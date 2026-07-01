@@ -19,9 +19,27 @@ Reihenfolge-Empfehlung am Ende.
 > ComfyUI-Fehler. Pin-Schutz (API kann gepinnte Nodes nicht überschreiben).
 > Doku komplett überarbeitet (README/CLAUDE/config/anima-versa).
 >
+> **Status 2026-07-01 — seither umgebaut/ergänzt:**
+> - **Media-Pipeline:** Generierung liefert **Bild/Video/Audio** end-to-end — Adapter
+>   scannt alle ComfyUI-Output-Keys (SaveVideo etc.), `kind`+`mime` durch die API,
+>   `<video>`/`<audio>` im Playground/Job-Detail. Tabs umbenannt **Image → Media**.
+> - **Parking neu (ersetzt F-Design):** Sync-Park ist jetzt **Default** (kein Client-Feld),
+>   faire FIFO-Queue, **per-Alias `park_s`** (+ globaler Default 60s im Server-Tab,
+>   `max_parked`), „Parked calls"-Panel im Dashboard, Timeout → **503** + `Retry-After`.
+>   Das alte `park:"sync"/"async"`-Client-Feld ist **entfernt**.
+> - **Async = offizieller OpenAI-Responses-Background-Mode:** `POST /v1/responses
+>   {background:true}` → `resp_…` queued → `GET /v1/responses/{id}` poll → `POST …/cancel`.
+>   non-background `/v1/responses` sync-parkt jetzt auch; `X-Park-Mode` wird gestrippt.
+>   Streaming-Reconnect für Background bewusst vertagt (poll-only).
+> - **Konsole:** Recent-LLM-Calls (running+5min) + eigener **LLM-Calls**-Tab, farbige
+>   Backend-Typ-Chips, `req·1h`-Spalte, klick-sortierbare Tabellen, Offline-Backends
+>   im Dashboard ausgeblendet.
+>
 > **Offene Spitze:** C1 (weitere img2img/inpaint-Aliase verdrahten — Mechanismus steht) ·
-> C2/C3 (img2video / TTS — neue Modalität) · B (VRAM-Koordinator, nur bei GPU-Co-
-> Residency) · D4 (Audit-Log, Master-Key-Rotation).
+> C2 (img2video: Mechanismus steht, WAN-Workflow user-verdrahtet) · C3 (TTS/Audio —
+> Mechanismus steht, Workflow offen) · B (VRAM-Koordinator, nur bei GPU-Co-Residency) ·
+> D4 (Audit-Log, Master-Key-Rotation) · llama-swap Load-/Switch-Erkennung (via
+> `/api/events`, vertagt).
 
 ---
 
