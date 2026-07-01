@@ -113,12 +113,17 @@ def rebuild_backends() -> None:
 def rebuild_virtual_models() -> None:
     """Effective chat aliases = config `virtual_models`, with UI-managed (store)
     entries merged over them by alias (store overrides config for the same name).
-    Call after config reload or any store chat-alias change."""
-    global virtual_models
+    Also refreshes the per-alias park times. Call after config reload or any store
+    chat-alias change."""
+    global virtual_models, alias_park_s
     merged = dict(config_virtual_models)
     if store.is_active():
         merged.update(store.list_chat_aliases())
     virtual_models = merged
+    park = dict(config.get("alias_park") or {}) if isinstance(config, dict) else {}
+    if store.is_active():
+        park.update(store.get_alias_park())
+    alias_park_s = park
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -213,26 +218,45 @@ def _active_done(token) -> None:
     _active_calls.pop(token, None)
 
 
-# ── Call parking (queue instead of immediate busy/503) ────────────────────────
-# When every backend mapping an alias is at its in-flight cap, hold the request
-# until a slot frees (sync) instead of returning 503. One global FIFO of waiter
-# futures; _inflight_dec wakes them. The event loop is single-threaded, so each
-# woken waiter atomically re-checks resolve_routes() and claims a slot (dispatch
-# increments in-flight before its first await) before the next runs — so wake-all
-# cannot burst past the cap.
-park_timeout_s: float = 30.0
+# ── Call parking (a queue: hold instead of 503 when all backends are busy) ─────
+# Parking is the DEFAULT for chat: when every backend mapping an alias is at its
+# in-flight cap, the call is held in a FIFO queue until a mapping backend frees
+# (then dispatched) or its park time elapses (→ 503). Each entry stays in `_parked`
+# for its whole wait — keeping its FIFO position and staying visible in the console.
+# `_inflight_dec` wakes all waiters in order; the event loop is single-threaded, so
+# the oldest resumes first and claims the freed slot (dispatch increments in-flight
+# before its first await), the rest re-check and wait again. Park time is per-alias
+# (`alias_park_s`), else the global default below; 0 disables parking for an alias.
+park_timeout_s: float = 60.0            # global default park time (Server tab); per-alias overrides in alias_park_s
 async_park_timeout_s: float = 600.0
 max_parked: int = 100
-_park_waiters: list = []
+alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
+_parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
+_park_seq: list = [0]
+
+
+def _next_park_id() -> int:
+    _park_seq[0] += 1
+    return _park_seq[0]
+
+
+def _park_time_for(alias: str) -> float:
+    v = alias_park_s.get(alias)
+    if v is None:
+        return park_timeout_s
+    try:
+        return max(0.0, float(v))
+    except (TypeError, ValueError):
+        return park_timeout_s
 
 
 def _notify_slot_free() -> None:
-    if not _park_waiters:
-        return
-    waiters, _park_waiters[:] = list(_park_waiters), []
-    for fut in waiters:
-        if not fut.done():
-            fut.set_result(None)
+    # Wake every parked call in FIFO order; each re-checks its own alias's routes.
+    # The oldest resumes first and claims the freed slot; the rest wait again.
+    for entry in _parked:
+        ev = entry.get("event")
+        if ev is not None and not ev.is_set():
+            ev.set()
 
 
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
@@ -716,8 +740,9 @@ build_backend_adapters()
 
 
 def _park_mode(body: dict, request: Request) -> Optional[str]:
-    """Parking mode chosen by the client: body `park` ("sync"|"async"|true) or the
-    `X-Park-Mode` header. None → today's behaviour (no parking → 503 when busy)."""
+    """Optional client override of the parking mode: body `park` ("sync"|"async"|true)
+    or the `X-Park-Mode` header. None → the default (sync park). Only "async" changes
+    behaviour now — sync parking is the default and needs no client field."""
     v = body.get("park")
     if v is True:
         return "sync"
@@ -753,32 +778,35 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
     raise HTTPException(503, f"All backends failed: {last_error}")
 
 
-async def _park_and_dispatch(alias, path, body, request, deadline):
-    """Sync parking: hold the request until a backend slot frees, then dispatch.
-    Raises 504 on timeout, 503 if nothing maps the alias anymore."""
-    while True:
-        ready, busy = resolve_routes(alias)
-        if ready:
-            return await _dispatch_over(ready, path, alias, body, request)
-        if not busy:
-            raise HTTPException(503, f"No healthy backend for model '{alias}'")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise HTTPException(504, f"park timeout: backends for '{alias}' busy for {park_timeout_s:.0f}s")
-        fut = asyncio.get_event_loop().create_future()
-        _park_waiters.append(fut)
-        ready, _ = resolve_routes(alias)          # re-check after registering → no lost wakeup
-        if ready:
-            if fut in _park_waiters:
-                _park_waiters.remove(fut)
-            return await _dispatch_over(ready, path, alias, body, request)
+async def _park_and_dispatch(alias, path, body, request, deadline, source="?"):
+    """Hold a request in the park queue until a mapping backend frees (then dispatch),
+    or until `deadline` (→ 503). The entry stays in `_parked` for the whole wait so it
+    keeps its FIFO position and shows in the console; `_notify_slot_free` wakes it."""
+    entry = {"id": _next_park_id(), "alias": alias, "source": source,
+             "enqueued": time.time(), "deadline": deadline, "event": asyncio.Event()}
+    _parked.append(entry)
+    try:
+        while True:
+            entry["event"].clear()                     # arm before checking → no lost wakeup
+            ready, busy = resolve_routes(alias)
+            if ready:
+                return await _dispatch_over(ready, path, alias, body, request)
+            if not busy:
+                raise HTTPException(503, f"No healthy backend for model '{alias}'")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(503, f"all backends for '{alias}' are busy — parked with no free "
+                                    "backend in time", headers={"Retry-After": "2"})
+            try:
+                await asyncio.wait_for(entry["event"].wait(), remaining)
+            except asyncio.TimeoutError:
+                raise HTTPException(503, f"all backends for '{alias}' are busy — parked with no free "
+                                    "backend in time", headers={"Retry-After": "2"})
+    finally:
         try:
-            await asyncio.wait_for(fut, remaining)
-        except asyncio.TimeoutError:
-            raise HTTPException(504, f"park timeout: backends for '{alias}' busy for {park_timeout_s:.0f}s")
-        finally:
-            if fut in _park_waiters:
-                _park_waiters.remove(fut)
+            _parked.remove(entry)
+        except ValueError:
+            pass
 
 
 async def _run_parked_job(job_id, alias, path, body, request):
@@ -787,7 +815,8 @@ async def _run_parked_job(job_id, alias, path, body, request):
     Non-streaming — the result is fetched via GET /v1/jobs/{id}, not streamed."""
     try:
         resp = await _park_and_dispatch(alias, path, body, request,
-                                        time.monotonic() + async_park_timeout_s)
+                                        time.monotonic() + async_park_timeout_s,
+                                        source=_source_of(request))
         data = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
         jobs.complete_json(job_id, data, meta={"model": data.get("model")})
     except HTTPException as e:
@@ -807,23 +836,29 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     ready, busy = resolve_routes(alias)
     if ready:
         return await _dispatch_over(ready, path, alias, body, request)
-    if busy and park == "sync":
-        if len(_park_waiters) >= max_parked:
-            raise HTTPException(503, f"park queue full ({max_parked}) — retry later")
-        return await _park_and_dispatch(alias, path, body, request, time.monotonic() + park_timeout_s)
-    if busy and park == "async":
+    if not busy:
+        raise HTTPException(503, f"No healthy backend for model '{alias}'")
+    # All mapping backends are busy. Parking is the DEFAULT (no client field needed):
+    # the call queues until a backend frees or its park time elapses (→ 503). `async`
+    # is an explicit opt-in that hands back a job id instead of blocking.
+    if park == "async":
         if not jobs.is_active():
             raise HTTPException(503, "async parking unavailable (job store off)")
-        if len(_park_waiters) >= max_parked:
-            raise HTTPException(503, f"park queue full ({max_parked}) — retry later")
+        if len(_parked) >= max_parked:
+            raise HTTPException(503, f"park queue full ({max_parked}) — retry later", headers={"Retry-After": "2"})
         owner = getattr(request.state, "gw_user", None) or "default"
         job_id = jobs.create("chat", alias, "(parked)", owner=owner)
         body["stream"] = False                         # async result is fetched, not streamed
         asyncio.create_task(_run_parked_job(job_id, alias, path, dict(body), request))
         return JSONResponse({"job_id": job_id, "status": "queued", "task": "chat"}, status_code=202)
-    if busy:
-        raise HTTPException(503, f"all backends for '{alias}' are busy — retry or set \"park\":\"sync\"")
-    raise HTTPException(503, f"No healthy backend for model '{alias}'")
+    ptime = _park_time_for(alias)
+    if ptime <= 0:                                      # parking disabled for this alias → 503 now
+        raise HTTPException(503, f"all backends for '{alias}' are busy (parking disabled)",
+                            headers={"Retry-After": "1"})
+    if len(_parked) >= max_parked:
+        raise HTTPException(503, f"park queue full ({max_parked}) — retry later", headers={"Retry-After": "2"})
+    return await _park_and_dispatch(alias, path, body, request,
+                                    time.monotonic() + ptime, source=_source_of(request))
 
 
 # ── Responses API ↔ Chat Completions bridge ──────────────────────────────────
@@ -1788,7 +1823,12 @@ def dashboard_snapshot() -> dict:
         "backends": bes,
         "llm_inflight": sum(backend_inflight.get(backend_id(b), 0) for b in backends if not is_comfy(b)),
         "img_inflight": sum(backend_inflight.get(backend_id(b), 0) for b in backends if is_comfy(b)),
-        "parked": len(_park_waiters),
+        "parked": len(_parked),
+        "parked_calls": [{
+            "id": e["id"], "alias": e["alias"], "source": e["source"],
+            "waited_s": max(0.0, time.time() - e["enqueued"]),
+            "remaining_s": max(0.0, e["deadline"] - time.monotonic()),
+        } for e in list(_parked)],
         "jobs_active": jobs.is_active(),
         "jobs_counts": jobs.counts(),
         "jobs_recent": jobs.recent(15),
@@ -2008,7 +2048,7 @@ admin.bind(lambda: [b for b in backends if b.get("type") == "comfyui"],
 async def health():
     return {
         "status": "ok",
-        "parked": len(_park_waiters),
+        "parked": len(_parked),
         "backends": {
             backend_id(b): {
                 "name": b["name"], "type": b.get("type", "openai"),

@@ -1077,11 +1077,19 @@ def _chat_editor(alias: str) -> str:
         add_sel = ('<select class="addsel" onchange="if(this.value)location.href=\'/ui/chat/badd?alias='
                    f"{_esc(alias)}&amp;backend='+encodeURIComponent(this.value)\">"
                    f'<option value="">+ Add backend…</option>{opts}</select>')
+    cur_park = store.get_alias_park().get(alias)
+    park_field = (_field("park seconds",
+                         _inp("park_s", "" if cur_park is None else cur_park,
+                              placeholder="blank = global default · 0 = off", typ="number"), short=True)
+                  + "<p class='hint' style='margin:-4px 0 10px'>When all backends are busy, a call waits in "
+                    "the queue up to this long for a free slot, then gets a 503. Blank = the global default "
+                    "(Server tab); <b>0</b> disables parking for this alias.</p>")
     return ('<form action="/ui/chat/save" method="post">'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
+            + park_field
             + "<h2>Backends</h2>"
             + "<p class='hint'>Assign backends to this alias, pick the model on each, and optionally "
               "override that backend's global priority for this alias only. Tried in priority order "
@@ -1122,13 +1130,16 @@ async def chat_save(request: Request):
                 value[bn] = m
         else:
             value[bn] = m
+    park_s = (f.get("park_s", "") or "").strip()
     if not alias or not value:
         return RedirectResponse(f"/ui/mapping?cedit={orig}" if orig else "/ui/mapping", status_code=303)
     if orig and orig != alias and store.get_chat_alias(orig) is not None:
         store.delete_chat_alias(orig)         # renamed a store entry → move it
+        store.set_alias_park(orig, None)      # drop the old name's park override
     store.upsert_chat_alias(alias, value)
+    store.set_alias_park(alias, park_s if park_s != "" else None)   # blank → global default
     _apply_chat_aliases()
-    logger.info(f"ui: chat alias '{alias}' = {value}")
+    logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'})")
     return RedirectResponse("/ui/mapping", status_code=303)
 
 
@@ -1159,6 +1170,7 @@ async def chat_del(request: Request):
     alias = (request.query_params.get("alias", "") or "").strip()
     if alias:
         store.delete_chat_alias(alias)
+        store.set_alias_park(alias, None)     # drop any park override with the alias
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
     return RedirectResponse("/ui/mapping", status_code=303)
@@ -2410,13 +2422,28 @@ async def dashboard_page(request: Request):
     else:
         llm_html = llm_head + "<p class='muted'>nothing running or in the last 5 min</p>"
 
+    # Parked calls: chat requests queued because all their backends are busy, waiting
+    # for a free slot up to the alias's park time (shown only when something is parked).
+    parked = d.get("parked_calls", [])
+    parked_html = ""
+    if parked:
+        prows = ""
+        for p in parked:
+            prows += (f"<tr><td>{_esc(p.get('alias'))}</td><td>{_esc(p.get('source'))}</td>"
+                      f"<td class='muted'>{_dur(float(p.get('waited_s') or 0) * 1000)}</td>"
+                      f"<td class='muted'>{_dur(float(p.get('remaining_s') or 0) * 1000)}</td></tr>")
+        parked_html = (f"<h2>Parked calls <span class='muted' style='font-weight:normal'>· queued, waiting for a "
+                       f"free backend</span> {_badge(f'parked {len(parked)}', 'warn')}</h2>"
+                       f"<table class='sortable' data-sk='dash-parked'><tr><th>alias</th><th>user</th>"
+                       f"<th>waited</th><th>park left</th></tr>{prows}</table>")
+
     tick = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
             "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
             "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
             ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
             "setInterval(_td,1000);_td();</script>")
     body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
-            + cards + backends_tbl + llm_html + jobs_html + tick)
+            + cards + backends_tbl + parked_html + llm_html + jobs_html + tick)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
 
 
@@ -2736,6 +2763,8 @@ async def users_del(request: Request):
 _SRV_RUNTIME = [
     ("health_check_interval", "int", "health check interval", "seconds"),
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
+    ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Mapping; 0 = off)"),
+    ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
 ]
 _SRV_RESTART = [
     ("__grp", "", "Gateway", ""),

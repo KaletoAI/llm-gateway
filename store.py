@@ -364,6 +364,36 @@ def delete_ip_alias(ip: str) -> None:
         save_ip_aliases(a)
 
 
+# ── Per-alias sync-park time (seconds a call may wait for a free backend) ────────
+# Stored as one settings dict {alias: seconds}. Absent → the global default; 0 → no
+# parking for that alias (immediate 503 when all its backends are busy).
+
+def get_alias_park() -> dict:
+    return get_settings().get("alias_park") or {}
+
+
+def set_alias_park(alias: str, park_s) -> None:
+    """Set/clear an alias's park seconds. None/'' removes the override (→ global default)."""
+    m = get_alias_park()
+    if park_s in (None, ""):
+        m.pop(alias, None)
+    else:
+        try:
+            m[alias] = max(0, int(park_s))
+        except (TypeError, ValueError):
+            return
+    set_settings({"alias_park": m})
+
+
+def rename_alias_park(old: str, new: str) -> None:
+    if old == new:
+        return
+    m = get_alias_park()
+    if old in m:
+        m[new] = m.pop(old)
+        set_settings({"alias_park": m})
+
+
 # ── Users (multi-user: api_key → identity, role, quota, model access) ────────────
 # Each user: {name, api_key(enc), role, enabled, models[], quota_req_day, quota_cost_month}.
 # api_key encrypted at rest; the empty `models` list means "all models allowed".
