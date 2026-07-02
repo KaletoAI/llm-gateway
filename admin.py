@@ -2546,16 +2546,22 @@ async def dashboard_page(request: Request):
 
 def _reasoning_cell(rsn) -> str:
     """Table cell for the applied reasoning control (off:prefill / on:enable_thinking /
-    unsupported / — for auto)."""
+    unsupported / — for auto). Says what the GATEWAY did with the requested switch,
+    not whether the model can think."""
     if not rsn:
-        return "<td class='muted'>—</td>"
-    if rsn == "unsupported" or str(rsn).endswith("noop"):
-        kind = "muted"
-    elif str(rsn).startswith("off"):
-        kind = "warn"
+        return "<td class='muted' title='no reasoning switch sent (auto) — request untouched'>—</td>"
+    rsn = str(rsn)
+    if rsn == "unsupported":
+        return ("<td><span class='badge muted' title='off/on was requested, but NO reasoning rule "
+                "covers this model×backend — the request was forwarded UNCHANGED. Not a statement "
+                "about the model: add a rule in the Reasoning tab.'>unsupported</span></td>")
+    if rsn.endswith("noop"):
+        kind, tip = "muted", "on requested — the model thinks by default, nothing to change"
+    elif rsn.startswith("off"):
+        kind, tip = "warn", "thinking switched OFF via this mechanism"
     else:
-        kind = "ok"
-    return f"<td>{_badge(_esc(rsn), kind)}</td>"
+        kind, tip = "ok", "thinking switched ON via this mechanism"
+    return f"<td><span class='badge {kind}' title='{tip}'>{_esc(rsn)}</span></td>"
 
 
 def _call_row(r, aliases) -> str:
