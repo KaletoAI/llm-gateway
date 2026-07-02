@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -23,6 +22,8 @@ import reasoning
 import stats
 import store
 from adapters import AdapterContext, NormalizedRequest, image_params, make_adapter
+from responses_bridge import (chat_to_responses, response_shell, responses_stream,
+                              responses_to_chat)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -521,6 +522,16 @@ async def gate_request(authorization: Optional[str], request: Request, model: Op
     return user
 
 
+def _check_owner(job: Optional[dict], user: Optional[dict], *, status: int, detail: str) -> None:
+    """Non-admin users may only touch their own jobs/responses; admin/master/anonymous
+    pass. `status` picks the flavor: jobs answer 403, background responses hide foreign
+    ids as 404 (no existence leak). Owner None/'default' (legacy/anonymous) is open."""
+    if not user or user.get("_master") or user.get("role") == "admin":
+        return
+    if job and job.get("owner") not in (user.get("name"), None, "default"):
+        raise HTTPException(status, detail)
+
+
 def resolve_admin(key: Optional[str]) -> Optional[dict]:
     """Resolve a bare key to an admin (master api_key or an admin-role user). Drives
     the /ui login. Returns None if the key isn't an admin credential."""
@@ -919,162 +930,9 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     return await _dispatch_or_park(alias, path, body, request)
 
 
-# ── Responses API ↔ Chat Completions bridge ──────────────────────────────────
-# Translation layer that lets clients hitting OpenAI's newer /v1/responses
-# endpoint reach backends that only speak /v1/chat/completions (Together,
-# llama-swap, vLLM, etc.). Non-streaming only — stream=true is silently
-# downgraded to a non-streaming call; the response is returned in one shot.
-
-def _content_parts_to_text(content: Any) -> Any:
-    """Flatten a Responses-style content array to a chat-completions content value."""
-    if not isinstance(content, list):
-        return content
-    text_pieces: list[str] = []
-    image_parts: list[dict] = []
-    for part in content:
-        ptype = part.get("type")
-        if ptype in ("input_text", "output_text", "text"):
-            text_pieces.append(part.get("text", ""))
-        elif ptype == "input_image":
-            url = part.get("image_url") or part.get("url")
-            if url:
-                image_parts.append({"type": "image_url", "image_url": {"url": url}})
-    if not image_parts:
-        return "".join(text_pieces)
-    parts: list[dict] = []
-    if text_pieces:
-        parts.append({"type": "text", "text": "".join(text_pieces)})
-    parts.extend(image_parts)
-    return parts
-
-
-def responses_to_chat(body: dict) -> dict:
-    """Translate an OpenAI Responses API request body to Chat Completions."""
-    passthrough = {
-        "model", "temperature", "top_p", "stop", "seed", "user", "metadata",
-        "presence_penalty", "frequency_penalty", "logit_bias",
-        "parallel_tool_calls", "response_format",
-    }
-    chat: dict = {k: v for k, v in body.items() if k in passthrough}
-
-    if "max_output_tokens" in body:
-        chat["max_tokens"] = body["max_output_tokens"]
-    # stream: silently downgrade — translating SSE event streams isn't supported yet
-    chat["stream"] = False
-
-    # Tools: Responses uses flat {type, name, description, parameters};
-    #        Chat uses nested {type, function: {name, description, parameters}}.
-    if tools := body.get("tools"):
-        chat_tools = []
-        for t in tools:
-            if t.get("type") != "function":
-                continue  # skip built-in tools (web_search, code_interpreter, …)
-            fn = {k: t[k] for k in ("name", "description", "parameters", "strict") if k in t}
-            chat_tools.append({"type": "function", "function": fn})
-        if chat_tools:
-            chat["tools"] = chat_tools
-    if "tool_choice" in body:
-        chat["tool_choice"] = body["tool_choice"]
-
-    messages: list[dict] = []
-    if instructions := body.get("instructions"):
-        messages.append({"role": "system", "content": instructions})
-
-    inp = body.get("input")
-    if isinstance(inp, str):
-        messages.append({"role": "user", "content": inp})
-    elif isinstance(inp, list):
-        for item in inp:
-            itype = item.get("type", "message")
-            if itype == "message":
-                role = item.get("role", "user")
-                if role == "developer":
-                    role = "system"
-                content = _content_parts_to_text(item.get("content", ""))
-                messages.append({"role": role, "content": content})
-            elif itype == "function_call":
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": item.get("call_id") or item.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name", ""),
-                            "arguments": item.get("arguments", "{}"),
-                        },
-                    }],
-                })
-            elif itype == "function_call_output":
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": item.get("call_id"),
-                    "content": item.get("output", ""),
-                })
-    chat["messages"] = messages
-    return chat
-
-
-def chat_to_responses(chat_resp: dict) -> dict:
-    """Translate a Chat Completions response body to a Responses API body."""
-    choice = (chat_resp.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    finish = choice.get("finish_reason")
-
-    output: list[dict] = []
-
-    text_content = message.get("content")
-    if text_content:
-        output.append({
-            "type": "message",
-            "id": f"msg_{uuid.uuid4().hex[:24]}",
-            "role": message.get("role", "assistant"),
-            "status": "completed",
-            "content": [{"type": "output_text", "text": text_content, "annotations": []}],
-        })
-
-    for tc in message.get("tool_calls") or []:
-        fn = tc.get("function") or {}
-        output.append({
-            "type": "function_call",
-            "id": f"fc_{uuid.uuid4().hex[:24]}",
-            "call_id": tc.get("id"),
-            "name": fn.get("name", ""),
-            "arguments": fn.get("arguments", ""),
-            "status": "completed",
-        })
-
-    usage_in = chat_resp.get("usage") or {}
-    usage = {
-        "input_tokens": usage_in.get("prompt_tokens", 0),
-        "output_tokens": usage_in.get("completion_tokens", 0),
-        "total_tokens": usage_in.get("total_tokens", 0),
-    }
-
-    output_text = "".join(
-        p.get("text", "") for o in output if o.get("type") == "message"
-        for p in (o.get("content") or []) if p.get("type") == "output_text"
-    )
-
-    return {
-        "id": chat_resp.get("id") or f"resp_{uuid.uuid4().hex[:24]}",
-        "object": "response",
-        "created_at": chat_resp.get("created", int(time.time())),
-        "status": "completed",
-        "error": None,
-        "incomplete_details": None,
-        "model": chat_resp.get("model"),
-        "output": output,
-        "output_text": output_text,
-        "usage": usage,
-        "metadata": {},
-        "parallel_tool_calls": True,
-        "tool_choice": "auto",
-        "tools": [],
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "_finish_reason": finish,
-    }
+# The Responses API ↔ Chat Completions translation layer (request/response/
+# stream/shell builders) lives in responses_bridge.py — pure functions, no
+# gateway state. The endpoints below own dispatch/parking + background mode.
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -1187,85 +1045,6 @@ async def run_chat(model: str, messages: list, params: Optional[dict] = None) ->
     raise HTTPException(503, f"All backends failed: {last}")
 
 
-async def _responses_stream(chat_resp, raw_body: dict, alias: str):
-    """A3: translate a backend chat-completion SSE stream into Responses API SSE
-    events. Consumes the adapter StreamingResponse's body_iterator (so in-flight
-    accounting + stats still fire in the adapter when it drains)."""
-    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
-    item_id = f"msg_{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
-    model = raw_body.get("model") or alias
-    seq = 0
-
-    def ev(etype: str, payload: dict) -> str:
-        nonlocal seq
-        body = {"type": etype, "sequence_number": seq, **payload}
-        seq += 1
-        return f"event: {etype}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
-
-    def shell(status: str, output: list, usage=None) -> dict:
-        return {
-            "id": resp_id, "object": "response", "created_at": created, "status": status,
-            "error": None, "incomplete_details": None, "model": model, "output": output,
-            "output_text": "".join(p.get("text", "") for o in output if o.get("type") == "message"
-                                   for p in (o.get("content") or [])),
-            "usage": usage, "metadata": {}, "parallel_tool_calls": True,
-            "tool_choice": "auto", "tools": [], "temperature": 1.0, "top_p": 1.0,
-        }
-
-    yield ev("response.created", {"response": shell("in_progress", [])})
-    yield ev("response.in_progress", {"response": shell("in_progress", [])})
-    yield ev("response.output_item.added", {"output_index": 0, "item": {
-        "id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
-    yield ev("response.content_part.added", {"item_id": item_id, "output_index": 0,
-             "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
-
-    full, buf, usage = "", "", None
-    try:
-        async for chunk in chat_resp.body_iterator:
-            buf += chunk.decode("utf-8", "ignore") if isinstance(chunk, (bytes, bytearray)) else chunk
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    obj = json.loads(data)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if obj.get("model"):
-                    model = obj["model"]
-                if obj.get("usage"):
-                    usage = obj["usage"]
-                delta = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content")
-                if delta:
-                    full += delta
-                    yield ev("response.output_text.delta", {"item_id": item_id,
-                             "output_index": 0, "content_index": 0, "delta": delta})
-    except Exception as e:
-        logger.warning(f"responses SSE translate aborted: {e}")
-
-    part = {"type": "output_text", "text": full, "annotations": []}
-    yield ev("response.output_text.done", {"item_id": item_id, "output_index": 0,
-             "content_index": 0, "text": full})
-    yield ev("response.content_part.done", {"item_id": item_id, "output_index": 0,
-             "content_index": 0, "part": part})
-    final_item = {"id": item_id, "type": "message", "status": "completed",
-                  "role": "assistant", "content": [part]}
-    yield ev("response.output_item.done", {"output_index": 0, "item": final_item})
-    u = None
-    if usage:
-        u = {"input_tokens": usage.get("prompt_tokens", 0),
-             "output_tokens": usage.get("completion_tokens", 0),
-             "total_tokens": usage.get("total_tokens", 0)}
-    yield ev("response.completed", {"response": shell("completed", [final_item], u)})
-
-
 # ── Responses background mode (official async) ────────────────────────────────
 # `POST /v1/responses` with `background: true` returns immediately with a queued
 # response object; the worker parks/dispatches in the same queue and stores the
@@ -1273,14 +1052,17 @@ async def _responses_stream(chat_resp, raw_body: dict, alias: str):
 _bg_tasks: dict = {}                        # response_id → asyncio.Task (for cancellation)
 
 
-def _resp_shell(rid, status, model, created, output=None, usage=None, error=None) -> dict:
-    """A minimal Responses object for the non-terminal / error states of a background
-    response (the completed one is the full chat_to_responses body, stored verbatim)."""
-    txt = "".join(p.get("text", "") for o in (output or []) if o.get("type") == "message"
-                  for p in (o.get("content") or []) if p.get("type") == "output_text")
-    return {"id": rid, "object": "response", "created_at": created, "status": status,
-            "background": True, "model": model, "output": output or [],
-            "output_text": txt, "error": error, "usage": usage, "incomplete_details": None}
+def _dispatch_json(resp) -> dict:
+    """Parsed JSON of a non-stream dispatch result. The adapter attaches the body it
+    already parsed for usage as `resp.parsed_json` — reuse it instead of re-parsing
+    the raw bytes; fall back to the body for foreign Response objects."""
+    parsed = getattr(resp, "parsed_json", None)
+    if isinstance(parsed, dict):
+        return parsed
+    try:
+        return json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
+    except Exception:
+        return {}
 
 
 async def _run_bg_response(job_id, rid, alias, chat_body, request, created):
@@ -1290,7 +1072,7 @@ async def _run_bg_response(job_id, rid, alias, chat_body, request, created):
         resp = await _dispatch_or_park(alias, "/v1/chat/completions", chat_body, request,
                                        stats_endpoint="/v1/responses",
                                        deadline=time.monotonic() + async_park_timeout_s)
-        chat_json = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
+        chat_json = _dispatch_json(resp)
         if getattr(resp, "status_code", 200) >= 400:
             await asyncio.to_thread(jobs.fail, job_id,
                                     f"{resp.status_code}: {(json.dumps(chat_json) or '')[:300]}")
@@ -1323,7 +1105,8 @@ async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
     t.add_done_callback(lambda _: _bg_tasks.pop(rid, None))
     if log_per_call:
         logger.info(f"→ background response {rid} (alias '{alias}') queued")
-    return JSONResponse(_resp_shell(rid, "queued", alias, created), status_code=200)
+    return JSONResponse(response_shell(rid, "queued", alias, created, background=True),
+                        status_code=200)
 
 
 async def _bg_job_for(response_id: str) -> dict:
@@ -1337,23 +1120,22 @@ async def _bg_job_for(response_id: str) -> dict:
 
 def _bg_owner_check(job: dict, user: Optional[dict]) -> None:
     # non-admin users can only touch their own responses; hide others as 404 (no leak).
-    if user and user is not _MASTER_ADMIN and user.get("role") != "admin":
-        if job.get("owner") not in (user.get("name"), "default"):
-            raise HTTPException(404, "response not found")
+    _check_owner(job, user, status=404, detail="response not found")
 
 
 def _bg_view(response_id: str, job: dict) -> dict:
     status = job["status"]
     created = int(job.get("created") or time.time())
     model = (job.get("meta") or {}).get("model") or job.get("alias")
+    shell = lambda st, **kw: response_shell(response_id, st, model, created, background=True, **kw)
     if status == "done":
-        return (job.get("results") or [None])[0] or _resp_shell(response_id, "completed", model, created)
+        return (job.get("results") or [None])[0] or shell("completed")
     if status == "failed":
         err = job.get("error") or "failed"
         if err == "cancelled":
-            return _resp_shell(response_id, "cancelled", model, created)
-        return _resp_shell(response_id, "failed", model, created, error={"message": err})
-    return _resp_shell(response_id, "in_progress" if status == "running" else "queued", model, created)
+            return shell("cancelled")
+        return shell("failed", error={"message": err})
+    return shell("in_progress" if status == "running" else "queued")
 
 
 @app.post("/v1/responses")
@@ -1385,11 +1167,11 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
                                    stats_endpoint="/v1/responses")
     if wants_stream:                                   # A3: translate chat SSE → Responses SSE
         if isinstance(resp, StreamingResponse):
-            return StreamingResponse(_responses_stream(resp, raw_body, alias),
+            return StreamingResponse(responses_stream(resp, raw_body, alias),
                                      media_type="text/event-stream")
-        err = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
+        err = _dispatch_json(resp)
         raise HTTPException(resp.status_code, (json.dumps(err) or "")[:500])
-    chat_resp_json = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
+    chat_resp_json = _dispatch_json(resp)
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, (json.dumps(chat_resp_json) or "")[:500])
     return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code)
@@ -1738,10 +1520,9 @@ async def gen_alias_loras(alias: str, request: Request, authorization: Optional[
 async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:
     """A non-admin user may only touch their own jobs; admin/master/anonymous see all."""
     user = authenticate(authorization)
-    if user and user.get("role") != "admin" and not user.get("_master"):
+    if user and not user.get("_master") and user.get("role") != "admin":
         job = await asyncio.to_thread(jobs.get, job_id)
-        if job and job.get("owner") not in (user["name"], None, "default"):
-            raise HTTPException(403, "not your job")
+        _check_owner(job, user, status=403, detail="not your job")
 
 
 @app.get("/v1/jobs/{job_id}")

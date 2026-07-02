@@ -40,10 +40,10 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Seven self-contained Python files hold everything. `main.py` owns app state; the
-others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`) never import
-`main` — they receive what they need via injected callables, staying
-hot-reload-safe.
+Eight self-contained Python files hold everything. `main.py` owns app state; the
+others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
+`responses_bridge`) never import `main` — they receive what they need via
+injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
   endpoints, auth/quotas, call parking, generation orchestration, the Responses
@@ -83,6 +83,13 @@ hot-reload-safe.
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console). Zero new dependencies — keep it.
   The `calls` row carries the applied `reasoning` control (shown in LLM Calls).
+- **`responses_bridge.py`** — pure Responses↔Chat translation functions (no
+  gateway state): `responses_to_chat` / `chat_to_responses` / `responses_stream`
+  (chat SSE → Responses SSE) and `response_shell()`, the ONE Responses-object
+  skeleton every state (completed / stream events / background queued-failed)
+  builds on. `main.py` keeps the endpoints, dispatch/parking, and background
+  mode; the adapter attaches `resp.parsed_json` so the bridge never re-parses
+  the raw body.
 - **`reasoning.py`** — pure functions for the normalized thinking toggle, no
   `main`/`adapters` imports (hot-reload/test-friendly). Rules are an ordered list
   of `{match(model-glob), backends[], adapter, param}`; `resolve()` picks the
@@ -182,9 +189,10 @@ per-token). Streaming records `0` tokens.
 - The Responses↔Chat bridge supports `stream:true` (chat SSE → Responses SSE) and
   `background:true` (async). What's **not** built yet: streaming-reconnect for a
   background response (poll-only). Keep in sync when touching `/v1/responses`.
-- Keep `stats.py`/`jobs.py`/`store.py`/`reasoning.py` dependency-free and
-  hot-reload-safe (no caching config values at import time); `reasoning.py` must
-  stay pure (no `main`/`adapters` imports) — it's called on the request path.
+- Keep `stats.py`/`jobs.py`/`store.py`/`reasoning.py`/`responses_bridge.py`
+  dependency-free and hot-reload-safe (no caching config values at import time);
+  `reasoning.py` and `responses_bridge.py` must stay pure (no `main`/`adapters`
+  imports) — they're called on the request path.
 - Generation: workflow + mapping are **backend-independent** (shared across an
   alias's candidates); only **pinned values** (`fixed`) are per-backend. A pinned
   `(node,field)` is authoritative — never overridden by an API request param.

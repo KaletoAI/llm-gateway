@@ -419,9 +419,11 @@ class OpenAIAdapter(BackendAdapter):
                                   response_text=resp.text)
         if call.log_on:
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
-        return Response(resp.content, status_code=resp.status_code,
-                        media_type=resp.headers.get("content-type", "application/json"),
-                        headers=call.rheaders)
+        out = Response(resp.content, status_code=resp.status_code,
+                       media_type=resp.headers.get("content-type", "application/json"),
+                       headers=call.rheaders)
+        out.parsed_json = resp_json    # internal callers (Responses bridge) reuse this — no re-parse
+        return out
 
 
 # ── ComfyUI adapter ───────────────────────────────────────────────────────────
