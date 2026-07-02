@@ -2649,49 +2649,58 @@ def _reasoning_form(rule: Optional[dict], idx) -> str:
             + "</form>" + js)
 
 
+def _reasoning_testbox(rules: list, qp) -> str:
+    tm = (qp.get("test_model") or "").strip()
+    tb = (qp.get("test_backend") or "").strip()
+    res = ""
+    if tm and tb:
+        rule = reasoning.resolve(rules, tb, tm)
+        res = (f"<p style='margin-top:8px'><code>{_esc(tm)}</code> on <b>{_esc(tb)}</b> → "
+               + (f"{_badge(rule.get('adapter'), 'ok')} <span class='muted'>(rule #{rules.index(rule) + 1})</span>"
+                  if rule else _badge("unsupported", "muted") + " <span class='muted'>(no matching rule)</span>")
+               + "</p>")
+    bopts = "".join(f"<option{' selected' if n == tb else ''}>{_esc(n)}</option>" for n in _llm_backend_names())
+    return ("<h2 style='margin-top:22px'>Test resolution</h2>"
+            "<p class='hint'>See which rule would apply for a (model, backend) — without a real call.</p>"
+            "<form method='get' action='/ui/reasoning' style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
+            f"{_inp('test_model', tm, placeholder='real model id, e.g. qwen3.5-9b-heretic-thinking')}"
+            f"<select name='test_backend'><option value=''>backend…</option>{bopts}</select>"
+            f"{_btn('Resolve', submit=True, kind='secondary')}</form>{res}")
+
+
 async def reasoning_page(request: Request):
     rules = store.get_reasoning_rules() if store.is_active() else []
     qp = request.query_params
-    if qp.get("new"):
-        return HTMLResponse(_page("Reasoning", _reasoning_form(None, None), "reasoning"))
-    if qp.get("edit", "").isdigit() and int(qp["edit"]) < len(rules):
-        i = int(qp["edit"])
-        return HTMLResponse(_page("Reasoning", _reasoning_form(rules[i], i), "reasoning"))
+    edit_i = int(qp["edit"]) if (qp.get("edit", "").isdigit() and int(qp["edit"]) < len(rules)) else None
     rows = ""
     for i, r in enumerate(rules):
         bks = r.get("backends") or ["*"]
         bstr = "all" if "*" in bks else ", ".join(bks)
         acts = _icon_acts(("✎", f"/ui/reasoning?edit={i}", "secondary", "Edit"),
                           ("✕", f"/ui/reasoning/delete?idx={i}", "danger", "Delete", "Delete this rule?"))
-        rows += (f"<tr><td>{_esc(r.get('order', ''))}</td><td><code>{_esc(r.get('match', '*'))}</code></td>"
+        cls = " class='sel'" if edit_i == i else ""
+        rows += (f"<tr{cls}><td>{_esc(r.get('order', ''))}</td><td><code>{_esc(r.get('match', '*'))}</code></td>"
                  f"<td>{_esc(bstr)}</td><td>{_esc(r.get('adapter', 'none'))}</td>"
                  f"<td class='muted'>{_esc(_reason_pval(r))}</td><td class='acts'>{acts}</td></tr>")
     rows = rows or ("<tr><td colspan=6 class='muted'>no rules — reasoning off/on is reported "
                     "'unsupported' for every model</td></tr>")
-    lst = (f'<div class="bar"><h2>Reasoning rules</h2>{_btn("+ New rule", "/ui/reasoning?new=1")}</div>'
-           "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
-           "unchanged). The first rule whose <b>model glob</b> matches the real model <b>and</b> whose "
-           "<b>backend set</b> contains the serving backend is applied; no match → <code>unsupported</code> "
-           "(never fails). What was applied shows in the <a href='/ui/llmcalls'>LLM Calls</a> tab and the "
-           "<code>x-reasoning-control</code> response header.</p>"
-           f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
-           f"<th>adapter (off)</th><th>param</th><th></th></tr>{rows}</table>")
-    tm = (qp.get("test_model") or "").strip()
-    tb = (qp.get("test_backend") or "").strip()
-    res = ""
-    if tm and tb:
-        rule = reasoning.resolve(rules, tb, tm)
-        res = ("<p style='margin-top:8px'>" + f"<code>{_esc(tm)}</code> on <b>{_esc(tb)}</b> → "
-               + (f"{_badge(rule.get('adapter'), 'ok')} <span class='muted'>(rule #{rules.index(rule) + 1})</span>"
-                  if rule else _badge("unsupported", "muted") + " <span class='muted'>(no matching rule)</span>")
-               + "</p>")
-    bopts = "".join(f"<option{' selected' if n == tb else ''}>{_esc(n)}</option>" for n in _llm_backend_names())
-    test = ("<h2 style='margin-top:22px'>Test resolution</h2>"
-            "<form method='get' action='/ui/reasoning' style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
-            f"{_inp('test_model', tm, placeholder='real model id, e.g. qwen3.5-9b-heretic')}"
-            f"<select name='test_backend'><option value=''>backend…</option>{bopts}</select>"
-            f"{_btn('Resolve', submit=True, kind='secondary')}</form>{res}")
-    return HTMLResponse(_page("Reasoning", lst + test, "reasoning"))
+    list_html = (f'<div class="bar"><h2>Reasoning</h2>{_btn("+ New rule", "/ui/reasoning?new=1")}</div>'
+                 "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
+                 "unchanged). The first rule whose <b>model glob</b> matches the real model <b>and</b> whose "
+                 "<b>backend set</b> contains the serving backend is applied; no match → <code>unsupported</code> "
+                 "(never fails). Applied control shows in <a href='/ui/llmcalls'>LLM Calls</a> + the "
+                 "<code>x-reasoning-control</code> header.</p>"
+                 f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
+                 f"<th>adapter</th><th>param</th><th></th></tr>{rows}</table>")
+    if qp.get("new"):
+        detail = _reasoning_form(None, None)
+    elif edit_i is not None:
+        detail = _reasoning_form(rules[edit_i], edit_i)
+    else:
+        detail = ("<h2>Details</h2><p class='hint'>Select a rule's <b>✎</b>, or <b>+ New rule</b> to add one.</p>"
+                  + _reasoning_testbox(rules, qp))
+    body = f'<div class="cols"><div class="col">{list_html}</div><div class="col">{detail}</div></div>'
+    return HTMLResponse(_page("Reasoning", body, "reasoning"))
 
 
 async def reasoning_save(request: Request):
