@@ -246,6 +246,17 @@ def apply_reasoning_rules() -> None:
     reasoning_rules = store.get_reasoning_rules() if store.is_active() else []
 
 
+# Shared outbound HTTP client — ONE connection pool (keep-alive, no TLS re-handshake)
+# for every proxied call, discovery poll, and ComfyUI helper. Constructed at import
+# (connections open lazily), closed in lifespan shutdown. Carries only a safety-net
+# timeout: every hot call site passes its own `timeout=` per request.
+http_client = httpx.AsyncClient(
+    limits=httpx.Limits(max_connections=200, max_keepalive_connections=50,
+                        keepalive_expiry=30.0),
+    timeout=httpx.Timeout(30.0),
+)
+
+
 def _next_park_id() -> int:
     _park_seq[0] += 1
     return _park_seq[0]
@@ -302,11 +313,10 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
 
 
 async def health_loop() -> None:
-    async with httpx.AsyncClient() as client:
-        while True:
-            for backend in enabled_backends():
-                await refresh_backend(backend, client)
-            await asyncio.sleep(health_check_interval)
+    while True:
+        for backend in enabled_backends():
+            await refresh_backend(backend, http_client)
+        await asyncio.sleep(health_check_interval)
 
 
 def reload_config() -> None:
@@ -369,8 +379,7 @@ async def lifespan(app: FastAPI):
         jobs_prune_task = asyncio.create_task(jobs.prune_loop(jobs_cfg.get("prune_interval_s", 3600)))
 
     log_config_summary()
-    async with httpx.AsyncClient() as client:
-        await asyncio.gather(*[refresh_backend(b, client) for b in enabled_backends()])
+    await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
     health_task = asyncio.create_task(health_loop())
     watch_task = asyncio.create_task(watch_config_loop())
 
@@ -401,6 +410,7 @@ async def lifespan(app: FastAPI):
         jobs_prune_task.cancel()
     if prune_task is not None:
         prune_task.cancel()
+    await http_client.aclose()         # drain the shared connection pool last
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -768,6 +778,7 @@ adapter_ctx = AdapterContext(
     active_register=_active_register,
     active_done=_active_done,
     apply_reasoning=_reasoning_apply,
+    http_client=lambda: http_client,   # shared pool; callable so adapters never cache it
 )
 
 
@@ -1129,8 +1140,7 @@ async def run_chat(model: str, messages: list, params: Optional[dict] = None) ->
         url = f"{backend['url']}/v1/chat/completions"
         headers = {"content-type": "application/json", **backend_auth_headers(backend)}
         try:
-            async with httpx.AsyncClient(timeout=300.0) as c:
-                r = await c.post(url, json=body, headers=headers)
+            r = await http_client.post(url, json=body, headers=headers, timeout=300.0)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError) as e:
             last = f"{type(e).__name__}: {e}"
             continue
@@ -1528,8 +1538,7 @@ async def cancel_generation(job_id: str) -> bool:
               and x.get("type") == "comfyui"), None)
     if b and b.get("url"):
         try:
-            async with httpx.AsyncClient(timeout=5.0) as c:
-                await c.post(f"{b['url'].rstrip('/')}/interrupt")
+            await http_client.post(f"{b['url'].rstrip('/')}/interrupt", timeout=5.0)
         except Exception:
             pass
     t = _gen_tasks.get(job_id)
@@ -1816,9 +1825,8 @@ async def _decode_ref_image(ref) -> Optional[bytes]:
         ref = ref.split(",", 1)[-1]
     if ref.startswith(("http://", "https://")):
         try:
-            async with httpx.AsyncClient(timeout=20.0) as c:
-                r = await c.get(ref)
-                return r.content if r.status_code == 200 else None
+            r = await http_client.get(ref, timeout=20.0)
+            return r.content if r.status_code == 200 else None
         except Exception:
             return None
     try:
@@ -1994,8 +2002,7 @@ def apply_backend_change() -> None:
     build_backend_adapters()
 
     async def _discover():
-        async with httpx.AsyncClient() as client:
-            await asyncio.gather(*[refresh_backend(b, client) for b in enabled_backends()])
+        await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
     try:
         asyncio.get_running_loop().create_task(_discover())
     except RuntimeError:

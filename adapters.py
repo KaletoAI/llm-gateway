@@ -17,6 +17,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ import struct
 import time
 import zlib
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -196,6 +198,23 @@ class AdapterContext:
     # Default no-op (auto) so non-main constructions stay valid.
     apply_reasoning: Callable[[dict, Optional[str], Optional[str], dict], Any] = \
         lambda backend, model, requested, payload: (payload, None)
+    # App-shared pooled httpx client (connection reuse / keep-alive across requests).
+    # Callable so hot paths always see the live instance; None → adapters fall back
+    # to a transient per-call client, keeping non-main constructions valid.
+    http_client: Callable[[], Optional[httpx.AsyncClient]] = lambda: None
+
+
+@asynccontextmanager
+async def _pooled_client(ctx: AdapterContext):
+    """The app-shared pooled client when injected (NOT closed here — main owns its
+    lifecycle), else a transient one closed on exit. The shared client carries no
+    per-client timeout, so every call site passes its own `timeout=`."""
+    shared = ctx.http_client()
+    if shared is not None:
+        yield shared
+    else:
+        async with httpx.AsyncClient() as client:
+            yield client
 
 
 class BackendAdapter(ABC):
@@ -309,7 +328,7 @@ class OpenAIAdapter(BackendAdapter):
                 in_tok = out_tok = 0
                 buf = ""
                 try:
-                    async with httpx.AsyncClient() as client:
+                    async with _pooled_client(ctx) as client:
                         async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
                             stream_status = resp.status_code
                             if log_on:
@@ -337,7 +356,7 @@ class OpenAIAdapter(BackendAdapter):
             return StreamingResponse(generate(), media_type="text/event-stream", headers=rheaders)
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with _pooled_client(ctx) as client:
                 resp = await client.post(url, json=fwd, headers=headers, timeout=300.0)
         finally:
             ctx.inflight_dec(self.bid)
@@ -689,7 +708,7 @@ class ComfyUIAdapter(BackendAdapter):
         """A fresh, mutable copy of the workflow to inject into — preferring the
         gateway-owned JSON (registered via the UI), else a file path (share)."""
         if req.workflow_json is not None:
-            return json.loads(json.dumps(req.workflow_json))   # deep copy, never mutate the stored one
+            return copy.deepcopy(req.workflow_json)            # never mutate the stored one
         return self._load_workflow(req.workflow)
 
     async def _upload_image(self, client: httpx.AsyncClient, data: bytes, name: str) -> str:
@@ -700,7 +719,7 @@ class ComfyUIAdapter(BackendAdapter):
         try:
             r = await client.post(f"{url}/upload/image",
                                   files={"image": (name, data, "image/png")},
-                                  data={"overwrite": "true"})
+                                  data={"overwrite": "true"}, timeout=20.0)
             return (r.json() or {}).get("name", name) if r.status_code == 200 else name
         except Exception:
             return name
@@ -715,7 +734,7 @@ class ComfyUIAdapter(BackendAdapter):
         if not (has_ph or has_up):
             return fixed
         need_ph = has_ph or (has_up and not upload)        # placeholder also backs an empty upload
-        async with httpx.AsyncClient(timeout=20.0) as c:
+        async with _pooled_client(self.ctx) as c:
             ph = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png") if need_ph else None
             up = await self._upload_image(c, bytes(upload), "gw_upload.png") if (has_up and upload) else None
         def sub(b):
@@ -737,7 +756,7 @@ class ComfyUIAdapter(BackendAdapter):
         if not params:
             return []
         applied = []
-        async with httpx.AsyncClient(timeout=20.0) as c:
+        async with _pooled_client(self.ctx) as c:
             for p in params:
                 m = mapping.get(p) or {}
                 nid, fld = m.get("node"), m.get("field")
@@ -769,7 +788,7 @@ class ComfyUIAdapter(BackendAdapter):
                  and nid not in skip]
         if not empty:
             return []
-        async with httpx.AsyncClient(timeout=20.0) as c:
+        async with _pooled_client(self.ctx) as c:
             name = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png")
         for nid in empty:
             wf[nid].setdefault("inputs", {})["image"] = name
@@ -814,6 +833,9 @@ class ComfyUIAdapter(BackendAdapter):
             # short per-request read timeout (NOT max_wait): a hung /history or /view read
             # then fails fast → the disconnect-grace/failover logic kicks in instead of
             # blocking the whole job for max_wait. The overall budget is the poll deadline.
+            # Deliberately a per-job client (not the shared pool): the client-level
+            # timeout shapes every submit/poll/fetch call below, and one client per
+            # multi-second generation job costs nothing.
             timeout = httpx.Timeout(30.0, read=float(b.get("read_timeout", 60)))
             async with httpx.AsyncClient(timeout=timeout) as client:
                 pr = await client.post(f"{url}/prompt", json={"prompt": wf})
