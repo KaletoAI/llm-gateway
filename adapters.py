@@ -33,7 +33,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +273,23 @@ def _sse_usage(line: str) -> Optional[tuple]:
     return int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
 
 
+@dataclass
+class _Call:
+    """Per-dispatch bookkeeping shared by the stream and non-stream paths —
+    built once in OpenAIAdapter._prepare()."""
+    url: str
+    headers: dict                       # outgoing headers (client's, minus hop-by-hop, plus backend auth)
+    fwd: dict                           # outgoing payload (private keys stripped, reasoning applied)
+    real_model: Optional[str]
+    reasoning_ctl: Optional[str]        # x-reasoning-control value ("off:prefill", …) or None
+    rheaders: Optional[dict]            # response headers carrying the control, or None
+    source: str
+    req_text: str
+    started: float
+    log_on: bool
+    act: Any                            # live-call registry token
+
+
 class OpenAIAdapter(BackendAdapter):
     """llama.cpp / llama-swap / vLLM / Ollama / Together / OpenRouter / OpenAI —
     anything that speaks `/v1/models` + `/v1/chat|completions|embeddings`."""
@@ -290,80 +307,107 @@ class OpenAIAdapter(BackendAdapter):
                             pricing=extract_pricing(payload))
 
     async def dispatch(self, req: NormalizedRequest):
+        call = self._prepare(req)                 # claims the in-flight slot
+        if req.body.get("stream"):
+            return self._dispatch_stream(req, call)
+        return await self._dispatch_once(req, call)
+
+    def _prepare(self, req: NormalizedRequest) -> _Call:
+        """Shared per-dispatch setup: outgoing headers + payload (gateway-private
+        `_` keys stripped, normalized reasoning applied for THIS backend — a
+        per-backend, failover-safe copy), stats fields, live-call registry entry.
+        Claims the in-flight slot LAST (after anything that could raise), with no
+        await before dispatch uses it — the dispatching path's `finally` MUST
+        release it via _finish()."""
         b = self.backend
         ctx = self.ctx
-        bname = self.name
-        url = f"{b['url']}{req.path}"
         headers = {
             k: v for k, v in req.raw.headers.items()
             if k.lower() not in ("host", "content-length", "authorization", "x-park-mode")
         }
         headers.update(ctx.auth_headers(b))
-        ctx.inflight_inc(self.bid)        # released on completion (stream close / return / error)
         real_model = req.body.get("model")
-        # Outgoing payload: drop gateway-private keys (e.g. _reasoning), then apply the
-        # normalized reasoning toggle for THIS backend (per-backend, failover-safe copy).
         fwd = {k: v for k, v in req.body.items() if not k.startswith("_")}
         fwd, reasoning_ctl = ctx.apply_reasoning(b, real_model, req.reasoning, fwd)
-        rheaders = {"x-reasoning-control": reasoning_ctl} if reasoning_ctl else None
-        source = ctx.source_of(req.raw)
-        req_text = json.dumps(fwd, ensure_ascii=False)
-        started = time.monotonic()
-        log_on = ctx.log_enabled()
-        act = ctx.active_register({                # dropped on completion (both finally paths)
-            "alias": req.alias, "model": real_model, "backend": bname, "source": source,
-            "endpoint": (req.stats_endpoint or req.path), "stream": bool(req.body.get("stream")),
+        ctx.inflight_inc(self.bid)        # released on completion (stream close / return / error)
+        act = ctx.active_register({       # dropped on completion (both finally paths)
+            "alias": req.alias, "model": real_model, "backend": self.name,
+            "source": ctx.source_of(req.raw), "endpoint": (req.stats_endpoint or req.path),
+            "stream": bool(req.body.get("stream")),
         })
+        return _Call(
+            url=f"{b['url']}{req.path}", headers=headers, fwd=fwd, real_model=real_model,
+            reasoning_ctl=reasoning_ctl,
+            rheaders={"x-reasoning-control": reasoning_ctl} if reasoning_ctl else None,
+            source=ctx.source_of(req.raw), req_text=json.dumps(fwd, ensure_ascii=False),
+            started=time.monotonic(), log_on=ctx.log_enabled(), act=act,
+        )
 
-        if req.body.get("stream"):
-            path, alias = req.path, req.alias
-            # Ask the backend to emit a final usage chunk so streamed calls record
-            # real tokens/cost instead of 0 (graceful: backends that ignore the
-            # field just yield no usage line → tokens stay 0, as before).
-            body = {**fwd,
-                    "stream_options": {**(fwd.get("stream_options") or {}), "include_usage": True}}
+    def _finish(self, call: _Call) -> None:
+        """Release the in-flight slot + live-registry entry (every path's finally)."""
+        self.ctx.inflight_dec(self.bid)
+        self.ctx.active_done(call.act)
 
-            async def generate():
-                stream_status = 0
-                in_tok = out_tok = 0
-                buf = ""
-                try:
-                    async with _pooled_client(ctx) as client:
-                        async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
-                            stream_status = resp.status_code
-                            if log_on:
-                                logger.info(f"← [{bname}] {path} HTTP {stream_status} (stream open, {(time.monotonic()-started):.2f}s)")
-                            async for chunk in resp.aiter_bytes():
-                                yield chunk
-                                buf += chunk.decode("utf-8", "ignore")
-                                while "\n" in buf:
-                                    line, buf = buf.split("\n", 1)
-                                    got = _sse_usage(line.strip())
-                                    if got:
-                                        in_tok, out_tok = got
-                finally:
-                    ctx.inflight_dec(self.bid)
-                    ctx.active_done(act)
-                elapsed_ms = int((time.monotonic() - started) * 1000)
-                cost = ctx.cost_usd(self.bid, real_model, in_tok, out_tok) if (in_tok or out_tok) else 0.0
-                asyncio.create_task(ctx.record_call(
-                    duration_ms=elapsed_ms, backend=bname, source=source,
-                    alias=alias, model=real_model, endpoint=(req.stats_endpoint or path),
-                    status=stream_status, input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost,
-                    request_text=req_text, reasoning=reasoning_ctl,
-                ))
+    def _record(self, req: NormalizedRequest, call: _Call, status: int,
+                in_tok: int, out_tok: int, response_text: Optional[str] = None) -> int:
+        """Fire-and-forget stats row for this dispatch; returns the elapsed ms."""
+        ctx = self.ctx
+        elapsed_ms = int((time.monotonic() - call.started) * 1000)
+        asyncio.create_task(ctx.record_call(
+            duration_ms=elapsed_ms, backend=self.name, source=call.source,
+            alias=req.alias, model=call.real_model, endpoint=(req.stats_endpoint or req.path),
+            status=status, input_tokens=in_tok, output_tokens=out_tok,
+            cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok),
+            request_text=call.req_text, response_text=response_text,
+            reasoning=call.reasoning_ctl,
+        ))
+        return elapsed_ms
 
-            return StreamingResponse(generate(), media_type="text/event-stream", headers=rheaders)
+    def _dispatch_stream(self, req: NormalizedRequest, call: _Call) -> StreamingResponse:
+        ctx = self.ctx
+        # Ask the backend to emit a final usage chunk so streamed calls record
+        # real tokens/cost instead of 0 (graceful: backends that ignore the
+        # field just yield no usage line → tokens stay 0, as before).
+        body = {**call.fwd,
+                "stream_options": {**(call.fwd.get("stream_options") or {}), "include_usage": True}}
 
+        async def generate():
+            stream_status = 0
+            in_tok = out_tok = 0
+            buf = ""
+            try:
+                async with _pooled_client(ctx) as client:
+                    async with client.stream("POST", call.url, json=body,
+                                             headers=call.headers, timeout=300.0) as resp:
+                        stream_status = resp.status_code
+                        if call.log_on:
+                            logger.info(f"← [{self.name}] {req.path} HTTP {stream_status} "
+                                        f"(stream open, {(time.monotonic() - call.started):.2f}s)")
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                            buf += chunk.decode("utf-8", "ignore")
+                            while "\n" in buf:
+                                line, buf = buf.split("\n", 1)
+                                got = _sse_usage(line.strip())
+                                if got:
+                                    in_tok, out_tok = got
+            finally:
+                self._finish(call)
+            self._record(req, call, stream_status, in_tok, out_tok)
+
+        return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
+
+    async def _dispatch_once(self, req: NormalizedRequest, call: _Call) -> Response:
         try:
-            async with _pooled_client(ctx) as client:
-                resp = await client.post(url, json=fwd, headers=headers, timeout=300.0)
+            async with _pooled_client(self.ctx) as client:
+                resp = await client.post(call.url, json=call.fwd,
+                                         headers=call.headers, timeout=300.0)
         finally:
-            ctx.inflight_dec(self.bid)
-            ctx.active_done(act)
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        if log_on:
-            logger.info(f"← [{bname}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
+            self._finish(call)
+        # Parse ONCE (usage → tokens/cost); the body itself passes through as the
+        # backend's raw bytes — the gateway doesn't transform it, so the old
+        # parse → re-serialize (stats) → re-serialize (JSONResponse) round-trip
+        # is gone. Internal callers (Responses bridge) still read resp.body.
         try:
             resp_json = resp.json()
         except Exception:
@@ -371,16 +415,13 @@ class OpenAIAdapter(BackendAdapter):
         usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
         in_tok = int(usage.get("prompt_tokens") or 0)
         out_tok = int(usage.get("completion_tokens") or 0)
-        asyncio.create_task(ctx.record_call(
-            duration_ms=elapsed_ms, backend=bname, source=source,
-            alias=req.alias, model=real_model, endpoint=(req.stats_endpoint or req.path),
-            status=resp.status_code,
-            input_tokens=in_tok, output_tokens=out_tok,
-            cost_usd=ctx.cost_usd(self.bid, real_model, in_tok, out_tok),
-            request_text=req_text, response_text=json.dumps(resp_json, ensure_ascii=False),
-            reasoning=reasoning_ctl,
-        ))
-        return JSONResponse(resp_json, status_code=resp.status_code, headers=rheaders)
+        elapsed_ms = self._record(req, call, resp.status_code, in_tok, out_tok,
+                                  response_text=resp.text)
+        if call.log_on:
+            logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
+        return Response(resp.content, status_code=resp.status_code,
+                        media_type=resp.headers.get("content-type", "application/json"),
+                        headers=call.rheaders)
 
 
 # ── ComfyUI adapter ───────────────────────────────────────────────────────────
