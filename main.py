@@ -22,6 +22,8 @@ import reasoning
 import stats
 import store
 from adapters import AdapterContext, NormalizedRequest, image_params, make_adapter
+from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
+                                 images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
                               responses_to_chat)
 
@@ -1242,39 +1244,54 @@ async def embeddings(request: Request, authorization: Optional[str] = Header(Non
 # by id (TTL) — sync mode also returns them inline. No VRAM coordinator yet
 # (Phase 2): candidates are filtered by health + the existing busy cap only.
 
-def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, dict]]:
-    """(backend, candidate) pairs for a generation alias, ordered by **backend
-    priority**, filtered to enabled + healthy + not-busy backends.
+def _gen_routes(alias: str) -> tuple[list, list]:
+    """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
+    by **backend priority** and filtered to enabled + healthy backends; `ready`
+    additionally drops busy ones. ONE store read serves both lists.
 
     An alias holds a flat list of *allowed* backends (no primary/fallback). They are
     tried in backend-priority order; on a connection error the job runner moves to the
     next. An optional per-alias `retries` caps how many backends are attempted (1 +
-    retries); blank = try all eligible.
+    retries); blank = try all eligible. Each list is capped independently — same
+    result as the old per-include_busy filtering.
 
     Reads from the writable store (UI source of truth) when active, falling back
-    to the `image_models` config for aliases the store doesn't hold."""
+    to the `image_models` config for aliases the store doesn't hold. Blocking
+    (store read) — call via asyncio.to_thread from async code."""
     candidates = store.get(alias) if store.is_active() else None
     if candidates is None:
         candidates = image_models.get(alias, [])
     # generation routes only to ComfyUI backends, so a name shared with an LLM backend
     # resolves to the right one.
     comfy = [b for b in _comfy_backends if not is_draining(b)]
-    out = []
+    allc = []
     for cand in candidates:
         b = next((b for b in comfy if b["name"] == cand.get("backend")), None)
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
-        if not include_busy and backend_busy(b):        # busy → skipped unless parking
-            continue
-        out.append((b, cand))
-    out.sort(key=lambda bc: bc[0].get("priority", 100))     # backend priority decides order
+        allc.append((b, cand))
+    allc.sort(key=lambda bc: bc[0].get("priority", 100))    # backend priority decides order
+    ready = [r for r in allc if not backend_busy(r[0])]     # busy → only parkable, not ready
     raw = next((c.get("retries") for c in candidates if c.get("retries") not in (None, "")), None)
     if raw is not None:
         try:
-            out = out[: max(1, int(raw) + 1)]               # first attempt + N retries
+            cap = max(1, int(raw) + 1)                      # first attempt + N retries
+            allc, ready = allc[:cap], ready[:cap]
         except (ValueError, TypeError):
             pass
-    return out
+    return ready, allc
+
+
+def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, dict]]:
+    """Single-list view of _gen_routes() — kept for callers that need only one side
+    (image slots, LoRA listing, admin)."""
+    ready, allc = _gen_routes(alias)
+    return allc if include_busy else ready
+
+
+def _force_filter(routes: list, force: str) -> list:
+    """Keep only the force-pinned backend's candidates (no-op without a pin)."""
+    return [r for r in routes if r[0].get("name") == force] if force else routes
 
 
 def _gen_inputs_params(body: dict) -> tuple[dict, dict]:
@@ -1381,20 +1398,21 @@ async def cancel_generation(job_id: str) -> bool:
     return True
 
 
-async def _run_gen_parked(job_id, alias, force, build_req):
+async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[set] = None):
     """Hold a generation job until a backend frees (polls backend-busy), then run it —
-    so a busy backend queues instead of 503'ing (async/playground)."""
+    so a busy backend queues instead of 503'ing (async/playground). `eligible` keeps
+    the LoRA constraint through the park: the job waits for a LoRA-capable backend
+    instead of spilling to whichever frees first."""
     deadline = time.monotonic() + async_park_timeout_s
     while True:
-        routes = await asyncio.to_thread(get_gen_routes, alias)
-        if force:
-            routes = [r for r in routes if r[0].get("name") == force]
-        if routes:
-            await _run_job(job_id, routes, build_req)
+        ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per poll
+        ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+        if eligible is not None:
+            ready = [r for r in ready if r[0].get("name") in eligible]
+            allc = [r for r in allc if r[0].get("name") in eligible]
+        if ready:
+            await _run_job(job_id, ready, build_req)
             return
-        allc = await asyncio.to_thread(get_gen_routes, alias, include_busy=True)
-        if force:
-            allc = [r for r in allc if r[0].get("name") == force]
         if not allc:
             await asyncio.to_thread(jobs.fail, job_id,
                                     f"no healthy backend for '{alias}'" + (f" on '{force}'" if force else ""))
@@ -1417,6 +1435,43 @@ def _requested_loras(body: dict) -> set:
     return out
 
 
+def _lora_eligible_names(all_cands: list, body: dict) -> Optional[set]:
+    """LoRA-aware backend eligibility: backends lacking a requested LoRA are dropped —
+    but only for LoRAs installed on SOME candidate; a LoRA installed nowhere is ignored
+    so priority still decides (per spec). Decided over ALL candidates (incl. busy), so
+    the eligible backend is parked-for rather than spilling to a backend without the
+    LoRA. None = no constraint."""
+    req_loras = _requested_loras(body)
+    if not req_loras or not all_cands:
+        return None
+    avail = set().union(*(backend_loras.get(backend_id(b), set()) for b, _ in all_cands))
+    need = req_loras & avail
+    if not need:
+        return None
+    elig = [r for r in all_cands if need <= backend_loras.get(backend_id(r[0]), set())]
+    if not elig:                                          # loras split across backends → no constraint
+        return None
+    return {r[0].get("name") for r in elig}
+
+
+async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Optional[set]]:
+    """Resolve a generation request's candidates ONCE (a single store read):
+    force-pin filter, LoRA eligibility, ready/busy split. Returns
+    (routes, parked, eligible_names); raises 503 when nothing is eligible."""
+    ready, allc = await asyncio.to_thread(_gen_routes, alias)
+    ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+    if not allc:
+        raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
+                                 + (f" on backend '{force}'" if force else ""))
+    eligible = None if force else _lora_eligible_names(allc, body)   # a pin is never overridden
+    if eligible is not None:
+        ready = [r for r in ready if r[0].get("name") in eligible]
+        allc = [r for r in allc if r[0].get("name") in eligible]
+    if ready:                                            # something is free → dispatch now
+        return ready, False, eligible
+    return allc, True, eligible                          # all busy → park (async: queue, sync: block)
+
+
 async def run_generation(body: dict, request: Request,
                          upload_images: Optional[dict] = None) -> dict:
     """Resolve a generation alias, create a job, and run it (sync) or schedule it
@@ -1427,47 +1482,9 @@ async def run_generation(body: dict, request: Request,
     output = dict(body.get("output") or {})
     mode = output.get("mode") or body.get("mode") or "sync"
     ttl_s = output.get("ttl_s") or body.get("ttl_s")
+    force = (body.get("backend") or "").strip()          # pin to one backend (playground testing)
 
-    force = (body.get("backend") or "").strip()         # pin to one backend (playground testing)
-    all_cands = await asyncio.to_thread(get_gen_routes, alias, include_busy=True)
-    if force:
-        all_cands = [r for r in all_cands if r[0].get("name") == force]
-    if not all_cands:
-        raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
-                                 + (f" on backend '{force}'" if force else ""))
-
-    # LoRA-aware backend eligibility (skipped when a backend is force-pinned): a backend
-    # that lacks a requested LoRA is dropped — but only for LoRAs installed on SOME
-    # candidate; a LoRA installed nowhere is ignored so priority still decides (per spec).
-    # Decided over ALL candidates (incl. busy), so the eligible backend is parked-for
-    # rather than spilling to a backend that doesn't have the LoRA.
-    eligible_names = None
-    req_loras = _requested_loras(body)
-    if req_loras and not force:
-        avail = set().union(*(backend_loras.get(backend_id(b), set()) for b, _ in all_cands))
-        need = req_loras & avail
-        if need:
-            elig = [r for r in all_cands if need <= backend_loras.get(backend_id(r[0]), set())]
-            if elig:                                      # else loras split across backends → no constraint
-                eligible_names = {r[0].get("name") for r in elig}
-
-    async def _pick(include_busy: bool) -> list:
-        rs = await asyncio.to_thread(get_gen_routes, alias, include_busy=include_busy)
-        if force:
-            rs = [r for r in rs if r[0].get("name") == force]
-        if eligible_names is not None:
-            rs = [r for r in rs if r[0].get("name") in eligible_names]
-        return rs
-
-    routes = await _pick(False)                          # ready (not busy) + lora-eligible
-    parked = False
-    if not routes:                                       # nothing ready → busy-eligible, or none at all?
-        busy = await _pick(True)
-        if not busy:
-            raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
-                                     + (f" on backend '{force}'" if force else ""))
-        parked, routes = True, busy                      # all busy → park (async: queue, sync: block)
-
+    routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
 
     def build_req(backend: dict, cand: dict) -> NormalizedRequest:
@@ -1497,9 +1514,9 @@ async def run_generation(body: dict, request: Request,
 
     if parked:
         if mode == "async":                              # queue and hand back a job id
-            _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req))
+            _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
             return {"job_id": job_id, "status": "queued"}
-        await _run_gen_parked(job_id, alias, force, build_req)   # sync: block through the park
+        await _run_gen_parked(job_id, alias, force, build_req, eligible)   # sync: block through the park
         return await _job_view(job_id, request)
     if mode == "async":
         _spawn_gen(job_id, _run_job(job_id, routes, build_req))
@@ -1582,63 +1599,9 @@ async def cancel_job(job_id: str, request: Request, authorization: Optional[str]
 #  /v1/images/generations : JSON, text->image (+ bonus LocalAI-style ref_images)
 #  /v1/images/edits       : multipart, reference image(s) -> alias image-input slots
 
-# Known OpenAI image-request keys; everything else a client sends is forwarded as a
-# native workflow param (loras, seed, steps, cfg, …) → dynamic control, no presets.
-_OAI_IMG_KEYS = {"prompt", "model", "n", "size", "response_format", "negative_prompt",
-                 "ref_images", "quality", "style", "background", "output_format", "user",
-                 "mode", "ttl_s", "params", "stream"}
-_EDIT_KNOWN = {"model", "prompt", "negative_prompt", "size", "n", "response_format", "image", "mask"}
-
-
-def _coerce(s):
-    """'12'->12, '0.8'->0.8, else unchanged ('None' / 'x.safetensors' stay strings).
-    Multipart fields arrive as strings; the workflow wants real numbers for strengths."""
-    if not isinstance(s, str):
-        return s
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        return s
-
-
-def _parse_size(size: Optional[str]) -> tuple[int, int]:
-    """OpenAI `size` ('1024x1024' | 'auto' | None) -> (width, height)."""
-    if not size or str(size).lower() == "auto":
-        return 1024, 1024
-    try:
-        w, h = str(size).lower().split("x")
-        return int(w), int(h)
-    except (ValueError, AttributeError):
-        return 1024, 1024
-
-
-async def _multipart_list(request: Request) -> dict:
-    """multipart/form-data -> {name: [values]} (files->bytes, scalars->str),
-    repeated fields preserved; `image[]` normalised to `image`."""
-    ctype = request.headers.get("content-type", "")
-    m = re.search(r"boundary=([^;]+)", ctype)
-    if not m:
-        return {}
-    body = await request.body()
-    delim = b"--" + m.group(1).strip().strip('"').encode()
-    out: dict = {}
-    for part in body.split(delim):
-        part = part.strip(b"\r\n")
-        if not part or part == b"--" or b"\r\n\r\n" not in part:
-            continue
-        head, _, content = part.partition(b"\r\n\r\n")
-        head_s = head.decode("utf-8", "replace")
-        nm = re.search(r'name="([^"]*)"', head_s)
-        if not nm:
-            continue
-        val = content if 'filename="' in head_s else content.decode("utf-8", "replace")
-        out.setdefault(nm.group(1).rstrip("[]"), []).append(val)
-    return out
-
+# Request/response plumbing (multipart parsing, size/scalar coercion, the OpenAI
+# images response shape) lives in openai_image_bridge.py; main keeps only what
+# needs gateway state: the slot lookup below and the endpoints.
 
 def _gen_image_slots(alias: str) -> list:
     """Ordered image-input param names of a generation alias (its workflow's image
@@ -1670,44 +1633,6 @@ async def _decode_ref_image(ref) -> Optional[bytes]:
         return None
 
 
-def _images_uploads(images: list, alias: str) -> dict:
-    """Map reference-image blobs positionally onto the alias's ordered image-input
-    slots. The cap is the alias's slot count (not a fixed number): extra images are
-    ignored, unfilled slots get the adapter's 8x8 placeholder."""
-    slots = _gen_image_slots(alias)
-    uploads: dict = {}
-    for i, slot in enumerate(slots):
-        if i < len(images) and images[i]:
-            uploads[slot] = bytes(images[i])
-    return uploads
-
-
-def _images_response(view: dict, response_format: str) -> dict:
-    """Native job view -> OpenAI images response {created, data:[{url|b64_json}]}.
-    Each entry also carries `mime` so a client can tell a video/audio artifact from
-    an image (video aliases are better consumed via the native /v1/generations,
-    which returns per-result kind+mime)."""
-    data = []
-    for r in view.get("results", []):
-        entry = {"mime": r.get("mime")}
-        if response_format == "b64_json":
-            rp = jobs.result_path(view["job_id"], r["n"])
-            if not rp:
-                continue
-            with open(rp[0], "rb") as fh:
-                entry["b64_json"] = base64.b64encode(fh.read()).decode()
-        else:
-            entry["url"] = r["url"]
-        data.append(entry)
-    return {"created": int(time.time()), "data": data}
-
-
-def _gen_done_or_502(view: dict) -> dict:
-    if view.get("status") != "done":
-        raise HTTPException(502, f"image generation {view.get('status')}: {view.get('error')}")
-    return view
-
-
 @app.post("/v1/images/generations")
 async def images_generations(request: Request, authorization: Optional[str] = Header(None)):
     """OpenAI Images API (text->image). Bonus: LocalAI-style `ref_images`
@@ -1717,13 +1642,14 @@ async def images_generations(request: Request, authorization: Optional[str] = He
     await gate_request(authorization, request, alias)
     if not body.get("prompt"):
         raise HTTPException(400, "`prompt` is required")
-    w, h = _parse_size(body.get("size"))
+    w, h = parse_size(body.get("size"))
     refs = body.get("ref_images") or []
     decoded = [await _decode_ref_image(r) for r in refs]
-    uploads = _images_uploads(decoded, alias) if refs else None
-    extra = {k: v for k, v in body.items() if k not in _OAI_IMG_KEYS}   # dynamic workflow params
+    slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
+    uploads = images_uploads(decoded, slots) if refs else None
+    extra = {k: v for k, v in body.items() if k not in OAI_IMG_KEYS}   # dynamic workflow params
     logger.info(f"images/generations '{alias}': ref_images={len(refs)} "   # where client images land
-                f"decoded_ok={sum(1 for d in decoded if d)} slots={_gen_image_slots(alias)} "
+                f"decoded_ok={sum(1 for d in decoded if d)} slots={slots} "
                 f"filled={sorted((uploads or {}).keys())} extra_keys={sorted(extra)}")
     native = {
         "model": alias, "mode": "sync",
@@ -1731,9 +1657,9 @@ async def images_generations(request: Request, authorization: Optional[str] = He
         "params": {"width": w, "height": h, **(body.get("params") or {}), **extra},
         "output": {"n": int(body.get("n") or 1), "mode": "sync"},
     }
-    view = _gen_done_or_502(await run_generation(native, request, upload_images=uploads))
+    view = gen_done_or_502(await run_generation(native, request, upload_images=uploads))
     return JSONResponse(await asyncio.to_thread(          # b64 branch reads result files
-        _images_response, view, body.get("response_format") or "url"))
+        images_response, view, body.get("response_format") or "url"))
 
 
 @app.post("/v1/images/edits")
@@ -1741,7 +1667,7 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     """OpenAI Images Edit API (multipart): `image` field(s) carry reference images,
     mapped positionally onto the alias's declared image-input slots (cap = slot count;
     OpenAI itself allows 1 for dall-e-2, up to 16 for gpt-image-1)."""
-    f = await _multipart_list(request)
+    f = await multipart_list(request)
     one = lambda k, d="": (f.get(k) or [d])[0]
     alias = (one("model") or "").strip()
     await gate_request(authorization, request, alias)
@@ -1749,24 +1675,25 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     if not images:
         raise HTTPException(400, "at least one `image` file is required")
     masks = [v for v in (f.get("mask") or []) if isinstance(v, (bytes, bytearray))]
+    slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
     logger.info(f"images/edits '{alias}': image_files={len(images)} mask_files={len(masks)} "  # where they land
-                f"slots={_gen_image_slots(alias)} "
+                f"slots={slots} "
                 f"scalar_keys={sorted(k for k, vs in f.items() if not isinstance((vs or [None])[0], (bytes, bytearray)))}")
     # OpenAI `mask` field → the next positional slot (the mask slot is normally last in
     # the mapping order, after the reference image[s]).
     images = (images + masks)[:16]                      # OpenAI gpt-image-1 max; workflow may use fewer
-    w, h = _parse_size(one("size") or None)
-    extra = {k: _coerce(one(k)) for k, vs in f.items()  # dynamic scalar params (loras, seed, …)
-             if k not in _EDIT_KNOWN and not isinstance((vs or [None])[0], (bytes, bytearray))}
+    w, h = parse_size(one("size") or None)
+    extra = {k: coerce_scalar(one(k)) for k, vs in f.items()  # dynamic scalar params (loras, seed, …)
+             if k not in EDIT_KNOWN and not isinstance((vs or [None])[0], (bytes, bytearray))}
     native = {
         "model": alias, "mode": "sync", "task": "img2img",
         "prompt": one("prompt"), "negative_prompt": one("negative_prompt"),
         "params": {"width": w, "height": h, **extra},
         "output": {"n": int((one("n") or "1") or 1), "mode": "sync"},
     }
-    view = _gen_done_or_502(await run_generation(native, request, upload_images=_images_uploads(images, alias)))
+    view = gen_done_or_502(await run_generation(native, request, upload_images=images_uploads(images, slots)))
     return JSONResponse(await asyncio.to_thread(          # b64 branch reads result files
-        _images_response, view, one("response_format") or "url"))
+        images_response, view, one("response_format") or "url"))
 
 
 def dashboard_snapshot() -> dict:

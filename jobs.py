@@ -163,34 +163,26 @@ def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
         manifest.append({"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname})
     with _conn() as c:                              # one connection: read meta + update
         meta = {**_read_meta(c, job_id), **(meta or {})}   # keep inputs persisted at create time
-        ran_on = meta.get("backend")
-        if ran_on:
-            c.execute(
-                "UPDATE jobs SET status='done', backend=?, updated=?, result_count=?, results_json=?, meta_json=? WHERE id=?",
-                (ran_on, int(time.time()), len(manifest), json.dumps(manifest), json.dumps(meta), job_id),
-            )
-        else:
-            c.execute(
-                "UPDATE jobs SET status='done', updated=?, result_count=?, results_json=?, meta_json=? WHERE id=?",
-                (int(time.time()), len(manifest), json.dumps(manifest), json.dumps(meta), job_id),
-            )
+        _mark_done(c, job_id, meta, manifest)
     return manifest
 
 
 def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
     """Mark a job done with an inline JSON result (e.g. a parked chat completion) —
     no disk blob; the payload is retrievable via get()['results'][0]."""
-    meta = meta or {}
-    ran_on = meta.get("backend")
     with _conn() as c:
-        if ran_on:
-            c.execute("UPDATE jobs SET status='done', backend=?, updated=?, result_count=1, "
-                      "results_json=?, meta_json=? WHERE id=?",
-                      (ran_on, int(time.time()), json.dumps([payload]), json.dumps(meta), job_id))
-        else:
-            c.execute("UPDATE jobs SET status='done', updated=?, result_count=1, "
-                      "results_json=?, meta_json=? WHERE id=?",
-                      (int(time.time()), json.dumps([payload]), json.dumps(meta), job_id))
+        _mark_done(c, job_id, meta or {}, [payload])
+
+
+def _mark_done(c, job_id: str, meta: dict, results: list) -> None:
+    """The one done-UPDATE. Re-points `backend` to where the job actually ran
+    (meta['backend']) — after a failover that differs from the create() value."""
+    sets = "status='done', updated=?, result_count=?, results_json=?, meta_json=?"
+    args = [int(time.time()), len(results), json.dumps(results), json.dumps(meta)]
+    if meta.get("backend"):
+        sets += ", backend=?"
+        args.append(meta["backend"])
+    c.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*args, job_id))
 
 
 def _read_meta(c, job_id: str) -> dict:
@@ -241,17 +233,32 @@ def set_inputs(job_id: str, inputs: dict, ref_blobs: Optional[list] = None) -> N
         c.execute("UPDATE jobs SET meta_json=? WHERE id=?", (json.dumps(meta), job_id))
 
 
-def input_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
-    """(filesystem path, mime) for input reference image `n` of a job, or None."""
-    job = get(job_id)
-    if not job:
+def _manifest_path(job_id: str, n: int, column: str, key: Optional[str]) -> Optional[tuple[str, str]]:
+    """(filesystem path, mime) for entry `n` of one manifest column — reads just that
+    JSON column (artifact-serving hot path) instead of a full get() with both parses."""
+    if not _active:
         return None
-    for r in job["meta"].get("input_images", []):
-        if r["n"] == n:
+    with _conn() as c:
+        row = c.execute(f"SELECT {column} FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        entries = json.loads(row[0])
+    except Exception:
+        return None
+    if key is not None:
+        entries = (entries or {}).get(key)
+    for r in entries or []:
+        if isinstance(r, dict) and r.get("n") == n and r.get("filename"):
             path = os.path.join(_BLOB_DIR, job_id, r["filename"])
             if os.path.exists(path):
-                return path, r["mime"]
+                return path, r.get("mime")
     return None
+
+
+def input_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
+    """(filesystem path, mime) for input reference image `n` of a job, or None."""
+    return _manifest_path(job_id, n, "meta_json", "input_images")
 
 
 def get(job_id: str) -> Optional[dict]:
@@ -269,16 +276,9 @@ def get(job_id: str) -> Optional[dict]:
 
 
 def result_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
-    """(filesystem path, mime) for result `n` of a job, or None if absent."""
-    job = get(job_id)
-    if not job:
-        return None
-    for r in job["results"]:
-        if r["n"] == n:
-            path = os.path.join(_BLOB_DIR, job_id, r["filename"])
-            if os.path.exists(path):
-                return path, r["mime"]
-    return None
+    """(filesystem path, mime) for result `n` of a job, or None if absent (also for
+    inline-JSON results, e.g. a background response — those have no file)."""
+    return _manifest_path(job_id, n, "results_json", None)
 
 
 def _delete(job_id: str) -> None:

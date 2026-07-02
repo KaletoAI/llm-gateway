@@ -40,10 +40,10 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Eight self-contained Python files hold everything. `main.py` owns app state; the
+Nine self-contained Python files hold everything. `main.py` owns app state; the
 others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
-`responses_bridge`) never import `main` — they receive what they need via
-injected callables, staying hot-reload-safe.
+`responses_bridge`, `openai_image_bridge`) never import `main` — they receive
+what they need via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
   endpoints, auth/quotas, call parking, generation orchestration, the Responses
@@ -90,6 +90,11 @@ injected callables, staying hot-reload-safe.
   builds on. `main.py` keeps the endpoints, dispatch/parking, and background
   mode; the adapter attaches `resp.parsed_json` so the bridge never re-parses
   the raw body.
+- **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
+  image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
+  slot mapping, `images_response`); imports only the leaf `jobs`. `main.py`
+  keeps the endpoints and passes the alias's image `slots` in (one
+  `_gen_image_slots` lookup per request).
 - **`reasoning.py`** — pure functions for the normalized thinking toggle, no
   `main`/`adapters` imports (hot-reload/test-friendly). Rules are an ordered list
   of `{match(model-glob), backends[], adapter, param}`; `resolve()` picks the
