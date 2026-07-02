@@ -87,12 +87,19 @@ def is_active() -> bool:
     return _active
 
 
-def counts() -> dict:
-    """Job count per status, for the dashboard."""
+# Task types that live in the job store but are NOT media generations: parked-chat
+# results and background /v1/responses jobs. Media views filter them out.
+_NON_MEDIA_TASKS = ("chat", "response")
+_MEDIA_FLT = f" WHERE task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))})"
+
+
+def counts(media_only: bool = False) -> dict:
+    """Job count per status, for the dashboard. `media_only` drops chat/response rows."""
     if not _active:
         return {}
+    flt, args = (_MEDIA_FLT, _NON_MEDIA_TASKS) if media_only else ("", ())
     with _conn() as c:
-        rows = c.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall()
+        rows = c.execute(f"SELECT status, COUNT(*) FROM jobs{flt} GROUP BY status", args).fetchall()
     return {r[0]: r[1] for r in rows}
 
 
@@ -107,14 +114,16 @@ def count_by_backend_since(ts: int) -> dict:
     return {r[0]: r[1] for r in rows if r[0]}
 
 
-def recent(limit: int = 20) -> list:
-    """Most recent jobs (metadata only), newest first."""
+def recent(limit: int = 20, media_only: bool = False) -> list:
+    """Most recent jobs (metadata only), newest first. `media_only` drops the
+    chat/response rows (those live under Statistic / the Responses API)."""
     if not _active:
         return []
+    flt, args = (_MEDIA_FLT, _NON_MEDIA_TASKS) if media_only else ("", ())
     with _conn() as c:
         rows = c.execute(
-            "SELECT id, created, updated, status, task, alias, backend, owner, result_count, error "
-            "FROM jobs ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error "
+            f"FROM jobs{flt} ORDER BY created DESC LIMIT ?", (*args, limit)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -177,7 +186,7 @@ def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
 def _mark_done(c, job_id: str, meta: dict, results: list) -> None:
     """The one done-UPDATE. Re-points `backend` to where the job actually ran
     (meta['backend']) — after a failover that differs from the create() value."""
-    sets = "status='done', updated=?, result_count=?, results_json=?, meta_json=?"
+    sets = "status='done', error=NULL, updated=?, result_count=?, results_json=?, meta_json=?"
     args = [int(time.time()), len(results), json.dumps(results), json.dumps(meta)]
     if meta.get("backend"):
         sets += ", backend=?"

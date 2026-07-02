@@ -1719,8 +1719,8 @@ def dashboard_snapshot() -> dict:
             "remaining_s": max(0.0, e["deadline"] - time.monotonic()),
         } for e in list(_parked)],
         "jobs_active": jobs.is_active(),
-        "jobs_counts": jobs.counts(),
-        "jobs_recent": jobs.recent(15),
+        "jobs_counts": jobs.counts(media_only=True),     # the dashboard cards/panel are MEDIA
+        "jobs_recent": jobs.recent(15, media_only=True),  # jobs — chat/response rows stay out
         "stats_active": stats.is_active(),
         "calls_24h": stats.count_since(int(time.time()) - 86400),
         # Recent LLM calls = currently running (live registry) + ended in the last 5 min (stats).

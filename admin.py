@@ -1265,8 +1265,14 @@ def _chatplay_form(vals: dict) -> str:
             + _field("message", _textarea("user", v("user"), 6, "your message"))
             + _field("max tokens", _inp("max_tokens", v("max_tokens"), typ="number"), short=True)
             + _field("temperature", _inp("temperature", v("temperature"), typ="number"), short=True)
+            + _field("reasoning", "<select name='reasoning'>" + "".join(
+                f'<option value="{x}"{" selected" if (v("reasoning") or "auto") == x else ""}>{x}</option>'
+                for x in ("auto", "on", "off")) + "</select>", short=True)
             + "<p class='hint'>Non-streaming. Routes by priority with failover, exactly like the API. "
-              "Pick a <b>backend</b> to pin the call and filter the model list; empty = all backends.</p>"
+              "Pick a <b>backend</b> to pin the call and filter the model list; empty = all backends. "
+              "<b>reasoning</b> sends the API's thinking switch (applied via the "
+              "<a href='/ui/reasoning'>Reasoning</a> rules; auto = model default — an alias's own "
+              "default applies only when calling the alias, not a backend/model form).</p>"
             + "</form>" + _datalist("cpmodels", init_models) + filt_js + _CHATPLAY_JS)
 
 
@@ -1277,8 +1283,9 @@ def _chatplay_body(vals: dict, result_html: str) -> str:
 
 def _chat_result_html(res: dict) -> str:
     data, status = res.get("response") or {}, res.get("status")
+    rsn = f" · reasoning <b>{_esc(res['reasoning'])}</b>" if res.get("reasoning") else ""
     meta = (f"backend <b>{_esc(res.get('backend'))}</b> · model {_esc(res.get('model'))} · "
-            f"HTTP {status}")
+            f"HTTP {status}{rsn}")
     if status != 200:
         return (f"<h2>Response</h2><p class='bad'>{meta}</p>"
                 f"<pre class='err'>{_esc(json.dumps(data, indent=2)[:4000])}</pre>")
@@ -1293,7 +1300,7 @@ def _chat_result_html(res: dict) -> str:
             f"<div class='chatout'>{_esc(content)}</div>")
 
 
-_CHATPLAY_KEYS = ("backend", "model", "system", "user", "max_tokens", "temperature")
+_CHATPLAY_KEYS = ("backend", "model", "system", "user", "max_tokens", "temperature", "reasoning")
 
 
 async def chatplay_page(request: Request):
@@ -1330,10 +1337,11 @@ async def chatplay_send(request: Request):
     send_model = f"{backend}/{model}" if (backend and not model.startswith(backend + "/")) else model
     # A REAL API call through the gateway's own /v1 endpoint — dispatch, parking,
     # reasoning, stats and quotas all apply, exactly like any external client.
+    body = {"model": send_model, "messages": messages, "stream": False, **params}
+    if vals["reasoning"].strip() in ("on", "off"):     # auto → field omitted (API default)
+        body["reasoning"] = vals["reasoning"].strip()
     try:
-        r = await _self_api(request, "POST", "/v1/chat/completions",
-                            json={"model": send_model, "messages": messages,
-                                  "stream": False, **params})
+        r = await _self_api(request, "POST", "/v1/chat/completions", json=body)
         try:
             data = r.json()
         except Exception:
@@ -1343,6 +1351,7 @@ async def chatplay_send(request: Request):
             "backend": r.headers.get("x-gateway-backend", "—"),
             "model": (data.get("model") if isinstance(data, dict) else None) or send_model,
             "alias": send_model, "response": data,
+            "reasoning": r.headers.get("x-reasoning-control"),
         })
     except httpx.HTTPError as e:
         result = f"<h2>Response</h2><p class='bad'>Error: {_esc(f'{type(e).__name__}: {e}')}</p>"
@@ -2238,7 +2247,7 @@ async def jobs_page(request: Request):
     detail page. Excludes parked-chat jobs (those live under Statistic)."""
     if not jobs.is_active():
         return _inactive()
-    rows = [j for j in jobs.recent(200) if j.get("task") != "chat"]
+    rows = jobs.recent(200, media_only=True)   # no parked-chat / background-response rows
     if not rows:
         return HTMLResponse(_page("Media Jobs", "<h2>Media Jobs</h2><p class='hint'>No generation "
             "jobs yet. Run one in the <a href='/ui/playground'>Media Playground</a>.</p>", "jobs"))
