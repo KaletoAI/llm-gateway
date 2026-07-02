@@ -1031,6 +1031,7 @@ async def run_chat(model: str, messages: list, params: Optional[dict] = None) ->
         body = dict(base, model=real_model)
         url = f"{backend['url']}/v1/chat/completions"
         headers = {"content-type": "application/json", **backend_auth_headers(backend)}
+        started = time.monotonic()
         try:
             r = await http_client.post(url, json=body, headers=headers, timeout=300.0)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError) as e:
@@ -1040,6 +1041,20 @@ async def run_chat(model: str, messages: list, params: Optional[dict] = None) ->
             data = r.json()
         except Exception:
             data = {"raw": r.text}
+        # Record like the adapter does, so playground calls show in the LLM Calls tab
+        # (they bypass dispatch(), which is where API calls get recorded).
+        usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
+        in_tok = int(usage.get("prompt_tokens") or 0)
+        out_tok = int(usage.get("completion_tokens") or 0)
+        asyncio.create_task(stats.record_call(
+            duration_ms=int((time.monotonic() - started) * 1000),
+            backend=backend["name"], source="playground", alias=model, model=real_model,
+            endpoint="/v1/chat/completions", status=r.status_code,
+            input_tokens=in_tok, output_tokens=out_tok,
+            cost_usd=_cost_usd(backend_id(backend), real_model, in_tok, out_tok),
+            request_text=json.dumps(body, ensure_ascii=False),
+            response_text=json.dumps(data, ensure_ascii=False),
+        ))
         return {"status": r.status_code, "backend": backend["name"],
                 "model": real_model, "alias": model, "response": data}
     raise HTTPException(503, f"All backends failed: {last}")
