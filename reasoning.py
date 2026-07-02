@@ -33,6 +33,8 @@ def resolve(rules: list, backend: str, model: str) -> Optional[dict]:
     for r in rules or []:
         if not isinstance(r, dict):
             continue
+        if r.get("enabled") is False:            # disabled rules are skipped (kept for re-enabling)
+            continue
         if not fnmatch(model, r.get("match") or "*"):
             continue
         bks = r.get("backends") or ["*"]

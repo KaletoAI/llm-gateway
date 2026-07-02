@@ -2640,6 +2640,7 @@ def _reasoning_form(rule: Optional[dict], idx) -> str:
     return ('<form action="/ui/reasoning/save" method="post">' + hidden +
             f'<div class="formbar"><h2>{"Edit rule" if rule else "New rule"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/reasoning", "secondary")}</div>'
+            + _field("enabled", _checkbox("enabled", r.get("enabled", True), "rule is active"))
             + _field("order", _inp("order", str(r.get("order", "")), placeholder="1", typ="number"), short=True)
             + _field("match (model glob)", _inp("match", r.get("match", ""),
                      placeholder="qwen3.5*  ·  gemma-4-12b-it  ·  *"), short=True)
@@ -2676,22 +2677,29 @@ async def reasoning_page(request: Request):
     for i, r in enumerate(rules):
         bks = r.get("backends") or ["*"]
         bstr = "all" if "*" in bks else ", ".join(bks)
-        acts = _icon_acts(("✎", f"/ui/reasoning?edit={i}", "secondary", "Edit"),
+        on = r.get("enabled", True)
+        state = _badge("on", "ok") if on else _badge("off", "muted")
+        toggle = (("⏸", f"/ui/reasoning/toggle?idx={i}", "secondary", "Disable this rule") if on
+                  else ("▶", f"/ui/reasoning/toggle?idx={i}", "secondary", "Enable this rule"))
+        acts = _icon_acts(toggle, ("✎", f"/ui/reasoning?edit={i}", "secondary", "Edit"),
                           ("✕", f"/ui/reasoning/delete?idx={i}", "danger", "Delete", "Delete this rule?"))
-        cls = " class='sel'" if edit_i == i else ""
+        cls = "sel" if edit_i == i else ""
+        if not on:
+            cls = (cls + " muted").strip()
+        cls = f" class='{cls}'" if cls else ""
         rows += (f"<tr{cls}><td>{_esc(r.get('order', ''))}</td><td><code>{_esc(r.get('match', '*'))}</code></td>"
                  f"<td>{_esc(bstr)}</td><td>{_esc(r.get('adapter', 'none'))}</td>"
-                 f"<td class='muted'>{_esc(_reason_pval(r))}</td><td class='acts'>{acts}</td></tr>")
-    rows = rows or ("<tr><td colspan=6 class='muted'>no rules — reasoning off/on is reported "
+                 f"<td class='muted'>{_esc(_reason_pval(r))}</td><td>{state}</td><td class='acts'>{acts}</td></tr>")
+    rows = rows or ("<tr><td colspan=7 class='muted'>no rules — reasoning off/on is reported "
                     "'unsupported' for every model</td></tr>")
     list_html = (f'<div class="bar"><h2>Reasoning</h2>{_btn("+ New rule", "/ui/reasoning?new=1")}</div>'
                  "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
-                 "unchanged). The first rule whose <b>model glob</b> matches the real model <b>and</b> whose "
-                 "<b>backend set</b> contains the serving backend is applied; no match → <code>unsupported</code> "
-                 "(never fails). Applied control shows in <a href='/ui/llmcalls'>LLM Calls</a> + the "
-                 "<code>x-reasoning-control</code> header.</p>"
+                 "unchanged). The first <b>enabled</b> rule whose <b>model glob</b> matches the real model <b>and</b> "
+                 "whose <b>backend set</b> contains the serving backend is applied; no match → "
+                 "<code>unsupported</code> (never fails). Applied control shows in <a href='/ui/llmcalls'>LLM Calls</a> "
+                 "+ the <code>x-reasoning-control</code> header.</p>"
                  f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
-                 f"<th>adapter</th><th>param</th><th></th></tr>{rows}</table>")
+                 f"<th>adapter</th><th>param</th><th>state</th><th></th></tr>{rows}</table>")
     if qp.get("new"):
         detail = _reasoning_form(None, None)
     elif edit_i is not None:
@@ -2719,7 +2727,8 @@ async def reasoning_save(request: Request):
     if key and pv:
         param[key] = pv
     rule = {"order": order, "match": (g("match").strip() or "*"),
-            "backends": backends, "adapter": adapter, "param": param}
+            "backends": backends, "adapter": adapter, "param": param,
+            "enabled": bool(qs.get("enabled"))}
     idx = g("idx")
     if idx.isdigit() and int(idx) < len(rules):
         rules[int(idx)] = rule
@@ -2728,7 +2737,18 @@ async def reasoning_save(request: Request):
     rules.sort(key=lambda r: r.get("order") if isinstance(r.get("order"), int) else 999)
     store.set_reasoning_rules(rules)
     _apply_reasoning()
-    logger.info(f"ui: reasoning rule saved — {rule['match']} @ {backends} → {adapter}")
+    logger.info(f"ui: reasoning rule saved — {rule['match']} @ {backends} → {adapter} "
+                f"({'on' if rule['enabled'] else 'off'})")
+    return RedirectResponse("/ui/reasoning", status_code=303)
+
+
+async def reasoning_toggle(request: Request):
+    idx = request.query_params.get("idx") or ""
+    rules = store.get_reasoning_rules() if store.is_active() else []
+    if idx.isdigit() and int(idx) < len(rules):
+        rules[int(idx)]["enabled"] = not rules[int(idx)].get("enabled", True)
+        store.set_reasoning_rules(rules)
+        _apply_reasoning()
     return RedirectResponse("/ui/reasoning", status_code=303)
 
 
@@ -3134,6 +3154,7 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/delete", delete, methods=["GET"])
     app.add_api_route("/ui/reasoning", reasoning_page, methods=["GET"])
     app.add_api_route("/ui/reasoning/save", reasoning_save, methods=["POST"])
+    app.add_api_route("/ui/reasoning/toggle", reasoning_toggle, methods=["GET"])
     app.add_api_route("/ui/reasoning/delete", reasoning_del, methods=["GET"])
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
