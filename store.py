@@ -243,10 +243,10 @@ def list_backends() -> list:
     return [_decode_backend(r["json"]) for r in rows]
 
 
-def get_backend(name: str, type: str = "openai") -> Optional[dict]:
+def get_backend(name: str, btype: str = "openai") -> Optional[dict]:
     with _conn() as c:
         row = c.execute("SELECT json FROM backends WHERE name=? AND type=?",
-                        (name, type)).fetchone()
+                        (name, btype)).fetchone()
     return _decode_backend(row["json"]) if row else None
 
 
@@ -262,9 +262,9 @@ def upsert_backend(backend: dict) -> None:
         )
 
 
-def delete_backend(name: str, type: str = "openai") -> None:
+def delete_backend(name: str, btype: str = "openai") -> None:
     with _conn() as c:
-        c.execute("DELETE FROM backends WHERE name=? AND type=?", (name, type))
+        c.execute("DELETE FROM backends WHERE name=? AND type=?", (name, btype))
 
 
 def rename_backend_references(old: str, new: str) -> int:

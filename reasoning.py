@@ -63,12 +63,13 @@ def _append_to_last_user(messages: list, token: str) -> list:
 
 
 def apply(rule: Optional[dict], requested: Optional[str], payload: dict) -> tuple[dict, Optional[str]]:
-    """Apply the reasoning control to a COPY of `payload`.
+    """Apply the reasoning control. Returns (payload, control).
 
-    `requested` ∈ {"off", "on", None}. None (auto) → payload untouched, control None
-    (full back-compat). Otherwise returns (new_payload, control) where control is the
+    `requested` ∈ {"off", "on", None}. Only an APPLIED adapter returns a modified
+    COPY of `payload`; auto (None) and unsupported paths return the ORIGINAL object
+    unchanged — callers must not assume a fresh dict. `control` is the
     `x-reasoning-control` string, e.g. "off:prefill" / "on:enable_thinking" /
-    "unsupported" (no matching rule or adapter "none").
+    "unsupported" (no matching rule or adapter "none"), or None for auto.
     """
     if requested not in ("off", "on"):
         return payload, None                          # auto → no change

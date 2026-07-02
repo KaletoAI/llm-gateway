@@ -22,6 +22,11 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _oid(prefix: str) -> str:
+    """OpenAI-style object id: <prefix>_<24 hex chars> (msg_/fc_/resp_…)."""
+    return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+
 def _content_parts_to_text(content: Any) -> Any:
     """Flatten a Responses-style content array to a chat-completions content value."""
     if not isinstance(content, list):
@@ -150,7 +155,7 @@ def chat_to_responses(chat_resp: dict) -> dict:
     if text_content:
         output.append({
             "type": "message",
-            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "id": _oid("msg"),
             "role": message.get("role", "assistant"),
             "status": "completed",
             "content": [{"type": "output_text", "text": text_content, "annotations": []}],
@@ -160,7 +165,7 @@ def chat_to_responses(chat_resp: dict) -> dict:
         fn = tc.get("function") or {}
         output.append({
             "type": "function_call",
-            "id": f"fc_{uuid.uuid4().hex[:24]}",
+            "id": _oid("fc"),
             "call_id": tc.get("id"),
             "name": fn.get("name", ""),
             "arguments": fn.get("arguments", ""),
@@ -175,7 +180,7 @@ def chat_to_responses(chat_resp: dict) -> dict:
     }
 
     return response_shell(
-        chat_resp.get("id") or f"resp_{uuid.uuid4().hex[:24]}", "completed",
+        chat_resp.get("id") or _oid("resp"), "completed",
         chat_resp.get("model"), chat_resp.get("created", int(time.time())),
         output=output, usage=usage, _finish_reason=choice.get("finish_reason"),
     )
@@ -185,8 +190,8 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
     """A3: translate a backend chat-completion SSE stream into Responses API SSE
     events. Consumes the adapter StreamingResponse's body_iterator (so in-flight
     accounting + stats still fire in the adapter when it drains)."""
-    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
-    item_id = f"msg_{uuid.uuid4().hex[:24]}"
+    resp_id = _oid("resp")
+    item_id = _oid("msg")
     created = int(time.time())
     model = raw_body.get("model") or alias
     seq = 0

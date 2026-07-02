@@ -37,6 +37,13 @@ from fastapi.responses import Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
+# Outbound timeouts (seconds): discovery is short (health tick must stay snappy),
+# chat generous (long completions), ComfyUI uploads sized for LAN image posts.
+_CHAT_TIMEOUT = 300.0
+_DISCOVERY_TIMEOUT = 5.0
+_COMFY_DISCOVERY_TIMEOUT = 8.0
+_UPLOAD_TIMEOUT = 20.0
+
 
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
 
@@ -148,6 +155,9 @@ class NormalizedRequest:
     raw: Optional[Request] = None
     stream: bool = False
     stats_endpoint: Optional[str] = None            # stats label when it differs from path (e.g. /v1/responses)
+    # CONVENTION: body keys starting with "_" are gateway-private control fields
+    # (e.g. route() stashes body["_reasoning"]); _prepare() strips them all before
+    # forwarding, so they never reach a backend.
     reasoning: Optional[str] = None                 # normalized reasoning control: "off" | "on" | None(auto)
     # ── generation extension ──
     task: str = "chat"                              # text2img | img2video | tts | …
@@ -299,7 +309,7 @@ class OpenAIAdapter(BackendAdapter):
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         b = self.backend
         resp = await client.get(
-            f"{b['url']}/v1/models", headers=self.ctx.auth_headers(b), timeout=5.0
+            f"{b['url']}/v1/models", headers=self.ctx.auth_headers(b), timeout=_DISCOVERY_TIMEOUT
         )
         resp.raise_for_status()
         payload = resp.json()
@@ -383,7 +393,7 @@ class OpenAIAdapter(BackendAdapter):
             try:
                 async with _pooled_client(ctx) as client:
                     async with client.stream("POST", call.url, json=body,
-                                             headers=call.headers, timeout=300.0) as resp:
+                                             headers=call.headers, timeout=_CHAT_TIMEOUT) as resp:
                         stream_status = resp.status_code
                         if call.log_on:
                             logger.info(f"← [{self.name}] {req.path} HTTP {stream_status} "
@@ -406,7 +416,7 @@ class OpenAIAdapter(BackendAdapter):
         try:
             async with _pooled_client(self.ctx) as client:
                 resp = await client.post(call.url, json=call.fwd,
-                                         headers=call.headers, timeout=300.0)
+                                         headers=call.headers, timeout=_CHAT_TIMEOUT)
         finally:
             self._finish(call)
         # Parse ONCE (usage → tokens/cost); the body itself passes through as the
@@ -739,7 +749,7 @@ class ComfyUIAdapter(BackendAdapter):
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         url = self.backend["url"].rstrip("/")
-        resp = await client.get(f"{url}/object_info", timeout=8.0)
+        resp = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
         resp.raise_for_status()
         oi = resp.json()
         return Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
@@ -767,7 +777,7 @@ class ComfyUIAdapter(BackendAdapter):
         try:
             r = await client.post(f"{url}/upload/image",
                                   files={"image": (name, data, "image/png")},
-                                  data={"overwrite": "true"}, timeout=20.0)
+                                  data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
             return (r.json() or {}).get("name", name) if r.status_code == 200 else name
         except Exception:
             return name

@@ -111,7 +111,7 @@ def rebuild_backends() -> None:
     if store.is_active():
         for b in store.list_backends():
             merged[backend_id(b)] = b      # store overrides config per (name, type)
-    backends = sorted(merged.values(), key=lambda b: b.get("priority", 100))
+    backends = sorted(merged.values(), key=lambda b: b.get("priority", _DEFAULT_PRIORITY))
     rebuild_route_index()                  # backend set/enabled flags changed
 
 
@@ -133,6 +133,8 @@ def rebuild_virtual_models() -> None:
     rebuild_route_index()                  # alias mappings changed
 
 # ── State ─────────────────────────────────────────────────────────────────────
+
+_DEFAULT_PRIORITY = 100                 # backends without an explicit priority sort last-ish
 
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
 backend_healthy: dict[str, bool] = {}                          # name → bool
@@ -800,11 +802,12 @@ def _reasoning_apply(backend: dict, model: Optional[str], requested: Optional[st
     return reasoning.apply(rule, requested, payload)
 
 
-def _cost_usd(backend_name: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
-    """USD cost for a call from cached pricing (Together-style /v1/models). 0 if unknown."""
+def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
+    """USD cost for a call from cached pricing (Together-style /v1/models), keyed by
+    the backend id (`type:name`, same as `backend_pricing`). 0 if unknown."""
     if not model_id:
         return 0.0
-    p = backend_pricing.get(backend_name, {}).get(model_id, {})
+    p = backend_pricing.get(bid, {}).get(model_id, {})
     return ((in_tok or 0) * p.get("input", 0.0) + (out_tok or 0) * p.get("output", 0.0)) / 1_000_000
 
 
@@ -1031,6 +1034,12 @@ def _playground_key(name: str) -> Optional[str]:
 # response object; the worker parks/dispatches in the same queue and stores the
 # result. Poll `GET /v1/responses/{id}`; cancel `POST /v1/responses/{id}/cancel`.
 _bg_tasks: dict = {}                        # response_id → asyncio.Task (for cancellation)
+_RESP_PREFIX = "resp_"                      # background response id = resp_<job_id>
+
+
+def _bg_job_id(response_id: str) -> str:
+    """jobs.py id behind a background response id (strips the resp_ prefix)."""
+    return response_id[len(_RESP_PREFIX):]
 
 
 def _dispatch_json(resp) -> dict:
@@ -1079,7 +1088,7 @@ async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
         raise HTTPException(503, f"too many queued ({max_parked}) — retry later", headers={"Retry-After": "2"})
     owner = getattr(request.state, "gw_user", None) or "default"
     job_id = await asyncio.to_thread(jobs.create, "response", alias, "(background)", owner=owner)
-    rid, created = f"resp_{job_id}", int(time.time())
+    rid, created = f"{_RESP_PREFIX}{job_id}", int(time.time())
     body = dict(chat_body); body["stream"] = False     # background result is fetched, not streamed
     t = asyncio.create_task(_run_bg_response(job_id, rid, alias, body, request, created))
     _bg_tasks[rid] = t
@@ -1091,9 +1100,9 @@ async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
 
 
 async def _bg_job_for(response_id: str) -> dict:
-    if not response_id.startswith("resp_") or not jobs.is_active():
+    if not response_id.startswith(_RESP_PREFIX) or not jobs.is_active():
         raise HTTPException(404, f"response '{response_id}' not found")
-    job = await asyncio.to_thread(jobs.get, response_id[len("resp_"):])
+    job = await asyncio.to_thread(jobs.get, _bg_job_id(response_id))
     if job is None or job.get("task") != "response":
         raise HTTPException(404, f"response '{response_id}' not found")
     return job
@@ -1179,9 +1188,9 @@ async def cancel_response(response_id: str, request: Request, authorization: Opt
             t.cancel()                                 # stop a parked/in-flight worker at its next await
         # Mark cancelled right away so the response reflects it now — but only if it
         # hasn't just reached a terminal state (cancel racing completion).
-        cur = await asyncio.to_thread(jobs.get, response_id[len("resp_"):])
+        cur = await asyncio.to_thread(jobs.get, _bg_job_id(response_id))
         if cur and cur.get("status") in ("queued", "running"):
-            await asyncio.to_thread(jobs.fail, response_id[len("resp_"):], "cancelled")
+            await asyncio.to_thread(jobs.fail, _bg_job_id(response_id), "cancelled")
         job = await _bg_job_for(response_id)           # re-read post-cancel
     return JSONResponse(_bg_view(response_id, job))
 
@@ -1234,7 +1243,7 @@ def _gen_routes(alias: str) -> tuple[list, list]:
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
         allc.append((b, cand))
-    allc.sort(key=lambda bc: bc[0].get("priority", 100))    # backend priority decides order
+    allc.sort(key=lambda bc: bc[0].get("priority", _DEFAULT_PRIORITY))   # backend priority decides order
     ready = [r for r in allc if not backend_busy(r[0])]     # busy → only parkable, not ready
     raw = next((c.get("retries") for c in candidates if c.get("retries") not in (None, "")), None)
     if raw is not None:
