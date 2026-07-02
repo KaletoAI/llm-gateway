@@ -16,6 +16,8 @@ RSYNC_EXCLUDES=(
     --exclude='config.yaml'  --exclude='config.yaml.bak*'  --exclude='config.prod.yaml'
     --exclude='secret.key'   --exclude='store.db'      --exclude='store.db-wal' --exclude='store.db-shm'
     --exclude='stats.db'     --exclude='stats.db-wal'  --exclude='stats.db-shm'
+    --exclude='jobs.db'      --exclude='jobs.db-wal'   --exclude='jobs.db-shm'
+    --exclude='jobs/'        --exclude='calls/'
     --exclude='deploy.sh'
 )
 TAR_EXCLUDES=(
@@ -25,6 +27,8 @@ TAR_EXCLUDES=(
     --exclude='./config.yaml' --exclude='./config.yaml.bak*' --exclude='./config.prod.yaml'
     --exclude='./secret.key'  --exclude='./store.db'    --exclude='./store.db-wal' --exclude='./store.db-shm'
     --exclude='./stats.db'    --exclude='./stats.db-wal' --exclude='./stats.db-shm'
+    --exclude='./jobs.db'     --exclude='./jobs.db-wal'  --exclude='./jobs.db-shm'
+    --exclude='./jobs'        --exclude='./calls'
     --exclude='./deploy.sh'
 )
 
