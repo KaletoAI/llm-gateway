@@ -429,6 +429,27 @@ def rename_alias_park(old: str, new: str) -> None:
         set_settings({"alias_park": m})
 
 
+# ── Per-alias reasoning default (normalized thinking toggle) ─────────────────────
+# One settings dict {alias: "off"|"on"}; absent = auto. Lets two aliases point at the
+# same backend+model with different thinking behavior (e.g. `tool` off /
+# `tool-thinking` auto); an explicit client `reasoning` field always wins.
+
+def get_alias_reasoning() -> dict:
+    return get_setting("alias_reasoning") or {}
+
+
+def set_alias_reasoning(alias: str, mode) -> None:
+    """Set/clear an alias's reasoning default. Anything but 'on'/'off' clears (→ auto)."""
+    m = get_alias_reasoning()
+    if mode in ("on", "off"):
+        m[alias] = mode
+    elif alias in m:
+        del m[alias]
+    else:
+        return
+    set_settings({"alias_reasoning": m})
+
+
 # ── Reasoning rules (normalized thinking toggle) ────────────────────────────────
 # Ordered list of {match, backends[], adapter, param} — see reasoning.py. Stored as
 # one settings entry; first matching rule (model-glob × backend-set) wins.

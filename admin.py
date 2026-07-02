@@ -1079,12 +1079,21 @@ def _chat_editor(alias: str) -> str:
                   + "<p class='hint' style='margin:-4px 0 10px'>When all backends are busy, a call waits in "
                     "the queue up to this long for a free slot, then gets a 503. Blank = the global default "
                     "(Server tab); <b>0</b> disables parking for this alias.</p>")
+    cur_rsn = store.get_alias_reasoning().get(alias) or "auto"
+    rsn_opts = "".join(f'<option value="{v}"{" selected" if cur_rsn == v else ""}>{v}</option>'
+                       for v in ("auto", "on", "off"))
+    rsn_field = (_field("reasoning", f'<select name="reasoning">{rsn_opts}</select>', short=True)
+                 + "<p class='hint' style='margin:-4px 0 10px'>Default thinking mode for this alias, applied "
+                   "via the <a href='/ui/reasoning'>Reasoning</a> rules (model×backend decide the mechanism). "
+                   "<b>auto</b> = model default; an explicit client <code>reasoning</code> field always wins. "
+                   "Lets e.g. <code>tool</code> (off) and <code>tool-thinking</code> (auto/on) share one "
+                   "backend+model.</p>")
     return ('<form action="/ui/chat/save" method="post">'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
-            + park_field
+            + park_field + rsn_field
             + "<h2>Backends</h2>"
             + "<p class='hint'>Assign backends to this alias, pick the model on each, and optionally "
               "override that backend's global priority for this alias only. Tried in priority order "
@@ -1126,15 +1135,19 @@ async def chat_save(request: Request):
         else:
             value[bn] = m
     park_s = (f.get("park_s", "") or "").strip()
+    rsn = (f.get("reasoning", "") or "").strip()
     if not alias or not value:
         return RedirectResponse(f"/ui/mapping?cedit={orig}" if orig else "/ui/mapping", status_code=303)
     if orig and orig != alias and store.get_chat_alias(orig) is not None:
         store.delete_chat_alias(orig)         # renamed a store entry → move it
-        store.set_alias_park(orig, None)      # drop the old name's park override
+        store.set_alias_park(orig, None)      # drop the old name's overrides
+        store.set_alias_reasoning(orig, None)
     store.upsert_chat_alias(alias, value)
     store.set_alias_park(alias, park_s if park_s != "" else None)   # blank → global default
+    store.set_alias_reasoning(alias, rsn)                           # 'auto'/blank clears
     _apply_chat_aliases()
-    logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'})")
+    logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'}, "
+                f"reasoning={rsn or 'auto'})")
     return RedirectResponse("/ui/mapping", status_code=303)
 
 
@@ -1165,7 +1178,8 @@ async def chat_del(request: Request):
     alias = (request.query_params.get("alias", "") or "").strip()
     if alias:
         store.delete_chat_alias(alias)
-        store.set_alias_park(alias, None)     # drop any park override with the alias
+        store.set_alias_park(alias, None)     # drop the alias's overrides with it
+        store.set_alias_reasoning(alias, None)
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
     return RedirectResponse("/ui/mapping", status_code=303)

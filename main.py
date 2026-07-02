@@ -118,9 +118,9 @@ def rebuild_backends() -> None:
 def rebuild_virtual_models() -> None:
     """Effective chat aliases = config `virtual_models`, with UI-managed (store)
     entries merged over them by alias (store overrides config for the same name).
-    Also refreshes the per-alias park times. Call after config reload or any store
-    chat-alias change."""
-    global virtual_models, alias_park_s
+    Also refreshes the per-alias park times and reasoning defaults. Call after
+    config reload or any store chat-alias change."""
+    global virtual_models, alias_park_s, alias_reasoning
     merged = dict(config_virtual_models)
     if store.is_active():
         merged.update(store.list_chat_aliases())
@@ -129,6 +129,7 @@ def rebuild_virtual_models() -> None:
     if store.is_active():
         park.update(store.get_alias_park())
     alias_park_s = park
+    alias_reasoning = store.get_alias_reasoning() if store.is_active() else {}
     apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
     rebuild_route_index()                  # alias mappings changed
 
@@ -240,6 +241,7 @@ park_timeout_s: float = 60.0            # global default park time (Server tab);
 async_park_timeout_s: float = 600.0
 max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
+alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
 
@@ -927,6 +929,8 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     await gate_request(authorization, request, alias)        # auth + model allow-list + quota
     body.pop("park", None)                              # legacy control field — parking is automatic; never forward
     r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
+    if r is None:
+        r = alias_reasoning.get(alias)                  # per-alias default (tool vs tool-thinking)
     if r is not None:
         body["_reasoning"] = r
     # Sync park is the default: a ready backend dispatches now; all busy → queue until one
@@ -1144,6 +1148,8 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     await gate_request(authorization, request, alias)        # auth + model allow-list + quota
 
     r = _normalize_reasoning(raw_body)                 # honors reasoning + reasoning_effort + {effort}
+    if r is None:
+        r = alias_reasoning.get(alias)                 # per-alias default (tool vs tool-thinking)
     if r is not None:
         chat_body["_reasoning"] = r
 

@@ -105,6 +105,10 @@ what they need via injected callables, staying hot-reload-safe.
   `unsupported` (never fails). Rules live in `store` (settings key
   `reasoning_rules`), are cached in `main.reasoning_rules` (refreshed on save via
   `apply_reasoning_rules()`), and are edited in the `/ui` **Reasoning** tab.
+  Additionally a **per-alias default** (`alias_reasoning`, store settings; edited
+  in the chat-alias editor) supplies off/on when the client sends nothing — so
+  `tool`/`tool-thinking` can share one backend+model; an explicit client
+  `reasoning` always wins.
 
 ### Request flow
 
