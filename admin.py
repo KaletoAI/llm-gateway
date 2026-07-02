@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 
 import adapters
 import jobs
+import reasoning
 import stats
 import store
 
@@ -39,6 +40,7 @@ _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", 
 TABS = [
     ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
     ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
+    ("reasoning", "Reasoning"),
     ("chatplay", "Chat Playground"), ("playground", "Media Playground"),
     ("jobs", "Media Jobs"), ("llmcalls", "LLM Calls"),
     ("statistic", "Statistic"), ("users", "Users"),
@@ -82,6 +84,8 @@ _apply_users: Callable[[], None] = lambda: None
 _resolve_admin: Callable = lambda key: None
 _ui_locked: Callable[[], bool] = lambda: False
 _dashboard_snapshot: Callable[[], dict] = lambda: {}
+_apply_reasoning: Callable[[], None] = lambda: None
+_llm_backend_names: Callable[[], list] = lambda: []
 
 
 def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Callable[[], dict],
@@ -95,11 +99,15 @@ def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Calla
          resolve_admin: Callable = lambda key: None,
          ui_locked: Callable[[], bool] = lambda: False,
          dashboard_snapshot: Callable[[], dict] = lambda: {}, cancel_generation=None,
-         drain_backend=None, cancel_drain=None, set_backend_enabled=None) -> None:
+         drain_backend=None, cancel_drain=None, set_backend_enabled=None,
+         llm_backend_names: Callable[[], list] = lambda: [],
+         apply_reasoning: Callable[[], None] = lambda: None) -> None:
     global _comfy_backends, _run_generation, _gateway_info, _apply_backends
     global _llm_backends, _config_chat_aliases, _apply_chat_aliases, _run_chat, _routing_snapshot
     global _server_info, _apply_server_settings, _apply_users, _resolve_admin, _ui_locked
     global _dashboard_snapshot, _cancel_gen, _drain_backend, _cancel_drain, _set_backend_enabled
+    global _apply_reasoning, _llm_backend_names
+    _apply_reasoning, _llm_backend_names = apply_reasoning, llm_backend_names
     _dashboard_snapshot = dashboard_snapshot
     _cancel_gen = cancel_generation
     _drain_backend, _cancel_drain = drain_backend, cancel_drain
@@ -2398,7 +2406,7 @@ async def dashboard_page(request: Request):
                f"<td class='muted jdur' data-since='{started}'>{_dur((now - started) * 1000)}</td>"
                f"<td class='muted'>—</td><td class='muted'>—</td></tr>")
     for r in d.get("llm_recent", []):
-        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body = r
+        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, _rsn = r
         scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
         am = (_esc(alias) or "") + (("→" + _esc(model)) if model else "")
         view = f"<a href='/ui/call/{cid}'>view</a>" if has_body else "<span class='muted'>—</span>"
@@ -2447,12 +2455,26 @@ async def dashboard_page(request: Request):
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
 
 
+def _reasoning_cell(rsn) -> str:
+    """Table cell for the applied reasoning control (off:prefill / on:enable_thinking /
+    unsupported / — for auto)."""
+    if not rsn:
+        return "<td class='muted'>—</td>"
+    if rsn == "unsupported" or str(rsn).endswith("noop"):
+        kind = "muted"
+    elif str(rsn).startswith("off"):
+        kind = "warn"
+    else:
+        kind = "ok"
+    return f"<td>{_badge(_esc(rsn), kind)}</td>"
+
+
 def _recent_calls_table(rows, aliases) -> str:
-    """The per-call history table (time/source/backend/alias→model/…/req body link).
+    """The per-call history table (time/source/backend/alias→model/…/reasoning/req body).
     Shared row template — also reused by the dashboard's running+5min LLM view."""
     rec = ""
     for r in rows:
-        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body = r
+        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, rsn = r
         scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
         if has_body:
             view = f"<a href='/ui/call/{cid}' title='{_esc(prev or '')}'>view</a>"
@@ -2464,12 +2486,13 @@ def _recent_calls_table(rows, aliases) -> str:
                 f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
                 f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
                 f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
-                f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td><td>{view}</td></tr>")
+                f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
     if not rec:
         return "<p class='muted'>no calls yet</p>"
     return (f"<table class='recent filterable sortable' data-sk='llm-calls'><tr><th>time</th><th>source</th>"
             f"<th>backend</th><th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th>"
-            f"<th>cost</th><th>req</th></tr>{rec}</table>")
+            f"<th>cost</th><th title='normalized reasoning control applied to this call'>reasoning</th>"
+            f"<th>req</th></tr>{rec}</table>")
 
 
 async def llmcalls_page(request: Request):
@@ -2571,6 +2594,143 @@ async def call_view(call_id: int, request: Request):
     page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
             f"{_btn('← Back to LLM Calls', '/ui/llmcalls', 'secondary')}</div>{inner}")
     return HTMLResponse(_page("Call", page, "llmcalls"))
+
+
+# ── Reasoning tab: normalized thinking toggle (per-model × per-backend rules) ────
+
+_REASON_ADAPTERS = ["enable_thinking", "reasoning_effort", "nothink_token", "prefill", "none"]
+_REASON_HINT = {
+    "enable_thinking": "sends chat_template_kwargs:{enable_thinking:false} — the backend must pass it through "
+                       "(vLLM: yes · llama.cpp: needs --jinja · LocalAI: verify)",
+    "reasoning_effort": "sets reasoning_effort — off uses the param value (default 'minimal'), on uses 'high'",
+    "nothink_token": "appends a token to the last user message (param, default '/nothink')",
+    "prefill": "appends a closed think block as an assistant turn (param, default '<think>\\n\\n</think>')",
+    "none": "no mechanism — reasoning off/on is reported as 'unsupported'",
+}
+_REASON_PKEY = {"reasoning_effort": "off", "nothink_token": "token", "prefill": "content"}
+
+
+def _reason_pval(rule: dict) -> str:
+    k = _REASON_PKEY.get(rule.get("adapter", ""))
+    return str((rule.get("param") or {}).get(k, "")) if k else ""
+
+
+def _reasoning_form(rule: Optional[dict], idx) -> str:
+    r = rule or {}
+    hidden = f'<input type="hidden" name="idx" value="{idx}">' if idx is not None else ""
+    sel = set(r.get("backends") or [])
+    allck = " checked" if ("*" in sel or not sel) else ""
+    bk = (f'<label class="ckbox"><input type="checkbox" name="bk_all" value="1"{allck} onclick="rAll(this)"> '
+          f'<b>all backends</b></label><div style="margin:6px 0">')
+    for n in _llm_backend_names():
+        ck = " checked" if (n in sel and "*" not in sel) else ""
+        bk += (f'<label class="ckbox" style="margin:0 12px 4px 0"><input type="checkbox" name="bk" '
+               f'value="{_esc(n)}" class="rbk"{ck}> {_esc(n)}</label>')
+    bk += "</div>"
+    ad = r.get("adapter", "enable_thinking")
+    aopts = "".join(f'<option{" selected" if a == ad else ""}>{a}</option>' for a in _REASON_ADAPTERS)
+    asel = f'<select name="adapter" onchange="rAd(this.value)">{aopts}</select>'
+    hints = "".join(f'<div class="hint rh" data-a="{a}" style="display:{"block" if a == ad else "none"};'
+                    f'margin:-4px 0 10px">{_esc(_REASON_HINT[a])}</div>' for a in _REASON_ADAPTERS)
+    js = ("<script>function rAll(c){document.querySelectorAll('.rbk').forEach(function(x){"
+          "x.disabled=c.checked; if(c.checked) x.checked=false;});}"
+          "function rAd(a){document.querySelectorAll('.rh').forEach(function(e){"
+          "e.style.display=e.getAttribute('data-a')===a?'block':'none';});}"
+          "rAll(document.querySelector('input[name=bk_all]'));</script>")
+    return ('<form action="/ui/reasoning/save" method="post">' + hidden +
+            f'<div class="formbar"><h2>{"Edit rule" if rule else "New rule"}</h2>'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/reasoning", "secondary")}</div>'
+            + _field("order", _inp("order", str(r.get("order", "")), placeholder="1", typ="number"), short=True)
+            + _field("match (model glob)", _inp("match", r.get("match", ""),
+                     placeholder="qwen3.5*  ·  gemma-4-12b-it  ·  *"), short=True)
+            + _field("backends", bk)
+            + _field("adapter (off)", asel) + hints
+            + _field("param", _inp("param", _reason_pval(r), placeholder="optional — see hint above"), short=True)
+            + "</form>" + js)
+
+
+async def reasoning_page(request: Request):
+    rules = store.get_reasoning_rules() if store.is_active() else []
+    qp = request.query_params
+    if qp.get("new"):
+        return HTMLResponse(_page("Reasoning", _reasoning_form(None, None), "reasoning"))
+    if qp.get("edit", "").isdigit() and int(qp["edit"]) < len(rules):
+        i = int(qp["edit"])
+        return HTMLResponse(_page("Reasoning", _reasoning_form(rules[i], i), "reasoning"))
+    rows = ""
+    for i, r in enumerate(rules):
+        bks = r.get("backends") or ["*"]
+        bstr = "all" if "*" in bks else ", ".join(bks)
+        acts = _icon_acts(("✎", f"/ui/reasoning?edit={i}", "secondary", "Edit"),
+                          ("✕", f"/ui/reasoning/delete?idx={i}", "danger", "Delete", "Delete this rule?"))
+        rows += (f"<tr><td>{_esc(r.get('order', ''))}</td><td><code>{_esc(r.get('match', '*'))}</code></td>"
+                 f"<td>{_esc(bstr)}</td><td>{_esc(r.get('adapter', 'none'))}</td>"
+                 f"<td class='muted'>{_esc(_reason_pval(r))}</td><td class='acts'>{acts}</td></tr>")
+    rows = rows or ("<tr><td colspan=6 class='muted'>no rules — reasoning off/on is reported "
+                    "'unsupported' for every model</td></tr>")
+    lst = (f'<div class="bar"><h2>Reasoning rules</h2>{_btn("+ New rule", "/ui/reasoning?new=1")}</div>'
+           "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
+           "unchanged). The first rule whose <b>model glob</b> matches the real model <b>and</b> whose "
+           "<b>backend set</b> contains the serving backend is applied; no match → <code>unsupported</code> "
+           "(never fails). What was applied shows in the <a href='/ui/llmcalls'>LLM Calls</a> tab and the "
+           "<code>x-reasoning-control</code> response header.</p>"
+           f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
+           f"<th>adapter (off)</th><th>param</th><th></th></tr>{rows}</table>")
+    tm = (qp.get("test_model") or "").strip()
+    tb = (qp.get("test_backend") or "").strip()
+    res = ""
+    if tm and tb:
+        rule = reasoning.resolve(rules, tb, tm)
+        res = ("<p style='margin-top:8px'>" + f"<code>{_esc(tm)}</code> on <b>{_esc(tb)}</b> → "
+               + (f"{_badge(rule.get('adapter'), 'ok')} <span class='muted'>(rule #{rules.index(rule) + 1})</span>"
+                  if rule else _badge("unsupported", "muted") + " <span class='muted'>(no matching rule)</span>")
+               + "</p>")
+    bopts = "".join(f"<option{' selected' if n == tb else ''}>{_esc(n)}</option>" for n in _llm_backend_names())
+    test = ("<h2 style='margin-top:22px'>Test resolution</h2>"
+            "<form method='get' action='/ui/reasoning' style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
+            f"{_inp('test_model', tm, placeholder='real model id, e.g. qwen3.5-9b-heretic')}"
+            f"<select name='test_backend'><option value=''>backend…</option>{bopts}</select>"
+            f"{_btn('Resolve', submit=True, kind='secondary')}</form>{res}")
+    return HTMLResponse(_page("Reasoning", lst + test, "reasoning"))
+
+
+async def reasoning_save(request: Request):
+    qs = parse_qs((await request.body()).decode("utf-8", "replace"), keep_blank_values=True)
+    g = lambda k, d="": (qs.get(k) or [d])[-1]
+    rules = store.get_reasoning_rules() if store.is_active() else []
+    adapter = (g("adapter", "none").strip() or "none")
+    if adapter not in _REASON_ADAPTERS:
+        adapter = "none"
+    o = g("order").strip()
+    order = int(o) if o.lstrip("-").isdigit() else (len(rules) + 1)
+    backends = ["*"] if qs.get("bk_all") else ([b for b in qs.get("bk", []) if b] or ["*"])
+    param = {}
+    pv = g("param").strip()
+    key = _REASON_PKEY.get(adapter)
+    if key and pv:
+        param[key] = pv
+    rule = {"order": order, "match": (g("match").strip() or "*"),
+            "backends": backends, "adapter": adapter, "param": param}
+    idx = g("idx")
+    if idx.isdigit() and int(idx) < len(rules):
+        rules[int(idx)] = rule
+    else:
+        rules.append(rule)
+    rules.sort(key=lambda r: r.get("order") if isinstance(r.get("order"), int) else 999)
+    store.set_reasoning_rules(rules)
+    _apply_reasoning()
+    logger.info(f"ui: reasoning rule saved — {rule['match']} @ {backends} → {adapter}")
+    return RedirectResponse("/ui/reasoning", status_code=303)
+
+
+async def reasoning_del(request: Request):
+    idx = request.query_params.get("idx") or ""
+    rules = store.get_reasoning_rules() if store.is_active() else []
+    if idx.isdigit() and int(idx) < len(rules):
+        rules.pop(int(idx))
+        store.set_reasoning_rules(rules)
+        _apply_reasoning()
+    return RedirectResponse("/ui/reasoning", status_code=303)
 
 
 def _user_form(u: Optional[dict]) -> str:
@@ -2963,6 +3123,9 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/export-all", mapping_export_all, methods=["GET"])
     app.add_api_route("/ui/mapping/copy", copy, methods=["GET"])
     app.add_api_route("/ui/mapping/delete", delete, methods=["GET"])
+    app.add_api_route("/ui/reasoning", reasoning_page, methods=["GET"])
+    app.add_api_route("/ui/reasoning/save", reasoning_save, methods=["POST"])
+    app.add_api_route("/ui/reasoning/delete", reasoning_del, methods=["GET"])
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])

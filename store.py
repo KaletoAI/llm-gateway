@@ -394,6 +394,19 @@ def rename_alias_park(old: str, new: str) -> None:
         set_settings({"alias_park": m})
 
 
+# ── Reasoning rules (normalized thinking toggle) ────────────────────────────────
+# Ordered list of {match, backends[], adapter, param} — see reasoning.py. Stored as
+# one settings entry; first matching rule (model-glob × backend-set) wins.
+
+def get_reasoning_rules() -> list:
+    v = get_settings().get("reasoning_rules")
+    return v if isinstance(v, list) else []
+
+
+def set_reasoning_rules(rules: list) -> None:
+    set_settings({"reasoning_rules": list(rules or [])})
+
+
 # ── Users (multi-user: api_key → identity, role, quota, model access) ────────────
 # Each user: {name, api_key(enc), role, enabled, models[], quota_req_day, quota_cost_month}.
 # api_key encrypted at rest; the empty `models` list means "all models allowed".

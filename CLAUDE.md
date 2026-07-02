@@ -11,8 +11,11 @@ does per-backend auto-discovery, priority routing with failover, virtual aliases
 per-backend concurrency caps, an optional multi-user auth layer, **call parking**
 (a default FIFO queue instead of 503 when busy; per-alias park time; async via the
 Responses background mode), a full **media-generation subsystem** (image/video/
-audio; workflow mapping, LoRAs, jobs), and a server-rendered `/ui` console. Read
-`README.md` first — it documents every config knob, endpoint, and routing rule.
+audio; workflow mapping, LoRAs, jobs), a **normalized reasoning toggle** (one
+`reasoning: off|on|auto` control mapped to the right per-(model,backend)
+mechanism), and a server-rendered `/ui` console. Read `README.md` first — it
+documents every config knob, endpoint, and routing rule (note: reasoning is not
+in README yet — see `reasoning.py`).
 
 ## Run / develop
 
@@ -37,9 +40,10 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Six self-contained Python files hold everything. `main.py` owns app state; the
-others (`adapters`, `jobs`, `store`, `stats`, `admin`) never import `main` — they
-receive what they need via injected callables, staying hot-reload-safe.
+Seven self-contained Python files hold everything. `main.py` owns app state; the
+others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`) never import
+`main` — they receive what they need via injected callables, staying
+hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
   endpoints, auth/quotas, call parking, generation orchestration, the Responses
@@ -78,6 +82,17 @@ receive what they need via injected callables, staying hot-reload-safe.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console). Zero new dependencies — keep it.
+  The `calls` row carries the applied `reasoning` control (shown in LLM Calls).
+- **`reasoning.py`** — pure functions for the normalized thinking toggle, no
+  `main`/`adapters` imports (hot-reload/test-friendly). Rules are an ordered list
+  of `{match(model-glob), backends[], adapter, param}`; `resolve()` picks the
+  first rule whose glob matches AND whose backend-set contains the dispatch
+  backend, `apply()` rewrites a **copy** of the outgoing chat body per the chosen
+  `adapter` (`enable_thinking` / `reasoning_effort` / `nothink_token` / `prefill`
+  / `none`) and returns the `x-reasoning-control` string. `none`/no-match →
+  `unsupported` (never fails). Rules live in `store` (settings key
+  `reasoning_rules`), are cached in `main.reasoning_rules` (refreshed on save via
+  `apply_reasoning_rules()`), and are edited in the `/ui` **Reasoning** tab.
 
 ### Request flow
 
@@ -86,9 +101,14 @@ receive what they need via injected callables, staying hot-reload-safe.
   ready vs busy split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the
   first ready, failing over only on connection/timeout errors (HTTP error status
   returned as-is). All busy → **park by default** (FIFO queue, per-alias `park_s`)
-  until a backend frees, else 503; no client field. `/v1/responses` translates
-  bodies and shares `_dispatch_or_park()` too (also parks); `background:true` runs
-  it async via the official Responses background mode (see below).
+  until a backend frees, else 503; no client field. Before dispatch,
+  `_normalize_reasoning()` folds the client `reasoning`/`reasoning_effort` control
+  to `off|on|None` and stashes it in `body["_reasoning"]`; the adapter strips all
+  `_`-prefixed keys and runs `apply_reasoning` **per backend** on a copy of the
+  body (so failover re-derives it). `/v1/responses` translates bodies and shares
+  `_dispatch_or_park()` too (also parks, and normalizes reasoning incl. the
+  Responses `{effort}` shape); `background:true` runs it async via the official
+  Responses background mode (see below).
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   the alias via the **separate** generation store (`image_models`/store), filtered
@@ -155,8 +175,9 @@ per-token). Streaming records `0` tokens.
 - The Responses↔Chat bridge supports `stream:true` (chat SSE → Responses SSE) and
   `background:true` (async). What's **not** built yet: streaming-reconnect for a
   background response (poll-only). Keep in sync when touching `/v1/responses`.
-- Keep `stats.py`/`jobs.py`/`store.py` dependency-free and hot-reload-safe (no
-  caching config values at import time).
+- Keep `stats.py`/`jobs.py`/`store.py`/`reasoning.py` dependency-free and
+  hot-reload-safe (no caching config values at import time); `reasoning.py` must
+  stay pure (no `main`/`adapters` imports) — it's called on the request path.
 - Generation: workflow + mapping are **backend-independent** (shared across an
   alias's candidates); only **pinned values** (`fixed`) are per-backend. A pinned
   `(node,field)` is authoritative — never overridden by an API request param.

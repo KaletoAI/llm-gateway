@@ -146,6 +146,7 @@ class NormalizedRequest:
     raw: Optional[Request] = None
     stream: bool = False
     stats_endpoint: Optional[str] = None            # stats label when it differs from path (e.g. /v1/responses)
+    reasoning: Optional[str] = None                 # normalized reasoning control: "off" | "on" | None(auto)
     # ── generation extension ──
     task: str = "chat"                              # text2img | img2video | tts | …
     inputs: dict = field(default_factory=dict)      # prompt, negative_prompt, …
@@ -191,6 +192,10 @@ class AdapterContext:
     # streamed-finally. Default no-ops so non-main constructions stay valid.
     active_register: Callable[[dict], Any] = lambda meta: None
     active_done: Callable[[Any], None] = lambda token: None
+    # Normalized reasoning toggle: (backend, model, requested, payload) -> (payload, control).
+    # Default no-op (auto) so non-main constructions stay valid.
+    apply_reasoning: Callable[[dict, Optional[str], Optional[str], dict], Any] = \
+        lambda backend, model, requested, payload: (payload, None)
 
 
 class BackendAdapter(ABC):
@@ -277,8 +282,13 @@ class OpenAIAdapter(BackendAdapter):
         headers.update(ctx.auth_headers(b))
         ctx.inflight_inc(self.bid)        # released on completion (stream close / return / error)
         real_model = req.body.get("model")
+        # Outgoing payload: drop gateway-private keys (e.g. _reasoning), then apply the
+        # normalized reasoning toggle for THIS backend (per-backend, failover-safe copy).
+        fwd = {k: v for k, v in req.body.items() if not k.startswith("_")}
+        fwd, reasoning_ctl = ctx.apply_reasoning(b, real_model, req.reasoning, fwd)
+        rheaders = {"x-reasoning-control": reasoning_ctl} if reasoning_ctl else None
         source = ctx.source_of(req.raw)
-        req_text = json.dumps(req.body, ensure_ascii=False)
+        req_text = json.dumps(fwd, ensure_ascii=False)
         started = time.monotonic()
         log_on = ctx.log_enabled()
         act = ctx.active_register({                # dropped on completion (both finally paths)
@@ -291,8 +301,8 @@ class OpenAIAdapter(BackendAdapter):
             # Ask the backend to emit a final usage chunk so streamed calls record
             # real tokens/cost instead of 0 (graceful: backends that ignore the
             # field just yield no usage line → tokens stay 0, as before).
-            body = {**req.body,
-                    "stream_options": {**(req.body.get("stream_options") or {}), "include_usage": True}}
+            body = {**fwd,
+                    "stream_options": {**(fwd.get("stream_options") or {}), "include_usage": True}}
 
             async def generate():
                 stream_status = 0
@@ -321,14 +331,14 @@ class OpenAIAdapter(BackendAdapter):
                     duration_ms=elapsed_ms, backend=bname, source=source,
                     alias=alias, model=real_model, endpoint=(req.stats_endpoint or path),
                     status=stream_status, input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost,
-                    request_text=req_text,
+                    request_text=req_text, reasoning=reasoning_ctl,
                 ))
 
-            return StreamingResponse(generate(), media_type="text/event-stream")
+            return StreamingResponse(generate(), media_type="text/event-stream", headers=rheaders)
 
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.post(url, json=req.body, headers=headers, timeout=300.0)
+                resp = await client.post(url, json=fwd, headers=headers, timeout=300.0)
         finally:
             ctx.inflight_dec(self.bid)
             ctx.active_done(act)
@@ -349,8 +359,9 @@ class OpenAIAdapter(BackendAdapter):
             input_tokens=in_tok, output_tokens=out_tok,
             cost_usd=ctx.cost_usd(self.bid, real_model, in_tok, out_tok),
             request_text=req_text, response_text=json.dumps(resp_json, ensure_ascii=False),
+            reasoning=reasoning_ctl,
         ))
-        return JSONResponse(resp_json, status_code=resp.status_code)
+        return JSONResponse(resp_json, status_code=resp.status_code, headers=rheaders)
 
 
 # ── ComfyUI adapter ───────────────────────────────────────────────────────────

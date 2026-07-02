@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS calls (
     input_tokens  INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     cost_usd      REAL    DEFAULT 0,
-    req_preview   TEXT
+    req_preview   TEXT,
+    reasoning     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_calls_ts      ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
@@ -66,7 +67,7 @@ def recent_since(ts: int, limit: int = 100) -> list:
     if _DB_PATH is None:
         return []
     return _q("SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
-              "input_tokens, output_tokens, cost_usd, req_preview, has_body "
+              "input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
               "FROM calls WHERE ts > ? ORDER BY id DESC LIMIT ?", ts, limit)
 
 
@@ -115,7 +116,7 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
             "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", source_limit),
         "recent": _q(
             f"SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
-            f"input_tokens, output_tokens, cost_usd, req_preview, has_body "
+            f"input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
             f"FROM calls{flt} ORDER BY id DESC LIMIT ?", *ua, recent_limit),
     }
 
@@ -147,6 +148,8 @@ def init(db_path: str, blob_dir: str = "calls") -> None:
             c.execute("ALTER TABLE calls ADD COLUMN req_preview TEXT")
         if "has_body" not in cols:
             c.execute("ALTER TABLE calls ADD COLUMN has_body INTEGER DEFAULT 0")
+        if "reasoning" not in cols:
+            c.execute("ALTER TABLE calls ADD COLUMN reasoning TEXT")
     logger.info(f"stats: SQLite at {_DB_PATH} (WAL), call bodies in {_BLOB_DIR}/")
 
 
@@ -186,8 +189,8 @@ def _record_sync(row: tuple, request_text=None, response_text=None) -> None:
     with _conn() as c:
         cur = c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
-            "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview, reasoning) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
         if request_text is not None or response_text is not None:
@@ -224,6 +227,7 @@ async def record_call(
     cost_usd: float = 0.0,
     request_text: Optional[str] = None,
     response_text: Optional[str] = None,
+    reasoning: Optional[str] = None,
 ) -> None:
     """Async-safe insert. Never raises into the request path. Full request/response
     bodies (when given) are written to an on-disk blob, not the DB row."""
@@ -242,6 +246,7 @@ async def record_call(
         output_tokens,
         cost_usd,
         _preview(request_text),
+        reasoning,
     )
     try:
         await asyncio.to_thread(_record_sync, row, request_text, response_text)

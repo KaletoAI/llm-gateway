@@ -19,6 +19,7 @@ from watchfiles import awatch
 
 import admin
 import jobs
+import reasoning
 import stats
 import store
 from adapters import AdapterContext, NormalizedRequest, image_params, make_adapter
@@ -124,6 +125,7 @@ def rebuild_virtual_models() -> None:
     if store.is_active():
         park.update(store.get_alias_park())
     alias_park_s = park
+    apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -233,6 +235,15 @@ max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
+
+# Normalized reasoning rules (store-backed, UI-editable). Cached here and refreshed on
+# save so the resolver doesn't hit the DB per request. See reasoning.py.
+reasoning_rules: list = []
+
+
+def apply_reasoning_rules() -> None:
+    global reasoning_rules
+    reasoning_rules = store.get_reasoning_rules() if store.is_active() else []
 
 
 def _next_park_id() -> int:
@@ -703,6 +714,37 @@ def _source_of(request: Request) -> str:
     return request.headers.get("x-source") or (request.client.host if request.client else "unknown")
 
 
+def _normalize_reasoning(body: dict) -> Optional[str]:
+    """Client reasoning control → 'off' | 'on' | None(auto). Pops the gateway control
+    field `reasoning` (string, or a Responses-style object {effort}); falls back to the
+    OpenAI `reasoning_effort` alias (minimal→off, else→on). `reasoning_effort` itself is
+    left in the body (it's a real field a native-effort backend may use)."""
+    v = body.pop("reasoning", None)
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v in ("off", "on"):
+            return v
+        return None                                  # "auto"/unknown → default
+    if isinstance(v, dict):                          # Responses API shape: {"effort": ...}
+        eff = v.get("effort")
+        if isinstance(eff, str):
+            return "off" if eff.strip().lower() == "minimal" else "on"
+        return None
+    eff = body.get("reasoning_effort")
+    if isinstance(eff, str):
+        return "off" if eff.strip().lower() == "minimal" else "on"
+    return None
+
+
+def _reasoning_apply(backend: dict, model: Optional[str], requested: Optional[str], payload: dict):
+    """Adapter-context hook: resolve the reasoning rule for (backend, model) and apply
+    it. Rules live in the store (UI-editable, hot); empty → everything 'unsupported'."""
+    if requested not in ("off", "on"):
+        return payload, None
+    rule = reasoning.resolve(reasoning_rules, backend.get("name", ""), model or "")
+    return reasoning.apply(rule, requested, payload)
+
+
 def _cost_usd(backend_name: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
     """USD cost for a call from cached pricing (Together-style /v1/models). 0 if unknown."""
     if not model_id:
@@ -725,6 +767,7 @@ adapter_ctx = AdapterContext(
     log_enabled=lambda: log_per_call,
     active_register=_active_register,
     active_done=_active_done,
+    apply_reasoning=_reasoning_apply,
 )
 
 
@@ -778,7 +821,7 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
             req = NormalizedRequest(
                 path=path, alias=alias, real_model=real_model,
                 body=body, raw=request, stream=bool(body.get("stream")),
-                stats_endpoint=stats_endpoint,
+                stats_endpoint=stats_endpoint, reasoning=body.get("_reasoning"),
             )
             return await adapter.dispatch(req)
         except (httpx.ConnectError, httpx.TimeoutException) as e:
@@ -823,6 +866,9 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     alias = body.get("model", "")
     gate_request(authorization, request, alias)        # auth + model allow-list + quota
     body.pop("park", None)                              # legacy control field — parking is automatic; never forward
+    r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
+    if r is not None:
+        body["_reasoning"] = r
     # Sync park is the default: a ready backend dispatches now; all busy → queue until one
     # frees (per-alias park time) or 503. Async is not on chat/completions — it lives on the
     # standard /v1/responses background mode.
@@ -1278,6 +1324,10 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     chat_body = responses_to_chat(raw_body)
     alias = chat_body.get("model", "")
     gate_request(authorization, request, alias)        # auth + model allow-list + quota
+
+    r = _normalize_reasoning(raw_body)                 # honors reasoning + reasoning_effort + {effort}
+    if r is not None:
+        chat_body["_reasoning"] = r
 
     if raw_body.get("background") is True:             # official async: immediate queued object
         return await _create_bg_response(alias, chat_body, request)
@@ -2118,7 +2168,10 @@ admin.bind(lambda: [b for b in backends if b.get("type") == "comfyui"],
            resolve_admin=resolve_admin, ui_locked=ui_locked,
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
            drain_backend=begin_drain, cancel_drain=cancel_drain,
-           set_backend_enabled=set_backend_enabled)
+           set_backend_enabled=set_backend_enabled,
+           llm_backend_names=lambda: sorted({b["name"] for b in backends
+                                             if b.get("type", "openai") != "comfyui"}),
+           apply_reasoning=apply_reasoning_rules)
 
 
 @app.get("/health")
