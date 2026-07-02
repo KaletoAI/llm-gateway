@@ -144,12 +144,26 @@ def response_shell(rid: str, status: str, model: Optional[str], created: int,
     return shell
 
 
+def _reasoning_item(text: str) -> dict:
+    """A Responses-API reasoning output item carrying the model's thinking text as a
+    summary part — how thinking-model output (delta/message `reasoning`) is surfaced
+    instead of being dropped (some models stream EVERYTHING there; see the
+    thinking-models note in the repo docs)."""
+    return {"type": "reasoning", "id": _oid("rs"),
+            "summary": [{"type": "summary_text", "text": text}], "status": "completed"}
+
+
 def chat_to_responses(chat_resp: dict) -> dict:
-    """Translate a Chat Completions response body to a Responses API body."""
+    """Translate a Chat Completions response body to a Responses API body. A
+    `message.reasoning`/`reasoning_content` field becomes a reasoning output item
+    (listed first, like OpenAI); `output_text` stays content-only."""
     choice = (chat_resp.get("choices") or [{}])[0]
     message = choice.get("message") or {}
 
     output: list[dict] = []
+    think = message.get("reasoning") or message.get("reasoning_content")
+    if isinstance(think, str) and think:
+        output.append(_reasoning_item(think))
 
     text_content = message.get("content")
     if text_content:
@@ -189,9 +203,15 @@ def chat_to_responses(chat_resp: dict) -> dict:
 async def responses_stream(chat_resp, raw_body: dict, alias: str):
     """A3: translate a backend chat-completion SSE stream into Responses API SSE
     events. Consumes the adapter StreamingResponse's body_iterator (so in-flight
-    accounting + stats still fire in the adapter when it drains)."""
+    accounting + stats still fire in the adapter when it drains).
+
+    Thinking-model chunks (`delta.reasoning`/`reasoning_content`) are forwarded as
+    reasoning-summary events on a reasoning item (output_index 1 — the message item
+    stays at 0, its events having already been announced) instead of being dropped;
+    clients that don't know reasoning events simply ignore them."""
     resp_id = _oid("resp")
     item_id = _oid("msg")
+    rs_id = _oid("rs")
     created = int(time.time())
     model = raw_body.get("model") or alias
     seq = 0
@@ -211,7 +231,7 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
     yield ev("response.content_part.added", {"item_id": item_id, "output_index": 0,
              "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
 
-    full, buf, usage = "", "", None
+    full, think, buf, usage = "", "", "", None
     try:
         async for chunk in chat_resp.body_iterator:
             buf += chunk.decode("utf-8", "ignore") if isinstance(chunk, (bytes, bytearray)) else chunk
@@ -233,7 +253,16 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
                     model = obj["model"]
                 if obj.get("usage"):
                     usage = obj["usage"]
-                delta = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content")
+                d = (obj.get("choices") or [{}])[0].get("delta") or {}
+                rdelta = d.get("reasoning") or d.get("reasoning_content")
+                if isinstance(rdelta, str) and rdelta:
+                    if not think:                       # first thinking token → announce the item
+                        yield ev("response.output_item.added", {"output_index": 1, "item": {
+                            "id": rs_id, "type": "reasoning", "status": "in_progress", "summary": []}})
+                    think += rdelta
+                    yield ev("response.reasoning_summary_text.delta", {"item_id": rs_id,
+                             "output_index": 1, "summary_index": 0, "delta": rdelta})
+                delta = d.get("content")
                 if delta:
                     full += delta
                     yield ev("response.output_text.delta", {"item_id": item_id,
@@ -249,6 +278,13 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
     final_item = {"id": item_id, "type": "message", "status": "completed",
                   "role": "assistant", "content": [part]}
     yield ev("response.output_item.done", {"output_index": 0, "item": final_item})
+    output = [final_item]
+    if think:
+        rs_item = dict(_reasoning_item(think), id=rs_id)
+        yield ev("response.reasoning_summary_text.done", {"item_id": rs_id,
+                 "output_index": 1, "summary_index": 0, "text": think})
+        yield ev("response.output_item.done", {"output_index": 1, "item": rs_item})
+        output.append(rs_item)
     u = None
     if usage:
         u = {"input_tokens": usage.get("prompt_tokens", 0),
@@ -256,4 +292,4 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
              "total_tokens": usage.get("total_tokens", 0)}
     yield ev("response.completed",
              {"response": response_shell(resp_id, "completed", model, created,
-                                         output=[final_item], usage=u)})
+                                         output=output, usage=u)})
