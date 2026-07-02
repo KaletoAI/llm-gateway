@@ -282,7 +282,7 @@ class _Call:
     fwd: dict                           # outgoing payload (private keys stripped, reasoning applied)
     real_model: Optional[str]
     reasoning_ctl: Optional[str]        # x-reasoning-control value ("off:prefill", …) or None
-    rheaders: Optional[dict]            # response headers carrying the control, or None
+    rheaders: dict                      # gateway response headers (serving backend + reasoning control)
     source: str
     req_text: str
     started: float
@@ -335,10 +335,15 @@ class OpenAIAdapter(BackendAdapter):
             "source": ctx.source_of(req.raw), "endpoint": (req.stats_endpoint or req.path),
             "stream": bool(req.body.get("stream")),
         })
+        # Response headers: which backend served the call (so API clients — incl. the
+        # /ui playgrounds, which are plain clients — can show routing), plus the
+        # reasoning control actually applied.
+        rheaders = {"x-gateway-backend": self.name}
+        if reasoning_ctl:
+            rheaders["x-reasoning-control"] = reasoning_ctl
         return _Call(
             url=f"{b['url']}{req.path}", headers=headers, fwd=fwd, real_model=real_model,
-            reasoning_ctl=reasoning_ctl,
-            rheaders={"x-reasoning-control": reasoning_ctl} if reasoning_ctl else None,
+            reasoning_ctl=reasoning_ctl, rheaders=rheaders,
             source=ctx.source_of(req.raw), req_text=json.dumps(fwd, ensure_ascii=False),
             started=time.monotonic(), log_on=ctx.log_enabled(), act=act,
         )

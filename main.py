@@ -1017,49 +1017,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     return await route("/v1/chat/completions", request, authorization)
 
 
-async def run_chat(model: str, messages: list, params: Optional[dict] = None) -> dict:
-    """Non-streaming chat completion for the UI playground. Routes like the API
-    (priority order, fail over on connection errors) but returns the parsed response
-    plus which backend actually ran it. Raises HTTPException on no-route/all-failed."""
-    candidates = get_routes_for(model)
-    if not candidates:
-        raise HTTPException(503, f"No healthy backend for model '{model}'")
-    base = {"messages": messages, "stream": False}
-    for k, v in (params or {}).items():
-        if v is not None:
-            base[k] = v
-    last = "unknown"
-    for backend, real_model in candidates:
-        body = dict(base, model=real_model)
-        url = f"{backend['url']}/v1/chat/completions"
-        headers = {"content-type": "application/json", **backend_auth_headers(backend)}
-        started = time.monotonic()
-        try:
-            r = await http_client.post(url, json=body, headers=headers, timeout=300.0)
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError) as e:
-            last = f"{type(e).__name__}: {e}"
-            continue
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
-        # Record like the adapter does, so playground calls show in the LLM Calls tab
-        # (they bypass dispatch(), which is where API calls get recorded).
-        usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
-        in_tok = int(usage.get("prompt_tokens") or 0)
-        out_tok = int(usage.get("completion_tokens") or 0)
-        asyncio.create_task(stats.record_call(
-            duration_ms=int((time.monotonic() - started) * 1000),
-            backend=backend["name"], source="playground", alias=model, model=real_model,
-            endpoint="/v1/chat/completions", status=r.status_code,
-            input_tokens=in_tok, output_tokens=out_tok,
-            cost_usd=_cost_usd(backend_id(backend), real_model, in_tok, out_tok),
-            request_text=json.dumps(body, ensure_ascii=False),
-            response_text=json.dumps(data, ensure_ascii=False),
-        ))
-        return {"status": r.status_code, "backend": backend["name"],
-                "model": real_model, "alias": model, "response": data}
-    raise HTTPException(503, f"All backends failed: {last}")
+def _playground_key(name: str) -> Optional[str]:
+    """API key the /ui playgrounds use to call the gateway's OWN endpoints as a real
+    client (they test the API, so they go through it — dispatch, parking, reasoning,
+    stats, quotas). The logged-in admin's own key wins (correct attribution), else the
+    master key; None in bootstrap-open mode (anonymous, x-source attributes it)."""
+    u = next((u for u in users if u.get("name") == name and u.get("api_key")), None)
+    return (u or {}).get("api_key") or api_key
 
 
 # ── Responses background mode (official async) ────────────────────────────────
@@ -1530,7 +1494,18 @@ async def run_generation(body: dict, request: Request,
 async def generations(request: Request, authorization: Optional[str] = Header(None)):
     body = await request.json()
     await gate_request(authorization, request, body.get("model"))    # auth + allow-list + quota
-    view = await run_generation(body, request)
+    # Optional per-field reference images: {"images": {<image-param>: <base64|data-URI|URL>}}
+    # — the native counterpart of the playground's per-field uploads and the OpenAI
+    # shims' positional ref_images.
+    uploads = None
+    imgs = body.pop("images", None)
+    if isinstance(imgs, dict):
+        uploads = {}
+        for param, val in imgs.items():
+            data = await _decode_ref_image(val)
+            if data:
+                uploads[param] = data
+    view = await run_generation(body, request, upload_images=uploads)
     code = {"queued": 202, "done": 200}.get(view.get("status"), 502)
     return JSONResponse(view, status_code=code)
 
@@ -1927,11 +1902,11 @@ def llm_backends_info() -> list[dict]:
 # Wire the UI to the generation core, the ComfyUI backends, the status snapshot,
 # and the backend-change hook.
 admin.bind(lambda: [b for b in backends if b.get("type") == "comfyui"],
-           run_generation, gateway_info, apply_backend_change,
+           gateway_info, apply_backend_change,
            llm_backends=llm_backends_info,
            config_chat_aliases=lambda: dict(config_virtual_models),
            apply_chat_aliases=apply_chat_aliases,
-           run_chat=run_chat,
+           playground_key=_playground_key,
            routing_snapshot=routing_snapshot,
            server_info=server_info,
            apply_server_settings=apply_server_settings_hook,

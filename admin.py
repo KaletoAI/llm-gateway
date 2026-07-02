@@ -11,6 +11,7 @@ Deferred (Phase 3 hardening): admin auth / multi-user, HTMX live validation.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import ipaddress
 import json
@@ -67,7 +68,6 @@ def _num(s: str):
 
 _comfy_backends: Callable[[], list] = lambda: []
 _gateway_info: Callable[[], dict] = lambda: {}
-_run_generation = None
 _cancel_gen = None
 _drain_backend = None
 _cancel_drain = None
@@ -76,7 +76,7 @@ _apply_backends: Callable[[], None] = lambda: None
 _llm_backends: Callable[[], list] = lambda: []
 _config_chat_aliases: Callable[[], dict] = lambda: {}
 _apply_chat_aliases: Callable[[], None] = lambda: None
-_run_chat = None
+_playground_key: Callable[[str], Optional[str]] = lambda name: None
 _routing_snapshot: Callable[[], dict] = lambda: {"aliases": [], "models": [], "conflicts": []}
 _server_info: Callable[[], dict] = lambda: {"effective": {}, "runtime": {}}
 _apply_server_settings: Callable[[], None] = lambda: None
@@ -88,10 +88,11 @@ _apply_reasoning: Callable[[], None] = lambda: None
 _llm_backend_names: Callable[[], list] = lambda: []
 
 
-def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Callable[[], dict],
+def bind(comfy_backends: Callable[[], list], gateway_info: Callable[[], dict],
          apply_backends: Callable[[], None], *, llm_backends: Callable[[], list] = lambda: [],
          config_chat_aliases: Callable[[], dict] = lambda: {},
-         apply_chat_aliases: Callable[[], None] = lambda: None, run_chat=None,
+         apply_chat_aliases: Callable[[], None] = lambda: None,
+         playground_key: Callable[[str], Optional[str]] = lambda name: None,
          routing_snapshot: Callable[[], dict] = lambda: {"aliases": [], "models": [], "conflicts": []},
          server_info: Callable[[], dict] = lambda: {"effective": {}, "runtime": {}},
          apply_server_settings: Callable[[], None] = lambda: None,
@@ -102,8 +103,8 @@ def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Calla
          drain_backend=None, cancel_drain=None, set_backend_enabled=None,
          llm_backend_names: Callable[[], list] = lambda: [],
          apply_reasoning: Callable[[], None] = lambda: None) -> None:
-    global _comfy_backends, _run_generation, _gateway_info, _apply_backends
-    global _llm_backends, _config_chat_aliases, _apply_chat_aliases, _run_chat, _routing_snapshot
+    global _comfy_backends, _gateway_info, _apply_backends
+    global _llm_backends, _config_chat_aliases, _apply_chat_aliases, _playground_key, _routing_snapshot
     global _server_info, _apply_server_settings, _apply_users, _resolve_admin, _ui_locked
     global _dashboard_snapshot, _cancel_gen, _drain_backend, _cancel_drain, _set_backend_enabled
     global _apply_reasoning, _llm_backend_names
@@ -112,10 +113,10 @@ def bind(comfy_backends: Callable[[], list], run_generation, gateway_info: Calla
     _cancel_gen = cancel_generation
     _drain_backend, _cancel_drain = drain_backend, cancel_drain
     _set_backend_enabled = set_backend_enabled
-    _comfy_backends, _run_generation = comfy_backends, run_generation
+    _comfy_backends = comfy_backends
     _gateway_info, _apply_backends = gateway_info, apply_backends
     _llm_backends, _config_chat_aliases = llm_backends, config_chat_aliases
-    _apply_chat_aliases, _run_chat = apply_chat_aliases, run_chat
+    _apply_chat_aliases, _playground_key = apply_chat_aliases, playground_key
     _routing_snapshot = routing_snapshot
     _server_info, _apply_server_settings = server_info, apply_server_settings
     _apply_users = apply_users
@@ -1213,6 +1214,21 @@ def _chat_models() -> list:
     return out
 
 
+async def _self_api(request: Request, method: str, path: str, **kw) -> httpx.Response:
+    """Call the gateway's OWN API as a real client — the playground contract: they
+    exist to TEST the API, so they go through it (auth, routing, parking, reasoning,
+    stats, quotas) and bypass nothing. Auth = the logged-in admin's own key (correct
+    attribution in LLM Calls), else the master key; anonymous in bootstrap-open mode,
+    where the x-source header attributes the call as 'playground'."""
+    key = _playground_key(_session_user(request) or "admin")
+    headers = {"x-source": "playground"}
+    if key:
+        headers["authorization"] = f"Bearer {key}"
+    url = str(request.base_url).rstrip("/") + path       # our own listener, whatever host/port serves /ui
+    async with httpx.AsyncClient(timeout=600.0) as c:    # sync calls may park before running
+        return await c.request(method, url, headers=headers, **kw)
+
+
 # On submit, show immediate feedback: replace the (possibly stale) result with a
 # "sending…" spinner and disable Send. The full-page POST then re-renders with the
 # real reply — so a slow call, or a second Send, no longer leaves the old result up.
@@ -1287,8 +1303,6 @@ async def chatplay_page(request: Request):
 
 
 async def chatplay_send(request: Request):
-    if _run_chat is None:
-        raise HTTPException(503, "chat not wired")
     f = await _form(request)
     vals = {k: (f.get(k, "") or "") for k in _CHATPLAY_KEYS}
     model, user = vals["model"].strip(), vals["user"].strip()
@@ -1314,11 +1328,24 @@ async def chatplay_send(request: Request):
     # A picked backend pins the request to it via the '<backend>/<model>' convention
     # (same as the API); empty = route across all backends by priority.
     send_model = f"{backend}/{model}" if (backend and not model.startswith(backend + "/")) else model
+    # A REAL API call through the gateway's own /v1 endpoint — dispatch, parking,
+    # reasoning, stats and quotas all apply, exactly like any external client.
     try:
-        res = await _run_chat(send_model, messages, params)
-        result = _chat_result_html(res)
-    except HTTPException as e:
-        result = f"<h2>Response</h2><p class='bad'>Error {e.status_code}: {_esc(e.detail)}</p>"
+        r = await _self_api(request, "POST", "/v1/chat/completions",
+                            json={"model": send_model, "messages": messages,
+                                  "stream": False, **params})
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text[:4000]}
+        result = _chat_result_html({
+            "status": r.status_code,
+            "backend": r.headers.get("x-gateway-backend", "—"),
+            "model": (data.get("model") if isinstance(data, dict) else None) or send_model,
+            "alias": send_model, "response": data,
+        })
+    except httpx.HTTPError as e:
+        result = f"<h2>Response</h2><p class='bad'>Error: {_esc(f'{type(e).__name__}: {e}')}</p>"
     return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result), "chatplay"))
 
 
@@ -2069,8 +2096,6 @@ async def playground_page(request: Request):
 
 
 async def generate(request: Request):
-    if _run_generation is None:
-        raise HTTPException(503, "generation not wired")
     f = await _multipart(request)
     model = str(f.get("model", ""))
     force_bk = str(f.get("backend", "")).strip()       # pin to one backend (testing per-backend)
@@ -2104,8 +2129,22 @@ async def generate(request: Request):
     images = dict(stash)
     cand = (store.get(model) or [None])[0]
     vals = {"model": model, "backend": force_bk, **submitted}
+    # A REAL API call through POST /v1/generations (reference images as the API's
+    # per-field base64 `images` dict) — the playground tests the API, bypassing nothing.
+    if images:
+        body["images"] = {p: base64.b64encode(v).decode() for p, v in images.items()}
     try:
-        view = await _run_generation(body, request, upload_images=images)
+        try:
+            r = await _self_api(request, "POST", "/v1/generations", json=body)
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"{type(e).__name__}: {e}")
+        if r.status_code not in (200, 202):
+            try:
+                detail = str((r.json() or {}).get("detail") or "")[:300] or r.text[:300]
+            except Exception:
+                detail = r.text[:300]
+            raise HTTPException(r.status_code, detail)
+        view = r.json()
     except HTTPException as e:
         aliases = list(store.list_aliases().keys())
         result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
