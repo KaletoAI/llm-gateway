@@ -1226,8 +1226,10 @@ _CHATPLAY_JS = ("<script>function cpSending(f){"
 
 def _chatplay_form(vals: dict) -> str:
     v = lambda k: vals.get(k, "")
+    bk_select = _select("backend", [("", "— all backends (route by priority) —")] + _llm_backend_names(), v("backend"))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
+            + _field("backend", bk_select, short=True)
             + _field("model", _dl_input("model", v("model"), "cpmodels", "alias or model id"), short=True)
             + _field("system", _textarea("system", v("system"), 2, "optional system prompt"))
             + _field("message", _textarea("user", v("user"), 6, "your message"))
@@ -1260,7 +1262,7 @@ def _chat_result_html(res: dict) -> str:
             f"<div class='chatout'>{_esc(content)}</div>")
 
 
-_CHATPLAY_KEYS = ("model", "system", "user", "max_tokens", "temperature")
+_CHATPLAY_KEYS = ("backend", "model", "system", "user", "max_tokens", "temperature")
 
 
 async def chatplay_page(request: Request):
@@ -1293,8 +1295,12 @@ async def chatplay_send(request: Request):
             params["temperature"] = float(vals["temperature"])
         except ValueError:
             pass
+    backend = vals["backend"].strip()
+    # A picked backend pins the request to it via the '<backend>/<model>' convention
+    # (same as the API); empty = route across all backends by priority.
+    send_model = f"{backend}/{model}" if (backend and not model.startswith(backend + "/")) else model
     try:
-        res = await _run_chat(model, messages, params)
+        res = await _run_chat(send_model, messages, params)
         result = _chat_result_html(res)
     except HTTPException as e:
         result = f"<h2>Response</h2><p class='bad'>Error {e.status_code}: {_esc(e.detail)}</p>"
