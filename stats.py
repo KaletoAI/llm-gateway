@@ -145,12 +145,11 @@ def init(db_path: str, blob_dir: str = "calls") -> None:
         c.executescript(_SCHEMA)
         # Migrate older DBs that predate later columns.
         cols = {r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()}
-        if "req_preview" not in cols:
-            c.execute("ALTER TABLE calls ADD COLUMN req_preview TEXT")
-        if "has_body" not in cols:
-            c.execute("ALTER TABLE calls ADD COLUMN has_body INTEGER DEFAULT 0")
-        if "reasoning" not in cols:
-            c.execute("ALTER TABLE calls ADD COLUMN reasoning TEXT")
+        for col, ddl in (("req_preview", "TEXT"),
+                         ("has_body", "INTEGER DEFAULT 0"),
+                         ("reasoning", "TEXT")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE calls ADD COLUMN {col} {ddl}")
     logger.info(f"stats: SQLite at {_DB_PATH} (WAL), call bodies in {_BLOB_DIR}/")
 
 
@@ -200,8 +199,8 @@ def _record_sync(row: tuple, request_text=None, response_text=None) -> None:
                     json.dump({"request": _as_obj(request_text), "response": _as_obj(response_text)},
                               f, ensure_ascii=False)
                 c.execute("UPDATE calls SET has_body=1 WHERE id=?", (cur.lastrowid,))
-            except Exception:
-                pass
+            except Exception as e:                  # row stays valid, body view just absent
+                logger.warning(f"stats: body blob write failed for call {cur.lastrowid}: {e}")
 
 
 def _preview(text: Optional[str], head: int = 50, tail: int = 50) -> Optional[str]:

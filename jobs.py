@@ -191,8 +191,8 @@ def _read_meta(c, job_id: str) -> dict:
     if row and row[0]:
         try:
             return json.loads(row[0])
-        except Exception:
-            pass
+        except Exception as e:                       # corrupt meta is worth knowing about
+            logger.warning(f"jobs: unreadable meta_json for job {job_id}: {e}")
     return {}
 
 

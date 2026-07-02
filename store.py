@@ -122,8 +122,9 @@ def init(db_path: str = "store.db") -> None:
         # Backends are keyed by (name, type), so an LLM and a ComfyUI backend may share
         # a name. Migrate the old single-PK (name) table if present.
         bcols = {r[1] for r in c.execute("PRAGMA table_info(backends)").fetchall()}
+        old_rows: list = []
         if bcols and "type" not in bcols:
-            old = c.execute("SELECT name, json, updated FROM backends").fetchall()
+            old_rows = c.execute("SELECT name, json, updated FROM backends").fetchall()
             c.execute("DROP TABLE backends")
             bcols = set()
         if not bcols:
@@ -136,7 +137,7 @@ def init(db_path: str = "store.db") -> None:
                     PRIMARY KEY (name, type)
                 )
             """)
-            for r in (locals().get("old") or []):
+            for r in old_rows:
                 b = json.loads(r["json"])
                 c.execute("INSERT INTO backends (name, type, json, updated) VALUES (?,?,?,?)",
                           (r["name"], b.get("type", "openai"), r["json"], r["updated"]))
@@ -187,6 +188,58 @@ def _conn():
         conn.close()
 
 
+# ── Generic single-JSON-column table access ──────────────────────────────────────
+# Every store entity shares one shape: PK column(s) + one JSON value column +
+# `updated`. These four helpers hold the ONE select/upsert/delete implementation;
+# the public per-entity functions below keep their exact signatures, so callers in
+# main/admin stay untouched. Table/column names are module constants, never input.
+
+def _row_get(table: str, key_cols: tuple, key_vals: tuple, val_col: str) -> Optional[str]:
+    where = " AND ".join(f"{c}=?" for c in key_cols)
+    with _conn() as c:
+        row = c.execute(f"SELECT {val_col} FROM {table} WHERE {where}", key_vals).fetchone()
+    return row[val_col] if row else None
+
+
+def _row_upsert(table: str, key_cols: tuple, key_vals: tuple, val_col: str, value: str) -> None:
+    cols = ", ".join((*key_cols, val_col, "updated"))
+    marks = ",".join("?" * (len(key_cols) + 2))
+    with _conn() as c:
+        c.execute(
+            f"INSERT INTO {table} ({cols}) VALUES ({marks}) "
+            f"ON CONFLICT({', '.join(key_cols)}) DO UPDATE "
+            f"SET {val_col}=excluded.{val_col}, updated=excluded.updated",
+            (*key_vals, value, int(time.time())),
+        )
+
+
+def _row_delete(table: str, key_cols: tuple, key_vals: tuple) -> None:
+    where = " AND ".join(f"{c}=?" for c in key_cols)
+    with _conn() as c:
+        c.execute(f"DELETE FROM {table} WHERE {where}", key_vals)
+
+
+def _rows_all(table: str, cols: tuple, order: str) -> list:
+    with _conn() as c:
+        return c.execute(f"SELECT {', '.join(cols)} FROM {table} ORDER BY {order}").fetchall()
+
+
+def _decode_secret_json(raw: str) -> dict:
+    """JSON row → dict with `api_key` decrypted (backends and users share this shape)."""
+    d = json.loads(raw)
+    if d.get("api_key"):
+        d["api_key"] = decrypt_secret(d["api_key"])
+    return d
+
+
+def _encode_secret_json(entity: dict) -> str:
+    """dict → JSON row with `api_key` encrypted — plaintext is never persisted."""
+    d = dict(entity)
+    if d.get("api_key"):
+        d["api_key"] = encrypt_secret(d["api_key"])
+    return json.dumps(d)
+
+
 def bootstrap(image_models_cfg: dict) -> None:
     """Seed the store from config `image_models` for aliases not already present
     (one-way import; the store wins once populated)."""
@@ -201,70 +254,43 @@ def bootstrap(image_models_cfg: dict) -> None:
 
 
 def list_aliases() -> dict:
-    with _conn() as c:
-        rows = c.execute("SELECT alias, candidates_json FROM gen_aliases ORDER BY alias").fetchall()
-    return {r["alias"]: json.loads(r["candidates_json"]) for r in rows}
+    return {r["alias"]: json.loads(r["candidates_json"])
+            for r in _rows_all("gen_aliases", ("alias", "candidates_json"), "alias")}
 
 
 def get(alias: str) -> Optional[list]:
-    with _conn() as c:
-        row = c.execute("SELECT candidates_json FROM gen_aliases WHERE alias=?", (alias,)).fetchone()
-    return json.loads(row["candidates_json"]) if row else None
+    raw = _row_get("gen_aliases", ("alias",), (alias,), "candidates_json")
+    return json.loads(raw) if raw else None
 
 
 def upsert(alias: str, candidates: list) -> None:
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO gen_aliases (alias, candidates_json, updated) VALUES (?,?,?) "
-            "ON CONFLICT(alias) DO UPDATE SET candidates_json=excluded.candidates_json, updated=excluded.updated",
-            (alias, json.dumps(candidates), int(time.time())),
-        )
+    _row_upsert("gen_aliases", ("alias",), (alias,), "candidates_json", json.dumps(candidates))
 
 
 def delete(alias: str) -> None:
-    with _conn() as c:
-        c.execute("DELETE FROM gen_aliases WHERE alias=?", (alias,))
+    _row_delete("gen_aliases", ("alias",), (alias,))
 
 
 # ── Backends (UI-added, additive to config) ─────────────────────────────────────
 # api_key is stored encrypted (encrypt_secret) and decrypted on read, so callers
 # always see/store plaintext while the DB never holds it.
 
-def _decode_backend(raw: str) -> dict:
-    b = json.loads(raw)
-    if b.get("api_key"):
-        b["api_key"] = decrypt_secret(b["api_key"])
-    return b
-
-
 def list_backends() -> list:
-    with _conn() as c:
-        rows = c.execute("SELECT json FROM backends ORDER BY name").fetchall()
-    return [_decode_backend(r["json"]) for r in rows]
+    return [_decode_secret_json(r["json"]) for r in _rows_all("backends", ("json",), "name")]
 
 
 def get_backend(name: str, btype: str = "openai") -> Optional[dict]:
-    with _conn() as c:
-        row = c.execute("SELECT json FROM backends WHERE name=? AND type=?",
-                        (name, btype)).fetchone()
-    return _decode_backend(row["json"]) if row else None
+    raw = _row_get("backends", ("name", "type"), (name, btype), "json")
+    return _decode_secret_json(raw) if raw else None
 
 
 def upsert_backend(backend: dict) -> None:
-    b = dict(backend)
-    if b.get("api_key"):
-        b["api_key"] = encrypt_secret(b["api_key"])      # never persist plaintext
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO backends (name, type, json, updated) VALUES (?,?,?,?) "
-            "ON CONFLICT(name, type) DO UPDATE SET json=excluded.json, updated=excluded.updated",
-            (b["name"], b.get("type", "openai"), json.dumps(b), int(time.time())),
-        )
+    _row_upsert("backends", ("name", "type"), (backend["name"], backend.get("type", "openai")),
+                "json", _encode_secret_json(backend))
 
 
 def delete_backend(name: str, btype: str = "openai") -> None:
-    with _conn() as c:
-        c.execute("DELETE FROM backends WHERE name=? AND type=?", (name, btype))
+    _row_delete("backends", ("name", "type"), (name, btype))
 
 
 def rename_backend_references(old: str, new: str) -> int:
@@ -298,11 +324,7 @@ def save_backend_models(bid: str, models) -> None:
     """Persist a backend's discovered model ids so they survive a restart — lets the
     gateway still resolve a bare model id to its (now offline) backend, returning a
     truthful 503 instead of 403, even if the backend isn't reachable at startup."""
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO backend_models (bid, models_json, updated) VALUES (?,?,?) "
-            "ON CONFLICT(bid) DO UPDATE SET models_json=excluded.models_json, updated=excluded.updated",
-            (bid, json.dumps(sorted(models)), int(time.time())))
+    _row_upsert("backend_models", ("bid",), (bid,), "models_json", json.dumps(sorted(models)))
 
 
 def load_backend_models() -> dict:
@@ -315,6 +337,7 @@ def load_backend_models() -> dict:
 
 
 def get_settings() -> dict:
+    """ALL settings (server tab / startup overlay). Per-key readers use get_setting()."""
     with _conn() as c:
         rows = c.execute("SELECT key, value_json FROM settings").fetchall()
     out = {}
@@ -324,6 +347,18 @@ def get_settings() -> dict:
             v = decrypt_secret(v)
         out[r["key"]] = v
     return out
+
+
+def get_setting(key: str, default=None):
+    """One settings value (single-row read — the per-key helpers below use this
+    instead of parsing the whole settings table)."""
+    raw = _row_get("settings", ("key",), (key,), "value_json")
+    if raw is None:
+        return default
+    v = json.loads(raw)
+    if key in _SECRET_SETTINGS and isinstance(v, str):
+        v = decrypt_secret(v)
+    return v
 
 
 def set_settings(values: dict) -> None:
@@ -344,7 +379,7 @@ def set_settings(values: dict) -> None:
 # was attempted but found no hostname" — kept so we don't retry every page load.
 
 def get_ip_aliases() -> dict:
-    return get_settings().get("ip_aliases") or {}
+    return get_setting("ip_aliases") or {}
 
 
 def save_ip_aliases(aliases: dict) -> None:
@@ -369,7 +404,7 @@ def delete_ip_alias(ip: str) -> None:
 # parking for that alias (immediate 503 when all its backends are busy).
 
 def get_alias_park() -> dict:
-    return get_settings().get("alias_park") or {}
+    return get_setting("alias_park") or {}
 
 
 def set_alias_park(alias: str, park_s) -> None:
@@ -399,7 +434,7 @@ def rename_alias_park(old: str, new: str) -> None:
 # one settings entry; first matching rule (model-glob × backend-set) wins.
 
 def get_reasoning_rules() -> list:
-    v = get_settings().get("reasoning_rules")
+    v = get_setting("reasoning_rules")
     return v if isinstance(v, list) else []
 
 
@@ -411,40 +446,21 @@ def set_reasoning_rules(rules: list) -> None:
 # Each user: {name, api_key(enc), role, enabled, models[], quota_req_day, quota_cost_month}.
 # api_key encrypted at rest; the empty `models` list means "all models allowed".
 
-def _decode_user(raw: str) -> dict:
-    u = json.loads(raw)
-    if u.get("api_key"):
-        u["api_key"] = decrypt_secret(u["api_key"])
-    return u
-
-
 def list_users() -> list:
-    with _conn() as c:
-        rows = c.execute("SELECT json FROM users ORDER BY name").fetchall()
-    return [_decode_user(r["json"]) for r in rows]
+    return [_decode_secret_json(r["json"]) for r in _rows_all("users", ("json",), "name")]
 
 
 def get_user(name: str) -> Optional[dict]:
-    with _conn() as c:
-        row = c.execute("SELECT json FROM users WHERE name=?", (name,)).fetchone()
-    return _decode_user(row["json"]) if row else None
+    raw = _row_get("users", ("name",), (name,), "json")
+    return _decode_secret_json(raw) if raw else None
 
 
 def upsert_user(user: dict) -> None:
-    u = dict(user)
-    if u.get("api_key"):
-        u["api_key"] = encrypt_secret(u["api_key"])
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO users (name, json, updated) VALUES (?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET json=excluded.json, updated=excluded.updated",
-            (u["name"], json.dumps(u), int(time.time())),
-        )
+    _row_upsert("users", ("name",), (user["name"],), "json", _encode_secret_json(user))
 
 
 def delete_user(name: str) -> None:
-    with _conn() as c:
-        c.execute("DELETE FROM users WHERE name=?", (name,))
+    _row_delete("users", ("name",), (name,))
 
 
 # ── Chat aliases (UI-added/overridden, merged over config `virtual_models`) ──────
@@ -453,26 +469,18 @@ def delete_user(name: str) -> None:
 # shapes, so the merged result drops straight into the LLM router.
 
 def list_chat_aliases() -> dict:
-    with _conn() as c:
-        rows = c.execute("SELECT alias, value_json FROM chat_aliases ORDER BY alias").fetchall()
-    return {r["alias"]: json.loads(r["value_json"]) for r in rows}
+    return {r["alias"]: json.loads(r["value_json"])
+            for r in _rows_all("chat_aliases", ("alias", "value_json"), "alias")}
 
 
 def get_chat_alias(alias: str) -> Optional[object]:
-    with _conn() as c:
-        row = c.execute("SELECT value_json FROM chat_aliases WHERE alias=?", (alias,)).fetchone()
-    return json.loads(row["value_json"]) if row else None
+    raw = _row_get("chat_aliases", ("alias",), (alias,), "value_json")
+    return json.loads(raw) if raw else None
 
 
 def upsert_chat_alias(alias: str, value) -> None:
-    with _conn() as c:
-        c.execute(
-            "INSERT INTO chat_aliases (alias, value_json, updated) VALUES (?,?,?) "
-            "ON CONFLICT(alias) DO UPDATE SET value_json=excluded.value_json, updated=excluded.updated",
-            (alias, json.dumps(value), int(time.time())),
-        )
+    _row_upsert("chat_aliases", ("alias",), (alias,), "value_json", json.dumps(value))
 
 
 def delete_chat_alias(alias: str) -> None:
-    with _conn() as c:
-        c.execute("DELETE FROM chat_aliases WHERE alias=?", (alias,))
+    _row_delete("chat_aliases", ("alias",), (alias,))
