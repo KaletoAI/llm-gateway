@@ -111,6 +111,7 @@ def init(db_path: str = "store.db") -> None:
     global _DB_PATH, _active
     _DB_PATH = db_path
     with _conn() as c:
+        c.execute("PRAGMA journal_mode=WAL")   # persistent DB property — set once here
         c.execute("""
             CREATE TABLE IF NOT EXISTS gen_aliases (
                 alias          TEXT PRIMARY KEY,
@@ -178,7 +179,6 @@ def is_active() -> bool:
 @contextmanager
 def _conn():
     conn = sqlite3.connect(_DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     try:
         yield conn

@@ -43,6 +43,7 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
     _DB_PATH, _BLOB_DIR, _DEFAULT_TTL, _active = db_path, blob_dir, default_ttl_s, True
     os.makedirs(_BLOB_DIR, exist_ok=True)
     with _conn() as c:
+        c.execute("PRAGMA journal_mode=WAL")   # persistent DB property — set once here
         c.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id           TEXT PRIMARY KEY,
@@ -70,7 +71,6 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
 @contextmanager
 def _conn():
     conn = sqlite3.connect(_DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -161,9 +161,9 @@ def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
         with open(os.path.join(job_dir, fname), "wb") as f:
             f.write(blob.data)
         manifest.append({"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname})
-    meta = {**_read_meta(job_id), **(meta or {})}   # keep inputs persisted at create time
-    ran_on = meta.get("backend")
-    with _conn() as c:
+    with _conn() as c:                              # one connection: read meta + update
+        meta = {**_read_meta(c, job_id), **(meta or {})}   # keep inputs persisted at create time
+        ran_on = meta.get("backend")
         if ran_on:
             c.execute(
                 "UPDATE jobs SET status='done', backend=?, updated=?, result_count=?, results_json=?, meta_json=? WHERE id=?",
@@ -193,9 +193,9 @@ def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
                       (int(time.time()), json.dumps([payload]), json.dumps(meta), job_id))
 
 
-def _read_meta(job_id: str) -> dict:
-    with _conn() as c:
-        row = c.execute("SELECT meta_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+def _read_meta(c, job_id: str) -> dict:
+    """Current meta_json of a job, read over the caller's connection."""
+    row = c.execute("SELECT meta_json FROM jobs WHERE id=?", (job_id,)).fetchone()
     if row and row[0]:
         try:
             return json.loads(row[0])
@@ -234,10 +234,10 @@ def set_inputs(job_id: str, inputs: dict, ref_blobs: Optional[list] = None) -> N
         with open(os.path.join(job_dir, fname), "wb") as f:
             f.write(bytes(data))
         manifest.append({"n": n, "slot": slot, "mime": mime, "filename": fname})
-    meta = _read_meta(job_id)
-    meta["inputs"] = inputs
-    meta["input_images"] = manifest
-    with _conn() as c:
+    with _conn() as c:                              # one connection: read meta + update
+        meta = _read_meta(c, job_id)
+        meta["inputs"] = inputs
+        meta["input_images"] = manifest
         c.execute("UPDATE jobs SET meta_json=? WHERE id=?", (json.dumps(meta), job_id))
 
 
@@ -255,6 +255,8 @@ def input_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
 
 
 def get(job_id: str) -> Optional[dict]:
+    if not _active:            # store off → clean "not found" instead of a 500 on a missing table
+        return None
     with _conn() as c:
         row = c.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     if row is None:

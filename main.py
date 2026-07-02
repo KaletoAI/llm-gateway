@@ -295,7 +295,7 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     try:
         caps = await adapter.discover(client)
         if store.is_active() and caps.models != backend_models.get(bid):
-            store.save_backend_models(bid, caps.models)   # persist on change (survives restart)
+            await asyncio.to_thread(store.save_backend_models, bid, caps.models)  # persist on change
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
@@ -489,10 +489,11 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     return False
 
 
-def gate_request(authorization: Optional[str], request: Request, model: Optional[str]) -> Optional[dict]:
+async def gate_request(authorization: Optional[str], request: Request, model: Optional[str]) -> Optional[dict]:
     """Authenticate + enforce model allow-list and per-day quota; attribute the call
     to the user (stats source / job owner read it off request.state). Returns the user
-    (None = anonymous bootstrap mode)."""
+    (None = anonymous bootstrap mode). Async only for the monthly-cost DB scan (run
+    off-loop); the daily-quota check+increment stays await-free → atomic."""
     user = authenticate(authorization)
     if user is None:
         return None
@@ -503,7 +504,7 @@ def gate_request(authorization: Optional[str], request: Request, model: Optional
     if cap and stats.is_active():
         t = time.gmtime()
         month_start = calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0))
-        spent = stats.month_cost(user["name"], month_start)
+        spent = await asyncio.to_thread(stats.month_cost, user["name"], month_start)
         if spent >= float(cap):
             raise HTTPException(402, f"monthly cost quota (${float(cap):.4f}) exceeded for "
                                      f"'{user['name']}' — spent ${spent:.4f}")
@@ -875,7 +876,7 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
 async def route(path: str, request: Request, authorization: Optional[str]) -> JSONResponse | StreamingResponse:
     body = await request.json()
     alias = body.get("model", "")
-    gate_request(authorization, request, alias)        # auth + model allow-list + quota
+    await gate_request(authorization, request, alias)        # auth + model allow-list + quota
     body.pop("park", None)                              # legacy control field — parking is automatic; never forward
     r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
     if r is not None:
@@ -1090,7 +1091,8 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # IMAGE generation aliases (separate namespace) — listed so image clients (anima-verse)
     # can discover them; granted by alias name. `?type=image` returns only these.
     if typ != "chat":
-        img_aliases = list(store.list_aliases().keys()) if store.is_active() else list(image_models.keys())
+        img_aliases = (list((await asyncio.to_thread(store.list_aliases)).keys())
+                       if store.is_active() else list(image_models.keys()))
         for alias in img_aliases:
             if alias not in seen and visible({alias}):
                 seen.add(alias)
@@ -1258,19 +1260,21 @@ async def _run_bg_response(job_id, rid, alias, chat_body, request, created):
                                        deadline=time.monotonic() + async_park_timeout_s)
         chat_json = json.loads(bytes(resp.body)) if getattr(resp, "body", None) else {}
         if getattr(resp, "status_code", 200) >= 400:
-            jobs.fail(job_id, f"{resp.status_code}: {(json.dumps(chat_json) or '')[:300]}")
+            await asyncio.to_thread(jobs.fail, job_id,
+                                    f"{resp.status_code}: {(json.dumps(chat_json) or '')[:300]}")
             return
         obj = chat_to_responses(chat_json)
         obj["id"], obj["background"], obj["created_at"] = rid, True, created
-        jobs.complete_json(job_id, obj, meta={"model": chat_json.get("model")})
+        await asyncio.to_thread(jobs.complete_json, job_id, obj,
+                                meta={"model": chat_json.get("model")})
     except asyncio.CancelledError:
-        jobs.fail(job_id, "cancelled")                 # GET maps this back to status "cancelled"
-        raise
+        jobs.fail(job_id, "cancelled")   # sync on purpose (no await while being cancelled);
+        raise                            # GET maps this back to status "cancelled"
     except HTTPException as e:
-        jobs.fail(job_id, f"{e.status_code}: {e.detail}")
+        await asyncio.to_thread(jobs.fail, job_id, f"{e.status_code}: {e.detail}")
     except Exception as e:                              # never let a background task vanish silently
         logger.warning(f"background response {rid} failed: {e}")
-        jobs.fail(job_id, str(e))
+        await asyncio.to_thread(jobs.fail, job_id, str(e))
 
 
 async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
@@ -1279,7 +1283,7 @@ async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
     if len(_parked) >= max_parked:
         raise HTTPException(503, f"too many queued ({max_parked}) — retry later", headers={"Retry-After": "2"})
     owner = getattr(request.state, "gw_user", None) or "default"
-    job_id = jobs.create("response", alias, "(background)", owner=owner)
+    job_id = await asyncio.to_thread(jobs.create, "response", alias, "(background)", owner=owner)
     rid, created = f"resp_{job_id}", int(time.time())
     body = dict(chat_body); body["stream"] = False     # background result is fetched, not streamed
     t = asyncio.create_task(_run_bg_response(job_id, rid, alias, body, request, created))
@@ -1290,10 +1294,10 @@ async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
     return JSONResponse(_resp_shell(rid, "queued", alias, created), status_code=200)
 
 
-def _bg_job_for(response_id: str) -> dict:
+async def _bg_job_for(response_id: str) -> dict:
     if not response_id.startswith("resp_") or not jobs.is_active():
         raise HTTPException(404, f"response '{response_id}' not found")
-    job = jobs.get(response_id[len("resp_"):])
+    job = await asyncio.to_thread(jobs.get, response_id[len("resp_"):])
     if job is None or job.get("task") != "response":
         raise HTTPException(404, f"response '{response_id}' not found")
     return job
@@ -1333,7 +1337,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     raw_body = await request.json()
     chat_body = responses_to_chat(raw_body)
     alias = chat_body.get("model", "")
-    gate_request(authorization, request, alias)        # auth + model allow-list + quota
+    await gate_request(authorization, request, alias)        # auth + model allow-list + quota
 
     r = _normalize_reasoning(raw_body)                 # honors reasoning + reasoning_effort + {effort}
     if r is not None:
@@ -1363,7 +1367,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
 async def get_response(response_id: str, request: Request, authorization: Optional[str] = Header(None)):
     """Poll a background response: queued → in_progress → completed | failed | cancelled."""
     user = authenticate(authorization)
-    job = _bg_job_for(response_id)
+    job = await _bg_job_for(response_id)
     _bg_owner_check(job, user)
     return JSONResponse(_bg_view(response_id, job))
 
@@ -1372,18 +1376,18 @@ async def get_response(response_id: str, request: Request, authorization: Option
 async def cancel_response(response_id: str, request: Request, authorization: Optional[str] = Header(None)):
     """Cancel a background response (no-op if already terminal)."""
     user = authenticate(authorization)
-    job = _bg_job_for(response_id)
+    job = await _bg_job_for(response_id)
     _bg_owner_check(job, user)
     if job["status"] in ("queued", "running"):
         t = _bg_tasks.get(response_id)
         if t and not t.done():
             t.cancel()                                 # stop a parked/in-flight worker at its next await
-        # Mark cancelled synchronously so the response reflects it now — but only if it
+        # Mark cancelled right away so the response reflects it now — but only if it
         # hasn't just reached a terminal state (cancel racing completion).
-        cur = jobs.get(response_id[len("resp_"):])
+        cur = await asyncio.to_thread(jobs.get, response_id[len("resp_"):])
         if cur and cur.get("status") in ("queued", "running"):
-            jobs.fail(response_id[len("resp_"):], "cancelled")
-        job = _bg_job_for(response_id)                 # re-read post-cancel
+            await asyncio.to_thread(jobs.fail, response_id[len("resp_"):], "cancelled")
+        job = await _bg_job_for(response_id)           # re-read post-cancel
     return JSONResponse(_bg_view(response_id, job))
 
 
@@ -1457,8 +1461,8 @@ def _gen_inputs_params(body: dict) -> tuple[dict, dict]:
     return inputs, params
 
 
-def _job_view(job_id: str, request: Request) -> dict:
-    job = jobs.get(job_id)
+async def _job_view(job_id: str, request: Request) -> dict:
+    job = await asyncio.to_thread(jobs.get, job_id)
     if job is None:
         raise HTTPException(404, f"job '{job_id}' not found")
     view = {
@@ -1493,7 +1497,7 @@ _GEN_FAILOVER_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.ReadEr
 async def _run_job(job_id: str, candidates: list, build_req) -> None:
     """Run a generation job, failing over to the next candidate on connection-type
     errors. Content errors are final (not retried). Stops at the first success."""
-    jobs.set_status(job_id, "running")
+    await asyncio.to_thread(jobs.set_status, job_id, "running")
     last = None
     for backend, cand in candidates:
         adapter = backend_adapters.get(backend_id(backend))
@@ -1512,9 +1516,10 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
             continue
         except Exception as e:
             logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {e}")
-            jobs.fail(job_id, str(e))
+            await asyncio.to_thread(jobs.fail, job_id, str(e))
             return
-    jobs.fail(job_id, f"all candidate backends unreachable (connection): {last}")
+    await asyncio.to_thread(jobs.fail, job_id,
+                            f"all candidate backends unreachable (connection): {last}")
 
 
 _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
@@ -1531,7 +1536,7 @@ async def cancel_generation(job_id: str) -> bool:
     """Cancel a queued/running generation job: best-effort interrupt the ComfyUI prompt
     (free the GPU), cancel the worker task, mark the job failed. Returns False if the job
     is already finished/unknown."""
-    job = jobs.get(job_id)
+    job = await asyncio.to_thread(jobs.get, job_id)
     if not job or job.get("status") not in ("queued", "running"):
         return False
     b = next((x for x in backends if x.get("name") == job.get("backend")
@@ -1544,7 +1549,7 @@ async def cancel_generation(job_id: str) -> bool:
     t = _gen_tasks.get(job_id)
     if t and not t.done():
         t.cancel()
-    jobs.fail(job_id, "cancelled by user")
+    await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
     return True
 
 
@@ -1553,20 +1558,22 @@ async def _run_gen_parked(job_id, alias, force, build_req):
     so a busy backend queues instead of 503'ing (async/playground)."""
     deadline = time.monotonic() + async_park_timeout_s
     while True:
-        routes = get_gen_routes(alias)
+        routes = await asyncio.to_thread(get_gen_routes, alias)
         if force:
             routes = [r for r in routes if r[0].get("name") == force]
         if routes:
             await _run_job(job_id, routes, build_req)
             return
-        allc = get_gen_routes(alias, include_busy=True)
+        allc = await asyncio.to_thread(get_gen_routes, alias, include_busy=True)
         if force:
             allc = [r for r in allc if r[0].get("name") == force]
         if not allc:
-            jobs.fail(job_id, f"no healthy backend for '{alias}'" + (f" on '{force}'" if force else ""))
+            await asyncio.to_thread(jobs.fail, job_id,
+                                    f"no healthy backend for '{alias}'" + (f" on '{force}'" if force else ""))
             return
         if time.monotonic() > deadline:
-            jobs.fail(job_id, f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
+            await asyncio.to_thread(jobs.fail, job_id,
+                                    f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
             return
         await asyncio.sleep(2.0)
 
@@ -1594,7 +1601,7 @@ async def run_generation(body: dict, request: Request,
     ttl_s = output.get("ttl_s") or body.get("ttl_s")
 
     force = (body.get("backend") or "").strip()         # pin to one backend (playground testing)
-    all_cands = get_gen_routes(alias, include_busy=True)
+    all_cands = await asyncio.to_thread(get_gen_routes, alias, include_busy=True)
     if force:
         all_cands = [r for r in all_cands if r[0].get("name") == force]
     if not all_cands:
@@ -1616,18 +1623,18 @@ async def run_generation(body: dict, request: Request,
             if elig:                                      # else loras split across backends → no constraint
                 eligible_names = {r[0].get("name") for r in elig}
 
-    def _pick(include_busy: bool) -> list:
-        rs = get_gen_routes(alias, include_busy=include_busy)
+    async def _pick(include_busy: bool) -> list:
+        rs = await asyncio.to_thread(get_gen_routes, alias, include_busy=include_busy)
         if force:
             rs = [r for r in rs if r[0].get("name") == force]
         if eligible_names is not None:
             rs = [r for r in rs if r[0].get("name") in eligible_names]
         return rs
 
-    routes = _pick(False)                                # ready (not busy) + lora-eligible
+    routes = await _pick(False)                          # ready (not busy) + lora-eligible
     parked = False
     if not routes:                                       # nothing ready → busy-eligible, or none at all?
-        busy = _pick(True)
+        busy = await _pick(True)
         if not busy:
             raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
                                      + (f" on backend '{force}'" if force else ""))
@@ -1648,7 +1655,7 @@ async def run_generation(body: dict, request: Request,
     first, cand0 = routes[0]
     task = cand0.get("task", body.get("task", "text2img"))
     owner = getattr(request.state, "gw_user", None) or "default"
-    job_id = jobs.create(task, alias, first["name"], owner=owner, ttl_s=ttl_s)
+    job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
     # persist the request inputs so the job stays inspectable in the UI within its TTL
     ref_blobs = [(slot, data) for slot, data in (upload_images or {}).items() if data]
     await asyncio.to_thread(jobs.set_inputs, job_id,
@@ -1665,19 +1672,19 @@ async def run_generation(body: dict, request: Request,
             _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req))
             return {"job_id": job_id, "status": "queued"}
         await _run_gen_parked(job_id, alias, force, build_req)   # sync: block through the park
-        return _job_view(job_id, request)
+        return await _job_view(job_id, request)
     if mode == "async":
         _spawn_gen(job_id, _run_job(job_id, routes, build_req))
         return {"job_id": job_id, "status": "queued"}
 
     await _run_job(job_id, routes, build_req)      # sync: block until done/failed
-    return _job_view(job_id, request)
+    return await _job_view(job_id, request)
 
 
 @app.post("/v1/generations")
 async def generations(request: Request, authorization: Optional[str] = Header(None)):
     body = await request.json()
-    gate_request(authorization, request, body.get("model"))    # auth + allow-list + quota
+    await gate_request(authorization, request, body.get("model"))    # auth + allow-list + quota
     view = await run_generation(body, request)
     code = {"queued": 202, "done": 200}.get(view.get("status"), 502)
     return JSONResponse(view, status_code=code)
@@ -1687,34 +1694,35 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
 async def gen_alias_loras(alias: str, request: Request, authorization: Optional[str] = Header(None)):
     """LoRA filenames valid for a generation alias — the union of what's installed on
     the alias's backends. Lets a client present a valid LoRA picker per alias."""
-    gate_request(authorization, request, alias)                # auth + allow-list
-    if not ((store.get(alias) if store.is_active() else None) or image_models.get(alias)):
+    await gate_request(authorization, request, alias)                # auth + allow-list
+    known = (await asyncio.to_thread(store.get, alias)) if store.is_active() else None
+    if not (known or image_models.get(alias)):
         raise HTTPException(404, f"generation alias '{alias}' not found")
     loras: set = set()
-    for b, _ in get_gen_routes(alias, include_busy=True):
+    for b, _ in await asyncio.to_thread(get_gen_routes, alias, include_busy=True):
         loras |= backend_loras.get(backend_id(b), set())
     return {"object": "list", "alias": alias, "loras": sorted(loras)}
 
 
-def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:
+async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:
     """A non-admin user may only touch their own jobs; admin/master/anonymous see all."""
     user = authenticate(authorization)
     if user and user.get("role") != "admin" and not user.get("_master"):
-        job = jobs.get(job_id)
+        job = await asyncio.to_thread(jobs.get, job_id)
         if job and job.get("owner") not in (user["name"], None, "default"):
             raise HTTPException(403, "not your job")
 
 
 @app.get("/v1/jobs/{job_id}")
 async def get_job(job_id: str, request: Request, authorization: Optional[str] = Header(None)):
-    _require_job_owner(authorization, request, job_id)
-    return _job_view(job_id, request)
+    await _require_job_owner(authorization, request, job_id)
+    return await _job_view(job_id, request)
 
 
 @app.get("/v1/jobs/{job_id}/result/{n}")
 async def get_job_result(job_id: str, n: int, request: Request, authorization: Optional[str] = Header(None)):
-    _require_job_owner(authorization, request, job_id)
-    rp = jobs.result_path(job_id, n)
+    await _require_job_owner(authorization, request, job_id)
+    rp = await asyncio.to_thread(jobs.result_path, job_id, n)
     if rp is None:
         raise HTTPException(404, f"result {n} of job '{job_id}' not found")
     path, mime = rp
@@ -1724,8 +1732,8 @@ async def get_job_result(job_id: str, n: int, request: Request, authorization: O
 @app.get("/v1/jobs/{job_id}/input/{n}")
 async def get_job_input(job_id: str, n: int, request: Request, authorization: Optional[str] = Header(None)):
     """Reference image `n` that was submitted with a generation job (kept within TTL)."""
-    _require_job_owner(authorization, request, job_id)
-    ip = jobs.input_path(job_id, n)
+    await _require_job_owner(authorization, request, job_id)
+    ip = await asyncio.to_thread(jobs.input_path, job_id, n)
     if ip is None:
         raise HTTPException(404, f"input {n} of job '{job_id}' not found")
     path, mime = ip
@@ -1735,7 +1743,7 @@ async def get_job_input(job_id: str, n: int, request: Request, authorization: Op
 @app.post("/v1/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, request: Request, authorization: Optional[str] = Header(None)):
     """Cancel a queued/running generation job (interrupts the backend, frees the GPU)."""
-    _require_job_owner(authorization, request, job_id)
+    await _require_job_owner(authorization, request, job_id)
     if not await cancel_generation(job_id):
         raise HTTPException(409, f"job '{job_id}' is not cancellable (already done/failed/unknown)")
     return {"job_id": job_id, "status": "failed", "cancelled": True}
@@ -1879,7 +1887,7 @@ async def images_generations(request: Request, authorization: Optional[str] = He
     (base64/URL list) are accepted and mapped onto the alias's image slots."""
     body = await request.json()
     alias = body.get("model", "")
-    gate_request(authorization, request, alias)
+    await gate_request(authorization, request, alias)
     if not body.get("prompt"):
         raise HTTPException(400, "`prompt` is required")
     w, h = _parse_size(body.get("size"))
@@ -1897,7 +1905,8 @@ async def images_generations(request: Request, authorization: Optional[str] = He
         "output": {"n": int(body.get("n") or 1), "mode": "sync"},
     }
     view = _gen_done_or_502(await run_generation(native, request, upload_images=uploads))
-    return JSONResponse(_images_response(view, body.get("response_format") or "url"))
+    return JSONResponse(await asyncio.to_thread(          # b64 branch reads result files
+        _images_response, view, body.get("response_format") or "url"))
 
 
 @app.post("/v1/images/edits")
@@ -1908,7 +1917,7 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     f = await _multipart_list(request)
     one = lambda k, d="": (f.get(k) or [d])[0]
     alias = (one("model") or "").strip()
-    gate_request(authorization, request, alias)
+    await gate_request(authorization, request, alias)
     images = [v for v in (f.get("image") or []) if isinstance(v, (bytes, bytearray))]
     if not images:
         raise HTTPException(400, "at least one `image` file is required")
@@ -1929,7 +1938,8 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
         "output": {"n": int((one("n") or "1") or 1), "mode": "sync"},
     }
     view = _gen_done_or_502(await run_generation(native, request, upload_images=_images_uploads(images, alias)))
-    return JSONResponse(_images_response(view, one("response_format") or "url"))
+    return JSONResponse(await asyncio.to_thread(          # b64 branch reads result files
+        _images_response, view, one("response_format") or "url"))
 
 
 def dashboard_snapshot() -> dict:

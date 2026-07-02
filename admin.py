@@ -2305,7 +2305,7 @@ async def _autoresolve_ips() -> None:
 
 
 async def dashboard_page(request: Request):
-    d = _dashboard_snapshot()
+    d = await asyncio.to_thread(_dashboard_snapshot)   # runs several stats/jobs queries off-loop
     bes_all = d.get("backends", [])
     # Backends taken offline (disabled) are intentionally out of rotation — hide them
     # from the live view (they stay manageable in the Backends tab). Draining ones stay

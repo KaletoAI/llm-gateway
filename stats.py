@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS calls (
 );
 CREATE INDEX IF NOT EXISTS idx_calls_ts      ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
+CREATE INDEX IF NOT EXISTS idx_calls_source  ON calls(source, ts);  -- month_cost quota scan
 """
 
 
