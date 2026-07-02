@@ -13,9 +13,8 @@ per-backend concurrency caps, an optional multi-user auth layer, **call parking*
 Responses background mode), a full **media-generation subsystem** (image/video/
 audio; workflow mapping, LoRAs, jobs), a **normalized reasoning toggle** (one
 `reasoning: off|on|auto` control mapped to the right per-(model,backend)
-mechanism), and a server-rendered `/ui` console. Read `README.md` first — it
-documents every config knob, endpoint, and routing rule (note: reasoning is not
-in README yet — see `reasoning.py`).
+mechanism, plus per-alias defaults), and a server-rendered `/ui` console. Read
+`README.md` first — it documents every config knob, endpoint, and routing rule.
 
 ## Run / develop
 

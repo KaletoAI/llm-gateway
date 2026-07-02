@@ -20,6 +20,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Authentication & multi-user](#authentication--multi-user) — keys, allow-lists, quotas
 - [Routing](#routing) — priority, prefixing, `local`, concurrency, parking
 - [Call parking](#call-parking) — queue instead of `503` when busy
+- [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Media generation](#media-generation) — ComfyUI image/video/audio, aliases, mapping, LoRA, jobs
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
@@ -247,6 +248,50 @@ returns immediately with `{id, status:"queued"}`; poll `GET /v1/responses/{id}`
 
 ---
 
+## Reasoning control
+
+One normalized switch turns a thinking model's reasoning **off/on** — regardless
+of which mechanism the model actually needs. Clients send a single field:
+
+```jsonc
+{ "model": "tool", "reasoning": "off", "messages": [...] }   // "off" | "on" | "auto"
+```
+
+`"auto"` (or omitting the field) leaves the request untouched. The OpenAI
+`reasoning_effort` field works as an alias (`minimal` → off, anything else → on),
+and `/v1/responses` also accepts the `reasoning: {effort}` object shape.
+
+**Rules decide the mechanism.** The switch is translated per (model × backend)
+by an ordered rule list (UI → **Reasoning** tab; stored, hot). The first enabled
+rule whose **model glob** matches the real model and whose **backend set**
+contains the serving backend wins; its *adapter* does the work:
+
+| Adapter | What it does |
+|---|---|
+| `enable_thinking` | sets `chat_template_kwargs: {enable_thinking: bool}` (vLLM; llama.cpp with `--jinja`) |
+| `reasoning_effort` | sets `reasoning_effort` (off → `minimal`, on → `high`; overridable per rule) |
+| `nothink_token` | appends a token (default `/nothink`) to the last user message |
+| `prefill` | appends a closed `<think>…</think>` assistant turn |
+| `none` | no mechanism — reported as `unsupported` |
+
+No matching rule → the request is forwarded unchanged and the control is
+reported as `unsupported` — **it never fails a call**. What was actually applied
+comes back in the **`x-reasoning-control`** response header (e.g. `off:prefill`,
+`on:noop`, `unsupported`) and is logged per call in the **LLM Calls** tab.
+
+**Per-alias default.** A chat alias can carry a reasoning default (chat-alias
+editor → `reasoning: auto|on|off`), applied when the client sends nothing — so
+`tool` (off) and `tool-thinking` (auto) can point at the **same backend and
+model**. An explicit client `reasoning` field always wins.
+
+**Thinking output on `/v1/responses`.** Models that stream their thinking in the
+`reasoning` delta channel are translated to Responses-API reasoning events
+(`response.reasoning_summary_text.delta`) and a `reasoning` output item —
+`output_text` stays answer-only; clients that don't know reasoning events simply
+ignore them.
+
+---
+
 ## Media generation
 
 A ComfyUI backend speaks a different protocol, so it declares `type: comfyui`.
@@ -368,9 +413,10 @@ locked). Tabs:
 | **Backends** | add/edit/remove backends (LLM + ComfyUI) |
 | **Input** | what clients can call — chat aliases, generation models, endpoints |
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
-| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s`) |
-| **Chat Playground** | send a chat completion through an alias |
-| **Media Playground** | run a generation (pick alias/backend, upload refs, set params) — image/video/audio |
+| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s` + reasoning default) |
+| **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
+| **Chat Playground** | send a chat completion — as a **real API client** through `/v1/chat/completions` (auth, routing, parking, stats all apply) |
+| **Media Playground** | run a generation via `POST /v1/generations` (pick alias/backend, upload refs, set params) — image/video/audio |
 | **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL) |
 | **LLM Calls** | per-call history with stored request/response bodies |
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
@@ -397,7 +443,9 @@ stats:
   Local backends → 0.
 - **Source** is the authenticated user, else the `X-Source` header, else client IP
   (IP aliases give those friendly names; reverse-DNS is auto-resolved).
-- **Streaming** calls record `0` tokens (no `usage` in stream chunks).
+- **Streaming** calls record real tokens when the backend honors
+  `stream_options.include_usage` (requested automatically), else `0`.
+- The applied **reasoning control** is logged per call (LLM Calls tab column).
 - Recent calls store the full request/response body (large/binary bodies on disk),
   viewable per-call, pruned with the same retention.
 
@@ -411,7 +459,7 @@ stats:
 |---|---|---|
 | `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|image` |
 | `GET` | `/v1/models/{id}` | single-model lookup |
-| `POST` | `/v1/chat/completions` | chat; priority + failover; streaming; parking |
+| `POST` | `/v1/chat/completions` | chat; priority + failover; streaming; parking; `reasoning: off\|on\|auto` |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
 | `POST` | `/v1/responses` | Responses API ↔ chat bridge; streaming; parking; `background:true` (async) |
@@ -424,7 +472,7 @@ stats:
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`) |
+| `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`); per-field reference images via `images: {param: base64\|URL}` |
 | `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias |
 | `GET` | `/v1/jobs/{id}` | job status + results |
 | `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |
@@ -438,6 +486,10 @@ stats:
 | `GET` | `/health` | per-backend health/model/priority + busy/inflight + conflicts |
 | `*` | `/ui/**` | the management console |
 
+Every proxied LLM response carries **`x-gateway-backend`** (which backend served
+the call) and, when a reasoning switch was requested, **`x-reasoning-control`**
+(what was actually applied).
+
 ### Responses API bridge
 
 Clients on LangChain.js (N8N's AI Agent, …) call `/v1/responses`; most backends
@@ -450,7 +502,8 @@ request asynchronously per the official OpenAI pattern: it returns immediately
 with a `queued` response object; poll `GET /v1/responses/{id}` until a terminal
 state and cancel via `POST /v1/responses/{id}/cancel`. The background worker
 parks in the shared queue (longer async window) — so long-running or busy
-requests never time out the client connection.
+requests never time out the client connection. Thinking-model output arrives as
+Responses-API **reasoning items/events** (see [Reasoning control](#reasoning-control)).
 
 ---
 
