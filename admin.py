@@ -89,6 +89,8 @@ _ui_locked: Callable[[], bool] = lambda: False
 _dashboard_snapshot: Callable[[], dict] = lambda: {}
 _apply_reasoning: Callable[[], None] = lambda: None
 _llm_backend_names: Callable[[], list] = lambda: []
+# (alias_or_model, backend) → real model id; None = alias not mapped on that backend.
+_resolve_for_backend: Callable[[str, str], Optional[str]] = lambda m, b: m
 
 
 def bind(**overrides) -> None:
@@ -2754,16 +2756,28 @@ def _reasoning_testbox(rules: list, qp) -> str:
     tb = (qp.get("test_backend") or "").strip()
     res = ""
     if tm and tb:
-        rule = reasoning.resolve(rules, tb, tm)
-        res = (f"<p style='margin-top:8px'><code>{_esc(tm)}</code> on <b>{_esc(tb)}</b> → "
-               + (f"{_badge(rule.get('adapter'), 'ok')} <span class='muted'>(rule #{rules.index(rule) + 1})</span>"
-                  if rule else _badge("unsupported", "muted") + " <span class='muted'>(no matching rule)</span>")
-               + "</p>")
+        # Accept an ALIAS like the API does: resolve it to this backend's real model
+        # first (rules always match against real model ids, never alias names).
+        real = _resolve_for_backend(tm, tb)
+        if real is None:
+            res = (f"<p style='margin-top:8px'><code>{_esc(tm)}</code> on <b>{_esc(tb)}</b> → "
+                   + _badge("not mapped", "bad")
+                   + " <span class='muted'>(this alias has no entry for this backend — "
+                     "a call would never route there)</span></p>")
+        else:
+            via = f" → <code>{_esc(real)}</code>" if real != tm else ""
+            rule = reasoning.resolve(rules, tb, real)
+            res = (f"<p style='margin-top:8px'><code>{_esc(tm)}</code>{via} on <b>{_esc(tb)}</b> → "
+                   + (f"{_badge(rule.get('adapter'), 'ok')} <span class='muted'>(rule #{rules.index(rule) + 1})</span>"
+                      if rule else _badge("unsupported", "muted") + " <span class='muted'>(no matching rule)</span>")
+                   + "</p>")
     bopts = "".join(f"<option{' selected' if n == tb else ''}>{_esc(n)}</option>" for n in _llm_backend_names())
     return ("<h2 style='margin-top:22px'>Test resolution</h2>"
-            "<p class='hint'>See which rule would apply for a (model, backend) — without a real call.</p>"
+            "<p class='hint'>See which rule would apply for a (model, backend) — without a real call. "
+            "Takes an <b>alias or a real model id</b>; aliases resolve to the backend's model first, "
+            "exactly like the API.</p>"
             "<form method='get' action='/ui/reasoning' style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
-            f"{_inp('test_model', tm, placeholder='real model id, e.g. qwen3.5-9b-heretic-thinking')}"
+            f"{_inp('test_model', tm, placeholder='alias or model id, e.g. tool / qwen3.5-9b-heretic')}"
             f"<select name='test_backend'><option value=''>backend…</option>{bopts}</select>"
             f"{_btn('Resolve', submit=True, kind='secondary')}</form>{res}")
 

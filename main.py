@@ -1933,6 +1933,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            set_backend_enabled=set_backend_enabled,
            llm_backend_names=lambda: sorted({b["name"] for b in backends
                                              if b.get("type", "openai") != "comfyui"}),
+           resolve_for_backend=resolve_for_backend,
            apply_reasoning=apply_reasoning_rules)
 
 
