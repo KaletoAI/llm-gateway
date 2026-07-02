@@ -1213,9 +1213,20 @@ def _chat_models() -> list:
     return out
 
 
+# On submit, show immediate feedback: replace the (possibly stale) result with a
+# "sending…" spinner and disable Send. The full-page POST then re-renders with the
+# real reply — so a slow call, or a second Send, no longer leaves the old result up.
+_CHATPLAY_JS = ("<script>function cpSending(f){"
+                "var r=document.getElementById('cpresult');"
+                "if(r)r.innerHTML=\"<h2>Response</h2><p class='muted'>\\u23f3 <b>Sending\\u2026</b> · routing + "
+                "waiting for the backend</p>\";"
+                "var b=f.querySelector('button[type=submit]');if(b){b.disabled=true;b.textContent='Sending\\u2026';}"
+                "return true;}</script>")
+
+
 def _chatplay_form(vals: dict) -> str:
     v = lambda k: vals.get(k, "")
-    return ('<form action="/ui/chatplay/send" method="post">'
+    return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("model", _dl_input("model", v("model"), "cpmodels", "alias or model id"), short=True)
             + _field("system", _textarea("system", v("system"), 2, "optional system prompt"))
@@ -1223,12 +1234,12 @@ def _chatplay_form(vals: dict) -> str:
             + _field("max tokens", _inp("max_tokens", v("max_tokens"), typ="number"), short=True)
             + _field("temperature", _inp("temperature", v("temperature"), typ="number"), short=True)
             + "<p class='hint'>Non-streaming. Routes by priority with failover, exactly like the API.</p>"
-            + "</form>" + _datalist("cpmodels", _chat_models()))
+            + "</form>" + _datalist("cpmodels", _chat_models()) + _CHATPLAY_JS)
 
 
 def _chatplay_body(vals: dict, result_html: str) -> str:
     return (f'<div class="cols"><div class="col">{_chatplay_form(vals)}</div>'
-            f'<div class="col">{result_html}</div></div>')
+            f'<div class="col" id="cpresult">{result_html}</div></div>')
 
 
 def _chat_result_html(res: dict) -> str:
