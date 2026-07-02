@@ -1226,7 +1226,21 @@ _CHATPLAY_JS = ("<script>function cpSending(f){"
 
 def _chatplay_form(vals: dict) -> str:
     v = lambda k: vals.get(k, "")
-    bk_select = _select("backend", [("", "— all backends (route by priority) —")] + _llm_backend_names(), v("backend"))
+    llm = _llm_backends()
+    bk_models = {b["name"]: sorted(b.get("models", [])) for b in llm}   # bare model ids per backend
+    all_models = _chat_models()                                         # aliases + bare + backend/model
+    cur_bk = v("backend")
+    init_models = bk_models[cur_bk] if (cur_bk in bk_models) else all_models   # pre-filter if a backend is picked
+    # Backend picker (manual, so it can filter the model datalist on change without a reload).
+    opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (route by priority) —</option>'
+    for n in bk_models:
+        opts += f'<option{" selected" if n == cur_bk else ""}>{_esc(n)}</option>'
+    bk_select = f'<select name="backend" onchange="cpFilterModels(this.value)">{opts}</select>'
+    filt_js = ("<script>var CP_BK=%s,CP_ALL=%s;function cpFilterModels(bk){"
+               "var dl=document.getElementById('cpmodels');if(!dl)return;"
+               "var ms=(bk&&CP_BK[bk])?CP_BK[bk]:CP_ALL;"
+               "dl.innerHTML=ms.map(function(m){var o=document.createElement('option');o.value=m;"
+               "return o.outerHTML;}).join('');}</script>") % (json.dumps(bk_models), json.dumps(all_models))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("backend", bk_select, short=True)
@@ -1235,8 +1249,9 @@ def _chatplay_form(vals: dict) -> str:
             + _field("message", _textarea("user", v("user"), 6, "your message"))
             + _field("max tokens", _inp("max_tokens", v("max_tokens"), typ="number"), short=True)
             + _field("temperature", _inp("temperature", v("temperature"), typ="number"), short=True)
-            + "<p class='hint'>Non-streaming. Routes by priority with failover, exactly like the API.</p>"
-            + "</form>" + _datalist("cpmodels", _chat_models()) + _CHATPLAY_JS)
+            + "<p class='hint'>Non-streaming. Routes by priority with failover, exactly like the API. "
+              "Pick a <b>backend</b> to pin the call and filter the model list; empty = all backends.</p>"
+            + "</form>" + _datalist("cpmodels", init_models) + filt_js + _CHATPLAY_JS)
 
 
 def _chatplay_body(vals: dict, result_html: str) -> str:
@@ -2617,12 +2632,21 @@ async def call_view(call_id: int, request: Request):
 
 _REASON_ADAPTERS = ["enable_thinking", "reasoning_effort", "nothink_token", "prefill", "none"]
 _REASON_HINT = {
-    "enable_thinking": "sends chat_template_kwargs:{enable_thinking:false} — the backend must pass it through "
-                       "(vLLM: yes · llama.cpp: needs --jinja · LocalAI: verify)",
-    "reasoning_effort": "sets reasoning_effort — off uses the param value (default 'minimal'), on uses 'high'",
-    "nothink_token": "appends a token to the last user message (param, default '/nothink')",
-    "prefill": "appends a closed think block as an assistant turn (param, default '<think>\\n\\n</think>')",
-    "none": "no mechanism — reasoning off/on is reported as 'unsupported'",
+    "enable_thinking": "Adds <code>chat_template_kwargs: {enable_thinking:false}</code> to the request. Works "
+                       "<b>only if the backend forwards chat_template_kwargs</b> to the model template — vLLM: yes · "
+                       "llama.cpp: only with <code>--jinja</code> · <b>LocalAI: usually NOT</b> (then use "
+                       "<b>nothink_token</b> or <b>prefill</b> instead). <b>param:</b> leave empty.",
+    "reasoning_effort": "Sets the OpenAI <code>reasoning_effort</code> field: off → the param value (default "
+                        "<code>minimal</code>), on → <code>high</code>. For gpt-oss / harmony models. "
+                        "<b>param:</b> the off value, e.g. <code>minimal</code>.",
+    "nothink_token": "Appends a soft-switch token to the last <b>user</b> message — message-level, so it always "
+                     "reaches the model. <b>Qwen3.x: <code>/no_think</code></b> · GLM: <code>/nothink</code>. "
+                     "<b>param:</b> the token (default <code>/nothink</code> — set <code>/no_think</code> for Qwen).",
+    "prefill": "Appends an assistant turn with a closed, empty think block so the model skips reasoning. "
+               "Message-level, works regardless of backend, but some backends reject a trailing assistant message. "
+               "<b>param:</b> the block content (default <code>&lt;think&gt;\\n\\n&lt;/think&gt;</code>).",
+    "none": "Do nothing — reasoning off/on is reported as <code>unsupported</code> (for models that can't toggle "
+            "thinking). <b>param:</b> unused.",
 }
 _REASON_PKEY = {"reasoning_effort": "off", "nothink_token": "token", "prefill": "content"}
 
@@ -2648,7 +2672,7 @@ def _reasoning_form(rule: Optional[dict], idx) -> str:
     aopts = "".join(f'<option{" selected" if a == ad else ""}>{a}</option>' for a in _REASON_ADAPTERS)
     asel = f'<select name="adapter" onchange="rAd(this.value)">{aopts}</select>'
     hints = "".join(f'<div class="hint rh" data-a="{a}" style="display:{"block" if a == ad else "none"};'
-                    f'margin:-4px 0 10px">{_esc(_REASON_HINT[a])}</div>' for a in _REASON_ADAPTERS)
+                    f'margin:-4px 0 10px">{_REASON_HINT[a]}</div>' for a in _REASON_ADAPTERS)
     js = ("<script>function rAll(c){document.querySelectorAll('.rbk').forEach(function(x){"
           "x.disabled=c.checked; if(c.checked) x.checked=false;});}"
           "function rAd(a){document.querySelectorAll('.rh').forEach(function(e){"
@@ -2663,7 +2687,7 @@ def _reasoning_form(rule: Optional[dict], idx) -> str:
                      placeholder="qwen3.5*  ·  gemma-4-12b-it  ·  *"), short=True)
             + _field("backends", bk)
             + _field("adapter (off)", asel) + hints
-            + _field("param", _inp("param", _reason_pval(r), placeholder="optional — see hint above"), short=True)
+            + _field("param", _inp("param", _reason_pval(r), placeholder="optional — see the adapter hint above"))
             + "</form>" + js)
 
 
