@@ -1543,6 +1543,119 @@ def _backends_section(alias: str, cands: list) -> str:
     return (f"<table class='pins'><tr><th>allowed backend</th><th></th></tr>{rows}</table>{add_sel}")
 
 
+_PIN_CSS_JS = ("<style>.ptabs{display:flex;gap:4px;margin:10px 0 0;flex-wrap:wrap}"
+               ".ptab{padding:6px 14px;background:#0c0e12;border:1px solid #242a33;border-bottom:none;"
+               "border-radius:8px 8px 0 0;color:#8b97a4;cursor:pointer;font:inherit}"
+               ".ptab.on{color:#dce4ec;background:#11151b;border-color:#3b82f6}"
+               ".ppanel{border:1px solid #242a33;border-radius:0 8px 8px 8px;padding:10px 12px}"
+               ".ovrow{margin:9px 0}.ovrow label{display:block;font-size:12px;color:#8b97a4;margin-bottom:3px}"
+               ".ovrow input,.ovrow select{width:100%;max-width:560px;box-sizing:border-box}"
+               ".ovrow.inherited{opacity:.5}.ovrow.inherited:focus-within{opacity:1}"
+               ".ovact{float:right}.ovtag{font-size:10px;padding:1px 6px;border-radius:6px;margin-left:6px}"
+               ".ovtag.inh{background:#1a1f27;color:#7e8b99}.ovtag.set{background:#15301f;color:#7fd6a0}"
+               ".ntitle{color:#cbd4de;font-style:italic}</style>"
+               "<script>function pinTab(b,p){var f=b.closest('form');"
+               "f.querySelectorAll('.ptab').forEach(function(x){x.classList.toggle('on',x===b);});"
+               "f.querySelectorAll('.ppanel').forEach(function(x){x.style.display="
+               "x.getAttribute('data-pt')===p?'':'none';});}</script>")
+
+
+def _map_del_btn(alias: str, qs: str) -> str:
+    return _btn("✕", f"/ui/mapping/field-del?alias={_esc(alias)}&{qs}", "danger", sm=True,
+                icon=True, title="Remove")
+
+
+def _req_fields_rows(alias: str, wf: dict, mapping: dict) -> str:
+    """Request fields: one row PER MAPPED param (dynamic — promoted from the
+    Available fields list via →; NOT a fixed list). Rendered in mapping order (NOT
+    sorted) so drag-to-reorder sticks; that order drives the Playground. node/field
+    stay editable, ∅ clears the workflow default, ✕ removes the param."""
+    rows = ""
+    for p in mapping:
+        m = mapping.get(p) or {}
+        node, fld = m.get("node", ""), m.get("field", "")
+        is_img = adapters.is_image_field(wf, node)
+        cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
+        cur_disp = ("image upload" if is_img else
+                    "(linked)" if isinstance(cur, list) else ("" if cur is None else str(cur)))
+        if is_img:
+            cur_cell = ('image upload <label class="muted" style="font-weight:normal" '
+                        'title="require an upload; do not substitute the 8×8 placeholder">'
+                        f'<input type="checkbox" name="noph__{_esc(p)}"'
+                        f'{" checked" if m.get("no_placeholder") else ""}> required</label>')
+        else:
+            cur_cell = _esc(cur_disp[:60])
+        tag = " <span class='tag'>image</span>" if is_img else ""
+        if node and node not in wf:                      # node vanished after a workflow update
+            tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
+        actions = ((_btn("∅", f"/ui/mapping/field-clear?alias={_esc(alias)}&param={_esc(p)}",
+                         "secondary", sm=True, icon=True, title="Clear the workflow default")
+                    if not is_img else "")
+                   + _map_del_btn(alias, "param=" + _esc(p)))
+        rows += (f'<tr draggable="true" data-p="{_esc(p)}">'
+                 f"<td><span class='grip' title='Drag to reorder'>⠿</span> {_esc(p)}{tag}</td>"
+                 f"<td>{_inp('label__' + p, m.get('label', ''), placeholder=p)}</td>"
+                 f"<td>{_inp('node__' + p, node)}</td>"
+                 f"<td>{_inp('field__' + p, fld)}</td>"
+                 f"<td class='muted'>{cur_cell}</td>"
+                 f"<td class='acts'>{actions}</td></tr>")
+    return rows or ("<tr><td colspan=6 class='muted'>none yet — promote a field "
+                    "from Available fields below (→)</td></tr>")
+
+
+def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, oi_bn: dict) -> str:
+    """One pinned-values tab — SAME layout in every tab (.ovrow). The PRIMARY (first
+    backend) tab is the editor: value + ✕ delete per slot. Extra backends override
+    only the VALUE (no delete; the slot set is shared). A value equal to the
+    primary's is flagged "inherited" and dimmed; a differing one "override"."""
+    rows = ""
+    for b in fixed:
+        nid, fld = str(b["node"]), str(b["field"])
+        cls = wf.get(nid, {}).get("class_type", "")
+        if is_primary:
+            cur, name, inherited = b.get("value"), f"fixed__{nid}__{fld}", False
+            acts = (f"<span class='ovact'>"
+                    f"{_map_del_btn(alias, 'node=' + _esc(nid) + '&field=' + _esc(fld))}</span>")
+        else:
+            cv = next((x.get("value") for x in (c.get("fixed") or [])
+                       if str(x.get("node")) == nid and str(x.get("field")) == fld), None)
+            inherited = cv is None or cv == b.get("value")
+            cur, name, acts = (cv if cv is not None else b.get("value")), \
+                "ovr__" + str(c.get("backend")) + "__" + nid + "__" + fld, ""
+        ctl = _value_control(name, nid, fld, cur, wf, oi_bn)
+        tag = "" if is_primary else (" <span class='ovtag inh'>inherited</span>" if inherited
+                                     else " <span class='ovtag set'>override</span>")
+        title = wf.get(nid, {}).get("_meta", {}).get("title", "")
+        ttl_html = f' <span class="ntitle">“{_esc(title)}”</span>' if title else ""
+        rows += (f'<div class="ovrow{" inherited" if inherited else ""}">'
+                 f'<label><code>{_esc(nid)}</code> {_esc(cls)}{ttl_html} '
+                 f'<span class="muted">· {_esc(fld)}</span>{tag}{acts}</label>{ctl}</div>')
+    return rows or "<p class='muted'>none pinned — add from Available fields below</p>"
+
+
+async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
+    """Pinned values as per-backend tabs (primary edits; extras override values)."""
+    primary_rows = _pin_tab_rows(alias, cands[0], True, fixed, wf, oi)
+    if len(cands) == 1:
+        return f"<h2>Pinned values</h2><div class='ppanel'>{primary_rows}</div>"
+    bn0 = str(cands[0].get("backend"))
+    tabs = "".join(
+        f'<button type="button" class="ptab{" on" if i == 0 else ""}" '
+        f"onclick=\"pinTab(this,'{_esc(str(c.get('backend')))}')\">{_esc(str(c.get('backend')))}</button>"
+        for i, c in enumerate(cands))
+    panels = f'<div class="ppanel" data-pt="{_esc(bn0)}">{primary_rows}</div>'
+    # override backends' own models fetched in PARALLEL (cold /object_info is slow)
+    oi_others = await asyncio.gather(*[_object_info(str(c.get("backend")), wf) for c in cands[1:]])
+    for c, oi_bn in zip(cands[1:], oi_others):
+        bn = str(c.get("backend"))
+        rows = _pin_tab_rows(alias, c, False, fixed, wf, oi_bn or oi)  # fall back to primary's models
+        panels += (f'<div class="ppanel" data-pt="{_esc(bn)}" style="display:none">'
+                   f"<p class='hint'>Models/values installed on <b>{_esc(bn)}</b> "
+                   f"(slots from primary <b>{_esc(bn0)}</b>; “inherited” = same as primary).</p>{rows}</div>")
+    return (f"<h2>Pinned values <span class='muted' style='font-weight:normal'>— tab per backend</span></h2>"
+            f'<div class="ptabs">{tabs}</div>{panels}')
+
+
 async def _alias_editor(alias: str) -> str:
     """The alias editor as a single-column fragment for the master-detail right
     side (request fields + pinned values in one form, available fields below)."""
@@ -1564,109 +1677,9 @@ async def _alias_editor(alias: str) -> str:
     mapped = ({(m["node"], m["field"]) for m in mapping.values()}
               | {(b["node"], b["field"]) for b in fixed})
 
-    def dl(qs):
-        return _btn("✕", f"/ui/mapping/field-del?alias={_esc(alias)}&{qs}", "danger", sm=True,
-                    icon=True, title="Remove")
-
-    # LEFT — request fields: one row PER MAPPED param (dynamic — promoted from the
-    # Available fields list via →; NOT a fixed list). Rendered in mapping order (NOT
-    # sorted) so drag-to-reorder sticks; that order drives the Playground. node/field
-    # stay editable, ∅ clears the workflow default, ✕ removes the param.
-    req_rows = ""
-    for p in mapping:
-        m = mapping.get(p) or {}
-        node, fld = m.get("node", ""), m.get("field", "")
-        is_img = adapters.is_image_field(wf, node)
-        cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
-        cur_disp = ("image upload" if is_img else
-                    "(linked)" if isinstance(cur, list) else ("" if cur is None else str(cur)))
-        if is_img:
-            cur_cell = ('image upload <label class="muted" style="font-weight:normal" '
-                        'title="require an upload; do not substitute the 8×8 placeholder">'
-                        f'<input type="checkbox" name="noph__{_esc(p)}"'
-                        f'{" checked" if m.get("no_placeholder") else ""}> required</label>')
-        else:
-            cur_cell = _esc(cur_disp[:60])
-        tag = " <span class='tag'>image</span>" if is_img else ""
-        if node and node not in wf:                      # node vanished after a workflow update
-            tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
-        actions = ((_btn("∅", f"/ui/mapping/field-clear?alias={_esc(alias)}&param={_esc(p)}",
-                         "secondary", sm=True, icon=True, title="Clear the workflow default")
-                    if not is_img else "")
-                   + dl("param=" + _esc(p)))
-        req_rows += (f'<tr draggable="true" data-p="{_esc(p)}">'
-                     f"<td><span class='grip' title='Drag to reorder'>⠿</span> {_esc(p)}{tag}</td>"
-                     f"<td>{_inp('label__' + p, m.get('label', ''), placeholder=p)}</td>"
-                     f"<td>{_inp('node__' + p, node)}</td>"
-                     f"<td>{_inp('field__' + p, fld)}</td>"
-                     f"<td class='muted'>{cur_cell}</td>"
-                     f"<td class='acts'>{actions}</td></tr>")
-    req_rows = req_rows or ("<tr><td colspan=6 class='muted'>none yet — promote a field "
-                            "from Available fields below (→)</td></tr>")
-
-    # Pinned values as per-backend tabs — SAME layout in every tab (.ovrow). The
-    # PRIMARY (first backend) tab is the editor: value + ✕ delete per slot. Extra
-    # backends override only the VALUE (no delete; the slot set is shared). A value
-    # equal to the primary's is flagged "inherited" and dimmed; a differing one "override".
-    async def _pin_tab(c, is_primary, oi_bn):
-        rows = ""
-        for b in fixed:
-            nid, fld = str(b["node"]), str(b["field"])
-            cls = wf.get(nid, {}).get("class_type", "")
-            if is_primary:
-                cur, name, inherited = b.get("value"), f"fixed__{nid}__{fld}", False
-                acts = f"<span class='ovact'>{dl('node=' + _esc(nid) + '&field=' + _esc(fld))}</span>"
-            else:
-                cv = next((x.get("value") for x in (c.get("fixed") or [])
-                           if str(x.get("node")) == nid and str(x.get("field")) == fld), None)
-                inherited = cv is None or cv == b.get("value")
-                cur, name, acts = (cv if cv is not None else b.get("value")), \
-                    "ovr__" + str(c.get("backend")) + "__" + nid + "__" + fld, ""
-            ctl = _value_control(name, nid, fld, cur, wf, oi_bn)
-            tag = "" if is_primary else (" <span class='ovtag inh'>inherited</span>" if inherited
-                                         else " <span class='ovtag set'>override</span>")
-            title = wf.get(nid, {}).get("_meta", {}).get("title", "")
-            ttl_html = f' <span class="ntitle">“{_esc(title)}”</span>' if title else ""
-            rows += (f'<div class="ovrow{" inherited" if inherited else ""}">'
-                     f'<label><code>{_esc(nid)}</code> {_esc(cls)}{ttl_html} '
-                     f'<span class="muted">· {_esc(fld)}</span>{tag}{acts}</label>{ctl}</div>')
-        return rows or "<p class='muted'>none pinned — add from Available fields below</p>"
-
-    primary_rows = await _pin_tab(cands[0], True, oi)
-    if len(cands) > 1:
-        bn0 = str(cands[0].get("backend"))
-        tabs = "".join(
-            f'<button type="button" class="ptab{" on" if i == 0 else ""}" '
-            f"onclick=\"pinTab(this,'{_esc(str(c.get('backend')))}')\">{_esc(str(c.get('backend')))}</button>"
-            for i, c in enumerate(cands))
-        panels = f'<div class="ppanel" data-pt="{_esc(bn0)}">{primary_rows}</div>'
-        # override backends' own models fetched in PARALLEL (cold /object_info is slow)
-        oi_others = await asyncio.gather(*[_object_info(str(c.get("backend")), wf) for c in cands[1:]])
-        for c, oi_bn in zip(cands[1:], oi_others):
-            bn = str(c.get("backend"))
-            rows = await _pin_tab(c, False, oi_bn or oi)  # fall back to primary's models
-            panels += (f'<div class="ppanel" data-pt="{_esc(bn)}" style="display:none">'
-                       f"<p class='hint'>Models/values installed on <b>{_esc(bn)}</b> "
-                       f"(slots from primary <b>{_esc(bn0)}</b>; “inherited” = same as primary).</p>{rows}</div>")
-        pinned_block = (f"<h2>Pinned values <span class='muted' style='font-weight:normal'>— tab per backend</span></h2>"
-                        f'<div class="ptabs">{tabs}</div>{panels}')
-    else:
-        pinned_block = f"<h2>Pinned values</h2><div class='ppanel'>{primary_rows}</div>"
-    pin_extra = ("<style>.ptabs{display:flex;gap:4px;margin:10px 0 0;flex-wrap:wrap}"
-                 ".ptab{padding:6px 14px;background:#0c0e12;border:1px solid #242a33;border-bottom:none;"
-                 "border-radius:8px 8px 0 0;color:#8b97a4;cursor:pointer;font:inherit}"
-                 ".ptab.on{color:#dce4ec;background:#11151b;border-color:#3b82f6}"
-                 ".ppanel{border:1px solid #242a33;border-radius:0 8px 8px 8px;padding:10px 12px}"
-                 ".ovrow{margin:9px 0}.ovrow label{display:block;font-size:12px;color:#8b97a4;margin-bottom:3px}"
-                 ".ovrow input,.ovrow select{width:100%;max-width:560px;box-sizing:border-box}"
-                 ".ovrow.inherited{opacity:.5}.ovrow.inherited:focus-within{opacity:1}"
-                 ".ovact{float:right}.ovtag{font-size:10px;padding:1px 6px;border-radius:6px;margin-left:6px}"
-                 ".ovtag.inh{background:#1a1f27;color:#7e8b99}.ovtag.set{background:#15301f;color:#7fd6a0}"
-                 ".ntitle{color:#cbd4de;font-style:italic}</style>"
-                 "<script>function pinTab(b,p){var f=b.closest('form');"
-                 "f.querySelectorAll('.ptab').forEach(function(x){x.classList.toggle('on',x===b);});"
-                 "f.querySelectorAll('.ppanel').forEach(function(x){x.style.display="
-                 "x.getAttribute('data-pt')===p?'':'none';});}</script>")
+    req_rows = _req_fields_rows(alias, wf, mapping)
+    pinned_block = await _pinned_block(alias, cands, fixed, wf, oi)
+    pin_extra = _PIN_CSS_JS
 
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
@@ -1697,8 +1710,12 @@ async def _alias_editor(alias: str) -> str:
             f'<tbody id="reqfields">{req_rows}</tbody></table>'
             + pinned_block
             + '</form>' + pin_extra + _reorder_js(alias))
+    return form, _available_fields(alias, wf, mapped, oi)
 
-    # available scalar fields (not yet mapped) → Add — stacked below the form
+
+def _available_fields(alias: str, wf: dict, mapped: set, oi: dict) -> str:
+    """Available scalar fields (not yet mapped) with + (pin) / → (request field)
+    actions — stacked below the editor form."""
     avail = ""
     for nid, n in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
         arows = ""
@@ -1725,11 +1742,10 @@ async def _alias_editor(alias: str) -> str:
             title = n.get("_meta", {}).get("title", "")
             head = f"<code>{_esc(nid)}</code> {_esc(n.get('class_type'))}" + (f" · {_esc(title)}" if title else "")
             avail += f"<tr class='node'><td colspan=2>{head}</td></tr>{arows}"
-    available = (f"<h2>Available fields</h2>"
-                 f"<p class='hint'>Add a field to pin it (Switch boolean, reference image, …). "
-                 f"Unmapped fields keep the workflow's value.</p>"
-                 f"<table class='avail'>{avail or '<tr><td>all scalar fields mapped</td></tr>'}</table>")
-    return form, available
+    return (f"<h2>Available fields</h2>"
+            f"<p class='hint'>Add a field to pin it (Switch boolean, reference image, …). "
+            f"Unmapped fields keep the workflow's value.</p>"
+            f"<table class='avail'>{avail or '<tr><td>all scalar fields mapped</td></tr>'}</table>")
 
 
 async def edit_add(request: Request):
@@ -2373,29 +2389,24 @@ async def _autoresolve_ips(by_source: list) -> None:
     store.save_ip_aliases(aliases)
 
 
-async def dashboard_page(request: Request):
-    d = await asyncio.to_thread(_dashboard_snapshot)   # runs several stats/jobs queries off-loop
-    bes_all = d.get("backends", [])
-    # Backends taken offline (disabled) are intentionally out of rotation — hide them
-    # from the live view (they stay manageable in the Backends tab). Draining ones stay
-    # enabled until idle, so they remain visible while finishing in-flight work.
-    offline = [b for b in bes_all if not b.get("enabled")]
-    bes = [b for b in bes_all if b.get("enabled")]
+def _dash_cards(d: dict, bes: list) -> str:
+    """Headline counters (in-flight / parked / active jobs / backends up / 24h)."""
     up = sum(1 for b in bes if b.get("healthy"))
     jc = d.get("jobs_counts", {})
     active_jobs = (jc.get("queued", 0) or 0) + (jc.get("running", 0) or 0)
+    card = lambda num, lbl: f"<div class='card'><div class='cnum'>{num}</div><div class='clbl'>{_esc(lbl)}</div></div>"
+    return ("<div class='cards'>"
+            + card(d.get("llm_inflight", 0), "LLM in flight")
+            + card(d.get("parked", 0), "calls parked")
+            + card(active_jobs, "media jobs active")
+            + card(f"{up}/{len(bes)}", "backends up")
+            + (card(d.get("calls_24h", 0), "calls · 24h") if d.get("stats_active") else "")
+            + "</div>")
 
-    def card(num, lbl):
-        return f"<div class='card'><div class='cnum'>{num}</div><div class='clbl'>{_esc(lbl)}</div></div>"
-    cards = ("<div class='cards'>"
-             + card(d.get("llm_inflight", 0), "LLM in flight")
-             + card(d.get("parked", 0), "calls parked")
-             + card(active_jobs, "media jobs active")
-             + card(f"{up}/{len(bes)}", "backends up")
-             + (card(d.get("calls_24h", 0), "calls · 24h") if d.get("stats_active") else "")
-             + "</div>")
 
-    def _srank(b):                                  # sort order: ready → busy → off → disabled
+def _dash_backends(bes: list, offline: list) -> str:
+    """Per-backend live table, sorted ready → busy → off → disabled."""
+    def srank(b):
         if not b.get("enabled"):
             return 3
         if not b.get("healthy"):
@@ -2410,8 +2421,9 @@ async def dashboard_page(request: Request):
         if not b.get("healthy"):
             return _badge("off", "bad")
         return _badge("busy", "warn") if b.get("busy") else _badge("ready", "ok")
+
     brows = ""
-    for b in sorted(bes, key=lambda x: (_srank(x), x.get("name", "").lower())):
+    for b in sorted(bes, key=lambda x: (srank(x), x.get("name", "").lower())):
         cap = b.get("max_concurrent")
         inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
         r1h = b.get("reqs_1h", 0)
@@ -2420,33 +2432,35 @@ async def dashboard_page(request: Request):
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td><td>{b.get('models', 0)}</td>"
                   f"<td>{b.get('priority')}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
-    backends_tbl = (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
-                    f"· click a header to sort{off_hint}</span></h2>"
-                    f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
-                    f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
-                    f"<th>models</th><th>prio</th></tr>{brows}</table>")
+    return (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
+            f"· click a header to sort{off_hint}</span></h2>"
+            f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
+            f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
+            f"<th>models</th><th>prio</th></tr>{brows}</table>")
 
-    now = int(time.time())
-    if d.get("jobs_active"):
-        order = (("running", "warn"), ("queued", "warn"), ("done", "ok"), ("failed", "bad"))
-        # Running/queued now, plus anything that finished within the last 5 min.
-        recent_jobs = [j for j in d.get("jobs_recent", [])
-                       if j.get("status") in ("running", "queued") or int(j.get("updated") or 0) > now - 300]
-        # Badges count this same window — not lifetime totals — so they can't claim
-        # "done 12" while the list shows nothing recent (lifetime is in the Media Jobs tab).
-        wc = {k: sum(1 for j in recent_jobs if j.get("status") == k) for k, _ in order}
-        badges = " ".join(_badge(f"{k} {wc[k]}", kind) for k, kind in order if wc[k])
-        jr = "".join(_job_row(j, now) for j in recent_jobs)
-        jobs_html = (f"<h2>Media jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
-                     f"{badges}</h2>"
-                     + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>id</th><th>alias</th>"
-                        f"<th>backend</th><th>status</th><th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
-                        else "<p class='muted'>nothing running or recently finished</p>"))
-    else:
-        jobs_html = "<h2>Media jobs</h2><p class='hint'>Media generation is off.</p>"
 
-    # Recent LLM calls: currently running (live registry) + finished within the last
-    # 5 min (stats, via the shared _call_row template — same columns as LLM Calls).
+def _dash_jobs(d: dict, now: int) -> str:
+    """Media jobs panel: running/queued now + finished within the last 5 min."""
+    if not d.get("jobs_active"):
+        return "<h2>Media jobs</h2><p class='hint'>Media generation is off.</p>"
+    order = (("running", "warn"), ("queued", "warn"), ("done", "ok"), ("failed", "bad"))
+    recent_jobs = [j for j in d.get("jobs_recent", [])
+                   if j.get("status") in ("running", "queued") or int(j.get("updated") or 0) > now - 300]
+    # Badges count this same window — not lifetime totals — so they can't claim
+    # "done 12" while the list shows nothing recent (lifetime is in the Media Jobs tab).
+    wc = {k: sum(1 for j in recent_jobs if j.get("status") == k) for k, _ in order}
+    badges = " ".join(_badge(f"{k} {wc[k]}", kind) for k, kind in order if wc[k])
+    jr = "".join(_job_row(j, now) for j in recent_jobs)
+    return (f"<h2>Media jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
+            f"{badges}</h2>"
+            + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>id</th><th>alias</th>"
+               f"<th>backend</th><th>status</th><th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
+               else "<p class='muted'>nothing running or recently finished</p>"))
+
+
+def _dash_llm(d: dict, now: int) -> str:
+    """Recent LLM calls: currently running (live registry) + finished within the last
+    5 min (stats, via the shared _call_row template — same columns as LLM Calls)."""
     aliases = store.get_ip_aliases()
     lr = ""
     for c in d.get("llm_running", []):
@@ -2463,39 +2477,45 @@ async def dashboard_page(request: Request):
     lr += "".join(_call_row(r, aliases) for r in d.get("llm_recent", []))
     nrun = len(d.get("llm_running", []))
     runbadge = _badge(f"running {nrun}", "warn") if nrun else ""
-    llm_head = (f"<h2>Recent LLM calls <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
-                f"{runbadge}</h2>")
+    head = (f"<h2>Recent LLM calls <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
+            f"{runbadge}</h2>")
     if lr:
-        llm_html = llm_head + _calls_table(lr, sk="dash-llm")
-    elif not d.get("stats_active") and not nrun:
-        llm_html = (llm_head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
-                    "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
-                    "and the full <a href='/ui/llmcalls'>LLM Calls</a> log.</p>")
-    else:
-        llm_html = llm_head + "<p class='muted'>nothing running or in the last 5 min</p>"
+        return head + _calls_table(lr, sk="dash-llm")
+    if not d.get("stats_active") and not nrun:
+        return (head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
+                "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
+                "and the full <a href='/ui/llmcalls'>LLM Calls</a> log.</p>")
+    return head + "<p class='muted'>nothing running or in the last 5 min</p>"
 
-    # Parked calls: chat requests queued because all their backends are busy, waiting
-    # for a free slot up to the alias's park time (shown only when something is parked).
+
+def _dash_parked(d: dict) -> str:
+    """Parked calls panel: chat requests queued because all their backends are busy,
+    waiting for a free slot up to the alias's park time (empty when nothing parks)."""
     parked = d.get("parked_calls", [])
-    parked_html = ""
-    if parked:
-        prows = ""
-        for p in parked:
-            prows += (f"<tr><td>{_esc(p.get('alias'))}</td><td>{_esc(p.get('source'))}</td>"
-                      f"<td class='muted'>{_dur(float(p.get('waited_s') or 0) * 1000)}</td>"
-                      f"<td class='muted'>{_dur(float(p.get('remaining_s') or 0) * 1000)}</td></tr>")
-        parked_html = (f"<h2>Parked calls <span class='muted' style='font-weight:normal'>· queued, waiting for a "
-                       f"free backend</span> {_badge(f'parked {len(parked)}', 'warn')}</h2>"
-                       f"<table class='sortable' data-sk='dash-parked'><tr><th>alias</th><th>user</th>"
-                       f"<th>waited</th><th>park left</th></tr>{prows}</table>")
+    if not parked:
+        return ""
+    prows = "".join(f"<tr><td>{_esc(p.get('alias'))}</td><td>{_esc(p.get('source'))}</td>"
+                    f"<td class='muted'>{_dur(float(p.get('waited_s') or 0) * 1000)}</td>"
+                    f"<td class='muted'>{_dur(float(p.get('remaining_s') or 0) * 1000)}</td></tr>"
+                    for p in parked)
+    return (f"<h2>Parked calls <span class='muted' style='font-weight:normal'>· queued, waiting for a "
+            f"free backend</span> {_badge(f'parked {len(parked)}', 'warn')}</h2>"
+            f"<table class='sortable' data-sk='dash-parked'><tr><th>alias</th><th>user</th>"
+            f"<th>waited</th><th>park left</th></tr>{prows}</table>")
 
-    tick = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
-            "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
-            "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
-            ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
-            "setInterval(_td,1000);_td();</script>")
+
+async def dashboard_page(request: Request):
+    d = await asyncio.to_thread(_dashboard_snapshot)   # runs several stats/jobs queries off-loop
+    # Backends taken offline (disabled) are intentionally out of rotation — hide them
+    # from the live view (they stay manageable in the Backends tab). Draining ones stay
+    # enabled until idle, so they remain visible while finishing in-flight work.
+    bes_all = d.get("backends", [])
+    offline = [b for b in bes_all if not b.get("enabled")]
+    bes = [b for b in bes_all if b.get("enabled")]
+    now = int(time.time())
     body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
-            + cards + backends_tbl + parked_html + llm_html + jobs_html + tick)
+            + _dash_cards(d, bes) + _dash_backends(bes, offline) + _dash_parked(d)
+            + _dash_llm(d, now) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
 
 
