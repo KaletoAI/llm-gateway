@@ -1910,8 +1910,9 @@ def llm_backends_info() -> list[dict]:
 
 # Wire the UI to the generation core, the ComfyUI backends, the status snapshot,
 # and the backend-change hook.
-admin.bind(lambda: [b for b in backends if b.get("type") == "comfyui"],
-           gateway_info, apply_backend_change,
+admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
+           gateway_info=gateway_info,
+           apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
            config_chat_aliases=lambda: dict(config_virtual_models),
            apply_chat_aliases=apply_chat_aliases,

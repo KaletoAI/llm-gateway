@@ -66,9 +66,12 @@ def _num(s: str):
             return s
 
 
+# Injected main.py callables — ONE registry: the module-level defaults below ARE the
+# catalog of bindable names; bind(**overrides) rebinds them by keyword (`foo=` sets
+# `_foo`). No triple bookkeeping (signature + global stmt + assignments) to keep in sync.
 _comfy_backends: Callable[[], list] = lambda: []
 _gateway_info: Callable[[], dict] = lambda: {}
-_cancel_gen = None
+_cancel_generation = None
 _drain_backend = None
 _cancel_drain = None
 _set_backend_enabled = None
@@ -88,39 +91,15 @@ _apply_reasoning: Callable[[], None] = lambda: None
 _llm_backend_names: Callable[[], list] = lambda: []
 
 
-def bind(comfy_backends: Callable[[], list], gateway_info: Callable[[], dict],
-         apply_backends: Callable[[], None], *, llm_backends: Callable[[], list] = lambda: [],
-         config_chat_aliases: Callable[[], dict] = lambda: {},
-         apply_chat_aliases: Callable[[], None] = lambda: None,
-         playground_key: Callable[[str], Optional[str]] = lambda name: None,
-         routing_snapshot: Callable[[], dict] = lambda: {"aliases": [], "models": [], "conflicts": []},
-         server_info: Callable[[], dict] = lambda: {"effective": {}, "runtime": {}},
-         apply_server_settings: Callable[[], None] = lambda: None,
-         apply_users: Callable[[], None] = lambda: None,
-         resolve_admin: Callable = lambda key: None,
-         ui_locked: Callable[[], bool] = lambda: False,
-         dashboard_snapshot: Callable[[], dict] = lambda: {}, cancel_generation=None,
-         drain_backend=None, cancel_drain=None, set_backend_enabled=None,
-         llm_backend_names: Callable[[], list] = lambda: [],
-         apply_reasoning: Callable[[], None] = lambda: None) -> None:
-    global _comfy_backends, _gateway_info, _apply_backends
-    global _llm_backends, _config_chat_aliases, _apply_chat_aliases, _playground_key, _routing_snapshot
-    global _server_info, _apply_server_settings, _apply_users, _resolve_admin, _ui_locked
-    global _dashboard_snapshot, _cancel_gen, _drain_backend, _cancel_drain, _set_backend_enabled
-    global _apply_reasoning, _llm_backend_names
-    _apply_reasoning, _llm_backend_names = apply_reasoning, llm_backend_names
-    _dashboard_snapshot = dashboard_snapshot
-    _cancel_gen = cancel_generation
-    _drain_backend, _cancel_drain = drain_backend, cancel_drain
-    _set_backend_enabled = set_backend_enabled
-    _comfy_backends = comfy_backends
-    _gateway_info, _apply_backends = gateway_info, apply_backends
-    _llm_backends, _config_chat_aliases = llm_backends, config_chat_aliases
-    _apply_chat_aliases, _playground_key = apply_chat_aliases, playground_key
-    _routing_snapshot = routing_snapshot
-    _server_info, _apply_server_settings = server_info, apply_server_settings
-    _apply_users = apply_users
-    _resolve_admin, _ui_locked = resolve_admin, ui_locked
+def bind(**overrides) -> None:
+    """Inject main.py's callables: bind(foo=fn) sets the module global `_foo`. Every
+    keyword must match a `_`-prefixed default defined above — a typo raises instead
+    of silently binding into the void."""
+    for name, value in overrides.items():
+        g = f"_{name}"
+        if g not in globals():
+            raise KeyError(f"admin.bind: unknown callback '{name}'")
+        globals()[g] = value
 
 
 # ── Shell + components ──────────────────────────────────────────────────────────
@@ -483,6 +462,13 @@ async def logout(request: Request):
 async def _form(request: Request) -> dict:
     raw = (await request.body()).decode("utf-8", "replace")
     return {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+
+
+async def _form_multi(request: Request) -> dict:
+    """Like _form(), but keeps EVERY value per key ({k: [v, …]}) — for handlers with
+    checkbox lists (reasoning backends, user model grants) that _form would collapse."""
+    raw = (await request.body()).decode("utf-8", "replace")
+    return parse_qs(raw, keep_blank_values=True)
 
 
 async def _multipart(request: Request) -> dict:
@@ -1654,10 +1640,11 @@ async def _alias_editor(alias: str) -> str:
             f"onclick=\"pinTab(this,'{_esc(str(c.get('backend')))}')\">{_esc(str(c.get('backend')))}</button>"
             for i, c in enumerate(cands))
         panels = f'<div class="ppanel" data-pt="{_esc(bn0)}">{primary_rows}</div>'
-        for c in cands[1:]:
+        # override backends' own models fetched in PARALLEL (cold /object_info is slow)
+        oi_others = await asyncio.gather(*[_object_info(str(c.get("backend")), wf) for c in cands[1:]])
+        for c, oi_bn in zip(cands[1:], oi_others):
             bn = str(c.get("backend"))
-            oi_bn = await _object_info(bn, wf) or oi      # override backend's own models; fall back to primary
-            rows = await _pin_tab(c, False, oi_bn)
+            rows = await _pin_tab(c, False, oi_bn or oi)  # fall back to primary's models
             panels += (f'<div class="ppanel" data-pt="{_esc(bn)}" style="display:none">'
                        f"<p class='hint'>Models/values installed on <b>{_esc(bn)}</b> "
                        f"(slots from primary <b>{_esc(bn0)}</b>; “inherited” = same as primary).</p>{rows}</div>")
@@ -2182,6 +2169,40 @@ _JOB_TICK = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=
 _JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
 
 
+def _job_dur_cell(j: dict, now: int) -> str:
+    """Duration cell: fixed for finished jobs, JS-ticking (`.jdur` + _JOB_TICK) while
+    running, em-dash while queued. Shared by Media Jobs and the dashboard."""
+    st = j["status"]
+    cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
+    if st in ("done", "failed") and upd >= cr:
+        return f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
+    if st == "running":
+        return f"<td class='muted jdur' data-since='{cr}'>{_dur((now - cr) * 1000)}</td>"
+    return "<td class='muted'>—</td>"
+
+
+def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = False,
+             actions: bool = False) -> str:
+    """One job table row (id-link / [task] / alias / backend / status / [imgs] / age /
+    dur / owner / [actions]) — the ONE template behind Media Jobs and the dashboard."""
+    st, jid = j["status"], j["id"]
+    cells = [f"<td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>"]
+    if task_col:
+        cells.append(f"<td>{_esc(j.get('task'))}</td>")
+    cells += [f"<td>{_esc(j.get('alias'))}</td>", f"<td>{_esc(j.get('backend'))}</td>",
+              f"<td><span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></td>"]
+    if count_col:
+        cells.append(f"<td class='muted'>{j.get('result_count') or 0}</td>")
+    cells += [f"<td class='muted'>{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
+              f"<td class='muted'>{_esc(j.get('owner'))}</td>"]
+    if actions:
+        acts = ((_btn('✕', f'/ui/job/{jid}/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
+                 if st in ('queued', 'running') else '')
+                + _btn('view', f'/ui/job/{jid}', 'secondary', sm=True))
+        cells.append(f"<td style='text-align:right;white-space:nowrap'>{acts}</td>")
+    return "<tr>" + "".join(cells) + "</tr>"
+
+
 async def jobs_page(request: Request):
     """List of generation jobs (image/video/audio), newest first, each linking to its
     detail page. Excludes parked-chat jobs (those live under Statistic)."""
@@ -2192,29 +2213,7 @@ async def jobs_page(request: Request):
         return HTMLResponse(_page("Media Jobs", "<h2>Media Jobs</h2><p class='hint'>No generation "
             "jobs yet. Run one in the <a href='/ui/playground'>Media Playground</a>.</p>", "jobs"))
     now = int(time.time())
-    tr = ""
-    for j in rows:
-        st = j["status"]
-        scls = _JOB_SCLS.get(st, "muted")
-        cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
-        if st in ("done", "failed") and upd >= cr:
-            dcell = f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
-        elif st == "running":
-            dcell = f"<td class='muted jdur' data-since='{cr}'>{_dur((now - cr) * 1000)}</td>"
-        else:
-            dcell = "<td class='muted'>—</td>"
-        jid = j["id"]
-        tr += (f"<tr><td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>"
-               f"<td>{_esc(j.get('task'))}</td><td>{_esc(j.get('alias'))}</td>"
-               f"<td>{_esc(j.get('backend'))}</td>"
-               f"<td><span class='badge {scls}'>{_esc(st)}</span></td>"
-               f"<td class='muted'>{j.get('result_count') or 0}</td>"
-               f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
-               f"<td class='muted'>{_esc(j.get('owner'))}</td>"
-               f"<td style='text-align:right;white-space:nowrap'>"
-               + ((_btn('✕', '/ui/job/' + jid + '/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
-                   if st in ('queued', 'running') else '')
-                  + _btn('view', '/ui/job/' + jid, 'secondary', sm=True)) + "</td></tr>")
+    tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True) for j in rows)
     tbl = (f"<table><tr><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
            f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
@@ -2309,8 +2308,8 @@ async def job_input(job_id: str, n: int):
 
 
 async def job_cancel(job_id: str):
-    if _cancel_gen:
-        await _cancel_gen(job_id)
+    if _cancel_generation:
+        await _cancel_generation(job_id)
     return RedirectResponse(f"/ui/job/{job_id}", status_code=303)
 
 
@@ -2359,13 +2358,12 @@ async def _reverse_dns(ip: str) -> str:
         return ""
 
 
-async def _autoresolve_ips() -> None:
+async def _autoresolve_ips(by_source: list) -> None:
     """Best-effort: for caller IPs seen in stats with no alias yet, reverse-DNS them
-    and persist the hostname (or '' to mark 'attempted', so we don't retry forever)."""
-    if not stats.is_active():
-        return
+    and persist the hostname (or '' to mark 'attempted', so we don't retry forever).
+    Takes the caller's already-fetched summary()['by_source'] rows (one query/render)."""
     aliases = store.get_ip_aliases()
-    seen = [r[0] for r in stats.summary()["by_source"]]
+    seen = [r[0] for r in by_source]
     todo = [s for s in seen if _looks_like_ip(s) and s not in aliases][:20]
     if not todo:
         return
@@ -2438,22 +2436,7 @@ async def dashboard_page(request: Request):
         # "done 12" while the list shows nothing recent (lifetime is in the Media Jobs tab).
         wc = {k: sum(1 for j in recent_jobs if j.get("status") == k) for k, _ in order}
         badges = " ".join(_badge(f"{k} {wc[k]}", kind) for k, kind in order if wc[k])
-        jr = ""
-        for j in recent_jobs:
-            st = j["status"]
-            scls = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}.get(st, "muted")
-            cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
-            if st in ("done", "failed") and upd >= cr:
-                dcell = f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
-            elif st == "running":                       # live tick-up via JS (data-since)
-                dcell = f"<td class='muted jdur' data-since='{cr}'>{_dur((int(time.time()) - cr) * 1000)}</td>"
-            else:
-                dcell = "<td class='muted'>—</td>"
-            jr += (f"<tr><td><a href='/ui/job/{_esc(j['id'])}'><code>{_esc(j['id'][:8])}</code></a></td>"
-                   f"<td>{_esc(j.get('alias'))}</td>"
-                   f"<td>{_esc(j.get('backend'))}</td><td><span class='badge {scls}'>{_esc(st)}</span></td>"
-                   f"<td class='muted'>{_age(j.get('created'))}</td>{dcell}"
-                   f"<td class='muted'>{_esc(j.get('owner'))}</td></tr>")
+        jr = "".join(_job_row(j, now) for j in recent_jobs)
         jobs_html = (f"<h2>Media jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
                      f"{badges}</h2>"
                      + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>id</th><th>alias</th>"
@@ -2463,7 +2446,7 @@ async def dashboard_page(request: Request):
         jobs_html = "<h2>Media jobs</h2><p class='hint'>Media generation is off.</p>"
 
     # Recent LLM calls: currently running (live registry) + finished within the last
-    # 5 min (stats). The full per-call history lives in the LLM Calls tab.
+    # 5 min (stats, via the shared _call_row template — same columns as LLM Calls).
     aliases = store.get_ip_aliases()
     lr = ""
     for c in d.get("llm_running", []):
@@ -2475,25 +2458,15 @@ async def dashboard_page(request: Request):
                f"<td class='muted'>{_esc((c.get('endpoint') or '').replace('/v1/', ''))}</td>"
                f"<td><span class='badge warn'>running</span></td>"
                f"<td class='muted jdur' data-since='{started}'>{_dur((now - started) * 1000)}</td>"
-               f"<td class='muted'>—</td><td class='muted'>—</td></tr>")
-    for r in d.get("llm_recent", []):
-        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, _rsn = r
-        scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
-        am = (_esc(alias) or "") + (("→" + _esc(model)) if model else "")
-        view = f"<a href='/ui/call/{cid}'>view</a>" if has_body else "<span class='muted'>—</span>"
-        lr += (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td>"
-               f"<td>{_esc(backend)}</td><td>{am}</td>"
-               f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
-               f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
-               f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{view}</td></tr>")
+               f"<td class='muted'>—</td><td class='muted'>—</td><td class='muted'>—</td>"
+               f"<td class='muted'>—</td></tr>")
+    lr += "".join(_call_row(r, aliases) for r in d.get("llm_recent", []))
     nrun = len(d.get("llm_running", []))
     runbadge = _badge(f"running {nrun}", "warn") if nrun else ""
     llm_head = (f"<h2>Recent LLM calls <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
                 f"{runbadge}</h2>")
     if lr:
-        llm_html = (llm_head + f"<table class='recent sortable' data-sk='dash-llm'><tr><th>time</th>"
-                    f"<th>source</th><th>backend</th><th>alias→model</th><th>endpoint</th><th>status</th>"
-                    f"<th>dur</th><th>tok i/o</th><th>req</th></tr>{lr}</table>")
+        llm_html = llm_head + _calls_table(lr, sk="dash-llm")
     elif not d.get("stats_active") and not nrun:
         llm_html = (llm_head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
                     "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
@@ -2540,30 +2513,62 @@ def _reasoning_cell(rsn) -> str:
     return f"<td>{_badge(_esc(rsn), kind)}</td>"
 
 
-def _recent_calls_table(rows, aliases) -> str:
-    """The per-call history table (time/source/backend/alias→model/…/reasoning/req body).
-    Shared row template — also reused by the dashboard's running+5min LLM view."""
-    rec = ""
-    for r in rows:
-        cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, rsn = r
-        scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
-        if has_body:
-            view = f"<a href='/ui/call/{cid}' title='{_esc(prev or '')}'>view</a>"
-        elif prev:
-            view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
-        else:
-            view = "<span class='muted'>—</span>"
-        rec += (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
-                f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
-                f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
-                f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
-                f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
-    if not rec:
-        return "<p class='muted'>no calls yet</p>"
-    return (f"<table class='recent filterable sortable' data-sk='llm-calls'><tr><th>time</th><th>source</th>"
+def _call_row(r, aliases) -> str:
+    """One finished-call row (15-col stats tuple) — the ONE template behind the
+    LLM Calls list and the dashboard's running+5min panel."""
+    cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, rsn = r
+    scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
+    if has_body:
+        view = f"<a href='/ui/call/{cid}' title='{_esc(prev or '')}'>view</a>"
+    elif prev:
+        view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
+    else:
+        view = "<span class='muted'>—</span>"
+    return (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
+            f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
+            f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
+            f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
+            f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
+
+
+def _calls_table(rows_html: str, sk: str) -> str:
+    """Header + shell around _call_row rows (one column set everywhere)."""
+    return (f"<table class='recent filterable sortable' data-sk='{sk}'><tr><th>time</th><th>source</th>"
             f"<th>backend</th><th>alias→model</th><th>endpoint</th><th>status</th><th>dur</th><th>tok i/o</th>"
             f"<th>cost</th><th title='normalized reasoning control applied to this call'>reasoning</th>"
-            f"<th>req</th></tr>{rec}</table>")
+            f"<th>req</th></tr>{rows_html}</table>")
+
+
+def _recent_calls_table(rows, aliases) -> str:
+    """The per-call history table (time/source/backend/alias→model/…/reasoning/req body)."""
+    rec = "".join(_call_row(r, aliases) for r in rows)
+    if not rec:
+        return "<p class='muted'>no calls yet</p>"
+    return _calls_table(rec, sk="llm-calls")
+
+
+_BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
+_FILTER_JS = ("<script>function sfRun(){var q=(document.getElementById('sf').value||'').toLowerCase();"
+              "document.querySelectorAll('.filterable tr').forEach(function(r){"
+              "if(r.getElementsByTagName('th').length)return;"
+              "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}</script>")
+
+
+def _user_filter_bar(path: str, user, by_source, aliases) -> tuple[str, str]:
+    """(scope_suffix, bar_html) — the user picker + row-filter input shared by the
+    LLM Calls and Statistic pages. Append _FILTER_JS to the page body once."""
+    opts = "<option value=''>all users</option>" + "".join(
+        f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
+        for r in by_source)
+    picker = (f"<select style=\"width:auto;{_BOX_STYLE}\" onchange=\"location.href='{path}'+"
+              f"(this.value?('?user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
+    search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
+              f"placeholder='filter rows: backend / alias / model / user…' "
+              f"style=\"flex:1;min-width:220px;max-width:420px;{_BOX_STYLE}\">")
+    scope = (f" · <span class='muted' style='font-weight:normal'>user <b>{_esc(user)}</b> · "
+             f"<a href='{path}'>clear</a></span>") if user else ""
+    bar = f"<div style='display:flex;gap:10px;align-items:center;margin:6px 0 10px'>{picker}{search}</div>"
+    return scope, bar
 
 
 async def llmcalls_page(request: Request):
@@ -2575,26 +2580,12 @@ async def llmcalls_page(request: Request):
             "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to log "
             "per-call history here.</p>", "llmcalls"))
     user = (request.query_params.get("user") or "").strip() or None
-    s = stats.summary(recent_limit=300, user=user)
+    s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
     aliases = store.get_ip_aliases()
-    _box = ("padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0")
-    opts = "<option value=''>all users</option>" + "".join(
-        f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
-        for r in s["by_source"])
-    picker = (f"<select style=\"width:auto;{_box}\" onchange=\"location.href='/ui/llmcalls'+"
-              f"(this.value?('?user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
-    search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
-              f"placeholder='filter rows: backend / alias / model / user…' "
-              f"style=\"flex:1;min-width:220px;max-width:420px;{_box}\">")
-    scope = (f" · <span class='muted' style='font-weight:normal'>user <b>{_esc(user)}</b> · "
-             f"<a href='/ui/llmcalls'>clear</a></span>") if user else ""
-    sfjs = ("<script>function sfRun(){var q=(document.getElementById('sf').value||'').toLowerCase();"
-            "document.querySelectorAll('.filterable tr').forEach(function(r){"
-            "if(r.getElementsByTagName('th').length)return;"
-            "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}</script>")
+    scope, bar = _user_filter_bar("/ui/llmcalls", user, s["by_source"], aliases)
     head = (f"<h2>LLM Calls{scope} <span class='muted' style='font-weight:normal'>· last {len(s['recent'])}</span></h2>"
-            f"<div style='display:flex;gap:10px;align-items:center;margin:6px 0 10px'>{picker}{search}</div>")
-    body = head + _recent_calls_table(s["recent"], aliases) + sfjs
+            f"{bar}")
+    body = head + _recent_calls_table(s["recent"], aliases) + _FILTER_JS
     return HTMLResponse(_page("LLM Calls", body, "llmcalls"))
 
 
@@ -2604,19 +2595,9 @@ async def statistic_page(request: Request):
             "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to collect "
             "per-call stats here.</p>", "statistic"))
     user = (request.query_params.get("user") or "").strip() or None
-    s = stats.summary(user=user)
+    s = await asyncio.to_thread(stats.summary, user=user)
     aliases = store.get_ip_aliases()
-    _box = ("padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0")
-    opts = "<option value=''>all users</option>" + "".join(
-        f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
-        for r in s["by_source"])
-    picker = (f"<select style=\"width:auto;{_box}\" onchange=\"location.href='/ui/statistic'+"
-              f"(this.value?('?user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
-    search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
-              f"placeholder='filter rows: backend / alias / model / user…' "
-              f"style=\"flex:1;min-width:220px;max-width:420px;{_box}\">")
-    scope = (f" · <span class='muted' style='font-weight:normal'>user <b>{_esc(user)}</b> · "
-             f"<a href='/ui/statistic'>clear</a></span>") if user else ""
+    scope, bar = _user_filter_bar("/ui/statistic", user, s["by_source"], aliases)
     cards = (f"<div class='cards'>"
              f"<div class='card'><div class='cnum'>{s['total_count']}</div><div class='clbl'>calls total</div></div>"
              f"<div class='card'><div class='cnum'>{_cost(s['total_cost'])}</div><div class='clbl'>cost total</div></div>"
@@ -2642,13 +2623,8 @@ async def statistic_page(request: Request):
     # to the aggregates. Point there so the link is discoverable.
     recent = ("<p class='hint' style='margin-top:18px'>Per-call history (with request/response bodies) "
               "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
-    sfjs = ("<script>function sfRun(){var q=(document.getElementById('sf').value||'').toLowerCase();"
-            "document.querySelectorAll('.filterable tr').forEach(function(r){"
-            "if(r.getElementsByTagName('th').length)return;"
-            "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}</script>")
-    head = (f"<h2>Statistic{scope}</h2>"
-            f"<div style='display:flex;gap:10px;align-items:center;margin:6px 0 10px'>{picker}{search}</div>")
-    body = head + cards + by_backend + by_model + by_source + recent + sfjs
+    head = f"<h2>Statistic{scope}</h2>{bar}"
+    body = head + cards + by_backend + by_model + by_source + recent + _FILTER_JS
     return HTMLResponse(_page("Statistic", body, "statistic"))
 
 
@@ -2792,7 +2768,7 @@ async def reasoning_page(request: Request):
 
 
 async def reasoning_save(request: Request):
-    qs = parse_qs((await request.body()).decode("utf-8", "replace"), keep_blank_values=True)
+    qs = await _form_multi(request)                     # backends arrive as a checkbox list
     g = lambda k, d="": (qs.get(k) or [d])[-1]
     rules = store.get_reasoning_rules() if store.is_active() else []
     adapter = (g("adapter", "none").strip() or "none")
@@ -2944,10 +2920,11 @@ async def users_page(request: Request):
         detail = _user_form(None)
     else:
         detail = "<h2>Details</h2><p class='hint'>Select a user's <b>Edit</b>, or <b>+ New user</b>.</p>"
-    await _autoresolve_ips()
+    by_source = ((await asyncio.to_thread(stats.summary))["by_source"]
+                 if stats.is_active() else [])              # ONE summary per render
+    await _autoresolve_ips(by_source)
     ipa = store.get_ip_aliases()
-    seen_ips = sorted({r[0] for r in (stats.summary()["by_source"] if stats.is_active() else [])
-                       if _looks_like_ip(r[0])} | set(ipa.keys()))
+    seen_ips = sorted({r[0] for r in by_source if _looks_like_ip(r[0])} | set(ipa.keys()))
     iprows = ""
     for ip in seen_ips:
         iprows += (f"<tr><td><code>{_esc(ip)}</code></td>"
@@ -2988,9 +2965,7 @@ async def ipalias_del(request: Request):
 
 
 async def users_save(request: Request):
-    # parse_qs directly: the model allow-list is a multi-value field (one per checkbox),
-    # which _form() would collapse to a single value.
-    qs = parse_qs((await request.body()).decode("utf-8", "replace"), keep_blank_values=True)
+    qs = await _form_multi(request)                     # model allow-list is a checkbox list
     g = lambda k, d="": (qs.get(k) or [d])[-1]
     name = g("name").strip()
     if not name:
