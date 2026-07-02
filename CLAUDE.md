@@ -122,6 +122,13 @@ hot-reload-safe.
 A backend is a candidate only if enabled, healthy, **not busy** (in-flight cap),
 maps the alias, and exposes the resolved model. Recurring concepts:
 
+- **Route index** (`_route_index` + `rebuild_route_index()`): alias→candidates and
+  bare-model-id pass-through are **precomputed** (pre-sorted by effective priority);
+  `resolve_routes()` only evaluates the live flags (healthy/busy/draining) per
+  request. Rebuilt by `rebuild_backends()`/`rebuild_virtual_models()` and on every
+  discovery model-set change — never mutate `backends`/`virtual_models` outside
+  those functions or the index goes stale.
+
 - **Aliases** (`virtual_models`): string (same everywhere) or per-backend dict whose
   value is a model id or `{model, priority}` (per-alias priority override).
   `alias_entry()` resolves all shapes.

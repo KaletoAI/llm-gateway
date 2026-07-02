@@ -109,6 +109,7 @@ def rebuild_backends() -> None:
         for b in store.list_backends():
             merged[backend_id(b)] = b      # store overrides config per (name, type)
     backends = sorted(merged.values(), key=lambda b: b.get("priority", 100))
+    rebuild_route_index()                  # backend set/enabled flags changed
 
 
 def rebuild_virtual_models() -> None:
@@ -126,6 +127,7 @@ def rebuild_virtual_models() -> None:
         park.update(store.get_alias_park())
     alias_park_s = park
     apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
+    rebuild_route_index()                  # alias mappings changed
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -294,11 +296,14 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         return
     try:
         caps = await adapter.discover(client)
-        if store.is_active() and caps.models != backend_models.get(bid):
+        changed = caps.models != backend_models.get(bid)
+        if changed and store.is_active():
             await asyncio.to_thread(store.save_backend_models, bid, caps.models)  # persist on change
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
+        if changed:
+            rebuild_route_index()          # model set changed → refresh routing candidates
         if not backend_healthy.get(bid):
             logger.info(f"[{label}] UP  — {len(caps.models)} models, {len(caps.pricing)} priced")
         backend_healthy[bid] = True
@@ -574,9 +579,44 @@ def split_backend_prefix(model: str) -> tuple[Optional[str], str]:
     """
     if "/" in model:
         prefix, rest = model.split("/", 1)
-        if any(b["name"] == prefix for b in backends):
+        if prefix in _backend_names:
             return prefix, rest
     return None, model
+
+
+# ── Route index (precomputed candidates; health/busy/drain stay live checks) ────
+# The static routing inputs — which enabled LLM backend maps an alias to which real
+# model at what effective priority, and which bare model ids pass through — change
+# only on config/store edits or a discovery model-set change. They are precomputed
+# here (pre-sorted by priority) instead of rescanned and re-sorted on every request;
+# resolve_routes() then only evaluates the live flags (healthy / busy / draining).
+# Rebuilt by rebuild_backends() / rebuild_virtual_models() and by refresh_backend()
+# whenever a backend's model set changes. Swapped atomically (built local, then
+# assigned) — safe for the off-loop readers (get_gen_routes runs in a thread).
+_backend_names: set = set()            # all backend names — split_backend_prefix test
+_llm_backends: list = []               # enabled non-ComfyUI backends, priority order
+_comfy_backends: list = []             # enabled ComfyUI backends (generation routing)
+_route_index: dict = {}                # alias/model-id → [(backend, real_model)] pre-sorted
+
+
+def rebuild_route_index() -> None:
+    global _backend_names, _llm_backends, _comfy_backends, _route_index
+    _backend_names = {b["name"] for b in backends}
+    _llm_backends = [b for b in enabled_backends() if b.get("type", "openai") != "comfyui"]
+    _comfy_backends = [b for b in enabled_backends() if b.get("type") == "comfyui"]
+    index: dict[str, list] = {}
+    for alias in virtual_models:                       # aliases (they shadow same-named real ids)
+        for b in _llm_backends:
+            real, prio = alias_entry(alias, b["name"])
+            if real is not None and real in backend_models.get(backend_id(b), set()):
+                index.setdefault(alias, []).append(
+                    (prio if prio is not None else b["priority"], b, real))
+    for b in _llm_backends:                            # bare model ids → pass-through routing
+        for mid in backend_models.get(backend_id(b), set()):
+            if mid not in virtual_models:
+                index.setdefault(mid, []).append((b["priority"], b, mid))
+    _route_index = {k: [(b, r) for _, b, r in sorted(rows, key=lambda x: x[0])]
+                    for k, rows in index.items()}
 
 
 def resolve_routes(alias: str) -> tuple[list, list]:
@@ -585,36 +625,27 @@ def resolve_routes(alias: str) -> tuple[list, list]:
     `ready` is routable now; `busy` maps + serves the alias but sits at its
     in-flight cap (→ parkable). A '<backend>/<model>' alias resolves to a single
     backend in whichever bucket. Drives both normal routing (ready) and call
-    parking (busy).
+    parking (busy). Candidates come pre-resolved and pre-sorted from
+    `_route_index`; only healthy/busy/draining are evaluated per request.
     """
-    # chat routing only considers LLM (non-ComfyUI) backends, so a name shared with a
-    # ComfyUI backend is unambiguous here.
-    llm = [b for b in enabled_backends()
-           if b.get("type", "openai") != "comfyui" and not is_draining(b)]
     bname, bare = split_backend_prefix(alias)
     if bname is not None:
-        b = next((b for b in llm if b["name"] == bname), None)
-        if b is None or not backend_healthy.get(backend_id(b)):
+        # chat routing only considers LLM backends, so a name shared with a ComfyUI
+        # backend is unambiguous here.
+        b = next((b for b in _llm_backends if b["name"] == bname), None)
+        if b is None or not backend_healthy.get(backend_id(b)) or is_draining(b):
             return [], []
         real = resolve_for_backend(bare, bname)
         if real is None or real not in backend_models.get(backend_id(b), set()):
             return [], []
         return ([], [(b, real)]) if backend_busy(b) else ([(b, real)], [])
 
-    # Bare alias → priority routing. The alias may override a backend's priority
-    # for this alias only; backends without an override keep their global prio.
     ready, busy = [], []
-    for b in llm:
-        if not backend_healthy.get(backend_id(b)):
+    for b, real in _route_index.get(alias, ()):
+        if not backend_healthy.get(backend_id(b)) or is_draining(b):
             continue
-        real, prio = alias_entry(alias, b["name"])
-        if real is None or real not in backend_models.get(backend_id(b), set()):
-            continue
-        eff_prio = prio if prio is not None else b["priority"]
-        (busy if backend_busy(b) else ready).append((eff_prio, b, real))
-    ready.sort(key=lambda r: r[0])
-    busy.sort(key=lambda r: r[0])
-    return ([(b, r) for _, b, r in ready], [(b, r) for _, b, r in busy])
+        (busy if backend_busy(b) else ready).append((b, real))
+    return ready, busy
 
 
 def get_routes_for(alias: str) -> list[tuple[dict, str]]:
@@ -792,6 +823,7 @@ def build_backend_adapters() -> None:
 
 
 build_backend_adapters()
+rebuild_route_index()                      # initial index (config backends; models fill in via discovery)
 
 
 async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, deadline=None):
@@ -823,7 +855,7 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
     `stats_endpoint` overrides the recorded endpoint label (e.g. /v1/responses)."""
     last_error: Exception = Exception("unknown")
     for backend, real_model in candidates:
-        body["model"] = real_model
+        cand_body = dict(body, model=real_model)  # per-candidate copy — the shared body stays untouched
         adapter = backend_adapters.get(backend_id(backend))
         if adapter is None:                       # config raced a reload — skip
             continue
@@ -832,7 +864,7 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
                 logger.info(f"→ [{backend['name']}] {alias} → {real_model}")
             req = NormalizedRequest(
                 path=path, alias=alias, real_model=real_model,
-                body=body, raw=request, stream=bool(body.get("stream")),
+                body=cand_body, raw=request, stream=bool(body.get("stream")),
                 stats_endpoint=stats_endpoint, reasoning=body.get("_reasoning"),
             )
             return await adapter.dispatch(req)
@@ -1429,8 +1461,7 @@ def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, d
         candidates = image_models.get(alias, [])
     # generation routes only to ComfyUI backends, so a name shared with an LLM backend
     # resolves to the right one.
-    comfy = [b for b in enabled_backends()
-             if b.get("type") == "comfyui" and not is_draining(b)]
+    comfy = [b for b in _comfy_backends if not is_draining(b)]
     out = []
     for cand in candidates:
         b = next((b for b in comfy if b["name"] == cand.get("backend")), None)
