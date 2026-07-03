@@ -450,6 +450,25 @@ def set_alias_reasoning(alias: str, mode) -> None:
     set_settings({"alias_reasoning": m})
 
 
+def get_alias_voice() -> dict:
+    return get_setting("alias_voice") or {}
+
+
+def set_alias_voice(alias: str, defaults) -> None:
+    """Set/clear an alias's TTS voice defaults ({voice, ref_text} — filled into
+    /v1/audio/speech bodies when the client omits them). Empty/None clears."""
+    m = get_alias_voice()
+    d = {k: str(v).strip() for k, v in (defaults or {}).items()
+         if k in ("voice", "ref_text") and str(v or "").strip()}
+    if d:
+        m[alias] = d
+    elif alias in m:
+        del m[alias]
+    else:
+        return
+    set_settings({"alias_voice": m})
+
+
 # ── Reasoning rules (normalized thinking toggle) ────────────────────────────────
 # Ordered list of {match, backends[], adapter, param} — see reasoning.py. Stored as
 # one settings entry; first matching rule (model-glob × backend-set) wins.

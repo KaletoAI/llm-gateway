@@ -120,7 +120,7 @@ def rebuild_virtual_models() -> None:
     entries merged over them by alias (store overrides config for the same name).
     Also refreshes the per-alias park times and reasoning defaults. Call after
     config reload or any store chat-alias change."""
-    global virtual_models, alias_park_s, alias_reasoning
+    global virtual_models, alias_park_s, alias_reasoning, alias_voice
     merged = dict(config_virtual_models)
     if store.is_active():
         merged.update(store.list_chat_aliases())
@@ -130,6 +130,7 @@ def rebuild_virtual_models() -> None:
         park.update(store.get_alias_park())
     alias_park_s = park
     alias_reasoning = store.get_alias_reasoning() if store.is_active() else {}
+    alias_voice = store.get_alias_voice() if store.is_active() else {}
     apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
     rebuild_route_index()                  # alias mappings changed
 
@@ -242,6 +243,7 @@ async_park_timeout_s: float = 600.0
 max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
+alias_voice: dict = {}                  # alias → {voice, ref_text} TTS defaults (store). Client wins.
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
 
@@ -980,6 +982,12 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     body.pop("park", None)                              # legacy control field — parking is automatic; never forward
     if path.startswith("/v1/audio/"):
         body.pop("stream", None)                        # audio is a binary passthrough — never SSE
+        av = alias_voice.get(alias)
+        if av:                                          # per-alias TTS defaults; explicit client fields win
+            if av.get("voice") and not body.get("voice"):
+                body["voice"] = av["voice"]
+            if av.get("ref_text") and not (body.get("params") or {}).get("ref_text"):
+                body.setdefault("params", {})["ref_text"] = av["ref_text"]
     r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
     if r is None:
         r = alias_reasoning.get(alias)                  # per-alias default (tool vs tool-thinking)

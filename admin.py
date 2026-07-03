@@ -1123,12 +1123,21 @@ def _chat_editor(alias: str) -> str:
                    "<b>auto</b> = model default; an explicit client <code>reasoning</code> field always wins. "
                    "Lets e.g. <code>tool</code> (off) and <code>tool-thinking</code> (auto/on) share one "
                    "backend+model.</p>")
+    cur_voice = store.get_alias_voice().get(alias) or {}
+    voice_field = (_field("voice default", _inp("voice_ref", cur_voice.get("voice", ""),
+                          placeholder="backend-side reference, e.g. voices/kai-ref.wav"))
+                   + _field("voice ref text", _inp("voice_ref_text", cur_voice.get("ref_text", ""),
+                          placeholder="exact transcript of the reference recording"))
+                   + "<p class='hint' style='margin:-4px 0 10px'>TTS defaults for <code>/v1/audio/speech</code> "
+                     "via this alias: filled in when the client sends no <code>voice</code>/<code>ref_text</code> "
+                     "(explicit client fields always win). Only relevant when the alias maps a TTS model — "
+                     "lets a client say just <code>model:\"kai\"</code> + <code>input</code>.</p>")
     return ('<form action="/ui/chat/save" method="post">'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
-            + park_field + rsn_field
+            + park_field + rsn_field + voice_field
             + "<h2>Backends</h2>"
             + "<p class='hint'>Assign backends to this alias, pick the model on each, and optionally "
               "override that backend's global priority for this alias only. Tried in priority order "
@@ -1177,9 +1186,12 @@ async def chat_save(request: Request):
         store.delete_chat_alias(orig)         # renamed a store entry → move it
         store.set_alias_park(orig, None)      # drop the old name's overrides
         store.set_alias_reasoning(orig, None)
+        store.set_alias_voice(orig, None)
     store.upsert_chat_alias(alias, value)
     store.set_alias_park(alias, park_s if park_s != "" else None)   # blank → global default
     store.set_alias_reasoning(alias, rsn)                           # 'auto'/blank clears
+    store.set_alias_voice(alias, {"voice": f.get("voice_ref", ""),  # blank fields clear
+                                  "ref_text": f.get("voice_ref_text", "")})
     _apply_chat_aliases()
     logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'}, "
                 f"reasoning={rsn or 'auto'})")
@@ -1215,6 +1227,7 @@ async def chat_del(request: Request):
         store.delete_chat_alias(alias)
         store.set_alias_park(alias, None)     # drop the alias's overrides with it
         store.set_alias_reasoning(alias, None)
+        store.set_alias_voice(alias, None)
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
     return RedirectResponse("/ui/mapping", status_code=303)
