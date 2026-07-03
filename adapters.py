@@ -509,6 +509,32 @@ def image_params(wf: dict, mapping: dict) -> list:
     return [p for p, m in (mapping or {}).items() if is_image_field(wf, (m or {}).get("node"))]
 
 
+def slot_empty_mode(m: dict) -> str:
+    """What a mapped image slot does when the request sends no image for it:
+    'placeholder' (8×8 black, the default) · 'required' (no fallback → ComfyUI errors
+    if it is missing) · 'disable' (drop the loader node and any link to it, so an
+    OPTIONAL downstream input runs without this image). Reads the `on_empty` field,
+    falling back to the legacy `no_placeholder` boolean."""
+    mode = (m or {}).get("on_empty")
+    if mode in ("placeholder", "required", "disable"):
+        return mode
+    return "required" if (m or {}).get("no_placeholder") else "placeholder"
+
+
+def _prune_node(wf: dict, nid: str) -> None:
+    """Deactivate a node: remove it from the prompt and drop any input link that points
+    at its output (`[nid, slot]`). The consuming node must accept the now-missing input
+    (an optional socket), else ComfyUI errors — that contract is on the workflow."""
+    if wf.pop(nid, None) is None:
+        return
+    for n in wf.values():
+        inp = n.get("inputs")
+        if isinstance(inp, dict):
+            for fld in [k for k, v in inp.items()
+                        if isinstance(v, list) and v and str(v[0]) == str(nid)]:
+                inp.pop(fld, None)
+
+
 def _img_slug(s: str) -> str:
     """A safe, stable per-param input filename so each image field reuses one slot."""
     keep = "".join(ch if ch.isalnum() else "_" for ch in (s or "img"))
@@ -823,10 +849,15 @@ class ComfyUIAdapter(BackendAdapter):
                 data = uploads.get(p)
                 if data:
                     name = await self._upload_image(c, bytes(data), _img_slug(p))
-                elif m.get("no_placeholder"):
-                    continue                  # required slot (e.g. inpaint image/mask): no 8×8 fallback,
-                                              # keep the workflow's own value
                 else:
+                    mode = slot_empty_mode(m)
+                    if mode == "required":
+                        continue              # no 8×8 fallback (e.g. inpaint image/mask) →
+                                              # keep the workflow's own value / error if empty
+                    if mode == "disable":     # drop the loader node + its links → optional consumer
+                        _prune_node(wf, nid)  # runs without this image
+                        applied.append(p)
+                        continue
                     name = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png")
                 wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = name
                 applied.append(p)
@@ -837,9 +868,10 @@ class ComfyUIAdapter(BackendAdapter):
         request field) → fill it with the 8×8 placeholder, so ComfyUI never tries to
         open the input/ directory. Mapped image fields are handled per-field above.
 
-        Slots a `no_placeholder` request-field maps to are REQUIRED uploads — never
-        auto-filled; left empty so ComfyUI errors clearly when one is missing."""
-        skip = {(m or {}).get("node") for m in (mapping or {}).values() if (m or {}).get("no_placeholder")}
+        Slots a `required`/`disable` request-field maps to are never auto-filled:
+        `required` is left empty so ComfyUI errors clearly, `disable` was already pruned."""
+        skip = {(m or {}).get("node") for m in (mapping or {}).values()
+                if slot_empty_mode(m) in ("required", "disable")}
         empty = [nid for nid, n in wf.items()
                  if n.get("class_type") in _IMG_LOADER_CLASSES
                  and not (n.get("inputs") or {}).get("image")

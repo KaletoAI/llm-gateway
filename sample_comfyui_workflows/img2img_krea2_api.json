@@ -1,0 +1,278 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "krea2-TurboOfficialComfy_krea2TurboFp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "qwen3-VL-4B-Abliterated.safetensors",
+      "type": "krea2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "input_clip"
+    }
+  },
+  "3": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "input_vae"
+    }
+  },
+  "4": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "input_resolution"
+    }
+  },
+  "16": {
+    "inputs": {
+      "text": [
+        "29",
+        0
+      ],
+      "image1_tokens": "normal",
+      "image2_tokens": "normal",
+      "image3_tokens": "normal",
+      "image4_tokens": "normal",
+      "clip": [
+        "34",
+        1
+      ],
+      "negative": [
+        "30",
+        0
+      ],
+      "image1": [
+        "17",
+        0
+      ],
+      "image2": [
+        "31",
+        0
+      ],
+      "image3": [
+        "32",
+        0
+      ],
+      "image4": [
+        "33",
+        0
+      ]
+    },
+    "class_type": "Krea2EditRebalance",
+    "_meta": {
+      "title": "Krea 2 Image Edit Rebalance"
+    }
+  },
+  "17": {
+    "inputs": {
+      "image": "Kira_1771187718.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_image1"
+    }
+  },
+  "20": {
+    "inputs": {
+      "model": [
+        "34",
+        0
+      ],
+      "conditioning": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "Basic Guider"
+    }
+  },
+  "21": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "22": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "34",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "23": {
+    "inputs": {
+      "noise": [
+        "28",
+        0
+      ],
+      "guider": [
+        "20",
+        0
+      ],
+      "sampler": [
+        "21",
+        0
+      ],
+      "sigmas": [
+        "22",
+        0
+      ],
+      "latent_image": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "24": {
+    "inputs": {
+      "samples": [
+        "23",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "25": {
+    "inputs": {
+      "images": [
+        "24",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "output_image"
+    }
+  },
+  "27": {
+    "inputs": {
+      "value": 5435543
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_seed"
+    }
+  },
+  "28": {
+    "inputs": {
+      "noise_seed": [
+        "27",
+        0
+      ]
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "29": {
+    "inputs": {
+      "value": "a candid full-body photo with natural light and high detail of a single woman Kira standing, Kira is 26 years young female, short athletic frame, light skin, large breasts, round perfect breasts, small butt, blonde medium hair, blue eyes, Kira is naked, standing with one hand on hip, weight shifted to one leg, shoulder slightly raised, chin up, bright focused eyes, slight knowing smile, head tilted, inspired engaged expression"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_positiv"
+    }
+  },
+  "30": {
+    "inputs": {
+      "value": "illustration, anime, cgi, 3d render, painting, airbrushed skin, plastic skin, smooth flawless skin, overexposed, glossy, fantasy, studio lighting, posed, cartoon, drawing, sketch, watermark, signature, text, logo, deformed, blurry, low quality\n"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_negativ"
+    }
+  },
+  "31": {
+    "inputs": {
+      "image": "Kira_1771187718.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_image2"
+    }
+  },
+  "32": {
+    "inputs": {
+      "image": "Kira_1771187718.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_image3"
+    }
+  },
+  "33": {
+    "inputs": {
+      "image": "1771970645.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_image4"
+    }
+  },
+  "34": {
+    "inputs": {
+      "lora_01": "krea2-KNPV3_1.safetensors",
+      "strength_01": 1,
+      "lora_02": "None",
+      "strength_02": 1,
+      "lora_03": "None",
+      "strength_03": 1,
+      "lora_04": "None",
+      "strength_04": 1,
+      "model": [
+        "1",
+        0
+      ],
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "Lora Loader Stack (rgthree)",
+    "_meta": {
+      "title": "input_lora"
+    }
+  }
+}

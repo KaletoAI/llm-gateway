@@ -1516,6 +1516,14 @@ async def update_workflow(request: Request):
     for c in cands:
         c["workflow_json"] = wf                          # workflow + mapping are backend-independent →
         c["mapping"] = base_mapping                      # keep synced; `fixed` stays per-backend
+    # Pull the node TITLE into the display label (input name) for image-loader slots
+    # whose label is still empty — so a re-exported workflow that (re)titles its
+    # LoadImage nodes updates their field names. A hand-set label is left untouched.
+    for m in base_mapping.values():
+        if m and not (m.get("label") or "").strip() and adapters.is_image_field(wf, m.get("node")):
+            title = ((wf.get(m.get("node"), {}) or {}).get("_meta") or {}).get("title", "").strip()
+            if title:
+                m["label"] = title
     store.upsert(alias, cands)
     mapping = base_mapping
     stale = [p for p, m in mapping.items() if (m or {}).get("node") not in wf]
@@ -1606,10 +1614,16 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict) -> str:
         cur_disp = ("image upload" if is_img else
                     "(linked)" if isinstance(cur, list) else ("" if cur is None else str(cur)))
         if is_img:
-            cur_cell = ('image upload <label class="muted" style="font-weight:normal" '
-                        'title="require an upload; do not substitute the 8×8 placeholder">'
-                        f'<input type="checkbox" name="noph__{_esc(p)}"'
-                        f'{" checked" if m.get("no_placeholder") else ""}> required</label>')
+            mode = adapters.slot_empty_mode(m)
+            eopts = [("placeholder", "8×8 if empty"), ("required", "required"),
+                     ("disable", "disable node if empty")]
+            esel = "".join(f'<option value="{v}"{" selected" if v == mode else ""}>{l}</option>'
+                           for v, l in eopts)
+            cur_cell = ('image upload <select name="empty__' + _esc(p) + '" style="width:auto" '
+                        'title="what to do when the request sends no image for this slot: '
+                        '8×8 black placeholder · required (error if missing) · disable the loader '
+                        'node (drop it + its links, optional consumer runs without it)">'
+                        + esel + '</select>')
         else:
             cur_cell = _esc(cur_disp[:60])
         tag = " <span class='tag'>image</span>" if is_img else ""
@@ -1806,18 +1820,31 @@ async def edit_del(request: Request):
     return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
 
 
+def _slug_param(s: str) -> str:
+    """A ComfyUI node title → a safe request-param name (lowercase, non-alnum → _)."""
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", (s or "").lower())).strip("_")
+
+
 async def field_map(request: Request):
-    """Promote an available node.field to a request param. The param name defaults to
-    the field name (node-qualified on collision); any scalar field is eligible — there
-    is no fixed param list. Rename it afterwards by editing the node/field cells."""
+    """Promote an available node.field to a request param. For image loaders the param
+    name (and label) default to the node TITLE — so 4 titled reference-image nodes get
+    distinct, readable names instead of image / image_<id> — else the field name;
+    node-qualified on collision. Rename afterwards by editing the cells."""
     alias, node = _qp(request, "alias"), _qp(request, "node")
     fld = _qp(request, "field")
     cands = store.get(alias)
     if cands and node and fld:
         cand = cands[0]
+        wf = cand.get("workflow_json") or {}
+        title = ((wf.get(node, {}) or {}).get("_meta") or {}).get("title", "").strip()
+        is_img = adapters.is_image_field(wf, node)
+        base = (_slug_param(title) if (is_img and title) else fld) or fld
         mp = cand.setdefault("mapping", {})
-        param = fld if fld not in mp else f"{fld}_{node}"
-        mp[param] = {"node": node, "field": fld}
+        param = base if base not in mp else f"{base}_{node}"
+        entry = {"node": node, "field": fld}
+        if is_img and title:
+            entry["label"] = title
+        mp[param] = entry
         store.upsert(alias, cands)
     return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
 
@@ -1917,8 +1944,9 @@ async def update(request: Request):
                 lbl = (f.get(f"label__{p}", "") or "").strip()
                 if lbl:                       # label overrides Playground label / API field name
                     entry["label"] = lbl
-                if f.get(f"noph__{p}"):       # image slot: require upload, no 8×8 placeholder fallback
-                    entry["no_placeholder"] = True
+                emode = (f.get(f"empty__{p}", "") or "").strip()   # image slot empty-behaviour
+                if emode in ("placeholder", "required", "disable"):
+                    entry["on_empty"] = emode
                 mapping[p] = entry
     fixed = []
     for key, val in f.items():
@@ -2002,8 +2030,9 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     # selecting an alias reloads with its workflow defaults pre-filled
     opts = "".join(f'<option value="{_esc(a)}"{" selected" if a == vals.get("model") else ""}>{_esc(a)}</option>'
                    for a in aliases)
-    alias_select = ('<select name="model" onchange="location.href=\'/ui/playground?model=\'+'
-                    f'encodeURIComponent(this.value)">{opts}</select>')
+    # switching alias carries the current scalar fields over, so same-named params
+    # (prompt, lora_01, …) survive; the new alias just ignores the ones it lacks.
+    alias_select = f'<select name="model" onchange="pgSwitch(this)">{opts}</select>'
     # one input per MAPPED param of the selected alias (dynamic — mirrors the request
     # fields configured in Mapping, in drag-set order). Image-loader fields render as
     # file uploads (img__<param>, empty → 8×8 placeholder); scalars as p__<param>
@@ -2017,11 +2046,14 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     for p, m in mapping.items():
         label = (m or {}).get("label") or p
         if p in imgset:
+            emode = adapters.slot_empty_mode(m)
             if kept and p in kept:
                 extra = (' <span class="badge ok">✓ kept</span> <label class="muted" '
                          f'style="font-weight:normal"><input type="checkbox" name="clear__{_esc(p)}"> clear</label>')
-            elif (m or {}).get("no_placeholder"):
+            elif emode == "required":
                 extra = ' <span class="muted">required — no placeholder</span>'
+            elif emode == "disable":
+                extra = ' <span class="muted">empty → loader node disabled</span>'
             else:
                 extra = ' <span class="muted">empty → 8×8 placeholder</span>'
             rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*">{extra}')
@@ -2048,12 +2080,18 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                + "".join(f'<option value="{_esc(b)}"{" selected" if b == sel_bk else ""}>{_esc(b)}</option>'
                          for b in bk_list))
     backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
+    pg_switch_js = ("<script>function pgSwitch(sel){var f=sel.form,"
+                    "q='model='+encodeURIComponent(sel.value);"
+                    "f.querySelectorAll('[name^=\"p__\"]').forEach(function(el){"
+                    "if(el.value!=='')q+='&'+encodeURIComponent(el.name)+'='+encodeURIComponent(el.value);});"
+                    "location.href='/ui/playground?'+q;}</script>")
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Media Playground</h2>{_btn("Generate", submit=True)}</div>'
             + _field("alias", alias_select)
             + backend_field
             + rows
-            + '<p class="hint">synchronous; image backends ~1 min · each image reuses one slot</p></form>')
+            + '<p class="hint">synchronous; image backends ~1 min · each image reuses one slot</p></form>'
+            + pg_switch_js)
 
 
 # Polls ONLY the result column (not a full-page meta-refresh), so the form stays
@@ -2333,8 +2371,12 @@ async def job_detail_page(job_id: str, request: Request):
             f"{_esc(job['backend'])} · owner {_esc(job['owner'])} · {_age(job['created'])}{exp}</p>")
     cancel_btn = (_btn("✕ Cancel", f"/ui/job/{_esc(job_id)}/cancel", "danger", confirm="Cancel this job?")
                   if st in ("queued", "running") else "")
+    # Load this job's inputs (prompt/params + reference images) into the Media Playground.
+    to_pg = (_btn("→ Send to Playground", f"/ui/job/{_esc(job_id)}/to-playground",
+                  title="Copy this job's prompt, params and reference images into the Media Playground")
+             if store.is_active() and job.get("task") != "response" else "")
     page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
-            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>{cancel_btn}{back}</div>{info}"
+            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>{cancel_btn}{to_pg}{back}</div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
             f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"
             f"<div style='flex:1;min-width:320px'><h2>Output</h2>{outbox}</div></div>"
@@ -2348,6 +2390,38 @@ async def job_input(job_id: str, n: int):
         raise HTTPException(404, "input not found")
     path, mime = ip
     return FileResponse(path, media_type=mime)
+
+
+async def job_to_playground(job_id: str, request: Request):
+    """Load a job's stored inputs into the Media Playground and jump there: scalar
+    params ride the URL (`p__<param>`, so same-named fields land), reference images go
+    into the per-user stash the Playground already reads — same store a real upload
+    uses, so they show as '✓ kept'."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    alias = job.get("alias", "")
+    meta = job.get("meta") or {}
+    inp = meta.get("inputs") or {}
+    q = {"model": alias}
+    if inp.get("prompt"):
+        q["p__prompt"] = inp["prompt"]
+    if inp.get("negative_prompt"):
+        q["p__negative_prompt"] = inp["negative_prompt"]
+    for k, val in (inp.get("params") or {}).items():
+        if val is not None and str(val) != "":
+            q[f"p__{k}"] = str(val)
+    user = _session_user(request) or "default"
+    stash = _pg_images.setdefault((user, alias), {})
+    for r in meta.get("input_images", []):
+        ip = jobs.input_path(job_id, r.get("n"))
+        if ip:
+            try:
+                with open(ip[0], "rb") as fh:
+                    stash[r.get("slot")] = fh.read()
+            except OSError:
+                pass
+    return RedirectResponse(f"/ui/playground?{urlencode(q)}", status_code=303)
 
 
 async def job_cancel(job_id: str):
@@ -3438,6 +3512,7 @@ def register(app) -> None:
     app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
+    app.add_api_route("/ui/job/{job_id}/to-playground", job_to_playground, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/cancel", job_cancel, methods=["GET"])
     app.add_api_route("/ui/dashboard", dashboard_page, methods=["GET"])
     app.add_api_route("/ui/llmcalls", llmcalls_page, methods=["GET"])
