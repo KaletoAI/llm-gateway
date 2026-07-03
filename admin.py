@@ -52,7 +52,7 @@ DEFAULT_TAB = "dashboard"
 # parent route (first child = default). General pattern — future tab groupings
 # register here; the parent page dispatches on `sub` and wraps its body with
 # _with_subnav() so the bar sits above the full-height .cols block.
-SUBTABS = {"playground": [("media", "Media"), ("chat", "Chat")]}
+SUBTABS = {"playground": [("media", "Media"), ("chat", "Chat"), ("voice", "Voice")]}
 
 
 def _subnav(parent: str, active_sub: str) -> str:
@@ -2181,6 +2181,11 @@ async def playground_page(request: Request):
         result_html = "<h2>Response</h2><p class='hint'>Send a message to see the reply here.</p>"
         return HTMLResponse(_page("Chat Playground",
                                   _with_subnav("playground", "chat", _chatplay_body(vals, result_html)), "playground"))
+    if sub == "voice":
+        vals = {k: qp.get(k, "") for k in _VOICEPLAY_KEYS}
+        result_html = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+        return HTMLResponse(_page("Voice",
+                                  _with_subnav("playground", "voice", _voiceplay_body(vals, result_html)), "playground"))
     if not store.is_active():
         return _inactive()
     aliases = list(store.list_aliases().keys())
@@ -2290,6 +2295,90 @@ async def playground_status(job_id: str):
     if not refresh:                              # done/failed → marker tells the poller to stop
         html += "<span data-jobdone hidden></span>"
     return HTMLResponse(html)
+
+
+# ── Playground sub-tab: Voice (direct /v1/audio/speech, synchronous) ─────────────
+# A real API client like chatplay: POSTs the gateway's own /v1/audio/speech and
+# plays the returned WAV. The result bytes live in a per-user stash (like the
+# media playground's reference images) served by /ui/playground/voice-audio.
+
+_VOICEPLAY_KEYS = ("model", "input", "voice", "ref_text")
+_voice_out: dict = {}          # user → (bytes, mime) — last synthesis result
+
+_VOICEPLAY_JS = ("<script>function vpSending(f){"
+                 "var r=document.getElementById('vpresult');"
+                 "if(r)r.innerHTML=\"<h2>Result</h2><p class='muted'>\\u23f3 <b>Synthesizing\\u2026</b> · "
+                 "routing + waiting for the backend (model load can take a while)</p>\";"
+                 "var b=f.querySelector('button[type=submit]');if(b){b.disabled=true;b.textContent='Synthesizing\\u2026';}"
+                 "return true;}</script>")
+
+
+def _voiceplay_form(vals: dict) -> str:
+    v = lambda k: vals.get(k, "")
+    return ('<form action="/ui/playground/voice" method="post" onsubmit="return vpSending(this)">'
+            f'<div class="formbar"><h2>Voice</h2>{_btn("Synthesize", submit=True)}</div>'
+            + _field("model", _dl_input("model", v("model") or "omnivoice-cpp", "vpmodels",
+                                        "TTS model id or alias"), short=True)
+            + _field("text", _textarea("input", v("input"), 5, "the text to speak"))
+            + _field("voice", _inp("voice", v("voice"),
+                                   placeholder="server-side reference, e.g. voices/kai-ref.wav"))
+            + _field("ref text", _textarea("ref_text", v("ref_text"), 2,
+                                           "exact transcript of the reference recording (optional)"))
+            + "<p class='hint'>Synchronous <code>POST /v1/audio/speech</code> — routed like chat "
+              "(bare model id or alias, parking/failover apply). <b>voice</b> is a file path on the "
+              "backend host; leave empty for the model's default voice.</p>"
+            + "</form>" + _datalist("vpmodels", _chat_models()) + _VOICEPLAY_JS)
+
+
+def _voiceplay_body(vals: dict, result_html: str) -> str:
+    return (f'<div class="cols"><div class="col">{_voiceplay_form(vals)}</div>'
+            f'<div class="col" id="vpresult">{result_html}</div></div>')
+
+
+async def voiceplay_send(request: Request):
+    f = await _form(request)
+    vals = {k: (f.get(k, "") or "") for k in _VOICEPLAY_KEYS}
+    model, text = vals["model"].strip() or "omnivoice-cpp", vals["input"].strip()
+    if not text:
+        result = "<h2>Result</h2><p class='bad'>text is required</p>"
+        return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
+                                                        _voiceplay_body(vals, result)), "playground"))
+    body = {"model": model, "input": text}
+    if vals["voice"].strip():
+        body["voice"] = vals["voice"].strip()
+    if vals["ref_text"].strip():
+        body["params"] = {"ref_text": vals["ref_text"].strip()}
+    try:
+        r = await _self_api(request, "POST", "/v1/audio/speech", json=body)
+        ct = r.headers.get("content-type", "")
+        if r.status_code == 200 and not ct.startswith(("application/json", "text/")):
+            _voice_out[_session_user(request) or "default"] = (r.content, ct or "audio/wav")
+            meta = (f"backend <b>{_esc(r.headers.get('x-gateway-backend', '—'))}</b> · "
+                    f"{len(r.content) // 1024} KB · {_esc(ct)}")
+            src = f"/ui/playground/voice-audio?t={int(time.time())}"   # cache-buster per synthesis
+            result = (f"<h2>Result</h2><p class='muted'>✓ {meta}</p>"
+                      f"<audio class='result' controls autoplay src='{src}'></audio>"
+                      f"<p>{_btn('⬇ Download', src, 'secondary')}</p>")
+        else:
+            try:
+                detail = str((r.json() or {}).get("detail") or "")[:600] or r.text[:600]
+            except Exception:
+                detail = r.text[:600]
+            result = (f"<h2>Result</h2><p class='bad'>HTTP {r.status_code}</p>"
+                      f"<pre class='err'>{_esc(detail)}</pre>")
+    except httpx.HTTPError as e:
+        result = f"<h2>Result</h2><p class='bad'>Error: {_esc(f'{type(e).__name__}: {e}')}</p>"
+    return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
+                                                    _voiceplay_body(vals, result)), "playground"))
+
+
+async def voice_audio(request: Request):
+    """Serve the current user's last synthesis result (stash — no persistence)."""
+    stash = _voice_out.get(_session_user(request) or "default")
+    if not stash:
+        raise HTTPException(404, "no synthesis result")
+    data, mime = stash
+    return Response(data, media_type=mime)
 
 
 # ── Media Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
@@ -3558,6 +3647,8 @@ def register(app) -> None:
     app.add_api_route("/ui/reasoning/toggle", reasoning_toggle, methods=["GET"])
     app.add_api_route("/ui/reasoning/delete", reasoning_del, methods=["GET"])
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
+    app.add_api_route("/ui/playground/voice", voiceplay_send, methods=["POST"])
+    app.add_api_route("/ui/playground/voice-audio", voice_audio, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
     app.add_api_route("/ui/playground/status/{job_id}", playground_status, methods=["GET"])
