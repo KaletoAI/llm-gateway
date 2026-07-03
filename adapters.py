@@ -423,15 +423,21 @@ class OpenAIAdapter(BackendAdapter):
         # backend's raw bytes — the gateway doesn't transform it, so the old
         # parse → re-serialize (stats) → re-serialize (JSONResponse) round-trip
         # is gone. Internal callers (Responses bridge) still read resp.body.
-        try:
-            resp_json = resp.json()
-        except Exception:
-            resp_json = {}
+        # Binary bodies (e.g. /v1/audio/speech WAV) are neither parsed nor stored
+        # in the stats blob — charset-decoding audio bytes is garbage + waste.
+        ct = resp.headers.get("content-type", "")
+        is_texty = ct.startswith(("application/json", "text/"))
+        resp_json = {}
+        if is_texty:
+            try:
+                resp_json = resp.json()
+            except Exception:
+                pass
         usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
         in_tok = int(usage.get("prompt_tokens") or 0)
         out_tok = int(usage.get("completion_tokens") or 0)
         elapsed_ms = self._record(req, call, resp.status_code, in_tok, out_tok,
-                                  response_text=resp.text)
+                                  response_text=(resp.text if is_texty else None))
         if call.log_on:
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
         out = Response(resp.content, status_code=resp.status_code,

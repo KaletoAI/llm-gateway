@@ -978,6 +978,8 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
     alias = body.get("model", "")
     await gate_request(authorization, request, alias)        # auth + model allow-list + quota
     body.pop("park", None)                              # legacy control field — parking is automatic; never forward
+    if path.startswith("/v1/audio/"):
+        body.pop("stream", None)                        # audio is a binary passthrough — never SSE
     r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
     if r is None:
         r = alias_reasoning.get(alias)                  # per-alias default (tool vs tool-thinking)
@@ -1264,6 +1266,17 @@ async def embeddings(request: Request, authorization: Optional[str] = Header(Non
     # Backends that filter out embedding models (chat_only) simply won't be
     # candidates here, so the request routes to a backend that actually serves it.
     return await route("/v1/embeddings", request, authorization)
+
+
+@app.post("/v1/audio/speech")
+async def audio_speech(request: Request, authorization: Optional[str] = Header(None)):
+    # OpenAI-shaped TTS / voice cloning: routed like chat by body["model"] (bare id
+    # or alias) through the same dispatch/parking/failover machinery. The backend's
+    # binary audio (audio/wav etc.) passes through untouched — route() strips any
+    # `stream` flag (audio is never SSE) and the adapter skips body parsing/stats
+    # blobs for non-text responses. Extra fields (`voice`, `params.ref_text`, …)
+    # are forwarded verbatim; a per-alias voice default may fill them in.
+    return await route("/v1/audio/speech", request, authorization)
 
 
 # ── Generation (image / video / TTS) ───────────────────────────────────────────
