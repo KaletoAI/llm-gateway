@@ -75,9 +75,11 @@ what they need via injected callables, staying hot-reload-safe.
 - **`admin.py`** — the `/ui` console (mounted via `admin.register(app)` +
   `add_api_route`, *not* `include_router` — broken in this starlette build;
   callbacks injected via `admin.bind(...)`). Session-gated by `_ui_guard` once
-  locked. Tabs in `TABS`; the workflow Mapping editor owns a pasted ComfyUI API
-  JSON and offers discovery-fed dropdowns. POST bodies parsed by hand (`parse_qs`)
-  to stay `python-multipart`-free.
+  locked. Tabs in `TABS`; a top tab can group child views via `SUBTABS` +
+  `_with_subnav()` (`?sub=` on the parent route, first child = default —
+  Playground: Media | Chat | Voice); the workflow Mapping editor owns a pasted
+  ComfyUI API JSON and offers discovery-fed dropdowns. POST bodies parsed by
+  hand (`parse_qs`) to stay `python-multipart`-free.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console). Zero new dependencies — keep it.
@@ -111,8 +113,11 @@ what they need via injected callables, staying hot-reload-safe.
 
 ### Request flow
 
-- **Chat/LLM** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` via
-  `route()`): all funnel through **`_dispatch_or_park()`** — `resolve_routes()` →
+- **Chat/LLM** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+  and `/v1/audio/speech` — a binary TTS passthrough: `route()` strips `stream`
+  on `/v1/audio/*`, fills per-alias `alias_voice` defaults, and the adapter
+  skips body parsing/stats blobs for non-text responses — via `route()`): all
+  funnel through **`_dispatch_or_park()`** — `resolve_routes()` →
   ready vs busy split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the
   first ready, failing over only on connection/timeout errors (HTTP error status
   returned as-is). All busy → **park by default** (FIFO queue, per-alias `park_s`)

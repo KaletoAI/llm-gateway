@@ -415,8 +415,7 @@ locked). Tabs:
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
-| **Chat Playground** | send a chat completion — as a **real API client** through `/v1/chat/completions` (auth, routing, parking, stats all apply) |
-| **Media Playground** | run a generation via `POST /v1/generations` (pick alias/backend, upload refs, set params) — image/video/audio |
+| **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL) |
 | **LLM Calls** | per-call history with stored request/response bodies |
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
@@ -462,6 +461,7 @@ stats:
 | `POST` | `/v1/chat/completions` | chat; priority + failover; streaming; parking; `reasoning: off\|on\|auto` |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
+| `POST` | `/v1/audio/speech` | TTS / voice cloning; same routing; binary audio passthrough (WAV …); `voice` + `params.ref_text` forward verbatim, per-alias voice defaults fill them in |
 | `POST` | `/v1/responses` | Responses API ↔ chat bridge; streaming; parking; `background:true` (async) |
 | `GET` | `/v1/responses/{id}` | poll a background response (queued→…→completed/failed/cancelled) |
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
