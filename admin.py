@@ -42,11 +42,30 @@ TABS = [
     ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
     ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
     ("reasoning", "Reasoning"),
-    ("chatplay", "Chat Playground"), ("playground", "Media Playground"),
+    ("playground", "Playground"),
     ("jobs", "Media Jobs"), ("llmcalls", "LLM Calls"),
     ("statistic", "Statistic"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
+
+# Sub-tabs: a top-level tab can group child views, picked via `?sub=<key>` on the
+# parent route (first child = default). General pattern — future tab groupings
+# register here; the parent page dispatches on `sub` and wraps its body with
+# _with_subnav() so the bar sits above the full-height .cols block.
+SUBTABS = {"playground": [("media", "Media"), ("chat", "Chat")]}
+
+
+def _subnav(parent: str, active_sub: str) -> str:
+    subs = SUBTABS.get(parent) or []
+    links = "".join(f'<a class="{"on" if k == active_sub else ""}" '
+                    f'href="/ui/{parent}?sub={k}">{_esc(lbl)}</a>' for k, lbl in subs)
+    return f'<nav class="subnav">{links}</nav>'
+
+
+def _with_subnav(parent: str, sub: str, body: str) -> str:
+    """Wrap a tab body with its sub-tab bar. The wrapper is a flex column so the
+    inner .cols block keeps its full-height/independent-scroll behaviour."""
+    return f'<div class="withsub">{_subnav(parent, sub)}{body}</div>'
 
 # Request fields (the params that vary per generation) are NOT a fixed list — each
 # alias defines its own by promoting Available fields to request fields in Mapping.
@@ -136,6 +155,12 @@ header{display:flex;align-items:center;background:#171a21;border-bottom:1px soli
 nav{display:flex;flex-wrap:wrap}
 nav a{color:#9aa7b4;padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
 nav a:hover{color:#dce4ec;background:#1b1f27}
+.subnav{display:flex;gap:2px;margin:0 0 12px;border-bottom:1px solid #272b33;flex:none}
+.subnav a{color:#9aa7b4;padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
+.subnav a:hover{color:#dce4ec;background:#1b1f27}
+.subnav a.on{color:#fff;border-bottom-color:#3b82f6}
+.withsub{display:flex;flex-direction:column;height:100%}
+.withsub>.cols{flex:1;min-height:0;height:auto}
 nav a.on{color:#fff;border-bottom-color:#3b82f6}
 main{flex:1;min-height:0;overflow-y:auto;padding:18px 26px}
 h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#7e8b99;margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid #242a33}
@@ -1314,9 +1339,10 @@ _CHATPLAY_KEYS = ("backend", "model", "system", "user", "max_tokens", "temperatu
 
 
 async def chatplay_page(request: Request):
-    vals = {k: request.query_params.get(k, "") for k in _CHATPLAY_KEYS}
-    result_html = "<h2>Response</h2><p class='hint'>Send a message to see the reply here.</p>"
-    return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result_html), "chatplay"))
+    """Legacy URL — the Chat Playground now lives under /ui/playground?sub=chat."""
+    q = dict(request.query_params)
+    q["sub"] = "chat"
+    return RedirectResponse(f"/ui/playground?{urlencode(q)}", status_code=307)
 
 
 async def chatplay_send(request: Request):
@@ -1325,7 +1351,8 @@ async def chatplay_send(request: Request):
     model, user = vals["model"].strip(), vals["user"].strip()
     if not model or not user:
         result = "<h2>Response</h2><p class='bad'>model and message are required</p>"
-        return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result), "chatplay"))
+        return HTMLResponse(_page("Chat Playground",
+                                  _with_subnav("playground", "chat", _chatplay_body(vals, result)), "playground"))
     messages = []
     if vals["system"].strip():
         messages.append({"role": "system", "content": vals["system"]})
@@ -1365,7 +1392,8 @@ async def chatplay_send(request: Request):
         })
     except httpx.HTTPError as e:
         result = f"<h2>Response</h2><p class='bad'>Error: {_esc(f'{type(e).__name__}: {e}')}</p>"
-    return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result), "chatplay"))
+    return HTMLResponse(_page("Chat Playground",
+                              _with_subnav("playground", "chat", _chatplay_body(vals, result)), "playground"))
 
 
 # ── Tab: Mapping ────────────────────────────────────────────────────────────────
@@ -2093,7 +2121,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                          for b in bk_list))
     backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
     pg_switch_js = ("<script>function pgSwitch(sel){var f=sel.form,"
-                    "q='model='+encodeURIComponent(sel.value);"
+                    "q='sub=media&model='+encodeURIComponent(sel.value);"
                     "f.querySelectorAll('[name^=\"p__\"]').forEach(function(el){"
                     "if(el.value!=='')q+='&'+encodeURIComponent(el.name)+'='+encodeURIComponent(el.value);});"
                     "location.href='/ui/playground?'+q;}</script>")
@@ -2145,13 +2173,21 @@ def _job_result_html(job_id: str, job: Optional[dict]):
 
 
 async def playground_page(request: Request):
+    """Parent tab: dispatches on ?sub= (see SUBTABS) — media (default) | chat."""
+    qp = request.query_params
+    sub = qp.get("sub") or "media"
+    if sub == "chat":
+        vals = {k: qp.get(k, "") for k in _CHATPLAY_KEYS}
+        result_html = "<h2>Response</h2><p class='hint'>Send a message to see the reply here.</p>"
+        return HTMLResponse(_page("Chat Playground",
+                                  _with_subnav("playground", "chat", _chatplay_body(vals, result_html)), "playground"))
     if not store.is_active():
         return _inactive()
     aliases = list(store.list_aliases().keys())
     if not aliases:
-        return HTMLResponse(_page("Media Playground", "<h2>Media Playground</h2><p class='hint'>Register an alias in "
-            "the <a href='/ui/mapping'>Mapping</a> tab first.</p>", "playground"))
-    qp = request.query_params
+        return HTMLResponse(_page("Media Playground", _with_subnav("playground", "media",
+            "<h2>Media Playground</h2><p class='hint'>Register an alias in "
+            "the <a href='/ui/mapping'>Mapping</a> tab first.</p>"), "playground"))
     model = qp.get("model", "") or aliases[0]   # first load: pick the first alias
     cand = (store.get(model) or [None])[0]
     # values per request param, keyed by param name; query (p__<param>) overrides the
@@ -2171,7 +2207,9 @@ async def playground_page(request: Request):
     oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
     kept = set(_pg_images.get((_session_user(request) or "default", model), {}).keys())
     poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
-    return HTMLResponse(_page("Media Playground", _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
+    return HTMLResponse(_page("Media Playground",
+                              _with_subnav("playground", "media",
+                                           _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job)),
                               "playground"))
 
 
@@ -2228,10 +2266,12 @@ async def generate(request: Request):
     except HTTPException as e:
         aliases = list(store.list_aliases().keys())
         result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
-        return HTMLResponse(_page("Media Playground", _playground_body(aliases, vals, cand, result_html,
-                                  kept=set(stash.keys())), "playground"))
+        return HTMLResponse(_page("Media Playground",
+                                  _with_subnav("playground", "media",
+                                               _playground_body(aliases, vals, cand, result_html,
+                                                                kept=set(stash.keys()))), "playground"))
     # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
-    q = urlencode({"model": model, "backend": force_bk, "job": view.get("job_id", ""),
+    q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
 
@@ -2415,7 +2455,7 @@ async def job_to_playground(job_id: str, request: Request):
     alias = job.get("alias", "")
     meta = job.get("meta") or {}
     inp = meta.get("inputs") or {}
-    q = {"model": alias}
+    q = {"sub": "media", "model": alias}
     if inp.get("prompt"):
         q["p__prompt"] = inp["prompt"]
     if inp.get("negative_prompt"):
