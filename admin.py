@@ -177,6 +177,10 @@ pre.err{white-space:pre-wrap;word-break:break-word;background:#1a1113;border:1px
 .cols{gap:0;align-items:stretch;height:100%}
 .cols>.col{flex:1 1 0;min-width:0;height:100%;overflow-y:auto;padding:0 16px 18px 0}
 .cols>.col+.col{border-left:1px solid #2a313c;margin-left:22px;padding-left:22px}
+/* Mapping image editor: give the editor (col 2) more room for the request-fields
+   table, taken from the Available fields column (col 3). */
+.cols.map3>.col:nth-child(2){flex:1.9 1 0}
+.cols.map3>.col:nth-child(3){flex:0.84 1 0}
 .bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 8px;padding:8px 0 8px;position:sticky;top:0;z-index:10;background:#0f1115}
 .bar h2{margin:0;border:0;padding:0}
 td.acts{white-space:nowrap;text-align:right;width:1%}
@@ -206,6 +210,8 @@ table.pins td:last-child{width:1%;white-space:nowrap;text-align:right}
 table.reqf tr[draggable]{cursor:grab}
 table.reqf tr.dragging{opacity:.45}
 table.reqf tr[draggable]:hover{background:#13202f}
+table.reqf th:nth-child(3),table.reqf td:nth-child(3){width:72px}   /* node — just an id */
+table.reqf th:nth-child(4),table.reqf td:nth-child(4){width:120px}  /* field */
 .grip{color:#5a6675;cursor:grab;user-select:none;margin-right:4px}
 .tag{font-size:10px;background:#1d3a52;color:#9fd0ff;border-radius:3px;padding:1px 5px;margin-left:4px;vertical-align:middle}
 textarea{height:auto;min-height:60px;padding:8px 10px;line-height:1.5}
@@ -1441,7 +1447,11 @@ async def mapping_page(request: Request):
         body = cols(list_html, _chat_new_form())
     elif iedit and store.get(iedit):
         editor, available = await _alias_editor(iedit)        # image editor (3 cols)
-        body = cols(list_html, editor, available)
+        # wider editor (col 2), narrower Available fields (col 3) — see .cols.map3 CSS
+        body = ('<div class="cols map3">'
+                f'<div class="col">{list_html}</div>'
+                f'<div class="col">{editor}</div>'
+                f'<div class="col">{available}</div></div>')
     elif qp.get("new"):
         body = cols(list_html, _register_form())
     else:
@@ -2070,6 +2080,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             elif isinstance(opts, dict) and opts.get("_num"):    # FLOAT/INT → bounded number input
                 cur = v(p) or (str(dv) if dv is not None else "")
                 rows += _field(label, _num_input(f"p__{p}", cur, opts))
+            elif "prompt" in p.lower():                          # prompt / negative_prompt → multi-line
+                rows += _field(label, _textarea(f"p__{p}", v(p), 4), wide=True)
             else:
                 typ = "number" if isinstance(dv, (int, float)) and not isinstance(dv, bool) else "text"
                 rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
