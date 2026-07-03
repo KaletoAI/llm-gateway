@@ -13,7 +13,7 @@
   },
   "61": {
     "inputs": {
-      "value": ""
+      "value": "a candid full-body photo with natural light and high detail of a single woman Kira standing, Kira is 26 years young female, short athletic frame, light skin, large breasts, round perfect breasts, small butt, blonde medium hair, blue eyes, Kira is naked, standing with one hand on hip, weight shifted to one leg, shoulder slightly raised, chin up, bright focused eyes, slight knowing smile, head tilted, inspired engaged expression"
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
@@ -22,7 +22,7 @@
   },
   "63": {
     "inputs": {
-      "value": ""
+      "value": "illustration, anime, cgi, 3d render, painting, airbrushed skin, plastic skin, smooth flawless skin, overexposed, glossy, fantasy, studio lighting, posed, cartoon, drawing, sketch, watermark, signature, text, logo, deformed, blurry, low quality"
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
@@ -132,7 +132,7 @@
     },
     "class_type": "ImageScaleToTotalPixels",
     "_meta": {
-      "title": "ImageScaleToTotalPixels"
+      "title": "Scale Image to Total Pixels"
     }
   },
   "132": {
@@ -185,7 +185,7 @@
     },
     "class_type": "CFGGuider",
     "_meta": {
-      "title": "CFGGuider"
+      "title": "CFG Guider"
     }
   },
   "135": {
@@ -303,7 +303,7 @@
   },
   "312": {
     "inputs": {
-      "image": "1781011414.png"
+      "image": "8x8.png"
     },
     "class_type": "LoadImage",
     "_meta": {
