@@ -91,6 +91,8 @@ _apply_reasoning: Callable[[], None] = lambda: None
 _llm_backend_names: Callable[[], list] = lambda: []
 # (alias_or_model, backend) → real model id; None = alias not mapped on that backend.
 _resolve_for_backend: Callable[[str, str], Optional[str]] = lambda m, b: m
+# Live reasoning probe: (backend, model, adapter, param, requested, prompt) → result dict.
+_probe_reasoning: Callable = None
 
 
 def bind(**overrides) -> None:
@@ -2722,8 +2724,70 @@ def _reason_pval(rule: dict) -> str:
     return str((rule.get("param") or {}).get(k, "")) if k else ""
 
 
-def _reasoning_form(rule: Optional[dict], idx) -> str:
+_REASON_TEST_PROMPT = "Say hello in one short sentence."
+
+# Probe verdict → badge kind. ok = mechanism works; bad = no-op / still thinks;
+# warn = suppressed but answer empty; error = backend rejected / unreachable;
+# info = model doesn't think by default (nothing to suppress).
+_VERDICT_KIND = {"ok": "ok", "warn": "warn", "bad": "bad", "error": "bad", "info": "muted"}
+
+
+def _reason_verdict(res: dict) -> tuple:
+    """(kind, headline) summarising a probe result for the tested adapter. Only 'ok'
+    (baseline provably thinks → adapter suppressed it, answer intact) offers auto-save."""
+    if res.get("error"):
+        return ("error", res["error"])
+    req = res.get("requested", "off")
+    base, cand = res["baseline"], res["candidate"]
+    if cand["status"] != 200:
+        return ("error", f"backend returned HTTP {cand['status']} with this adapter"
+                + (" — some backends reject a trailing assistant turn (prefill)"
+                   if res.get("adapter") == "prefill" else ""))
+    if req == "off":
+        thinks_by_default = base["status"] == 200 and base["reasoning_len"] > 0
+        if cand["reasoning_len"] > 0:
+            return ("bad", "no-op — the model still emitted reasoning")
+        if cand["content_len"] == 0:                       # suppressed but broke the answer
+            return ("warn", "no reasoning, but this adapter left the answer empty")
+        if thinks_by_default:                              # proven: thought → suppressed → answer intact
+            return ("ok", "reasoning suppressed, answer intact — this adapter works")
+        return ("info", "model didn't reason by default here — adapter is harmless but unproven")
+    # requested == "on"
+    if cand["reasoning_len"] > 0:
+        return ("ok", "reasoning present (on)")
+    return ("warn", "no reasoning produced with 'on'")
+
+
+def _reason_test_result(res: dict) -> str:
+    """Render a probe result: verdict badge, baseline vs. adapter numbers, preview,
+    and — on a positive verdict — an inline 'Save this rule' submit (auto-create)."""
+    kind, headline = _reason_verdict(res)
+    badge = _badge({"ok": "✓ works", "warn": "⚠ partial", "bad": "✗ no-op",
+                    "error": "✗ error", "info": "· n/a"}[kind], _VERDICT_KIND[kind])
+    if res.get("error"):
+        return f"<h2 style='margin-top:18px'>Test result</h2><p>{badge} <b>{_esc(headline)}</b></p>"
+    base, cand = res["baseline"], res["candidate"]
+    tbl = ("<table style='margin:8px 0'><tr><th></th><th>HTTP</th><th>reasoning</th><th>answer</th></tr>"
+           f"<tr><td class='muted'>baseline (no adapter)</td><td>{base['status']}</td>"
+           f"<td>{base['reasoning_len']} chars</td><td>{base['content_len']} chars</td></tr>"
+           f"<tr><td><b>with {_esc(res['adapter'])}</b> "
+           f"<code>{_esc(res.get('control') or '—')}</code></td><td>{cand['status']}</td>"
+           f"<td><b>{cand['reasoning_len']}</b> chars</td><td>{cand['content_len']} chars</td></tr></table>")
+    prev = _esc(cand.get("content_preview") or "")
+    prev_html = f"<p class='muted' style='margin:6px 0'>answer preview: <code>{prev or '(empty)'}</code></p>"
+    save = ("" if kind not in ("ok",) else
+            "<p style='margin-top:10px'>" + _btn("✔ Save this rule", submit=True) +
+            " <span class='muted'>— persists the rule exactly as tested (match · backends · "
+            "adapter · param) and applies it live.</span></p>")
+    return (f"<h2 style='margin-top:18px'>Test result</h2><p>{badge} <b>{_esc(headline)}</b> "
+            f"<span class='muted'>· {_esc(res['model'])} on {_esc(res['backend'])} · requested "
+            f"{_esc(res['requested'])}</span></p>{tbl}{prev_html}{save}")
+
+
+def _reasoning_form(rule: Optional[dict], idx, test: Optional[dict] = None,
+                    tvals: Optional[dict] = None) -> str:
     r = rule or {}
+    tv = tvals or {}
     hidden = f'<input type="hidden" name="idx" value="{idx}">' if idx is not None else ""
     sel = set(r.get("backends") or [])
     allck = " checked" if ("*" in sel or not sel) else ""
@@ -2743,7 +2807,42 @@ def _reasoning_form(rule: Optional[dict], idx) -> str:
           "x.disabled=c.checked; if(c.checked) x.checked=false;});}"
           "function rAd(a){document.querySelectorAll('.rh').forEach(function(e){"
           "e.style.display=e.getAttribute('data-a')===a?'block':'none';});}"
+          "function rTest(f){var r=document.getElementById('rtresult');"
+          "if(r)r.innerHTML=\"<h2 style='margin-top:18px'>Test result</h2><p class='muted'>\\u23f3 "
+          "<b>Testing\\u2026</b> · calling the backend twice (baseline + adapter)</p>\";return true;}"
           "rAll(document.querySelector('input[name=bk_all]'));</script>")
+    # Live test panel — shares the form, so 'Run test' and 'Save' submit the same
+    # rule fields (match · backends · adapter · param); the backend is called directly
+    # with the chosen adapter applied, so a candidate mechanism is validated before save.
+    tb_pre = (tv.get("test_backend") or next((n for n in (r.get("backends") or []) if n != "*"), ""))
+    bopts = '<option value="">backend…</option>' + "".join(
+        f"<option{' selected' if n == tb_pre else ''}>{_esc(n)}</option>" for n in _llm_backend_names())
+    ropts = "".join(f'<option value="{x}"{" selected" if (tv.get("test_requested") or "off") == x else ""}>{x}</option>'
+                    for x in ("off", "on"))
+    # Picking a backend filters the model datalist to THAT backend's models (like the
+    # Chat Playground) — a rule is per (model×backend), so the model list should follow.
+    rt_bk = {b["name"]: sorted(b.get("models", [])) for b in _llm_backends()}
+    rt_all = _chat_models()
+    rt_js = ("<script>var RT_BK=%s,RT_ALL=%s;function rtFilter(bk){"
+             "var dl=document.getElementById('rtmodels');if(!dl)return;"
+             "var ms=(bk&&RT_BK[bk])?RT_BK[bk]:RT_ALL;"
+             "dl.innerHTML=ms.map(function(m){var o=document.createElement('option');"
+             "o.value=m;return o.outerHTML;}).join('');}</script>") % (json.dumps(rt_bk), json.dumps(rt_all))
+    test_panel = (
+        "<div style='margin-top:16px;padding-top:12px;border-top:1px solid #272b33'>"
+        "<h2>Live test</h2><p class='hint'>Fire a real call to one backend with the "
+        "<b>adapter above</b> applied, and see if the model's reasoning is actually "
+        "suppressed. A green result → <b>Save this rule</b>.</p>"
+        + _field("test on backend",
+                 f"<select name='test_backend' onchange='rtFilter(this.value)'>{bopts}</select>", short=True)
+        + _field("test model / alias",
+                 _dl_input("test_model", tv.get("test_model", ""), "rtmodels", "alias or real model id"), short=True)
+        + _field("requested", f"<select name='test_requested'>{ropts}</select>", short=True)
+        + _field("prompt", _inp("test_prompt", tv.get("test_prompt", "") or _REASON_TEST_PROMPT))
+        + '<button type="submit" class="btn secondary" formaction="/ui/reasoning/test" '
+          'formnovalidate onclick="return rTest(this.form)">▶ Run test</button>'
+        + f"<div id='rtresult'>{_reason_test_result(test) if test else ''}</div>"
+        + "</div>" + _datalist("rtmodels", rt_bk.get(tb_pre) or rt_all))
     return ('<form action="/ui/reasoning/save" method="post">' + hidden +
             f'<div class="formbar"><h2>{"Edit rule" if rule else "New rule"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/reasoning", "secondary")}</div>'
@@ -2754,7 +2853,8 @@ def _reasoning_form(rule: Optional[dict], idx) -> str:
             + _field("backends", bk)
             + _field("adapter (off)", asel) + hints
             + _field("param", _inp("param", _reason_pval(r), placeholder="optional — see the adapter hint above"))
-            + "</form>" + js)
+            + test_panel
+            + "</form>" + js + rt_js)
 
 
 def _reasoning_testbox(rules: list, qp) -> str:
@@ -2788,10 +2888,7 @@ def _reasoning_testbox(rules: list, qp) -> str:
             f"{_btn('Resolve', submit=True, kind='secondary')}</form>{res}")
 
 
-async def reasoning_page(request: Request):
-    rules = store.get_reasoning_rules() if store.is_active() else []
-    qp = request.query_params
-    edit_i = int(qp["edit"]) if (qp.get("edit", "").isdigit() and int(qp["edit"]) < len(rules)) else None
+def _reasoning_list_html(rules: list, edit_i: Optional[int]) -> str:
     rows = ""
     for i, r in enumerate(rules):
         bks = r.get("backends") or ["*"]
@@ -2811,14 +2908,47 @@ async def reasoning_page(request: Request):
                  f"<td class='muted'>{_esc(_reason_pval(r))}</td><td>{state}</td><td class='acts'>{acts}</td></tr>")
     rows = rows or ("<tr><td colspan=7 class='muted'>no rules — reasoning off/on is reported "
                     "'unsupported' for every model</td></tr>")
-    list_html = (f'<div class="bar"><h2>Reasoning</h2>{_btn("+ New rule", "/ui/reasoning?new=1")}</div>'
-                 "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
-                 "unchanged). The first <b>enabled</b> rule whose <b>model glob</b> matches the real model <b>and</b> "
-                 "whose <b>backend set</b> contains the serving backend is applied; no match → "
-                 "<code>unsupported</code> (never fails). Applied control shows in <a href='/ui/llmcalls'>LLM Calls</a> "
-                 "+ the <code>x-reasoning-control</code> header.</p>"
-                 f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
-                 f"<th>adapter</th><th>param</th><th>state</th><th></th></tr>{rows}</table>")
+    return (f'<div class="bar"><h2>Reasoning</h2>{_btn("+ New rule", "/ui/reasoning?new=1")}</div>'
+            "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
+            "unchanged). The first <b>enabled</b> rule whose <b>model glob</b> matches the real model <b>and</b> "
+            "whose <b>backend set</b> contains the serving backend is applied; no match → "
+            "<code>unsupported</code> (never fails). Applied control shows in <a href='/ui/llmcalls'>LLM Calls</a> "
+            "+ the <code>x-reasoning-control</code> header.</p>"
+            f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
+            f"<th>adapter</th><th>param</th><th>state</th><th></th></tr>{rows}</table>")
+
+
+def _reasoning_shell(rules: list, detail: str, edit_i: Optional[int]) -> HTMLResponse:
+    body = (f'<div class="cols"><div class="col">{_reasoning_list_html(rules, edit_i)}</div>'
+            f'<div class="col">{detail}</div></div>')
+    return HTMLResponse(_page("Reasoning", body, "reasoning"))
+
+
+def _rule_from_form(qs: dict) -> tuple:
+    """Build a rule dict + edit-index from a submitted reasoning form (shared by save
+    and the live test). `qs` is the _form_multi mapping ({k:[v,…]})."""
+    g = lambda k, d="": (qs.get(k) or [d])[-1]
+    adapter = (g("adapter", "none").strip() or "none")
+    if adapter not in _REASON_ADAPTERS:
+        adapter = "none"
+    o = g("order").strip()
+    backends = ["*"] if qs.get("bk_all") else ([b for b in qs.get("bk", []) if b] or ["*"])
+    param = {}
+    pv = g("param").strip()
+    key = _REASON_PKEY.get(adapter)
+    if key and pv:
+        param[key] = pv
+    rule = {"order": (int(o) if o.lstrip("-").isdigit() else None),
+            "match": (g("match").strip() or "*"), "backends": backends,
+            "adapter": adapter, "param": param, "enabled": bool(qs.get("enabled"))}
+    idx = g("idx")
+    return rule, (int(idx) if idx.isdigit() else None)
+
+
+async def reasoning_page(request: Request):
+    rules = store.get_reasoning_rules() if store.is_active() else []
+    qp = request.query_params
+    edit_i = int(qp["edit"]) if (qp.get("edit", "").isdigit() and int(qp["edit"]) < len(rules)) else None
     if qp.get("new"):
         detail = _reasoning_form(None, None)
     elif edit_i is not None:
@@ -2826,8 +2956,34 @@ async def reasoning_page(request: Request):
     else:
         detail = ("<h2>Details</h2><p class='hint'>Select a rule's <b>✎</b>, or <b>+ New rule</b> to add one.</p>"
                   + _reasoning_testbox(rules, qp))
-    body = f'<div class="cols"><div class="col">{list_html}</div><div class="col">{detail}</div></div>'
-    return HTMLResponse(_page("Reasoning", body, "reasoning"))
+    return _reasoning_shell(rules, detail, edit_i)
+
+
+async def reasoning_test(request: Request):
+    """Live-test the (unsaved) rule in the form against one backend+model, then
+    re-render the form with the verdict + an inline Save (auto-create on success)."""
+    qs = await _form_multi(request)
+    g = lambda k, d="": (qs.get(k) or [d])[-1]
+    rule, idx = _rule_from_form(qs)
+    if rule.get("order") is None:
+        rule["order"] = ""
+    rules = store.get_reasoning_rules() if store.is_active() else []
+    tvals = {"test_backend": g("test_backend").strip(), "test_model": g("test_model").strip(),
+             "test_prompt": g("test_prompt"), "test_requested": (g("test_requested", "off").strip() or "off")}
+    tb, tm = tvals["test_backend"], tvals["test_model"]
+    if not tb or not tm:
+        res = {"error": "pick a test backend and a model/alias first"}
+    elif _probe_reasoning is None:
+        res = {"error": "probe unavailable (gateway not bound)"}
+    else:
+        real = _resolve_for_backend(tm, tb)      # alias → this backend's real model, like the API
+        if real is None:
+            res = {"error": f"'{tm}' is not mapped on backend '{tb}' — a call would never route there"}
+        else:
+            res = await _probe_reasoning(tb, real, rule["adapter"], rule["param"],
+                                         tvals["test_requested"], tvals["test_prompt"])
+    detail = _reasoning_form(rule, idx, test=res, tvals=tvals)
+    return _reasoning_shell(rules, detail, idx)
 
 
 async def reasoning_save(request: Request):
@@ -3272,6 +3428,7 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/delete", delete, methods=["GET"])
     app.add_api_route("/ui/reasoning", reasoning_page, methods=["GET"])
     app.add_api_route("/ui/reasoning/save", reasoning_save, methods=["POST"])
+    app.add_api_route("/ui/reasoning/test", reasoning_test, methods=["POST"])
     app.add_api_route("/ui/reasoning/toggle", reasoning_toggle, methods=["GET"])
     app.add_api_route("/ui/reasoning/delete", reasoning_del, methods=["GET"])
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])

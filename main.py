@@ -804,6 +804,56 @@ def _reasoning_apply(backend: dict, model: Optional[str], requested: Optional[st
     return reasoning.apply(rule, requested, payload)
 
 
+async def probe_reasoning(backend_name: str, model: str, adapter: str, param: dict,
+                          requested: str, prompt: str) -> dict:
+    """Live-test a reasoning adapter against ONE (backend, model): fire a baseline call
+    and a call with `adapter` applied, and report whether the model's reasoning channel
+    was actually suppressed. Goes DIRECT to the backend (bypasses routing + the stored
+    rules) so a candidate mechanism can be validated BEFORE a rule exists. Never raises —
+    the /ui Reasoning-tab live test drives this. Returns a plain dict for the UI."""
+    requested = requested if requested in ("off", "on") else "off"
+    b = next((x for x in backends if x.get("name") == backend_name
+              and x.get("type", "openai") != "comfyui"), None)
+    if b is None:
+        return {"error": f"backend '{backend_name}' not found or not an LLM backend"}
+    url = f"{b['url']}/v1/chat/completions"
+    headers = {"content-type": "application/json", **backend_auth_headers(b)}
+    base_body = {"model": model, "stream": False, "temperature": 0.1, "max_tokens": 300,
+                 "messages": [{"role": "user",
+                               "content": (prompt or "").strip() or "Say hello in one short sentence."}]}
+    rule = {"adapter": adapter, "param": param or {}}
+    cand_body, control = reasoning.apply(rule, requested, dict(base_body))
+
+    async def _one(body: dict) -> dict:
+        try:
+            r = await http_client.post(url, headers=headers, json=body, timeout=120.0)
+            try:
+                data = r.json()
+            except Exception:
+                data = {"raw": r.text[:600]}
+            msg = ((data.get("choices") or [{}])[0].get("message") or {}) if isinstance(data, dict) else {}
+            return {"status": r.status_code,
+                    "content": (msg.get("content") or ""),
+                    "reasoning": (msg.get("reasoning") or msg.get("reasoning_content") or ""),
+                    "err": None if r.status_code == 200 else json.dumps(data, ensure_ascii=False)[:400]}
+        except Exception as e:
+            return {"status": 0, "content": "", "reasoning": "", "err": f"{type(e).__name__}: {e}"}
+
+    # Sequential, not concurrent: single-slot backends (LocalAI / llama.cpp --parallel 1)
+    # give unreliable results when baseline + candidate hit them at once.
+    base = await _one(base_body)
+    cand = await _one(cand_body)
+    return {
+        "backend": backend_name, "model": model, "adapter": adapter,
+        "control": control, "requested": requested,
+        "baseline": {"status": base["status"], "reasoning_len": len(base["reasoning"]),
+                     "content_len": len(base["content"]), "err": base["err"]},
+        "candidate": {"status": cand["status"], "reasoning_len": len(cand["reasoning"]),
+                      "content_len": len(cand["content"]),
+                      "content_preview": cand["content"][:240], "err": cand["err"]},
+    }
+
+
 def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
     """USD cost for a call from cached pricing (Together-style /v1/models), keyed by
     the backend id (`type:name`, same as `backend_pricing`). 0 if unknown."""
@@ -1934,7 +1984,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            llm_backend_names=lambda: sorted({b["name"] for b in backends
                                              if b.get("type", "openai") != "comfyui"}),
            resolve_for_backend=resolve_for_backend,
-           apply_reasoning=apply_reasoning_rules)
+           apply_reasoning=apply_reasoning_rules,
+           probe_reasoning=probe_reasoning)
 
 
 @app.get("/health")
