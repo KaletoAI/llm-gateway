@@ -20,5 +20,6 @@ jobs.db-wal
 jobs.db-shm
 jobs/
 calls/
+voiceref/
 # Sample workflows: ship the curated ones directly; keep raw originals out of git
 sample_comfyui_workflows/org/

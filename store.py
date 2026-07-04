@@ -469,6 +469,28 @@ def set_alias_voice(alias: str, defaults) -> None:
     set_settings({"alias_voice": m})
 
 
+# ── Voice reference library ──────────────────────────────────────────────────────
+# Named voice-cloning references for /v1/audio/speech: the WAV blob lives on the
+# GATEWAY host (voiceref/<name>.wav — TTS backends read `voice` only as a local
+# file, so the blob must additionally be shipped to the backend host via scp).
+# Entry: {ref_text, file (gateway path), remote (backend-side abs path), shipped}.
+
+def get_voice_library() -> dict:
+    return get_setting("voice_library") or {}
+
+
+def set_voice_entry(name: str, entry) -> None:
+    """Upsert (dict) or delete (None) one library entry."""
+    m = get_voice_library()
+    if entry:
+        m[name] = entry
+    elif name in m:
+        del m[name]
+    else:
+        return
+    set_settings({"voice_library": m})
+
+
 # ── Reasoning rules (normalized thinking toggle) ────────────────────────────────
 # Ordered list of {match, backends[], adapter, param} — see reasoning.py. Stored as
 # one settings entry; first matching rule (model-glob × backend-set) wins.

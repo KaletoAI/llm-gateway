@@ -131,6 +131,7 @@ def rebuild_virtual_models() -> None:
     alias_park_s = park
     alias_reasoning = store.get_alias_reasoning() if store.is_active() else {}
     alias_voice = store.get_alias_voice() if store.is_active() else {}
+    apply_voice_library()
     apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
     rebuild_route_index()                  # alias mappings changed
 
@@ -244,6 +245,7 @@ max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
 alias_voice: dict = {}                  # alias → {voice, ref_text} TTS defaults (store). Client wins.
+voice_library: dict = {}                # name → {ref_text, file, remote, shipped} (store voice_library)
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
 
@@ -856,6 +858,122 @@ async def probe_reasoning(backend_name: str, model: str, adapter: str, param: di
     }
 
 
+# ── Voice reference library (TTS voice cloning) ─────────────────────────────────
+# WAV blobs live on the GATEWAY (voiceref/ — gitignored, deploy-excluded) and are
+# additionally SHIPPED via scp to the TTS backend host: qwen3-tts-style models read
+# `voice` strictly as a local file (measured: no base64/data-URI, no URL, no files
+# API). API/UI reference entries as voice:"lib:<name>"; route() resolves that to the
+# shipped path + fills ref_text.
+
+VOICE_REF_DIR = Path("voiceref")
+
+
+def _voice_safe(name: str) -> str:
+    keep = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (name or "voice"))
+    return keep[:48] or "voice"
+
+
+def apply_voice_library() -> None:
+    global voice_library
+    voice_library = store.get_voice_library() if store.is_active() else {}
+
+
+def voice_ref_target() -> str:
+    """scp destination for shipped references: 'user@host:/abs/dir' (store setting)."""
+    s = store.get_settings() if store.is_active() else {}
+    return str(s.get("voice_ref_target") or "")
+
+
+def _whisper_route() -> Optional[tuple[dict, str]]:
+    """First healthy LLM backend serving a whisper* model (for auto ref_text)."""
+    for b in enabled_backends():
+        if b.get("type", "openai") == "comfyui":
+            continue
+        for m in sorted(backend_models.get(backend_id(b), set())):
+            if "whisper" in m.lower() and backend_healthy.get(backend_id(b)):
+                return b, m
+    return None
+
+
+async def transcribe_audio(data: bytes, filename: str = "ref.wav") -> tuple[Optional[str], str]:
+    """(text, source-or-error): transcribe via the first whisper-serving backend's
+    /v1/audio/transcriptions; None when no whisper model exists or the call fails."""
+    hit = _whisper_route()
+    if hit is None:
+        return None, "no whisper model on any backend"
+    b, model = hit
+    try:
+        r = await http_client.post(f"{b['url']}/v1/audio/transcriptions",
+                                   headers=backend_auth_headers(b), data={"model": model},
+                                   files={"file": (filename, data, "audio/wav")}, timeout=180.0)
+        if r.status_code == 200:
+            txt = str((r.json() or {}).get("text") or "").strip()
+            return (txt or None), f"{b['name']}/{model}"
+        return None, f"{b['name']}/{model} HTTP {r.status_code}: {r.text[:150]}"
+    except Exception as ex:
+        return None, f"{type(ex).__name__}: {ex}"
+
+
+async def ship_voice_ref(name: str) -> tuple[bool, str]:
+    """scp the library WAV to the TTS backend host; records remote path + shipped
+    state on the entry. (ok, message) — never raises (UI renders the message)."""
+    e = (store.get_voice_library() if store.is_active() else {}).get(name)
+    if not e:
+        return False, f"unknown voice '{name}'"
+    target = voice_ref_target().rstrip("/")
+    if ":" not in target or not target.split(":", 1)[1].startswith("/"):
+        return False, "no scp target configured — set 'user@host:/abs/dir' in the Voice tab"
+    src = Path(e.get("file") or "")
+    if not src.is_file():
+        return False, f"gateway blob missing: {src}"
+    host, rdir = target.split(":", 1)
+    remote = f"{rdir}/{src.name}"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            str(src), f"{host}:{remote}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        ok = proc.returncode == 0
+    except Exception as ex:
+        ok, out = False, f"{type(ex).__name__}: {ex}".encode()
+    e.update({"remote": remote if ok else e.get("remote", ""), "shipped": ok})
+    store.set_voice_entry(name, e)
+    apply_voice_library()
+    return ok, (f"{host}:{remote}" if ok else (out or b"scp failed").decode(errors="replace")[-300:])
+
+
+async def save_voice_ref(name: str, data: bytes, ref_text: str = "") -> dict:
+    """Create/replace a library entry: write the gateway blob, auto-transcribe when
+    ref_text is empty (whisper backend, if any), then try to ship. Returns UI status."""
+    VOICE_REF_DIR.mkdir(exist_ok=True)
+    path = VOICE_REF_DIR / (_voice_safe(name) + ".wav")
+    path.write_bytes(data)
+    note = ""
+    if not (ref_text or "").strip():
+        txt, src = await transcribe_audio(data, path.name)
+        ref_text = txt or ""
+        note = f"ref_text transcribed via {src}" if txt else f"ref_text empty — {src}"
+    store.set_voice_entry(name, {"ref_text": (ref_text or "").strip(), "file": str(path),
+                                 "remote": "", "shipped": False})
+    apply_voice_library()                         # cache now — ship's early returns don't refresh
+    ok, msg = await ship_voice_ref(name)
+    return {"shipped": ok, "ship_msg": msg, "note": note,
+            "entry": voice_library.get(name) or {}}
+
+
+def delete_voice_ref(name: str) -> None:
+    e = (store.get_voice_library() if store.is_active() else {}).get(name) or {}
+    try:
+        p = Path(e.get("file") or "")
+        if p.is_file():
+            p.unlink()
+    except OSError:
+        pass
+    store.set_voice_entry(name, None)
+    apply_voice_library()
+
+
 def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
     """USD cost for a call from cached pricing (Together-style /v1/models), keyed by
     the backend id (`type:name`, same as `backend_pricing`). 0 if unknown."""
@@ -988,6 +1106,17 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
                 body["voice"] = av["voice"]
             if av.get("ref_text") and not (body.get("params") or {}).get("ref_text"):
                 body.setdefault("params", {})["ref_text"] = av["ref_text"]
+        v = body.get("voice")                           # voice:"lib:<name>" → shipped path + ref_text
+        if isinstance(v, str) and v.startswith("lib:"):
+            e = voice_library.get(v[4:])
+            if not e:
+                raise HTTPException(400, f"unknown voice library entry '{v[4:]}'")
+            if not (e.get("shipped") and e.get("remote")):
+                raise HTTPException(409, f"voice '{v[4:]}' is not on the backend host yet — "
+                                         "configure the scp target / retry ship in the Voice tab")
+            body["voice"] = e["remote"]
+            if e.get("ref_text") and not (body.get("params") or {}).get("ref_text"):
+                body.setdefault("params", {})["ref_text"] = e["ref_text"]
     r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
     if r is None:
         r = alias_reasoning.get(alias)                  # per-alias default (tool vs tool-thinking)
@@ -2006,7 +2135,10 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
                                              if b.get("type", "openai") != "comfyui"}),
            resolve_for_backend=resolve_for_backend,
            apply_reasoning=apply_reasoning_rules,
-           probe_reasoning=probe_reasoning)
+           probe_reasoning=probe_reasoning,
+           voice_lib_save=save_voice_ref, voice_lib_delete=delete_voice_ref,
+           voice_lib_ship=ship_voice_ref, voice_ref_target=voice_ref_target,
+           apply_voice_library=apply_voice_library)
 
 
 @app.get("/health")

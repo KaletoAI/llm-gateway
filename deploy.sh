@@ -17,7 +17,7 @@ RSYNC_EXCLUDES=(
     --exclude='secret.key'   --exclude='store.db'      --exclude='store.db-wal' --exclude='store.db-shm'
     --exclude='stats.db'     --exclude='stats.db-wal'  --exclude='stats.db-shm'
     --exclude='jobs.db'      --exclude='jobs.db-wal'   --exclude='jobs.db-shm'
-    --exclude='jobs/'        --exclude='calls/'
+    --exclude='jobs/'        --exclude='calls/'    --exclude='voiceref/'
     --exclude='deploy.sh'
 )
 TAR_EXCLUDES=(
@@ -28,7 +28,7 @@ TAR_EXCLUDES=(
     --exclude='./secret.key'  --exclude='./store.db'    --exclude='./store.db-wal' --exclude='./store.db-shm'
     --exclude='./stats.db'    --exclude='./stats.db-wal' --exclude='./stats.db-shm'
     --exclude='./jobs.db'     --exclude='./jobs.db-wal'  --exclude='./jobs.db-shm'
-    --exclude='./jobs'        --exclude='./calls'
+    --exclude='./jobs'        --exclude='./calls'   --exclude='./voiceref'
     --exclude='./deploy.sh'
 )
 

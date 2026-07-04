@@ -112,6 +112,12 @@ _llm_backend_names: Callable[[], list] = lambda: []
 _resolve_for_backend: Callable[[str, str], Optional[str]] = lambda m, b: m
 # Live reasoning probe: (backend, model, adapter, param, requested, prompt) → result dict.
 _probe_reasoning: Callable = None
+# Voice reference library (gateway blobs + scp ship to the TTS backend host).
+_voice_lib_save: Callable = None          # async (name, data, ref_text) → status dict
+_voice_lib_delete: Callable = None        # (name) → None
+_voice_lib_ship: Callable = None          # async (name) → (ok, msg)
+_voice_ref_target: Callable[[], str] = lambda: ""
+_apply_voice_library: Callable[[], None] = lambda: None
 
 
 def bind(**overrides) -> None:
@@ -2328,29 +2334,78 @@ _VOICEPLAY_JS = ("<script>function vpSending(f){"
 
 def _voiceplay_form(vals: dict) -> str:
     v = lambda k: vals.get(k, "")
+    lib = store.get_voice_library() if store.is_active() else {}
+    vopts = '<option value="">— custom path / model default —</option>' + "".join(
+        f'<option value="lib:{_esc(n)}"{" selected" if v("voice") == f"lib:{n}" else ""}>'
+        f'📚 {_esc(n)}{"" if (e or {}).get("shipped") else " (not shipped!)"}</option>'
+        for n, e in sorted(lib.items()))
     return ('<form action="/ui/playground/voice" method="post" onsubmit="return vpSending(this)">'
             f'<div class="formbar"><h2>Voice</h2>{_btn("Synthesize", submit=True)}</div>'
             + _field("model", _dl_input("model", v("model") or "omnivoice-cpp", "vpmodels",
                                         "TTS model id or alias"), short=True)
             + _field("text", _textarea("input", v("input"), 5, "the text to speak"))
-            + _field("voice", _inp("voice", v("voice"),
-                                   placeholder="server-side reference, e.g. voices/kai-ref.wav"))
+            + _field("voice (library)", f'<select name="voice_sel">{vopts}</select>')
+            + _field("…or path", _inp("voice", "" if v("voice").startswith("lib:") else v("voice"),
+                                      placeholder="raw backend-side path, e.g. /opt/voices/kai.wav"))
             + _field("ref text", _textarea("ref_text", v("ref_text"), 2,
-                                           "exact transcript of the reference recording (optional)"))
-            + "<p class='hint'>Synchronous <code>POST /v1/audio/speech</code> — routed like chat "
-              "(bare model id or alias, parking/failover apply). <b>voice</b> is a file path on the "
-              "backend host; leave empty for the model's default voice.</p>"
+                                           "transcript override (library entries carry their own)"))
+            + "<p class='hint'>Synchronous <code>POST /v1/audio/speech</code> — routed like chat. "
+              "Pick a <b>library voice</b> (its reference + transcript are applied by the gateway) "
+              "or give a raw path; empty = the model's default voice.</p>"
             + "</form>" + _datalist("vpmodels", _chat_models()) + _VOICEPLAY_JS)
 
 
-def _voiceplay_body(vals: dict, result_html: str) -> str:
-    return (f'<div class="cols"><div class="col">{_voiceplay_form(vals)}</div>'
+def _voice_lib_panel(status_html: str = "") -> str:
+    """Library management under the Voice form: scp target, upload, entries table."""
+    lib = store.get_voice_library() if store.is_active() else {}
+    rows = ""
+    for n, e in sorted(lib.items()):
+        e = e or {}
+        shipped = (_badge("shipped", "ok", e.get("remote", "")) if e.get("shipped")
+                   else _badge("pending", "warn", "not on the backend host yet — retry ship"))
+        rt = (e.get("ref_text") or "")[:60]
+        acts = _icon_acts(("▶", f"/ui/playground/voice-lib/{quote(n)}", "secondary", "Play the reference"),
+                          ("↻", f"/ui/playground/voice-ship?name={quote(n)}", "secondary", "Ship to the backend host (scp)"),
+                          ("✕", f"/ui/playground/voice-del?name={quote(n)}", "danger", "Delete",
+                           f"Delete voice '{n}'?"))
+        rows += (f"<tr><td><code>lib:{_esc(n)}</code></td><td>{shipped}</td>"
+                 f"<td class='muted' title='{_esc(e.get('ref_text', ''))}'>{_esc(rt)}</td>"
+                 f"<td class='acts'>{acts}</td></tr>")
+    rows = rows or "<tr><td colspan=4 class='muted'>no voices yet — upload one below</td></tr>"
+    target = _voice_ref_target()
+    return (
+        "<div style='margin-top:18px;padding-top:12px;border-top:1px solid #272b33'>"
+        "<h2>Voice library</h2>"
+        "<p class='hint'>Uploaded references are stored on the gateway and <b>shipped via scp</b> to the "
+        "TTS backend host (the model reads <code>voice</code> only as a local file there). Empty "
+        "<b>ref text</b> is auto-transcribed when any backend serves a <code>whisper*</code> model.</p>"
+        + status_html
+        + f"<table><tr><th>voice</th><th>state</th><th>ref text</th><th></th></tr>{rows}</table>"
+        + '<form action="/ui/playground/voice-upload" method="post" enctype="multipart/form-data" '
+          'style="margin-top:10px">'
+        + _field("name", _inp("name", "", placeholder="kai"), short=True)
+        + _field("wav file", '<input type="file" name="file" accept="audio/*">')
+        + _field("ref text", _textarea("ref_text", "", 2, "leave empty → auto-transcribe (whisper)"))
+        + f'<div class="field"><label></label><div class="control">{_btn("⬆ Upload voice", submit=True)}</div></div>'
+        + "</form>"
+        + '<form action="/ui/playground/voice-target" method="post" style="margin-top:6px">'
+        + _field("scp target", _inp("target", target, placeholder="root@192.168.8.38:/opt/llm-voices"))
+        + f'<div class="field"><label></label><div class="control">{_btn("Save target", submit=True, kind="secondary")}'
+          "<span class='hint' style='margin-left:10px'>needs a key: <code>ssh-copy-id</code> from the "
+          "gateway host to the backend host once</span></div></div>"
+        + "</form></div>")
+
+
+def _voiceplay_body(vals: dict, result_html: str, lib_status: str = "") -> str:
+    return (f'<div class="cols"><div class="col">{_voiceplay_form(vals)}{_voice_lib_panel(lib_status)}</div>'
             f'<div class="col" id="vpresult">{result_html}</div></div>')
 
 
 async def voiceplay_send(request: Request):
     f = await _form(request)
     vals = {k: (f.get(k, "") or "") for k in _VOICEPLAY_KEYS}
+    if (f.get("voice_sel", "") or "").strip():         # picked library voice wins over the path box
+        vals["voice"] = f["voice_sel"].strip()
     model, text = vals["model"].strip() or "omnivoice-cpp", vals["input"].strip()
     if not text:
         result = "<h2>Result</h2><p class='bad'>text is required</p>"
@@ -2392,6 +2447,68 @@ async def voice_audio(request: Request):
         raise HTTPException(404, "no synthesis result")
     data, mime = stash
     return Response(data, media_type=mime)
+
+
+def _voice_status(kind: str, msg: str) -> str:
+    cls = {"ok": "muted", "bad": "bad"}.get(kind, "muted")
+    return f"<p class='{cls}'>{msg}</p>"
+
+
+async def voice_upload(request: Request):
+    """Add a library voice: store the blob on the gateway, auto-transcribe when
+    ref_text is empty, then try to ship it to the backend host."""
+    f = await _multipart(request)
+    name = str(f.get("name", "")).strip()
+    data = f.get("file")
+    ref_text = str(f.get("ref_text", "") or "")
+    if not name or not isinstance(data, (bytes, bytearray)) or not data.strip():
+        status = _voice_status("bad", "name and a WAV file are required")
+    elif _voice_lib_save is None:
+        status = _voice_status("bad", "library unavailable (gateway not bound)")
+    else:
+        res = await _voice_lib_save(name, bytes(data), ref_text)
+        bits = [f"<b>lib:{_esc(name)}</b> saved ({len(data) // 1024} KB)"]
+        if res.get("note"):
+            bits.append(_esc(res["note"]))
+        bits.append("shipped ✓ " + _esc(res.get("ship_msg", "")) if res.get("shipped")
+                    else "<span class='bad'>not shipped:</span> " + _esc(res.get("ship_msg", "")))
+        status = _voice_status("ok", " · ".join(bits))
+        logger.info(f"ui: voice ref '{name}' uploaded (shipped={res.get('shipped')})")
+    result = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+    vals = {k: "" for k in _VOICEPLAY_KEYS}
+    return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
+                                                    _voiceplay_body(vals, result, status)), "playground"))
+
+
+async def voice_target(request: Request):
+    f = await _form(request)
+    store.set_settings({"voice_ref_target": (f.get("target", "") or "").strip()})
+    return RedirectResponse("/ui/playground?sub=voice", status_code=303)
+
+
+async def voice_ship(request: Request):
+    name = (request.query_params.get("name", "") or "").strip()
+    if name and _voice_lib_ship is not None:
+        ok, msg = await _voice_lib_ship(name)
+        logger.info(f"ui: voice ref '{name}' ship → {'ok' if ok else msg}")
+    return RedirectResponse("/ui/playground?sub=voice", status_code=303)
+
+
+async def voice_del(request: Request):
+    name = (request.query_params.get("name", "") or "").strip()
+    if name and _voice_lib_delete is not None:
+        _voice_lib_delete(name)
+        logger.info(f"ui: voice ref '{name}' deleted")
+    return RedirectResponse("/ui/playground?sub=voice", status_code=303)
+
+
+async def voice_lib_play(name: str):
+    """Serve a library reference's gateway blob (listen before/after shipping)."""
+    e = (store.get_voice_library() if store.is_active() else {}).get(name)
+    p = (e or {}).get("file")
+    if not p or not os.path.isfile(p):
+        raise HTTPException(404, "voice not found")
+    return FileResponse(p, media_type="audio/wav")
 
 
 # ── Media Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
@@ -3662,6 +3779,11 @@ def register(app) -> None:
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
     app.add_api_route("/ui/playground/voice", voiceplay_send, methods=["POST"])
     app.add_api_route("/ui/playground/voice-audio", voice_audio, methods=["GET"])
+    app.add_api_route("/ui/playground/voice-upload", voice_upload, methods=["POST"])
+    app.add_api_route("/ui/playground/voice-target", voice_target, methods=["POST"])
+    app.add_api_route("/ui/playground/voice-ship", voice_ship, methods=["GET"])
+    app.add_api_route("/ui/playground/voice-del", voice_del, methods=["GET"])
+    app.add_api_route("/ui/playground/voice-lib/{name}", voice_lib_play, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
     app.add_api_route("/ui/playground/status/{job_id}", playground_status, methods=["GET"])

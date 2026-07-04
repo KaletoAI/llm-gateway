@@ -211,4 +211,9 @@ per-token). Streaming records `0` tokens.
   `(node,field)` is authoritative — never overridden by an API request param.
 - Single instance only; verify with compile + a route/render check; restart the
   one instance when the user says idle. Never commit `config.yaml`, `store.db`
-  (+ `secret.key`), `stats.db*`, `jobs.db*`, `jobs/`, `*.key`.
+  (+ `secret.key`), `stats.db*`, `jobs.db*`, `jobs/`, `voiceref/`, `*.key`.
+- Voice cloning (`/v1/audio/speech`): TTS backends read `voice` strictly as a
+  file on THEIR host (no base64/URL/upload API — measured). The voice library
+  (`voiceref/` blobs + store `voice_library`, UI in the Voice sub-tab) therefore
+  ships references via scp (`voice_ref_target` setting); `voice:"lib:<name>"`
+  resolves to the shipped path + ref_text in `route()`.
