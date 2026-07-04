@@ -2393,13 +2393,15 @@ def _voice_lib_panel(status_html: str = "") -> str:
         + f'<div class="field"><label></label><div class="control">{_btn("⬆ Upload voice", submit=True)}</div></div>'
         + "</form>"
         + '<form action="/ui/playground/voice-target" method="post" style="margin-top:6px">'
-        + _field("ship to hosts", _inp("hosts", ", ".join(hosts),
-                                       placeholder="root@192.168.8.38, root@192.168.8.39"))
-        + _field("remote dir", _inp("dir", rdir, placeholder="/opt/llm-voices — SAME absolute dir on every host"))
+        + _field("scp targets", _inp("hosts", ", ".join(hosts),
+                                     placeholder="root@192.168.8.39:/root/localai/models/voices, …"))
+        + _field("voice dir (model view)", _inp("dir", rdir,
+                                                placeholder="/models/voices — the path the MODEL sees (container view)"))
         + _field("whisper model", _inp("whisper_model", wm, placeholder="small"), short=True)
         + f'<div class="field"><label></label><div class="control">{_btn("Save settings", submit=True, kind="secondary")}'
-          "<span class='hint' style='margin-left:10px'>every host serving a cloning model, comma-separated; "
-          "needs a key once per host: <code>ssh-copy-id</code> from the gateway host</span></div></div>"
+          "<span class='hint' style='margin-left:10px'>one scp target per cloning host (host-side dir, e.g. the "
+          "docker bind-mount source); <b>voice dir</b> is what goes into <code>voice</code> — the container path, "
+          "identical on every host. Key once per host: <code>ssh-copy-id</code> from the gateway.</span></div></div>"
         + "</form></div>")
 
 

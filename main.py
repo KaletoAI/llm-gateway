@@ -879,13 +879,16 @@ def apply_voice_library() -> None:
 
 
 def voice_ship_config() -> tuple[list[str], str]:
-    """(hosts, dir) for shipping references: `voice_ref_hosts` = comma-separated
-    'user@host' list — every host that serves a cloning model — and `voice_ref_dir`
-    = ONE absolute dir used on ALL of them (the request carries a single `voice`
-    path, so failover requires the same path everywhere)."""
+    """(targets, voice_dir) for shipping references.
+
+    `voice_ref_hosts` = comma-separated scp TARGETS 'user@host:/abs/host/dir' — one
+    per host serving a cloning model; the host-side dir may differ per host (e.g. a
+    docker bind-mount source). `voice_ref_dir` = the dir AS THE MODEL SEES IT (e.g.
+    the container path '/models/voices') — this single path goes into `voice`, so
+    it must be identical on every host (failover may pick any of them)."""
     s = store.get_settings() if store.is_active() else {}
-    hosts = [h.strip() for h in str(s.get("voice_ref_hosts") or "").split(",") if h.strip()]
-    return hosts, str(s.get("voice_ref_dir") or "").rstrip("/")
+    targets = [h.strip() for h in str(s.get("voice_ref_hosts") or "").split(",") if h.strip()]
+    return targets, str(s.get("voice_ref_dir") or "").rstrip("/")
 
 
 _whisper_model = None                       # lazy faster-whisper instance (CPU, loaded on first use)
@@ -957,30 +960,35 @@ async def _scp(src: Path, host: str, remote: str) -> tuple[bool, str]:
 
 
 async def ship_voice_ref(name: str) -> tuple[bool, str]:
-    """scp the library WAV to EVERY configured TTS host (same absolute dir on all —
-    routing may pick any of them). Records per-host results + the canonical remote
-    path. (all_ok, message) — never raises (UI renders the message)."""
+    """scp the library WAV to EVERY configured target (host-side dirs may differ —
+    docker bind mounts); the entry's `remote` is the MODEL-VISIBLE path
+    (voice_ref_dir/<file>), identical across hosts. (all_ok, message) — never
+    raises (UI renders the message)."""
     e = (store.get_voice_library() if store.is_active() else {}).get(name)
     if not e:
         return False, f"unknown voice '{name}'"
-    hosts, rdir = voice_ship_config()
-    if not hosts or not rdir.startswith("/"):
-        return False, "no ship config — set hosts (user@host, …) + an absolute dir in the Voice tab"
+    targets, vdir = voice_ship_config()
+    bad = [t for t in targets if ":" not in t or not t.split(":", 1)[1].startswith("/")]
+    if not targets or bad or not vdir.startswith("/"):
+        return False, ("no/invalid ship config — targets are 'user@host:/abs/host/dir' (comma-"
+                       "separated) + a model-visible voice dir (e.g. /models/voices)")
     src = Path(e.get("file") or "")
     if not src.is_file():
         return False, f"gateway blob missing: {src}"
-    remote = f"{rdir}/{src.name}"
+    remote = f"{vdir}/{src.name}"                       # what goes into `voice`
     results = {}
-    for h in hosts:
-        ok, msg = await _scp(src, h, remote)
-        results[h] = "ok" if ok else (msg or "scp failed")
+    for t in targets:
+        host, hdir = t.split(":", 1)
+        ok, msg = await _scp(src, host, f"{hdir.rstrip('/')}/{src.name}")
+        results[t] = "ok" if ok else (msg or "scp failed")
     all_ok = all(v == "ok" for v in results.values())
     e.update({"remote": remote if all_ok else e.get("remote", ""),
               "shipped": all_ok, "hosts": results})
     store.set_voice_entry(name, e)
     apply_voice_library()
-    summary = " · ".join(f"{h.split('@')[-1]}: {v if v == 'ok' else v[:80]}" for h, v in results.items())
-    return all_ok, (f"{remote} @ {summary}" if all_ok else summary)
+    summary = " · ".join(f"{t.split('@')[-1].split(':')[0]}: {v if v == 'ok' else v[:80]}"
+                         for t, v in results.items())
+    return all_ok, (f"voice={remote} · {summary}" if all_ok else summary)
 
 
 async def save_voice_ref(name: str, data: bytes, ref_text: str = "") -> dict:

@@ -482,13 +482,15 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 - An empty *ref text* is **auto-transcribed** by the gateway's local faster-whisper
   (CPU; `whisper_model` setting, default `small`). A backend serving a `whisper*`
   model is used as fallback.
-- The file is **shipped via scp to every host** listed under *ship to hosts* —
-  every LocalAI that serves a cloning model, because routing/failover may pick any
-  of them — into ONE *remote dir* that must be the **same absolute path on every
-  host** (a request carries a single `voice` path). One-time setup per host:
-  `ssh-copy-id` from the gateway host (root login via password is usually disabled
-  — `PermitRootLogin prohibit-password`; append the gateway's
-  `/root/.ssh/id_ed25519.pub` to the host's `authorized_keys` instead).
+- The file is **shipped via scp to every configured target** (one per LocalAI host
+  that serves a cloning model — routing/failover may pick any of them). A target is
+  `user@host:/abs/host/dir` — the **host-side** dir, e.g. the source of the docker
+  bind mount (`/root/localai/models/voices`). Separately, *voice dir (model view)*
+  is the path **as the model sees it** (the container path, e.g. `/models/voices`);
+  that single path goes into `voice`, so it must be identical on every host.
+  One-time setup per host: `ssh-copy-id` from the gateway host (root login via
+  password is usually disabled — `PermitRootLogin prohibit-password`; append the
+  gateway's `/root/.ssh/id_ed25519.pub` to the host's `authorized_keys` instead).
 - Use an entry as `voice: "lib:<name>"` — API body, playground picker, or an
   alias's voice default; the gateway substitutes the shipped path + ref text
   (explicit client fields always win). Not-yet-shipped entries return a clear 409.
