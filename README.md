@@ -468,6 +468,31 @@ stats:
 | `POST` | `/v1/images/generations` | text→image (sync); may return a video/audio URL for such aliases |
 | `POST` | `/v1/images/edits` | multipart image+mask edit (sync) |
 
+### Voice cloning & the reference library
+
+**Backend constraint (measured, not assumed):** LocalAI has **no upload API**, and
+cloning-capable TTS models (e.g. `qwen3-tts-cpp-customvoice`) read `voice` strictly
+as a **local file on the backend host** — base64/data-URIs are ignored and URLs are
+treated as file names. (`omnivoice-cpp` ignores `voice` entirely — it never clones.)
+
+The gateway therefore keeps a **voice reference library** (Playground → Voice):
+
+- **Upload a WAV once** — the master copy lives on the gateway (`voiceref/`, kept
+  out of git and deploys). Listen, re-ship or delete entries from the panel.
+- An empty *ref text* is **auto-transcribed** by the gateway's local faster-whisper
+  (CPU; `whisper_model` setting, default `small`). A backend serving a `whisper*`
+  model is used as fallback.
+- The file is **shipped via scp to every host** listed under *ship to hosts* —
+  every LocalAI that serves a cloning model, because routing/failover may pick any
+  of them — into ONE *remote dir* that must be the **same absolute path on every
+  host** (a request carries a single `voice` path). One-time setup per host:
+  `ssh-copy-id` from the gateway host (root login via password is usually disabled
+  — `PermitRootLogin prohibit-password`; append the gateway's
+  `/root/.ssh/id_ed25519.pub` to the host's `authorized_keys` instead).
+- Use an entry as `voice: "lib:<name>"` — API body, playground picker, or an
+  alias's voice default; the gateway substitutes the shipped path + ref text
+  (explicit client fields always win). Not-yet-shipped entries return a clear 409.
+
 ### Native generation + jobs
 
 | Method | Path | Notes |

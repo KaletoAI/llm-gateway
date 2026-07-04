@@ -878,14 +878,31 @@ def apply_voice_library() -> None:
     voice_library = store.get_voice_library() if store.is_active() else {}
 
 
-def voice_ref_target() -> str:
-    """scp destination for shipped references: 'user@host:/abs/dir' (store setting)."""
+def voice_ship_config() -> tuple[list[str], str]:
+    """(hosts, dir) for shipping references: `voice_ref_hosts` = comma-separated
+    'user@host' list — every host that serves a cloning model — and `voice_ref_dir`
+    = ONE absolute dir used on ALL of them (the request carries a single `voice`
+    path, so failover requires the same path everywhere)."""
     s = store.get_settings() if store.is_active() else {}
-    return str(s.get("voice_ref_target") or "")
+    hosts = [h.strip() for h in str(s.get("voice_ref_hosts") or "").split(",") if h.strip()]
+    return hosts, str(s.get("voice_ref_dir") or "").rstrip("/")
+
+
+_whisper_model = None                       # lazy faster-whisper instance (CPU, loaded on first use)
+
+
+def _local_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel        # heavy import — only on first transcription
+        s = store.get_settings() if store.is_active() else {}
+        size = str(s.get("whisper_model") or "small")
+        _whisper_model = WhisperModel(size, device="cpu", compute_type="int8")
+    return _whisper_model
 
 
 def _whisper_route() -> Optional[tuple[dict, str]]:
-    """First healthy LLM backend serving a whisper* model (for auto ref_text)."""
+    """First healthy LLM backend serving a whisper* model (fallback transcription)."""
     for b in enabled_backends():
         if b.get("type", "openai") == "comfyui":
             continue
@@ -896,11 +913,24 @@ def _whisper_route() -> Optional[tuple[dict, str]]:
 
 
 async def transcribe_audio(data: bytes, filename: str = "ref.wav") -> tuple[Optional[str], str]:
-    """(text, source-or-error): transcribe via the first whisper-serving backend's
-    /v1/audio/transcriptions; None when no whisper model exists or the call fails."""
+    """(text, source-or-error). Local faster-whisper on the gateway CPU first (small,
+    lazy-loaded); a backend's /v1/audio/transcriptions as fallback when the local
+    model is unavailable."""
+    import io
+    try:
+        def _run():
+            segs, _info = _local_whisper().transcribe(io.BytesIO(data))
+            return " ".join(s.text.strip() for s in segs).strip()
+        txt = await asyncio.to_thread(_run)
+        if txt:
+            return txt, "gateway whisper"
+    except ImportError:
+        pass                                            # not installed → try a backend
+    except Exception as ex:
+        logger.warning(f"local whisper failed: {type(ex).__name__}: {ex}")
     hit = _whisper_route()
     if hit is None:
-        return None, "no whisper model on any backend"
+        return None, "no local faster-whisper and no whisper model on any backend"
     b, model = hit
     try:
         r = await http_client.post(f"{b['url']}/v1/audio/transcriptions",
@@ -914,33 +944,43 @@ async def transcribe_audio(data: bytes, filename: str = "ref.wav") -> tuple[Opti
         return None, f"{type(ex).__name__}: {ex}"
 
 
-async def ship_voice_ref(name: str) -> tuple[bool, str]:
-    """scp the library WAV to the TTS backend host; records remote path + shipped
-    state on the entry. (ok, message) — never raises (UI renders the message)."""
-    e = (store.get_voice_library() if store.is_active() else {}).get(name)
-    if not e:
-        return False, f"unknown voice '{name}'"
-    target = voice_ref_target().rstrip("/")
-    if ":" not in target or not target.split(":", 1)[1].startswith("/"):
-        return False, "no scp target configured — set 'user@host:/abs/dir' in the Voice tab"
-    src = Path(e.get("file") or "")
-    if not src.is_file():
-        return False, f"gateway blob missing: {src}"
-    host, rdir = target.split(":", 1)
-    remote = f"{rdir}/{src.name}"
+async def _scp(src: Path, host: str, remote: str) -> tuple[bool, str]:
     try:
         proc = await asyncio.create_subprocess_exec(
             "scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
             str(src), f"{host}:{remote}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         out, _ = await proc.communicate()
-        ok = proc.returncode == 0
+        return proc.returncode == 0, (out or b"").decode(errors="replace")[-200:]
     except Exception as ex:
-        ok, out = False, f"{type(ex).__name__}: {ex}".encode()
-    e.update({"remote": remote if ok else e.get("remote", ""), "shipped": ok})
+        return False, f"{type(ex).__name__}: {ex}"
+
+
+async def ship_voice_ref(name: str) -> tuple[bool, str]:
+    """scp the library WAV to EVERY configured TTS host (same absolute dir on all —
+    routing may pick any of them). Records per-host results + the canonical remote
+    path. (all_ok, message) — never raises (UI renders the message)."""
+    e = (store.get_voice_library() if store.is_active() else {}).get(name)
+    if not e:
+        return False, f"unknown voice '{name}'"
+    hosts, rdir = voice_ship_config()
+    if not hosts or not rdir.startswith("/"):
+        return False, "no ship config — set hosts (user@host, …) + an absolute dir in the Voice tab"
+    src = Path(e.get("file") or "")
+    if not src.is_file():
+        return False, f"gateway blob missing: {src}"
+    remote = f"{rdir}/{src.name}"
+    results = {}
+    for h in hosts:
+        ok, msg = await _scp(src, h, remote)
+        results[h] = "ok" if ok else (msg or "scp failed")
+    all_ok = all(v == "ok" for v in results.values())
+    e.update({"remote": remote if all_ok else e.get("remote", ""),
+              "shipped": all_ok, "hosts": results})
     store.set_voice_entry(name, e)
     apply_voice_library()
-    return ok, (f"{host}:{remote}" if ok else (out or b"scp failed").decode(errors="replace")[-300:])
+    summary = " · ".join(f"{h.split('@')[-1]}: {v if v == 'ok' else v[:80]}" for h, v in results.items())
+    return all_ok, (f"{remote} @ {summary}" if all_ok else summary)
 
 
 async def save_voice_ref(name: str, data: bytes, ref_text: str = "") -> dict:
@@ -2137,7 +2177,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            apply_reasoning=apply_reasoning_rules,
            probe_reasoning=probe_reasoning,
            voice_lib_save=save_voice_ref, voice_lib_delete=delete_voice_ref,
-           voice_lib_ship=ship_voice_ref, voice_ref_target=voice_ref_target,
+           voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
            apply_voice_library=apply_voice_library)
 
 

@@ -116,7 +116,7 @@ _probe_reasoning: Callable = None
 _voice_lib_save: Callable = None          # async (name, data, ref_text) → status dict
 _voice_lib_delete: Callable = None        # (name) → None
 _voice_lib_ship: Callable = None          # async (name) → (ok, msg)
-_voice_ref_target: Callable[[], str] = lambda: ""
+_voice_ship_config: Callable[[], tuple] = lambda: ([], "")   # → (hosts, dir)
 _apply_voice_library: Callable[[], None] = lambda: None
 
 
@@ -2361,8 +2361,10 @@ def _voice_lib_panel(status_html: str = "") -> str:
     rows = ""
     for n, e in sorted(lib.items()):
         e = e or {}
-        shipped = (_badge("shipped", "ok", e.get("remote", "")) if e.get("shipped")
-                   else _badge("pending", "warn", "not on the backend host yet — retry ship"))
+        hosts_state = " · ".join(f"{h.split('@')[-1]}: {v if v == 'ok' else v[:60]}"
+                                 for h, v in (e.get("hosts") or {}).items())
+        shipped = (_badge("shipped", "ok", f"{e.get('remote', '')} — {hosts_state}") if e.get("shipped")
+                   else _badge("pending", "warn", hosts_state or "not on the backend hosts yet — retry ship"))
         rt = (e.get("ref_text") or "")[:60]
         acts = _icon_acts(("▶", f"/ui/playground/voice-lib/{quote(n)}", "secondary", "Play the reference"),
                           ("↻", f"/ui/playground/voice-ship?name={quote(n)}", "secondary", "Ship to the backend host (scp)"),
@@ -2372,13 +2374,15 @@ def _voice_lib_panel(status_html: str = "") -> str:
                  f"<td class='muted' title='{_esc(e.get('ref_text', ''))}'>{_esc(rt)}</td>"
                  f"<td class='acts'>{acts}</td></tr>")
     rows = rows or "<tr><td colspan=4 class='muted'>no voices yet — upload one below</td></tr>"
-    target = _voice_ref_target()
+    hosts, rdir = _voice_ship_config()
+    wm = str((store.get_settings() or {}).get("whisper_model") or "small") if store.is_active() else "small"
     return (
         "<div style='margin-top:18px;padding-top:12px;border-top:1px solid #272b33'>"
         "<h2>Voice library</h2>"
-        "<p class='hint'>Uploaded references are stored on the gateway and <b>shipped via scp</b> to the "
-        "TTS backend host (the model reads <code>voice</code> only as a local file there). Empty "
-        "<b>ref text</b> is auto-transcribed when any backend serves a <code>whisper*</code> model.</p>"
+        "<p class='hint'>Uploaded references are stored on the gateway (master copy) and <b>shipped via "
+        "scp to every TTS host</b> — LocalAI has no upload API; the model reads <code>voice</code> only "
+        "as a local file, and failover may route to any host serving the model. Empty <b>ref text</b> is "
+        "auto-transcribed by the gateway's local faster-whisper (CPU).</p>"
         + status_html
         + f"<table><tr><th>voice</th><th>state</th><th>ref text</th><th></th></tr>{rows}</table>"
         + '<form action="/ui/playground/voice-upload" method="post" enctype="multipart/form-data" '
@@ -2389,10 +2393,13 @@ def _voice_lib_panel(status_html: str = "") -> str:
         + f'<div class="field"><label></label><div class="control">{_btn("⬆ Upload voice", submit=True)}</div></div>'
         + "</form>"
         + '<form action="/ui/playground/voice-target" method="post" style="margin-top:6px">'
-        + _field("scp target", _inp("target", target, placeholder="root@192.168.8.38:/opt/llm-voices"))
-        + f'<div class="field"><label></label><div class="control">{_btn("Save target", submit=True, kind="secondary")}'
-          "<span class='hint' style='margin-left:10px'>needs a key: <code>ssh-copy-id</code> from the "
-          "gateway host to the backend host once</span></div></div>"
+        + _field("ship to hosts", _inp("hosts", ", ".join(hosts),
+                                       placeholder="root@192.168.8.38, root@192.168.8.39"))
+        + _field("remote dir", _inp("dir", rdir, placeholder="/opt/llm-voices — SAME absolute dir on every host"))
+        + _field("whisper model", _inp("whisper_model", wm, placeholder="small"), short=True)
+        + f'<div class="field"><label></label><div class="control">{_btn("Save settings", submit=True, kind="secondary")}'
+          "<span class='hint' style='margin-left:10px'>every host serving a cloning model, comma-separated; "
+          "needs a key once per host: <code>ssh-copy-id</code> from the gateway host</span></div></div>"
         + "</form></div>")
 
 
@@ -2482,7 +2489,9 @@ async def voice_upload(request: Request):
 
 async def voice_target(request: Request):
     f = await _form(request)
-    store.set_settings({"voice_ref_target": (f.get("target", "") or "").strip()})
+    store.set_settings({"voice_ref_hosts": (f.get("hosts", "") or "").strip(),
+                        "voice_ref_dir": (f.get("dir", "") or "").strip(),
+                        "whisper_model": (f.get("whisper_model", "") or "").strip() or "small"})
     return RedirectResponse("/ui/playground?sub=voice", status_code=303)
 
 
