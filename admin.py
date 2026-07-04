@@ -2346,7 +2346,7 @@ def _voiceplay_form(vals: dict) -> str:
     return ('<form action="/ui/playground/voice" method="post" onsubmit="return vpSending(this)">'
             f'<div class="formbar"><h2>Voice</h2>{_btn("Synthesize", submit=True)}</div>'
             + _field("model", _dl_input("model", v("model") or "omnivoice-cpp", "vpmodels",
-                                        "TTS model id or alias"), short=True)
+                                        "TTS model id or alias"))
             + _field("text", _textarea("input", v("input"), 5, "the text to speak"))
             + _field("voice (library)", f'<select name="voice_sel">{vopts}</select>')
             + _field("…or path", _inp("voice", "" if v("voice").startswith("lib:") else v("voice"),
