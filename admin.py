@@ -52,7 +52,7 @@ DEFAULT_TAB = "dashboard"
 # parent route (first child = default). General pattern — future tab groupings
 # register here; the parent page dispatches on `sub` and wraps its body with
 # _with_subnav() so the bar sits above the full-height .cols block.
-SUBTABS = {"playground": [("media", "Media"), ("chat", "Chat"), ("voice", "Voice")]}
+SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")]}
 
 
 def _subnav(parent: str, active_sub: str) -> str:
@@ -674,7 +674,11 @@ def _backend_form(b: Optional[dict]) -> str:
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
             + _field("name", _inp("name", g("name"), placeholder="evo-comfy"))
             + _field("type", _type_select(g("type", "openai")))
-            + _field("url", _inp("url", g("url"), placeholder="http://192.168.8.40:8188"))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>openai</b> = every OpenAI-compatible server "
+              "(llama.cpp / llama-swap / vLLM / LocalAI / cloud) — including <b>TTS/voice</b> and whisper "
+              "models, which are discovered and routed like any other model. <b>comfyui</b> = workflow-based "
+              "media generation.</p>"
+            + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
             + _field("priority", _inp("priority", g("priority", "10"), typ="number"))
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
             + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
@@ -2192,9 +2196,9 @@ def _job_result_html(job_id: str, job: Optional[dict]):
 
 
 async def playground_page(request: Request):
-    """Parent tab: dispatches on ?sub= (see SUBTABS) — media (default) | chat."""
+    """Parent tab: dispatches on ?sub= (see SUBTABS; first child = default)."""
     qp = request.query_params
-    sub = qp.get("sub") or "media"
+    sub = qp.get("sub") or SUBTABS["playground"][0][0]
     if sub == "chat":
         vals = {k: qp.get(k, "") for k in _CHATPLAY_KEYS}
         result_html = "<h2>Response</h2><p class='hint'>Send a message to see the reply here.</p>"
@@ -2366,16 +2370,20 @@ def _voice_lib_panel(status_html: str = "") -> str:
         shipped = (_badge("shipped", "ok", f"{e.get('remote', '')} — {hosts_state}") if e.get("shipped")
                    else _badge("pending", "warn", hosts_state or "not on the backend hosts yet — retry ship"))
         rt = (e.get("ref_text") or "")[:60]
-        acts = _icon_acts(("▶", f"/ui/playground/voice-lib/{quote(n)}", "secondary", "Play the reference"),
-                          ("↻", f"/ui/playground/voice-ship?name={quote(n)}", "secondary", "Ship to the backend host (scp)"),
-                          ("✕", f"/ui/playground/voice-del?name={quote(n)}", "danger", "Delete",
-                           f"Delete voice '{n}'?"))
+        play = (f'<a class="btn secondary sm icon" href="#" data-v="{_esc(n)}" '
+                f'onclick="return vlPlay(this)" title="Play the reference in the result column">▶</a>')
+        acts = play + _icon_acts(
+            ("↻", f"/ui/playground/voice-ship?name={quote(n)}", "secondary", "Ship to the backend host (scp)"),
+            ("✕", f"/ui/playground/voice-del?name={quote(n)}", "danger", "Delete", f"Delete voice '{n}'?"))
         rows += (f"<tr><td><code>lib:{_esc(n)}</code></td><td>{shipped}</td>"
                  f"<td class='muted' title='{_esc(e.get('ref_text', ''))}'>{_esc(rt)}</td>"
                  f"<td class='acts'>{acts}</td></tr>")
     rows = rows or "<tr><td colspan=4 class='muted'>no voices yet — upload one below</td></tr>"
     hosts, rdir = _voice_ship_config()
     wm = str((store.get_settings() or {}).get("whisper_model") or "small") if store.is_active() else "small"
+    wm_opts = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
+    if wm not in wm_opts:
+        wm_opts = [wm] + wm_opts
     return (
         "<div style='margin-top:18px;padding-top:12px;border-top:1px solid #272b33'>"
         "<h2>Voice library</h2>"
@@ -2394,15 +2402,21 @@ def _voice_lib_panel(status_html: str = "") -> str:
         + "</form>"
         + '<form action="/ui/playground/voice-target" method="post" style="margin-top:6px">'
         + _field("scp targets", _inp("hosts", ", ".join(hosts),
-                                     placeholder="root@192.168.8.39:/root/localai/models/voices, …"))
+                                     placeholder="user@tts-host:/abs/host/dir, … (comma-separated)"))
         + _field("voice dir (model view)", _inp("dir", rdir,
-                                                placeholder="/models/voices — the path the MODEL sees (container view)"))
-        + _field("whisper model", _inp("whisper_model", wm, placeholder="small"), short=True)
+                                                placeholder="the path the MODEL sees, e.g. its container mount"))
+        + _field("whisper model", _select("whisper_model", wm_opts, wm), short=True)
         + f'<div class="field"><label></label><div class="control">{_btn("Save settings", submit=True, kind="secondary")}'
-          "<span class='hint' style='margin-left:10px'>one scp target per cloning host (host-side dir, e.g. the "
-          "docker bind-mount source); <b>voice dir</b> is what goes into <code>voice</code> — the container path, "
-          "identical on every host. Key once per host: <code>ssh-copy-id</code> from the gateway.</span></div></div>"
-        + "</form></div>")
+          "<span class='hint' style='margin-left:10px'>one scp target per cloning host (host-side dir — for a "
+          "dockerized LocalAI the bind-mount source); <b>voice dir</b> is what goes into <code>voice</code> — the "
+          "path from the model's view, identical on every host. Key once per host: <code>ssh-copy-id</code> from "
+          "the gateway.</span></div></div>"
+        + "</form>"
+        + "<script>function vlPlay(a){var r=document.getElementById('vpresult');if(!r)return false;"
+          "var n=a.getAttribute('data-v');"
+          "r.innerHTML=\"<h2>Result</h2><p class='muted'>\\ud83d\\udcda reference: <b>\"+n+\"</b></p>"
+          "<audio class='result' controls autoplay src='/ui/playground/voice-lib/\"+encodeURIComponent(n)+"
+          "\"?t=\"+Date.now()+\"'></audio>\";return false;}</script></div>")
 
 
 def _voiceplay_body(vals: dict, result_html: str, lib_status: str = "") -> str:
