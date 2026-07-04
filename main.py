@@ -979,7 +979,15 @@ async def ship_voice_ref(name: str) -> tuple[bool, str]:
     results = {}
     for t in targets:
         host, hdir = t.split(":", 1)
-        ok, msg = await _scp(src, host, f"{hdir.rstrip('/')}/{src.name}")
+        hdir = hdir.rstrip("/")
+        try:                                            # scp can't create dirs — mkdir -p first
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, f"mkdir -p {hdir}",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await proc.communicate()
+        except Exception:
+            pass                                        # scp below reports the real error
+        ok, msg = await _scp(src, host, f"{hdir}/{src.name}")
         results[t] = "ok" if ok else (msg or "scp failed")
     all_ok = all(v == "ok" for v in results.values())
     e.update({"remote": remote if all_ok else e.get("remote", ""),
