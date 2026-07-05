@@ -2345,8 +2345,7 @@ def _voiceplay_form(vals: dict) -> str:
         for n, e in sorted(lib.items()))
     return ('<form action="/ui/playground/voice" method="post" onsubmit="return vpSending(this)">'
             f'<div class="formbar"><h2>Voice</h2>{_btn("Synthesize", submit=True)}</div>'
-            + _field("model", _dl_input("model", v("model") or "omnivoice-cpp", "vpmodels",
-                                        "TTS model id or alias"))
+            + _field("model", _dl_input("model", v("model"), "vpmodels", "TTS model id or alias"))
             + _field("text", _textarea("input", v("input"), 5, "the text to speak"))
             + _field("voice (library)", f'<select name="voice_sel">{vopts}</select>')
             + _field("…or path", _inp("voice", "" if v("voice").startswith("lib:") else v("voice"),
@@ -2394,7 +2393,7 @@ def _voice_lib_panel(status_html: str = "") -> str:
         + status_html
         + f"<table><tr><th>voice</th><th>state</th><th>ref text</th><th></th></tr>{rows}</table>"
         + '<form action="/ui/playground/voice-upload" method="post" enctype="multipart/form-data" '
-          'style="margin-top:10px">'
+          'onsubmit="return vuSending(this)" style="margin-top:10px">'
         + _field("name", _inp("name", "", placeholder="kai"), short=True)
         + _field("wav file", '<input type="file" name="file" accept="audio/*">')
         + _field("ref text", _textarea("ref_text", "", 2, "leave empty → auto-transcribe (whisper)"))
@@ -2416,7 +2415,13 @@ def _voice_lib_panel(status_html: str = "") -> str:
           "var n=a.getAttribute('data-v');"
           "r.innerHTML=\"<h2>Result</h2><p class='muted'>\\ud83d\\udcda reference: <b>\"+n+\"</b></p>"
           "<audio class='result' controls autoplay src='/ui/playground/voice-lib/\"+encodeURIComponent(n)+"
-          "\"?t=\"+Date.now()+\"'></audio>\";return false;}</script></div>")
+          "\"?t=\"+Date.now()+\"'></audio>\";return false;}"
+          "function vuSending(f){var r=document.getElementById('vpresult');"
+          "if(r)r.innerHTML=\"<h2>Result</h2><p class='muted'>\\u23f3 <b>Uploading voice\\u2026</b> · "
+          "transcribing (local whisper) + shipping to the TTS hosts (scp) — the first run can take a "
+          "while (whisper model load)</p>\";"
+          "var b=f.querySelector('button[type=submit]');if(b){b.disabled=true;b.textContent='Uploading\\u2026';}"
+          "return true;}</script></div>")
 
 
 def _voiceplay_body(vals: dict, result_html: str, lib_status: str = "") -> str:
@@ -2429,9 +2434,9 @@ async def voiceplay_send(request: Request):
     vals = {k: (f.get(k, "") or "") for k in _VOICEPLAY_KEYS}
     if (f.get("voice_sel", "") or "").strip():         # picked library voice wins over the path box
         vals["voice"] = f["voice_sel"].strip()
-    model, text = vals["model"].strip() or "omnivoice-cpp", vals["input"].strip()
-    if not text:
-        result = "<h2>Result</h2><p class='bad'>text is required</p>"
+    model, text = vals["model"].strip(), vals["input"].strip()
+    if not model or not text:
+        result = "<h2>Result</h2><p class='bad'>model and text are required</p>"
         return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
                                                         _voiceplay_body(vals, result)), "playground"))
     body = {"model": model, "input": text}
