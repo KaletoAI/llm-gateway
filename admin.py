@@ -43,7 +43,7 @@ TABS = [
     ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
     ("reasoning", "Reasoning"),
     ("playground", "Playground"),
-    ("jobs", "Media Jobs"), ("llmcalls", "LLM Calls"),
+    ("jobs", "Jobs & Calls"),
     ("statistic", "Statistic"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
@@ -52,7 +52,8 @@ DEFAULT_TAB = "dashboard"
 # parent route (first child = default). General pattern — future tab groupings
 # register here; the parent page dispatches on `sub` and wraps its body with
 # _with_subnav() so the bar sits above the full-height .cols block.
-SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")]}
+SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
+           "jobs": [("media", "Media Jobs"), ("llm", "LLM Calls"), ("voice", "Voice Calls")]}
 
 
 def _subnav(parent: str, active_sub: str) -> str:
@@ -2642,21 +2643,55 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     return "<tr>" + "".join(cells) + "</tr>"
 
 
-async def jobs_page(request: Request):
-    """List of generation jobs (image/video/audio), newest first, each linking to its
-    detail page. Excludes parked-chat jobs (those live under Statistic)."""
+def _jobs_media_body() -> tuple[str, Optional[int]]:
+    """(body, refresh) — generation jobs (image/video/audio), newest first; excludes
+    parked-chat / background-response rows."""
     if not jobs.is_active():
-        return _inactive()
-    rows = jobs.recent(200, media_only=True)   # no parked-chat / background-response rows
+        return ("<h2>Media Jobs</h2><p class='hint'>Job store is off — set <code>image_models</code> "
+                "or <code>jobs.enabled: true</code> in config.</p>", None)
+    rows = jobs.recent(200, media_only=True)
     if not rows:
-        return HTMLResponse(_page("Media Jobs", "<h2>Media Jobs</h2><p class='hint'>No generation "
-            "jobs yet. Run one in the <a href='/ui/playground'>Media Playground</a>.</p>", "jobs"))
+        return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
+                "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>", None)
     now = int(time.time())
     tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True) for j in rows)
     tbl = (f"<table><tr><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
            f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
-    return HTMLResponse(_page("Media Jobs", f"<h2>Media Jobs</h2>{tbl}{_JOB_TICK}", "jobs", refresh=refresh))
+    return (f"<h2>Media Jobs</h2>{tbl}{_JOB_TICK}", refresh)
+
+
+async def _calls_view_body(request: Request, voice: bool) -> str:
+    """Per-call history body — LLM Calls (everything except /v1/audio/*) or Voice
+    Calls (only /v1/audio/*). Same table/filter machinery, split by endpoint."""
+    title = "Voice Calls" if voice else "LLM Calls"
+    if not stats.is_active():
+        return (f"<h2>{title}</h2><p class='hint'>Call recording is off. Enable <b>stats</b> in the "
+                "<a href='/ui/server'>Server</a> tab (needs a restart) to log per-call history here.</p>")
+    user = (request.query_params.get("user") or "").strip() or None
+    s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
+    rows = [r for r in s["recent"] if bool(str(r[7] or "").startswith("/v1/audio")) == voice]
+    aliases = store.get_ip_aliases()
+    scope, bar = _user_filter_bar(f"/ui/jobs?sub={'voice' if voice else 'llm'}",
+                                  user, s["by_source"], aliases)
+    head = (f"<h2>{title}{scope} <span class='muted' style='font-weight:normal'>· last {len(rows)}</span></h2>"
+            f"{bar}")
+    return head + _recent_calls_table(rows, aliases) + _FILTER_JS
+
+
+async def jobs_page(request: Request):
+    """Parent tab Jobs & Calls: sub-tabs Media Jobs | LLM Calls | Voice Calls
+    (?sub=, first child = default)."""
+    sub = request.query_params.get("sub") or SUBTABS["jobs"][0][0]
+    refresh = None
+    if sub == "llm":
+        title, body = "LLM Calls", await _calls_view_body(request, voice=False)
+    elif sub == "voice":
+        title, body = "Voice Calls", await _calls_view_body(request, voice=True)
+    else:
+        sub = "media"
+        title, (body, refresh) = "Media Jobs", _jobs_media_body()
+    return HTMLResponse(_page(title, _with_subnav("jobs", sub, body), "jobs", refresh=refresh))
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
@@ -3045,8 +3080,9 @@ def _user_filter_bar(path: str, user, by_source, aliases) -> tuple[str, str]:
     opts = "<option value=''>all users</option>" + "".join(
         f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
         for r in by_source)
+    sep = "&" if "?" in path else "?"                  # path may already carry ?sub=…
     picker = (f"<select style=\"width:auto;{_BOX_STYLE}\" onchange=\"location.href='{path}'+"
-              f"(this.value?('?user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
+              f"(this.value?('{sep}user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
     search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
               f"placeholder='filter rows: backend / alias / model / user…' "
               f"style=\"flex:1;min-width:220px;max-width:420px;{_BOX_STYLE}\">")
@@ -3057,21 +3093,10 @@ def _user_filter_bar(path: str, user, by_source, aliases) -> tuple[str, str]:
 
 
 async def llmcalls_page(request: Request):
-    """Per-call LLM history — the analogue of the Media Jobs tab. A filterable list
-    of recent chat/completions/embeddings forwards; each row links to its stored
-    request/response body (/ui/call/{id})."""
-    if not stats.is_active():
-        return HTMLResponse(_page("LLM Calls", "<h2>LLM Calls</h2><p class='hint'>Call recording is off. "
-            "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to log "
-            "per-call history here.</p>", "llmcalls"))
-    user = (request.query_params.get("user") or "").strip() or None
-    s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
-    aliases = store.get_ip_aliases()
-    scope, bar = _user_filter_bar("/ui/llmcalls", user, s["by_source"], aliases)
-    head = (f"<h2>LLM Calls{scope} <span class='muted' style='font-weight:normal'>· last {len(s['recent'])}</span></h2>"
-            f"{bar}")
-    body = head + _recent_calls_table(s["recent"], aliases) + _FILTER_JS
-    return HTMLResponse(_page("LLM Calls", body, "llmcalls"))
+    """Legacy URL — LLM Calls now lives under /ui/jobs?sub=llm."""
+    q = dict(request.query_params)
+    q["sub"] = "llm"
+    return RedirectResponse(f"/ui/jobs?{urlencode(q)}", status_code=307)
 
 
 async def statistic_page(request: Request):
@@ -3124,8 +3149,8 @@ async def call_view(call_id: int, request: Request):
         inner = (f"<h3>Request</h3><pre class='chatout'>{_esc(req)}</pre>"
                  f"<h3>Response</h3><pre class='chatout'>{_esc(resp)}</pre>")
     page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
-            f"{_btn('← Back to LLM Calls', '/ui/llmcalls', 'secondary')}</div>{inner}")
-    return HTMLResponse(_page("Call", page, "llmcalls"))
+            f"{_btn('← Back to LLM Calls', '/ui/jobs?sub=llm', 'secondary')}</div>{inner}")
+    return HTMLResponse(_page("Call", page, "jobs"))
 
 
 # ── Reasoning tab: normalized thinking toggle (per-model × per-backend rules) ────
