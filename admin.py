@@ -2206,7 +2206,13 @@ async def playground_page(request: Request):
                                   _with_subnav("playground", "chat", _chatplay_body(vals, result_html)), "playground"))
     if sub == "voice":
         vals = {k: qp.get(k, "") for k in _VOICEPLAY_KEYS}
-        result_html = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+        prog = _voice_upload_prog.get(_session_user(request) or "default")
+        if qp.get("vu") == "done" and prog:              # post-upload reload: final checklist + fresh table
+            result_html = _vu_fragment(prog).replace("<span data-vudone hidden></span>", "")
+        elif prog and not prog.get("done"):              # reload during an upload → keep polling
+            result_html = _vu_fragment(prog) + _VU_POLL_JS
+        else:
+            result_html = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
         return HTMLResponse(_page("Voice",
                                   _with_subnav("playground", "voice", _voiceplay_body(vals, result_html)), "playground"))
     if not store.is_active():
@@ -2482,30 +2488,81 @@ def _voice_status(kind: str, msg: str) -> str:
     return f"<p class='{cls}'>{msg}</p>"
 
 
+_voice_upload_prog: dict = {}   # user → {name, steps: [(kind, text)], done, ok} — live upload progress
+
+
+def _vu_fragment(prog: dict) -> str:
+    """Progress checklist for the result column (polled): ✓/✗ per finished step,
+    ⏳ for the one currently running (superseded 'run' markers are dropped)."""
+    icons = {"ok": "✓", "err": "✗"}
+    steps = prog.get("steps") or []
+    rows = ""
+    for i, (k, t) in enumerate(steps):
+        if k == "run":
+            if i == len(steps) - 1 and not prog.get("done"):
+                rows += f"<p class='muted'>⏳ <b>{_esc(t)}…</b></p>"
+            continue
+        rows += f"<p class='{'bad' if k == 'err' else 'muted'}'>{icons.get(k, '·')} {_esc(t)}</p>"
+    head = f"<h2>Result</h2><p class='muted'>⬆ upload <b>lib:{_esc(prog.get('name', ''))}</b></p>"
+    if not prog.get("done"):
+        return head + rows
+    tail = ("<p>✓ <b>done — shipped to all hosts</b></p>" if prog.get("ok") else
+            "<p class='bad'>finished with problems — see the steps above (↻ retries the ship)</p>")
+    return head + rows + tail + "<span data-vudone hidden></span>"
+
+
+_VU_POLL_JS = ("<script>(function(){var t=setInterval(function(){"
+               "fetch('/ui/playground/voice-upload-status',{cache:'no-store'})"
+               ".then(function(r){return r.text();}).then(function(h){"
+               "var r=document.getElementById('vpresult');if(r)r.innerHTML=h;"
+               "if(h.indexOf('data-vudone')>=0){clearInterval(t);"
+               "setTimeout(function(){location.replace('/ui/playground?sub=voice&vu=done');},900);}"
+               "}).catch(function(){});},1000);})();</script>")
+
+
 async def voice_upload(request: Request):
-    """Add a library voice: store the blob on the gateway, auto-transcribe when
-    ref_text is empty, then try to ship it to the backend host."""
+    """Start the upload as a background task and show LIVE progress in the result
+    column (store → whisper transcription → scp per host); the poller refreshes
+    the page when done so the library table shows the new entry."""
     f = await _multipart(request)
     name = str(f.get("name", "")).strip()
     data = f.get("file")
     ref_text = str(f.get("ref_text", "") or "")
-    if not name or not isinstance(data, (bytes, bytearray)) or not data.strip():
-        status = _voice_status("bad", "name and a WAV file are required")
-    elif _voice_lib_save is None:
-        status = _voice_status("bad", "library unavailable (gateway not bound)")
-    else:
-        res = await _voice_lib_save(name, bytes(data), ref_text)
-        bits = [f"<b>lib:{_esc(name)}</b> saved ({len(data) // 1024} KB)"]
-        if res.get("note"):
-            bits.append(_esc(res["note"]))
-        bits.append("shipped ✓ " + _esc(res.get("ship_msg", "")) if res.get("shipped")
-                    else "<span class='bad'>not shipped:</span> " + _esc(res.get("ship_msg", "")))
-        status = _voice_status("ok", " · ".join(bits))
-        logger.info(f"ui: voice ref '{name}' uploaded (shipped={res.get('shipped')})")
-    result = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
     vals = {k: "" for k in _VOICEPLAY_KEYS}
+    if not name or not isinstance(data, (bytes, bytearray)) or not data.strip() or _voice_lib_save is None:
+        status = _voice_status("bad", "name and a WAV file are required"
+                               if _voice_lib_save else "library unavailable (gateway not bound)")
+        result = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+        return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
+                                                        _voiceplay_body(vals, result, status)), "playground"))
+    user = _session_user(request) or "default"
+    prog = {"name": name, "steps": [], "done": False, "ok": False}
+    _voice_upload_prog[user] = prog
+    blob = bytes(data)
+
+    async def _run():
+        try:
+            res = await _voice_lib_save(name, blob, ref_text,
+                                        lambda k, t: prog["steps"].append((k, t)))
+            prog["ok"] = bool(res.get("shipped"))
+        except Exception as ex:
+            prog["steps"].append(("err", f"{type(ex).__name__}: {ex}"))
+        finally:
+            prog["done"] = True
+            logger.info(f"ui: voice ref '{name}' uploaded (ok={prog['ok']})")
+
+    asyncio.create_task(_run())
     return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
-                                                    _voiceplay_body(vals, result, status)), "playground"))
+                              _voiceplay_body(vals, _vu_fragment(prog) + _VU_POLL_JS)), "playground"))
+
+
+async def voice_upload_status(request: Request):
+    """Result-column fragment for the upload poller."""
+    prog = _voice_upload_prog.get(_session_user(request) or "default")
+    if not prog:
+        return HTMLResponse("<h2>Result</h2><p class='muted'>no upload running</p>"
+                            "<span data-vudone hidden></span>")
+    return HTMLResponse(_vu_fragment(prog))
 
 
 async def voice_target(request: Request):
@@ -3810,6 +3867,7 @@ def register(app) -> None:
     app.add_api_route("/ui/playground/voice", voiceplay_send, methods=["POST"])
     app.add_api_route("/ui/playground/voice-audio", voice_audio, methods=["GET"])
     app.add_api_route("/ui/playground/voice-upload", voice_upload, methods=["POST"])
+    app.add_api_route("/ui/playground/voice-upload-status", voice_upload_status, methods=["GET"])
     app.add_api_route("/ui/playground/voice-target", voice_target, methods=["POST"])
     app.add_api_route("/ui/playground/voice-ship", voice_ship, methods=["GET"])
     app.add_api_route("/ui/playground/voice-del", voice_del, methods=["GET"])

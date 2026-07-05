@@ -959,27 +959,34 @@ async def _scp(src: Path, host: str, remote: str) -> tuple[bool, str]:
         return False, f"{type(ex).__name__}: {ex}"
 
 
-async def ship_voice_ref(name: str) -> tuple[bool, str]:
+async def ship_voice_ref(name: str, notify=None) -> tuple[bool, str]:
     """scp the library WAV to EVERY configured target (host-side dirs may differ —
     docker bind mounts); the entry's `remote` is the MODEL-VISIBLE path
     (voice_ref_dir/<file>), identical across hosts. (all_ok, message) — never
-    raises (UI renders the message)."""
+    raises (UI renders the message). `notify(kind, text)` (kind ok|err|run)
+    streams per-step progress to the UI poller."""
+    nb = notify or (lambda k, t: None)
     e = (store.get_voice_library() if store.is_active() else {}).get(name)
     if not e:
+        nb("err", f"unknown voice '{name}'")
         return False, f"unknown voice '{name}'"
     targets, vdir = voice_ship_config()
     bad = [t for t in targets if ":" not in t or not t.split(":", 1)[1].startswith("/")]
     if not targets or bad or not vdir.startswith("/"):
-        return False, ("no/invalid ship config — targets are 'user@host:/abs/host/dir' (comma-"
-                       "separated) + a model-visible voice dir (e.g. /models/voices)")
+        msg = ("no/invalid ship config — targets are 'user@host:/abs/host/dir' (comma-"
+               "separated) + a model-visible voice dir (e.g. /models/voices)")
+        nb("err", msg)
+        return False, msg
     src = Path(e.get("file") or "")
     if not src.is_file():
+        nb("err", f"gateway blob missing: {src}")
         return False, f"gateway blob missing: {src}"
     remote = f"{vdir}/{src.name}"                       # what goes into `voice`
     results = {}
     for t in targets:
         host, hdir = t.split(":", 1)
         hdir = hdir.rstrip("/")
+        nb("run", f"upload → {host}")
         try:                                            # scp can't create dirs — mkdir -p first
             proc = await asyncio.create_subprocess_exec(
                 "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, f"mkdir -p {hdir}",
@@ -989,6 +996,7 @@ async def ship_voice_ref(name: str) -> tuple[bool, str]:
             pass                                        # scp below reports the real error
         ok, msg = await _scp(src, host, f"{hdir}/{src.name}")
         results[t] = "ok" if ok else (msg or "scp failed")
+        nb("ok" if ok else "err", f"{host}: {'ok' if ok else (msg or 'scp failed')[:120]}")
     all_ok = all(v == "ok" for v in results.values())
     e.update({"remote": remote if all_ok else e.get("remote", ""),
               "shipped": all_ok, "hosts": results})
@@ -999,21 +1007,27 @@ async def ship_voice_ref(name: str) -> tuple[bool, str]:
     return all_ok, (f"voice={remote} · {summary}" if all_ok else summary)
 
 
-async def save_voice_ref(name: str, data: bytes, ref_text: str = "") -> dict:
+async def save_voice_ref(name: str, data: bytes, ref_text: str = "", notify=None) -> dict:
     """Create/replace a library entry: write the gateway blob, auto-transcribe when
-    ref_text is empty (whisper backend, if any), then try to ship. Returns UI status."""
+    ref_text is empty (whisper backend, if any), then try to ship. Returns UI status;
+    `notify(kind, text)` streams per-step progress (store → whisper → per-host scp)."""
+    nb = notify or (lambda k, t: None)
     VOICE_REF_DIR.mkdir(exist_ok=True)
     path = VOICE_REF_DIR / (_voice_safe(name) + ".wav")
     path.write_bytes(data)
+    nb("ok", f"stored on the gateway ({len(data) // 1024} KB)")
     note = ""
     if not (ref_text or "").strip():
+        nb("run", "whisper — transcribing the reference")
         txt, src = await transcribe_audio(data, path.name)
         ref_text = txt or ""
         note = f"ref_text transcribed via {src}" if txt else f"ref_text empty — {src}"
+        nb("ok" if txt else "err", note + (f": “{txt[:80]}…”" if txt and len(txt) > 80
+                                           else (f": “{txt}”" if txt else "")))
     store.set_voice_entry(name, {"ref_text": (ref_text or "").strip(), "file": str(path),
                                  "remote": "", "shipped": False})
     apply_voice_library()                         # cache now — ship's early returns don't refresh
-    ok, msg = await ship_voice_ref(name)
+    ok, msg = await ship_voice_ref(name, notify=notify)
     return {"shipped": ok, "ship_msg": msg, "note": note,
             "entry": voice_library.get(name) or {}}
 
