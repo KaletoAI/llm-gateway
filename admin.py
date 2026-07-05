@@ -166,7 +166,7 @@ header{display:flex;align-items:center;background:#171a21;border-bottom:1px soli
 nav{display:flex;flex-wrap:wrap}
 nav a{color:#9aa7b4;padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
 nav a:hover{color:#dce4ec;background:#1b1f27}
-.subnav{display:flex;gap:2px;margin:0 0 12px;border-bottom:1px solid #272b33;flex:none}
+.subnav{display:flex;gap:2px;margin:0 0 12px;border-bottom:1px solid #272b33;flex:none;position:sticky;top:0;z-index:11;background:#0f1115}
 .subnav a{color:#9aa7b4;padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
 .subnav a:hover{color:#dce4ec;background:#1b1f27}
 .subnav a.on{color:#fff;border-bottom-color:#3b82f6}
