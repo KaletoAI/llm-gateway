@@ -40,7 +40,7 @@ _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", 
 
 TABS = [
     ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
-    ("input", "Input"), ("routing", "Routing Overview"), ("mapping", "Mapping"),
+    ("routing", "Input & Routing"), ("mapping", "Mapping"),
     ("reasoning", "Reasoning"),
     ("playground", "Playground"),
     ("jobs", "Jobs & Calls"),
@@ -53,7 +53,9 @@ DEFAULT_TAB = "dashboard"
 # register here; the parent page dispatches on `sub` and wraps its body with
 # _with_subnav() so the bar sits above the full-height .cols block.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
-           "jobs": [("llm", "LLM Calls"), ("media", "Media Jobs"), ("voice", "Voice Calls")]}
+           "jobs": [("llm", "LLM Calls"), ("media", "Media Jobs"), ("voice", "Voice Calls")],
+           "routing": [("input", "Input"), ("chat", "Chat aliases"), ("llm", "LLM models"),
+                       ("gen", "Media aliases"), ("image", "Image models"), ("loras", "LoRAs")]}
 
 
 def _subnav(parent: str, active_sub: str) -> str:
@@ -119,6 +121,8 @@ _voice_lib_delete: Callable = None        # (name) → None
 _voice_lib_ship: Callable = None          # async (name) → (ok, msg)
 _voice_ship_config: Callable[[], tuple] = lambda: ([], "")   # → (hosts, dir)
 _apply_voice_library: Callable[[], None] = lambda: None
+# ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
+_backend_loras: Callable[[], dict] = lambda: {}
 
 
 def bind(**overrides) -> None:
@@ -862,6 +866,11 @@ async def backend_enable(request: Request):
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
 
 async def input_page(request: Request):
+    """Legacy URL — Input now lives under /ui/routing?sub=input."""
+    return RedirectResponse("/ui/routing?sub=input", status_code=307)
+
+
+def _input_body() -> str:
     info = _gateway_info()
     gen = sorted(store.list_aliases().keys()) if store.is_active() else []
     llm = _llm_backends()
@@ -892,7 +901,7 @@ async def input_page(request: Request):
                       f'</tr>{mrows}</table>')
     else:
         models_tbl = '<p class="muted">none discovered</p>'
-    body = (f"<h2>Input — what clients can call</h2>"
+    return (f"<h2>Input — what clients can call</h2>"
             f"<p class='hint'>Anything below can be the request <code>model</code>. Aliases are "
             f"shortcuts; every discovered model is <b>also callable without an alias</b> — bare "
             f"(routed by priority across its backends, with failover) or pinned as "
@@ -902,7 +911,6 @@ async def input_page(request: Request):
             + _field("Endpoints", chips(info.get("endpoints", [])), wide=True)
             + "<h2>Chat models · bare or backend/model</h2>"
             + models_tbl)
-    return HTMLResponse(_page("Input", body, "input"))
 
 
 # ── Tab: Routing (models + chat routing overview) ───────────────────────────────
@@ -955,13 +963,7 @@ def _img_status(bm: Optional[dict]) -> str:
     return _badge("healthy", "ok")
 
 
-async def routing_page(request: Request):
-    snap = _routing_snapshot()
-    info = _gateway_info()
-    # generation aliases reference ComfyUI backends → resolve names within that type.
-    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") == "comfyui"}
-
-    # ── LLM ──: chat aliases → routes, LLM models → backends, collisions
+def _routing_chat_body(snap: dict) -> str:
     arows = ""
     for a in snap.get("aliases", []):
         arows += f'<tr class="grp"><td colspan="4">{_esc(a["alias"])}</td></tr>'
@@ -972,34 +974,26 @@ async def routing_page(request: Request):
                     (" <span class='muted'>(override)</span>" if r.get("overridden") else ""))
             arows += (f'<tr><td>{_esc(r["backend"])}</td><td><code>{_esc(r["model"])}</code></td>'
                       f'<td>{prio}</td><td>{_route_status(r)}</td></tr>')
-    aliases_html = ("<h2>Chat aliases → routes</h2>" + (
+    html = ("<h2>Chat aliases → routes</h2>" + (
         f'<table><tr><th>backend</th><th>model</th><th>priority</th><th>status</th></tr>{arows}</table>'
         if arows else "<p class='muted'>No chat aliases configured.</p>"))
-    # split LLM-backend models into chat vs image (name heuristic — these backends
-    # carry no type metadata). Image ones move to the Image group below.
-    on_llm = [m for m in snap.get("models", []) if any(h.get("type") != "comfyui" for h in m["hosts"])]
-    llm_models = [m for m in on_llm if not _is_image_model(m["model"])]
-    img_on_llm = [m for m in on_llm if _is_image_model(m["model"])]
-    llm_models_html = ("<h2>LLM models → backends</h2>"
-                       "<p class='hint'>A bare model id routes to these in priority order, failing over. "
-                       "<b>shadowed by alias</b> = a chat alias of the same name intercepts the bare id.</p>"
-                       + _models_table(llm_models))
     conf = snap.get("conflicts", [])
-    crows = ""
-    for c in conf:
-        covered = ", ".join(c["covered"]) or "—"
-        shadowed = (f'<span class="bad">{_esc(", ".join(c["shadowed"]))}</span> {_badge("unreachable", "bad")}'
-                    if c["shadowed"] else '<span class="muted">—</span>')
-        crows += f'<tr><td><code>{_esc(c["name"])}</code></td><td>{_esc(covered)}</td><td>{shadowed}</td></tr>'
-    conflicts_html = ""
     if conf:
-        conflicts_html = ("<h2>Alias / model collisions</h2>"
-                          "<p class='hint'>An alias named like a real model shadows it. <b>shadowed</b> "
-                          "backends host that exact model id but the alias doesn't map them → unreachable "
-                          "by that name.</p>"
-                          f'<table><tr><th>alias</th><th>covered</th><th>shadowed</th></tr>{crows}</table>')
+        crows = ""
+        for c in conf:
+            covered = ", ".join(c["covered"]) or "—"
+            shadowed = (f'<span class="bad">{_esc(", ".join(c["shadowed"]))}</span> {_badge("unreachable", "bad")}'
+                        if c["shadowed"] else '<span class="muted">—</span>')
+            crows += f'<tr><td><code>{_esc(c["name"])}</code></td><td>{_esc(covered)}</td><td>{shadowed}</td></tr>'
+        html += ("<h2>Alias / model collisions</h2>"
+                 "<p class='hint'>An alias named like a real model shadows it. <b>shadowed</b> "
+                 "backends host that exact model id but the alias doesn't map them → unreachable "
+                 "by that name.</p>"
+                 f'<table><tr><th>alias</th><th>covered</th><th>shadowed</th></tr>{crows}</table>')
+    return html
 
-    # ── Image ──: generation aliases → backends, image models → backends
+
+def _routing_gen_body(bmeta: dict) -> str:
     grows = ""
     gen_aliases = store.list_aliases() if store.is_active() else {}
     for alias, cands in sorted(gen_aliases.items()):
@@ -1010,22 +1004,75 @@ async def routing_page(request: Request):
             bm = bmeta.get(bn)
             grows += (f'<tr><td>{_esc(bn)}</td><td>{_esc(c.get("task", ""))}</td>'
                       f'<td>{bm.get("priority", "?") if bm else "?"}</td><td>{_img_status(bm)}</td></tr>')
-    gen_html = ("<h2>Generation aliases → backends</h2>"
-                "<p class='hint'>Tried in backend-priority order with failover (see Image Mapping).</p>"
-                + (f'<table><tr><th>backend</th><th>task</th><th>priority</th><th>status</th></tr>{grows}</table>'
-                   if grows else "<p class='muted'>No generation aliases configured.</p>"))
-    img_models = [m for m in snap.get("models", []) if any(h.get("type") == "comfyui" for h in m["hosts"])]
-    img_models_html = ("<h2>Image models → backends</h2>"
-                       "<p class='hint'>ComfyUI checkpoints/models, plus image models served by LLM "
-                       "backends (e.g. flux.* on localai — matched by name, no type metadata).</p>"
-                       + _models_table(img_models + img_on_llm))
+    return ("<h2>Media Generation aliases → backends</h2>"
+            "<p class='hint'>Tried in backend-priority order with failover (see Mapping).</p>"
+            + (f'<table><tr><th>backend</th><th>task</th><th>priority</th><th>status</th></tr>{grows}</table>'
+               if grows else "<p class='muted'>No generation aliases configured.</p>"))
 
-    intro = ("<h2>Routing Overview</h2><p class='hint'>How requests resolve to backends, grouped by "
-             "kind.</p>")
-    body = (intro
-            + '<div class="grouphdr">LLM</div>' + aliases_html + llm_models_html + conflicts_html
-            + '<div class="grouphdr">Image</div>' + gen_html + img_models_html)
-    return HTMLResponse(_page("Routing Overview", body, "routing"))
+
+def _routing_loras_body(bmeta: dict) -> str:
+    """LoRA → hosting ComfyUI backends (from discovery) — searchable, so a client
+    string can be checked byte-for-byte against what the backends really expose."""
+    per_backend = _backend_loras()
+    hosts: dict = {}
+    for bn, loras in per_backend.items():
+        for name in loras:
+            hosts.setdefault(name, []).append(bn)
+    if not hosts:
+        return ("<h2>LoRAs → backends</h2><p class='muted'>No LoRAs discovered — no ComfyUI "
+                "backend up, or none installed.</p>")
+    rows = ""
+    for name in sorted(hosts):
+        chips = " ".join(
+            f'<span class="badge {"ok" if (bmeta.get(bn) or {}).get("healthy") else "bad"}">{_esc(bn)}</span>'
+            for bn in sorted(hosts[name]))
+        rows += f'<tr><td><code>{_esc(name)}</code></td><td>{chips}</td></tr>'
+    search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' placeholder='filter LoRAs…' "
+              f"style=\"min-width:260px;max-width:420px;{_BOX_STYLE}\">")
+    counts = " · ".join(f"{_esc(bn)}: {len(v)}" for bn, v in sorted(per_backend.items()))
+    return ("<h2>LoRAs → backends</h2>"
+            "<p class='hint'>Installed LoRAs per ComfyUI backend (from discovery, verbatim incl. "
+            "subfolder prefixes — requests must match these strings exactly). "
+            f"<span class='muted'>{counts}</span></p>"
+            f"<div style='margin:6px 0 10px'>{search}</div>"
+            f"<table class='filterable'><tr><th>lora</th><th>on backends</th></tr>{rows}</table>"
+            + _FILTER_JS)
+
+
+async def routing_page(request: Request):
+    """Parent tab Input & Routing: what clients can call + how it resolves —
+    sub-tabs Input | Chat aliases | LLM models | Media aliases | Image models |
+    LoRAs (?sub=, first child = default)."""
+    sub = request.query_params.get("sub") or SUBTABS["routing"][0][0]
+    info = _gateway_info()
+    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") == "comfyui"}
+    if sub == "chat":
+        title, body = "Chat aliases", _routing_chat_body(_routing_snapshot())
+    elif sub == "llm":
+        snap = _routing_snapshot()
+        on_llm = [m for m in snap.get("models", []) if any(h.get("type") != "comfyui" for h in m["hosts"])]
+        title, body = "LLM models", (
+            "<h2>LLM models → backends</h2>"
+            "<p class='hint'>A bare model id routes to these in priority order, failing over. "
+            "<b>shadowed by alias</b> = a chat alias of the same name intercepts the bare id.</p>"
+            + _models_table([m for m in on_llm if not _is_image_model(m["model"])]))
+    elif sub == "gen":
+        title, body = "Media aliases", _routing_gen_body(bmeta)
+    elif sub == "image":
+        snap = _routing_snapshot()
+        img_models = [m for m in snap.get("models", []) if any(h.get("type") == "comfyui" for h in m["hosts"])]
+        img_on_llm = [m for m in snap.get("models", [])
+                      if any(h.get("type") != "comfyui" for h in m["hosts"]) and _is_image_model(m["model"])]
+        title, body = "Image models", (
+            "<h2>Image models → backends</h2>"
+            "<p class='hint'>ComfyUI checkpoints/models, plus image models served by LLM "
+            "backends (e.g. flux.* on localai — matched by name, no type metadata).</p>"
+            + _models_table(img_models + img_on_llm))
+    elif sub == "loras":
+        title, body = "LoRAs", _routing_loras_body(bmeta)
+    else:
+        sub, title, body = "input", "Input", _input_body()
+    return HTMLResponse(_page(title, _with_subnav("routing", sub, body), "routing"))
 
 
 # ── Tab: Chat (LLM alias management) ────────────────────────────────────────────
