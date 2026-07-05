@@ -50,8 +50,8 @@ DEFAULT_TAB = "dashboard"
 
 # Sub-tabs: a top-level tab can group child views, picked via `?sub=<key>` on the
 # parent route (first child = default). General pattern — future tab groupings
-# register here; the parent page dispatches on `sub` and wraps its body with
-# _with_subnav() so the bar sits above the full-height .cols block.
+# register here; the parent page dispatches on `sub` and passes
+# _page(..., subnav=_subnav(parent, sub)) so the bar renders under the header.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
            "jobs": [("llm", "LLM Calls"), ("media", "Media Jobs"), ("voice", "Voice Calls")],
            "routing": [("input", "Input"), ("chat", "Chat aliases"), ("llm", "LLM models"),
@@ -65,15 +65,8 @@ def _subnav(parent: str, active_sub: str) -> str:
     return f'<nav class="subnav">{links}</nav>'
 
 
-def _with_subnav(parent: str, sub: str, body: str, cols: bool = True) -> str:
-    """Prepend the sub-tab bar. `cols=True` (column layouts) wraps in the flex
-    shell that keeps the full-height .cols block scrolling inside its columns.
-    Plain scrolling pages pass cols=False — no wrapper, so the sticky bar's
-    containing block is the whole page and it stays pinned for the full scroll
-    (a height:100% wrapper would push it away after one viewport)."""
-    if cols:
-        return f'<div class="withsub">{_subnav(parent, sub)}{body}</div>'
-    return _subnav(parent, sub) + body
+# The bar renders OUTSIDE <main>, directly under the header (via _page(subnav=…)) —
+# like the top tabs it never scrolls, and the body layout stays untouched.
 
 # Request fields (the params that vary per generation) are NOT a fixed list — each
 # alias defines its own by promoting Available fields to request fields in Mapping.
@@ -171,12 +164,10 @@ header{display:flex;align-items:center;background:#171a21;border-bottom:1px soli
 nav{display:flex;flex-wrap:wrap}
 nav a{color:#9aa7b4;padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
 nav a:hover{color:#dce4ec;background:#1b1f27}
-.subnav{display:flex;gap:2px;margin:-18px -26px 12px;padding:0 26px;border-bottom:1px solid #272b33;flex:none;position:sticky;top:0;z-index:11;background:#0f1115}
+.subnav{display:flex;flex-wrap:wrap;gap:2px;padding:0 20px;background:#12151b;border-bottom:1px solid #272b33;flex:none}
 .subnav a{color:#9aa7b4;padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
 .subnav a:hover{color:#dce4ec;background:#1b1f27}
 .subnav a.on{color:#fff;border-bottom-color:#3b82f6}
-.withsub{display:flex;flex-direction:column;height:100%}
-.withsub>.cols{flex:1;min-height:0;height:auto}
 nav a.on{color:#fff;border-bottom-color:#3b82f6}
 main{flex:1;min-height:0;overflow-y:auto;padding:18px 26px}
 h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#7e8b99;margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid #242a33}
@@ -321,11 +312,13 @@ _SORT_JS = ("<script>(function(){"
 
 
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
-          nologin: bool = False) -> str:
+          nologin: bool = False, subnav: str = "") -> str:
     meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
     head = "" if nologin else _nav(active)        # login page renders without the nav
+    # subnav (see SUBTABS) renders as a second header row — outside <main>, so it
+    # never scrolls and sits flush under the tabs.
     return (f'<!doctype html><html><head><meta charset="utf-8">{meta}<title>{_esc(title)} · Gateway</title>'
-            f"<style>{_CSS}</style></head><body>{head}<main>{body}</main>{_SCROLL_JS}{_SORT_JS}</body></html>")
+            f"<style>{_CSS}</style></head><body>{head}{subnav}<main>{body}</main>{_SCROLL_JS}{_SORT_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
@@ -1077,7 +1070,7 @@ async def routing_page(request: Request):
         title, body = "LoRAs", _routing_loras_body(bmeta)
     else:
         sub, title, body = "input", "Input", _input_body()
-    return HTMLResponse(_page(title, _with_subnav("routing", sub, body, cols=False), "routing"))
+    return HTMLResponse(_page(title, body, "routing", subnav=_subnav("routing", sub)))
 
 
 # ── Tab: Chat (LLM alias management) ────────────────────────────────────────────
@@ -1427,8 +1420,8 @@ async def chatplay_send(request: Request):
     model, user = vals["model"].strip(), vals["user"].strip()
     if not model or not user:
         result = "<h2>Response</h2><p class='bad'>model and message are required</p>"
-        return HTMLResponse(_page("Chat Playground",
-                                  _with_subnav("playground", "chat", _chatplay_body(vals, result)), "playground"))
+        return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result), "playground",
+                                  subnav=_subnav("playground", "chat")))
     messages = []
     if vals["system"].strip():
         messages.append({"role": "system", "content": vals["system"]})
@@ -1468,8 +1461,8 @@ async def chatplay_send(request: Request):
         })
     except httpx.HTTPError as e:
         result = f"<h2>Response</h2><p class='bad'>Error: {_esc(f'{type(e).__name__}: {e}')}</p>"
-    return HTMLResponse(_page("Chat Playground",
-                              _with_subnav("playground", "chat", _chatplay_body(vals, result)), "playground"))
+    return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result), "playground",
+                              subnav=_subnav("playground", "chat")))
 
 
 # ── Tab: Mapping ────────────────────────────────────────────────────────────────
@@ -2255,8 +2248,8 @@ async def playground_page(request: Request):
     if sub == "chat":
         vals = {k: qp.get(k, "") for k in _CHATPLAY_KEYS}
         result_html = "<h2>Response</h2><p class='hint'>Send a message to see the reply here.</p>"
-        return HTMLResponse(_page("Chat Playground",
-                                  _with_subnav("playground", "chat", _chatplay_body(vals, result_html)), "playground"))
+        return HTMLResponse(_page("Chat Playground", _chatplay_body(vals, result_html), "playground",
+                                  subnav=_subnav("playground", "chat")))
     if sub == "voice":
         vals = {k: qp.get(k, "") for k in _VOICEPLAY_KEYS}
         prog = _voice_upload_prog.get(_session_user(request) or "default")
@@ -2266,15 +2259,16 @@ async def playground_page(request: Request):
             result_html = _vu_fragment(prog) + _VU_POLL_JS
         else:
             result_html = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
-        return HTMLResponse(_page("Voice",
-                                  _with_subnav("playground", "voice", _voiceplay_body(vals, result_html)), "playground"))
+        return HTMLResponse(_page("Voice", _voiceplay_body(vals, result_html), "playground",
+                                  subnav=_subnav("playground", "voice")))
     if not store.is_active():
         return _inactive()
     aliases = list(store.list_aliases().keys())
     if not aliases:
-        return HTMLResponse(_page("Media Playground", _with_subnav("playground", "media",
+        return HTMLResponse(_page("Media Playground",
             "<h2>Media Playground</h2><p class='hint'>Register an alias in "
-            "the <a href='/ui/mapping'>Mapping</a> tab first.</p>"), "playground"))
+            "the <a href='/ui/mapping'>Mapping</a> tab first.</p>", "playground",
+            subnav=_subnav("playground", "media")))
     model = qp.get("model", "") or aliases[0]   # first load: pick the first alias
     cand = (store.get(model) or [None])[0]
     # values per request param, keyed by param name; query (p__<param>) overrides the
@@ -2295,9 +2289,8 @@ async def playground_page(request: Request):
     kept = set(_pg_images.get((_session_user(request) or "default", model), {}).keys())
     poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
     return HTMLResponse(_page("Media Playground",
-                              _with_subnav("playground", "media",
-                                           _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job)),
-                              "playground"))
+                              _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
+                              "playground", subnav=_subnav("playground", "media")))
 
 
 async def generate(request: Request):
@@ -2354,9 +2347,8 @@ async def generate(request: Request):
         aliases = list(store.list_aliases().keys())
         result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
         return HTMLResponse(_page("Media Playground",
-                                  _with_subnav("playground", "media",
-                                               _playground_body(aliases, vals, cand, result_html,
-                                                                kept=set(stash.keys()))), "playground"))
+                                  _playground_body(aliases, vals, cand, result_html, kept=set(stash.keys())),
+                                  "playground", subnav=_subnav("playground", "media")))
     # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
     q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
@@ -2496,8 +2488,8 @@ async def voiceplay_send(request: Request):
     model, text = vals["model"].strip(), vals["input"].strip()
     if not model or not text:
         result = "<h2>Result</h2><p class='bad'>model and text are required</p>"
-        return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
-                                                        _voiceplay_body(vals, result)), "playground"))
+        return HTMLResponse(_page("Voice", _voiceplay_body(vals, result), "playground",
+                                  subnav=_subnav("playground", "voice")))
     body = {"model": model, "input": text}
     if vals["voice"].strip():
         body["voice"] = vals["voice"].strip()
@@ -2523,8 +2515,8 @@ async def voiceplay_send(request: Request):
                       f"<pre class='err'>{_esc(detail)}</pre>")
     except httpx.HTTPError as e:
         result = f"<h2>Result</h2><p class='bad'>Error: {_esc(f'{type(e).__name__}: {e}')}</p>"
-    return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
-                                                    _voiceplay_body(vals, result)), "playground"))
+    return HTMLResponse(_page("Voice", _voiceplay_body(vals, result), "playground",
+                              subnav=_subnav("playground", "voice")))
 
 
 async def voice_audio(request: Request):
@@ -2586,8 +2578,8 @@ async def voice_upload(request: Request):
         status = _voice_status("bad", "name and a WAV file are required"
                                if _voice_lib_save else "library unavailable (gateway not bound)")
         result = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
-        return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
-                                                        _voiceplay_body(vals, result, status)), "playground"))
+        return HTMLResponse(_page("Voice", _voiceplay_body(vals, result, status), "playground",
+                                  subnav=_subnav("playground", "voice")))
     user = _session_user(request) or "default"
     prog = {"name": name, "steps": [], "done": False, "ok": False}
     _voice_upload_prog[user] = prog
@@ -2605,8 +2597,8 @@ async def voice_upload(request: Request):
             logger.info(f"ui: voice ref '{name}' uploaded (ok={prog['ok']})")
 
     asyncio.create_task(_run())
-    return HTMLResponse(_page("Voice", _with_subnav("playground", "voice",
-                              _voiceplay_body(vals, _vu_fragment(prog) + _VU_POLL_JS)), "playground"))
+    return HTMLResponse(_page("Voice", _voiceplay_body(vals, _vu_fragment(prog) + _VU_POLL_JS),
+                              "playground", subnav=_subnav("playground", "voice")))
 
 
 async def voice_upload_status(request: Request):
@@ -2743,7 +2735,7 @@ async def jobs_page(request: Request):
     else:
         sub = "media"
         title, (body, refresh) = "Media Jobs", _jobs_media_body()
-    return HTMLResponse(_page(title, _with_subnav("jobs", sub, body, cols=False), "jobs", refresh=refresh))
+    return HTMLResponse(_page(title, body, "jobs", refresh=refresh, subnav=_subnav("jobs", sub)))
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
