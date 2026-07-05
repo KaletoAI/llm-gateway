@@ -53,7 +53,7 @@ DEFAULT_TAB = "dashboard"
 # register here; the parent page dispatches on `sub` and wraps its body with
 # _with_subnav() so the bar sits above the full-height .cols block.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
-           "jobs": [("media", "Media Jobs"), ("llm", "LLM Calls"), ("voice", "Voice Calls")]}
+           "jobs": [("llm", "LLM Calls"), ("media", "Media Jobs"), ("voice", "Voice Calls")]}
 
 
 def _subnav(parent: str, active_sub: str) -> str:
@@ -2716,7 +2716,7 @@ async def job_detail_page(job_id: str, request: Request):
     if not jobs.is_active():
         return _inactive()
     job = jobs.get(job_id)
-    back = _btn("← Back to Media Jobs", "/ui/jobs", "secondary")
+    back = _btn("← Back to Media Jobs", "/ui/jobs?sub=media", "secondary")
     if job is None:
         return HTMLResponse(_page("Job", f"<div class='bar'><h2>Job</h2>{back}</div>"
             f"<p class='bad'>job {_esc(job_id)} not found (or pruned past its TTL).</p>", "jobs"), status_code=404)
@@ -3039,7 +3039,8 @@ def _call_row(r, aliases) -> str:
     cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, rsn = r
     scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
     if has_body:
-        view = f"<a href='/ui/call/{cid}' title='{_esc(prev or '')}'>view</a>"
+        src = "voice" if str(endpoint or "").startswith("/v1/audio") else "llm"
+        view = f"<a href='/ui/call/{cid}?src={src}' title='{_esc(prev or '')}'>view</a>"
     elif prev:
         view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
     else:
@@ -3139,18 +3140,37 @@ async def statistic_page(request: Request):
 
 
 async def call_view(call_id: int, request: Request):
-    """Full stored request + response body for one call (E3)."""
+    """Full stored request + response body for one call (E3). Binary audio
+    responses (/v1/audio/speech) render as an inline player instead of JSON."""
     body = stats.get_body(call_id)
     if body is None:
         inner = "<p class='muted'>No stored body for this call (predates the feature, or pruned).</p>"
     else:
         req = json.dumps(body.get("request"), indent=2, ensure_ascii=False)
-        resp = json.dumps(body.get("response"), indent=2, ensure_ascii=False)
+        respobj = body.get("response")
+        if isinstance(respobj, dict) and respobj.get("_audio"):
+            resp_html = (f"<p class='muted'>binary audio · {int(respobj.get('bytes', 0)) // 1024} KB · "
+                         f"{_esc(respobj['_audio'])}</p>"
+                         f"<audio class='result' controls src='/ui/call/{call_id}/audio'></audio>"
+                         f"<p>{_btn('⬇ Download', f'/ui/call/{call_id}/audio', 'secondary')}</p>")
+        else:
+            resp_html = f"<pre class='chatout'>{_esc(json.dumps(respobj, indent=2, ensure_ascii=False))}</pre>"
         inner = (f"<h3>Request</h3><pre class='chatout'>{_esc(req)}</pre>"
-                 f"<h3>Response</h3><pre class='chatout'>{_esc(resp)}</pre>")
-    page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
-            f"{_btn('← Back to LLM Calls', '/ui/jobs?sub=llm', 'secondary')}</div>{inner}")
+                 f"<h3>Response</h3>{resp_html}")
+    voice = request.query_params.get("src") == "voice"
+    back = _btn("← Back to Voice Calls" if voice else "← Back to LLM Calls",
+                f"/ui/jobs?sub={'voice' if voice else 'llm'}", "secondary")
+    page = f"<div class='bar'><h2>Call #{call_id}</h2>{back}</div>{inner}"
     return HTMLResponse(_page("Call", page, "jobs"))
+
+
+async def call_audio(call_id: int):
+    """Serve a call's stored binary audio response (within the stats retention)."""
+    hit = stats.get_audio(call_id)
+    if hit is None:
+        raise HTTPException(404, "no audio stored for this call")
+    path, mime = hit
+    return FileResponse(path, media_type=mime)
 
 
 # ── Reasoning tab: normalized thinking toggle (per-model × per-backend rules) ────
@@ -3909,6 +3929,7 @@ def register(app) -> None:
     app.add_api_route("/ui/llmcalls", llmcalls_page, methods=["GET"])
     app.add_api_route("/ui/statistic", statistic_page, methods=["GET"])
     app.add_api_route("/ui/call/{call_id}", call_view, methods=["GET"])
+    app.add_api_route("/ui/call/{call_id}/audio", call_audio, methods=["GET"])
     app.add_api_route("/ui/users", users_page, methods=["GET"])
     app.add_api_route("/ui/users/save", users_save, methods=["POST"])
     app.add_api_route("/ui/users/delete", users_del, methods=["GET"])

@@ -166,6 +166,10 @@ def _body_path(call_id: int) -> str:
     return os.path.join(_BLOB_DIR, f"{call_id}.json")
 
 
+def _audio_path(call_id: int) -> str:
+    return os.path.join(_BLOB_DIR, f"{call_id}.audio")
+
+
 def _as_obj(text):
     """Parse a JSON string back to an object for tidy storage; keep raw if not JSON."""
     if text is None:
@@ -185,7 +189,19 @@ def get_body(call_id: int) -> Optional[dict]:
         return None
 
 
-def _record_sync(row: tuple, request_text=None, response_text=None) -> None:
+def get_audio(call_id: int) -> Optional[tuple]:
+    """(path, mime) of a call's stored binary audio response, or None. The mime
+    lives in the JSON blob's response marker ({'_audio': mime, 'bytes': n})."""
+    p = _audio_path(int(call_id))
+    if not os.path.isfile(p):
+        return None
+    body = get_body(call_id) or {}
+    resp = body.get("response")
+    mime = resp.get("_audio") if isinstance(resp, dict) else None
+    return p, (mime or "audio/wav")
+
+
+def _record_sync(row: tuple, request_text=None, response_text=None, response_audio=None) -> None:
     with _conn() as c:
         cur = c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
@@ -193,11 +209,16 @@ def _record_sync(row: tuple, request_text=None, response_text=None) -> None:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
-        if request_text is not None or response_text is not None:
+        if request_text is not None or response_text is not None or response_audio is not None:
             try:
+                payload = {"request": _as_obj(request_text), "response": _as_obj(response_text)}
+                if response_audio:                  # binary body (TTS WAV): own file + JSON marker
+                    data, mime = response_audio
+                    with open(_audio_path(cur.lastrowid), "wb") as af:
+                        af.write(data)
+                    payload["response"] = {"_audio": mime or "audio/wav", "bytes": len(data)}
                 with open(_body_path(cur.lastrowid), "w", encoding="utf-8") as f:
-                    json.dump({"request": _as_obj(request_text), "response": _as_obj(response_text)},
-                              f, ensure_ascii=False)
+                    json.dump(payload, f, ensure_ascii=False)
                 c.execute("UPDATE calls SET has_body=1 WHERE id=?", (cur.lastrowid,))
             except Exception as e:                  # row stays valid, body view just absent
                 logger.warning(f"stats: body blob write failed for call {cur.lastrowid}: {e}")
@@ -227,10 +248,12 @@ async def record_call(
     cost_usd: float = 0.0,
     request_text: Optional[str] = None,
     response_text: Optional[str] = None,
+    response_audio: Optional[tuple] = None,
     reasoning: Optional[str] = None,
 ) -> None:
     """Async-safe insert. Never raises into the request path. Full request/response
-    bodies (when given) are written to an on-disk blob, not the DB row."""
+    bodies (when given) are written to an on-disk blob, not the DB row;
+    `response_audio` = (bytes, mime) for binary TTS replies (own blob + player)."""
     if _DB_PATH is None:
         return
     row = (
@@ -249,7 +272,7 @@ async def record_call(
         reasoning,
     )
     try:
-        await asyncio.to_thread(_record_sync, row, request_text, response_text)
+        await asyncio.to_thread(_record_sync, row, request_text, response_text, response_audio)
     except Exception as e:
         logger.warning(f"stats: insert failed: {e}")
 
@@ -265,10 +288,11 @@ async def prune_loop(retention_days: int, interval_s: int = 3600) -> None:
                 with _conn() as c:
                     ids = [r[0] for r in c.execute("SELECT id FROM calls WHERE ts < ?", (cutoff,)).fetchall()]
                     for cid in ids:
-                        try:
-                            os.remove(_body_path(cid))
-                        except OSError:
-                            pass
+                        for p in (_body_path(cid), _audio_path(cid)):
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
                     c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
                     return len(ids)
             n = await asyncio.to_thread(_prune)

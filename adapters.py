@@ -364,7 +364,8 @@ class OpenAIAdapter(BackendAdapter):
         self.ctx.active_done(call.act)
 
     def _record(self, req: NormalizedRequest, call: _Call, status: int,
-                in_tok: int, out_tok: int, response_text: Optional[str] = None) -> int:
+                in_tok: int, out_tok: int, response_text: Optional[str] = None,
+                response_audio: Optional[tuple] = None) -> int:
         """Fire-and-forget stats row for this dispatch; returns the elapsed ms."""
         ctx = self.ctx
         elapsed_ms = int((time.monotonic() - call.started) * 1000)
@@ -374,6 +375,7 @@ class OpenAIAdapter(BackendAdapter):
             status=status, input_tokens=in_tok, output_tokens=out_tok,
             cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok),
             request_text=call.req_text, response_text=response_text,
+            response_audio=response_audio,
             reasoning=call.reasoning_ctl,
         ))
         return elapsed_ms
@@ -436,8 +438,13 @@ class OpenAIAdapter(BackendAdapter):
         usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
         in_tok = int(usage.get("prompt_tokens") or 0)
         out_tok = int(usage.get("completion_tokens") or 0)
+        # Successful binary audio (TTS) → stored as its own stats blob so the call
+        # view can play it back; other binary bodies stay unstored.
+        resp_audio = ((resp.content, ct) if ct.startswith("audio/") and resp.status_code == 200
+                      else None)
         elapsed_ms = self._record(req, call, resp.status_code, in_tok, out_tok,
-                                  response_text=(resp.text if is_texty else None))
+                                  response_text=(resp.text if is_texty else None),
+                                  response_audio=resp_audio)
         if call.log_on:
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
         out = Response(resp.content, status_code=resp.status_code,
