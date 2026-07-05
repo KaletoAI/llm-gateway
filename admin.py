@@ -65,10 +65,15 @@ def _subnav(parent: str, active_sub: str) -> str:
     return f'<nav class="subnav">{links}</nav>'
 
 
-def _with_subnav(parent: str, sub: str, body: str) -> str:
-    """Wrap a tab body with its sub-tab bar. The wrapper is a flex column so the
-    inner .cols block keeps its full-height/independent-scroll behaviour."""
-    return f'<div class="withsub">{_subnav(parent, sub)}{body}</div>'
+def _with_subnav(parent: str, sub: str, body: str, cols: bool = True) -> str:
+    """Prepend the sub-tab bar. `cols=True` (column layouts) wraps in the flex
+    shell that keeps the full-height .cols block scrolling inside its columns.
+    Plain scrolling pages pass cols=False — no wrapper, so the sticky bar's
+    containing block is the whole page and it stays pinned for the full scroll
+    (a height:100% wrapper would push it away after one viewport)."""
+    if cols:
+        return f'<div class="withsub">{_subnav(parent, sub)}{body}</div>'
+    return _subnav(parent, sub) + body
 
 # Request fields (the params that vary per generation) are NOT a fixed list — each
 # alias defines its own by promoting Available fields to request fields in Mapping.
@@ -1072,7 +1077,7 @@ async def routing_page(request: Request):
         title, body = "LoRAs", _routing_loras_body(bmeta)
     else:
         sub, title, body = "input", "Input", _input_body()
-    return HTMLResponse(_page(title, _with_subnav("routing", sub, body), "routing"))
+    return HTMLResponse(_page(title, _with_subnav("routing", sub, body, cols=False), "routing"))
 
 
 # ── Tab: Chat (LLM alias management) ────────────────────────────────────────────
@@ -2738,7 +2743,7 @@ async def jobs_page(request: Request):
     else:
         sub = "media"
         title, (body, refresh) = "Media Jobs", _jobs_media_body()
-    return HTMLResponse(_page(title, _with_subnav("jobs", sub, body), "jobs", refresh=refresh))
+    return HTMLResponse(_page(title, _with_subnav("jobs", sub, body, cols=False), "jobs", refresh=refresh))
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
