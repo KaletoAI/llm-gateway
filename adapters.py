@@ -473,6 +473,39 @@ def _mime_and_kind(filename: str) -> tuple[str, str]:
                             ("application/octet-stream", "image"))
 
 
+def _comfy_prompt_error(status: int, text: str, wf: dict, mapping: dict) -> str:
+    """Human-readable ComfyUI /prompt rejection. Raw node_errors name only node ids —
+    meaningless in the console, where everything is wired by node TITLE. Each error
+    line therefore carries the node's title, class, field, the REQUEST PARAM mapped
+    onto that field (the thing the user actually typed), and the received value.
+    Falls back to the raw body when the payload shape is unknown."""
+    try:
+        err = json.loads(text or "")
+        node_errors = err.get("node_errors") or {}
+    except (ValueError, AttributeError):
+        return f"ComfyUI /prompt HTTP {status}: {text}"
+    lines = []
+    for nid, ne in node_errors.items():
+        node = (wf or {}).get(str(nid)) or {}
+        title = (node.get("_meta") or {}).get("title") or ""
+        cls = ne.get("class_type") or node.get("class_type") or "?"
+        where = f"node {nid} “{title}”" if title else f"node {nid}"
+        for e in ne.get("errors") or []:
+            extra = e.get("extra_info") or {}
+            fldn = extra.get("input_name") or ""
+            param = next((p for p, m in (mapping or {}).items()
+                          if str((m or {}).get("node")) == str(nid) and (m or {}).get("field") == fldn), None)
+            via = f" ← request param '{param}'" if param else ""
+            recv = extra.get("received_value")
+            recv_s = f" (received {recv!r})" if recv is not None else ""
+            lines.append(f"{where} ({cls}).{fldn}{via}: {e.get('message', 'error')}{recv_s}")
+    if not lines:
+        msg = (err.get("error") or {}).get("message") or text
+        return f"ComfyUI /prompt HTTP {status}: {msg}"
+    head = (err.get("error") or {}).get("message") or "prompt rejected"
+    return f"ComfyUI {head} (HTTP {status}): " + " · ".join(lines)
+
+
 def _node_by_title(wf: dict, title: str) -> Optional[str]:
     t = title.lower()
     for nid, node in wf.items():
@@ -908,8 +941,20 @@ class ComfyUIAdapter(BackendAdapter):
                      if b.get("node") and b.get("field")}
         values = _gen_values(req)
         mapping = req.node_mapping or suggest_mapping(wf)      # explicit wins, convention is fallback
-        if "seed" in mapping and values.get("seed") is None:
-            values["seed"] = random.randint(0, 2**63 - 1)
+        # Labels are the EXTERNAL field names (mapping editor: "label overrides the
+        # Playground label / API field name") — honor them as aliases: a client may
+        # send {"seed": …} when the param is wired as e.g. `value` labelled "seed".
+        for p, m in mapping.items():
+            lbl = ((m or {}).get("label") or "").strip()
+            if lbl and lbl != p and lbl in values and p not in values:
+                values[p] = values.pop(lbl)
+        # Auto-seed keys on the EFFECTIVE name (param or label), so a PrimitiveInt
+        # wired as `value` + label "seed" gets a random seed instead of int('') 400s.
+        seed_param = next((p for p, m in mapping.items()
+                           if p == "seed" or ((m or {}).get("label") or "").strip().lower() == "seed"),
+                          None)
+        if seed_param and values.get(seed_param) in (None, ""):
+            values[seed_param] = random.randint(0, 2**63 - 1)
         # image request-fields are filled per-field (upload or 8×8 placeholder), not
         # via the scalar mapping — keep them out of _apply_mapping.
         img_params = image_params(wf, mapping)
@@ -922,7 +967,8 @@ class ComfyUIAdapter(BackendAdapter):
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
         autofilled = await self._autofill_empty_images(wf, mapping)
-        summary = {"applied": sorted(applied.keys()), "seed": values.get("seed"),
+        summary = {"applied": sorted(applied.keys()),
+                   "seed": values.get(seed_param) if seed_param else None,
                    "fixed": sorted(fixed_applied.keys()),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
                    "images": sorted(img_applied), "autofilled_images": autofilled}
@@ -943,7 +989,7 @@ class ComfyUIAdapter(BackendAdapter):
             async with httpx.AsyncClient(timeout=timeout) as client:
                 pr = await client.post(f"{url}/prompt", json={"prompt": wf})
                 if pr.status_code != 200:
-                    raise RuntimeError(f"ComfyUI /prompt HTTP {pr.status_code}: {pr.text}")
+                    raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
                 prompt_id = (pr.json() or {}).get("prompt_id")
                 if not prompt_id:
                     raise RuntimeError("ComfyUI returned no prompt_id")
