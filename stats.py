@@ -189,6 +189,19 @@ def get_body(call_id: int) -> Optional[dict]:
         return None
 
 
+def call_neighbors(call_id: int, voice: bool) -> tuple:
+    """(newer_id, older_id) around a call within its list partition — Voice Calls
+    (endpoint /v1/audio/*) vs LLM Calls (the rest) — for the detail page's
+    prev/next navigation. None at the list ends."""
+    if _DB_PATH is None:
+        return None, None
+    flt = ("endpoint LIKE '/v1/audio/%'" if voice
+           else "(endpoint IS NULL OR endpoint NOT LIKE '/v1/audio/%')")
+    newer = _q(f"SELECT id FROM calls WHERE id > ? AND {flt} ORDER BY id ASC LIMIT 1", int(call_id))
+    older = _q(f"SELECT id FROM calls WHERE id < ? AND {flt} ORDER BY id DESC LIMIT 1", int(call_id))
+    return (newer[0][0] if newer else None, older[0][0] if older else None)
+
+
 def get_audio(call_id: int) -> Optional[tuple]:
     """(path, mime) of a call's stored binary audio response, or None. The mime
     lives in the JSON blob's response marker ({'_audio': mime, 'bytes': n})."""

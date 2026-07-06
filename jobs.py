@@ -127,6 +127,28 @@ def recent(limit: int = 20, media_only: bool = False) -> list:
     return [dict(r) for r in rows]
 
 
+def neighbors(job_id: str, media_only: bool = True) -> tuple:
+    """(newer_id, older_id) around a job in the media list's created-DESC order
+    (rowid tiebreak) — drives the detail page's prev/next navigation. None at the
+    list ends or for an unknown id."""
+    if not _active:
+        return None, None
+    flt = f" AND task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))})" if media_only else ""
+    args = _NON_MEDIA_TASKS if media_only else ()
+    with _conn() as c:
+        row = c.execute("SELECT created, rowid AS rid FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None, None
+        cr, rid = row["created"], row["rid"]
+        newer = c.execute(
+            f"SELECT id FROM jobs WHERE (created > ? OR (created = ? AND rowid > ?)){flt} "
+            f"ORDER BY created ASC, rowid ASC LIMIT 1", (cr, cr, rid, *args)).fetchone()
+        older = c.execute(
+            f"SELECT id FROM jobs WHERE (created < ? OR (created = ? AND rowid < ?)){flt} "
+            f"ORDER BY created DESC, rowid DESC LIMIT 1", (cr, cr, rid, *args)).fetchone()
+    return (newer["id"] if newer else None, older["id"] if older else None)
+
+
 def create(task: str, alias: str, backend: str, *,
            owner: str = "default", ttl_s: Optional[int] = None,
            job_id: Optional[str] = None) -> str:

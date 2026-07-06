@@ -2812,8 +2812,13 @@ async def job_detail_page(job_id: str, request: Request):
     to_pg = (_btn("→ Send to Playground", f"/ui/job/{_esc(job_id)}/to-playground",
                   title="Copy this job's prompt, params and reference images into the Media Playground")
              if store.is_active() and job.get("task") != "response" else "")
+    # prev/next in the Media Jobs list (newest first); hidden at the ends.
+    newer, older = jobs.neighbors(job_id)
+    nav = ((_btn("‹ Prev", f"/ui/job/{_esc(newer)}", "secondary", title="Newer job") if newer else "")
+           + (_btn("Next ›", f"/ui/job/{_esc(older)}", "secondary", title="Older job") if older else ""))
     page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
-            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>{cancel_btn}{to_pg}{back}</div>{info}"
+            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>"
+            f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
             f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"
             f"<div style='flex:1;min-width:320px'><h2>Output</h2>{outbox}</div></div>"
@@ -3202,9 +3207,16 @@ async def call_view(call_id: int, request: Request):
         inner = (f"<h3>Request</h3><pre class='chatout'>{_esc(req)}</pre>"
                  f"<h3>Response</h3>{resp_html}")
     voice = request.query_params.get("src") == "voice"
+    src = "voice" if voice else "llm"
     back = _btn("← Back to Voice Calls" if voice else "← Back to LLM Calls",
-                f"/ui/jobs?sub={'voice' if voice else 'llm'}", "secondary")
-    page = f"<div class='bar'><h2>Call #{call_id}</h2>{back}</div>{inner}"
+                f"/ui/jobs?sub={src}", "secondary")
+    # prev/next within the same list partition (newest first: prev = newer row
+    # above, next = older row below); hidden at the list ends.
+    newer, older = stats.call_neighbors(call_id, voice)
+    nav = ((_btn("‹ Prev", f"/ui/call/{newer}?src={src}", "secondary", title="Newer call") if newer else "")
+           + (_btn("Next ›", f"/ui/call/{older}?src={src}", "secondary", title="Older call") if older else ""))
+    page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
+            f"<div style='display:flex;gap:8px'>{nav}{back}</div></div>{inner}")
     return HTMLResponse(_page("Call", page, "jobs"))
 
 
