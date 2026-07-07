@@ -2998,10 +2998,10 @@ def _dash_jobs(d: dict, now: int) -> str:
     # "done 12" while the list shows nothing recent (lifetime is in the Media Jobs tab).
     wc = {k: sum(1 for j in recent_jobs if j.get("status") == k) for k, _ in order}
     badges = " ".join(_badge(f"{k} {wc[k]}", kind) for k, kind in order if wc[k])
-    jr = "".join(_job_row(j, now) for j in recent_jobs)
+    jr = "".join(_job_row(j, now, time_col=True) for j in recent_jobs)
     return (f"<h2>Media jobs <span class='muted' style='font-weight:normal'>· running + last 5 min</span> "
             f"{badges}</h2>"
-            + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>id</th><th>alias</th>"
+            + (f"<table class='sortable' data-sk='dash-jobs'><tr><th>time</th><th>id</th><th>alias</th>"
                f"<th>backend</th><th>status</th><th>age</th><th>dur</th><th>owner</th></tr>{jr}</table>" if jr
                else "<p class='muted'>nothing running or recently finished</p>"))
 
