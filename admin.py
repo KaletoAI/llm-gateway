@@ -2666,11 +2666,15 @@ def _job_dur_cell(j: dict, now: int) -> str:
 
 
 def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = False,
-             actions: bool = False) -> str:
-    """One job table row (id-link / [task] / alias / backend / status / [imgs] / age /
-    dur / owner / [actions]) — the ONE template behind Media Jobs and the dashboard."""
+             actions: bool = False, time_col: bool = False) -> str:
+    """One job table row ([time] / id-link / [task] / alias / backend / status /
+    [imgs] / age / dur / owner / [actions]) — the ONE template behind Media Jobs
+    and the dashboard (which stays compact: age only, no time column)."""
     st, jid = j["status"], j["id"]
-    cells = [f"<td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>"]
+    cells = []
+    if time_col:
+        cells.append(f"<td class='muted'>{_ts(j.get('created'))}</td>")
+    cells.append(f"<td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>")
     if task_col:
         cells.append(f"<td>{_esc(j.get('task'))}</td>")
     cells += [f"<td>{_esc(j.get('alias'))}</td>", f"<td>{_esc(j.get('backend'))}</td>",
@@ -2698,8 +2702,9 @@ def _jobs_media_body() -> tuple[str, Optional[int]]:
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>", None)
     now = int(time.time())
-    tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True) for j in rows)
-    tbl = (f"<table><tr><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
+    tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True, time_col=True)
+                 for j in rows)
+    tbl = (f"<table><tr><th>time</th><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
            f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
     return (f"<h2>Media Jobs</h2>{tbl}{_JOB_TICK}", refresh)
