@@ -54,14 +54,24 @@ what they need via injected callables, staying hot-reload-safe.
   `build_backend_adapters()` (re)binds one adapter per backend.
 - **`adapters.py`** — the pluggable per-backend protocol seam. `BackendAdapter`
   ABC; `OpenAIAdapter` (`dispatch()` forwards chat/completions/embeddings,
-  owns the in-flight counter incl. the streamed-`finally` decrement) and
+  owns the in-flight counter incl. the streamed-`finally` decrement; streamed
+  chat SSE is rewritten to strict OpenAI shape by `_StreamNormalizer` — no
+  null-valued delta keys, the terminal usage chunk only for clients that sent
+  `stream_options.include_usage`; strict clients like Hermes abort on the raw
+  LocalAI shape) and
   `ComfyUIAdapter` (`type: comfyui`; `discover()` via `/object_info` →
   models + **installed LoRAs**; `generate()` submits a parametrised workflow,
   polls `/history`, fetches `/view`). `AdapterContext` injects app services.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
-  sets `workflow[node].inputs[field]`); `_apply_lora_cascade` drops client LoRAs
-  into free stack slots; `_apply_fixed` applies admin pins (the API can't override
-  a pinned `(node,field)`); `suggest_mapping()` is only an auto-detect pre-fill.
+  sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
+  API name — incoming values are accepted under label OR param, and the
+  auto-random seed keys on that effective name (`''` counts as unset);
+  `_apply_lora_cascade` drops client LoRAs into free stack slots; `_apply_fixed`
+  applies admin pins (the API can't override a pinned `(node,field)`);
+  `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
+  rejections are translated to readable per-node errors (node title, class,
+  field, offending request param) via `_comfy_prompt_error`; raw body stays the
+  fallback.
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
@@ -194,7 +204,10 @@ session is gated by `_ui_guard` once locked.
 Every forward calls `stats.record_call(...)` fire-and-forget via
 `asyncio.create_task` — never raises into the request path. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
-per-token). Streaming records `0` tokens.
+per-token). Streaming records the backend's usage chunk (the adapter always
+requests `include_usage` upstream); a backend that reports zeros/nothing
+(LocalAI streams all-zero usage — measured) gets gateway estimates instead
+(content-delta count ≈ completion tokens, ~chars/4 for the prompt).
 
 ## Conventions
 
@@ -217,5 +230,10 @@ per-token). Streaming records `0` tokens.
 - Voice cloning (`/v1/audio/speech`): TTS backends read `voice` strictly as a
   file on THEIR host (no base64/URL/upload API — measured). The voice library
   (`voiceref/` blobs + store `voice_library`, UI in the Voice sub-tab) therefore
-  ships references via scp (`voice_ref_target` setting); `voice:"lib:<name>"`
-  resolves to the shipped path + ref_text in `route()`.
+  ships references via scp to EVERY target in `voice_ref_hosts` (settings;
+  comma-separated `user@host:/abs/host/dir`, host-side dirs may differ — docker
+  mounts), while `voice_ref_dir` is the single model-visible path written into
+  `voice`; `voice:"lib:<name>"` resolves to the shipped path + ref_text in
+  `route()`. An empty ref_text is auto-transcribed: local faster-whisper first
+  (lazy CPU import; the one heavyweight entry in `requirements.txt`), a backend
+  whisper model as fallback.
