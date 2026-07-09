@@ -1417,6 +1417,11 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
 
     wants_stream = bool(raw_body.get("stream"))
     chat_body["stream"] = wants_stream
+    if wants_stream:
+        # The bridge consumes the chat usage chunk for `response.completed`;
+        # since the adapter now hides it from clients that don't ask (strict
+        # OpenAI shape), ask explicitly — it never reaches the client raw.
+        chat_body["stream_options"] = {"include_usage": True}
     # Shared dispatch/park path (failover + in-flight + stats, labelled /v1/responses).
     resp = await _dispatch_or_park(alias, "/v1/chat/completions", chat_body, request,
                                    stats_endpoint="/v1/responses")

@@ -264,23 +264,131 @@ class BackendAdapter(ABC):
 
 # ── OpenAI-compatible adapter (the only one in Phase 0) ───────────────────────
 
-def _sse_usage(line: str) -> Optional[tuple]:
-    """Extract (prompt_tokens, completion_tokens) from one SSE `data:` line that
-    carries a `usage` block (emitted by the backend when we request
-    `stream_options.include_usage`). Returns None for normal delta lines."""
-    if not line.startswith("data:"):
-        return None
-    data = line[5:].strip()
-    if not data or data == "[DONE]":
-        return None
-    try:
-        obj = json.loads(data)
-    except Exception:
-        return None
-    u = obj.get("usage") if isinstance(obj, dict) else None
-    if not u:
-        return None
-    return int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
+def _estimate_prompt_tokens(fwd: dict) -> int:
+    """~chars/4 over the request's text parts — the fallback when a backend
+    streams its usage block as all zeros (LocalAI does; measured 2026-07-09,
+    non-streaming reports real numbers). Image parts are skipped: a base64
+    image would explode a char-based estimate."""
+    texts = []
+    if isinstance(fwd.get("prompt"), str):
+        texts.append(fwd["prompt"])
+    for m in fwd.get("messages") or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            texts.append(c)
+        elif isinstance(c, list):
+            texts.extend(p["text"] for p in c
+                         if isinstance(p, dict) and isinstance(p.get("text"), str))
+    chars = sum(len(t) for t in texts)
+    return (chars // 4 + 1) if chars else 0
+
+
+class _StreamNormalizer:
+    """Rewrites a backend's chat SSE into strict OpenAI shape. Strict clients
+    (Hermes) abort mid-stream on the deviations LocalAI ships, so:
+
+    - `delta` never carries null-valued keys (LocalAI puts `content:null` on
+      the role/finish chunks) or an empty-string `content` — the keys are
+      dropped; the finish chunk becomes the spec's `"delta":{}`.
+    - the terminal usage chunk (`"choices":[]`) reaches the client only if it
+      asked via `stream_options.include_usage` (WE always ask upstream, for
+      stats); without the flag a stray `usage` key on delta chunks is dropped
+      too. A client that did ask gets the chunk exactly once, directly before
+      [DONE] — synthesized from the last chunk's id/model if the backend never
+      sent one.
+    - usage numbers are the backend's; if it only ever reported zeros, the
+      fallback is counted content/reasoning deltas (llama.cpp-family streams
+      ≈ one token per delta) + the caller's prompt estimate.
+
+    Non-`data:` lines, [DONE], unparseable JSON and non-chunk payloads pass
+    through verbatim; buffering is bytes-based so multi-byte UTF-8 split
+    across network chunks survives. `flush()` returns the unterminated tail
+    (error bodies aren't newline-framed)."""
+
+    def __init__(self, want_usage: bool, prompt_estimate: int):
+        self.want_usage = want_usage
+        self.prompt_est = prompt_estimate
+        self.buf = b""
+        self.in_tok = self.out_tok = 0      # best backend-reported usage so far
+        self.pieces = 0                     # content-bearing deltas ≈ completion tokens
+        self.meta: dict = {}                # id/model/created of the last chunk seen
+        self.usage_sent = False
+
+    def feed(self, chunk: bytes) -> bytes:
+        self.buf += chunk
+        out = []
+        while b"\n" in self.buf:
+            raw, self.buf = self.buf.split(b"\n", 1)
+            out.append(self._line(raw.decode("utf-8", "ignore")))
+        return "".join(out).encode()
+
+    def flush(self) -> bytes:
+        tail, self.buf = self.buf, b""
+        return tail
+
+    def tokens(self) -> tuple:
+        """(prompt, completion) for stats + the client chunk — backend numbers,
+        zeros replaced by the estimates."""
+        return (self.in_tok or self.prompt_est, self.out_tok or self.pieces)
+
+    def _usage_json(self) -> str:
+        it, ot = self.tokens()
+        return json.dumps({**self.meta, "object": "chat.completion.chunk",
+                           "choices": [],
+                           "usage": {"prompt_tokens": it, "completion_tokens": ot,
+                                     "total_tokens": it + ot}},
+                          ensure_ascii=False, separators=(",", ":"))
+
+    def _line(self, line: str) -> str:
+        data = line.strip()
+        if not data.startswith("data:"):
+            return line + "\n"
+        payload = data[5:].strip()
+        if payload == "[DONE]":
+            if self.want_usage and not self.usage_sent:      # backend never sent one
+                self.usage_sent = True
+                return f"data: {self._usage_json()}\n\ndata: [DONE]\n"
+            return line + "\n"
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return line + "\n"
+        if not isinstance(obj, dict) or "choices" not in obj:
+            return line + "\n"
+        for k in ("id", "model", "created", "system_fingerprint"):
+            if k in obj and obj[k] is not None:
+                self.meta[k] = obj[k]
+        u = obj.get("usage")
+        if isinstance(u, dict):
+            self.in_tok = max(self.in_tok, int(u.get("prompt_tokens") or 0))
+            self.out_tok = max(self.out_tok, int(u.get("completion_tokens") or 0))
+        if not obj.get("choices"):                            # terminal usage chunk
+            if u is None:
+                return line + "\n"                            # odd keepalive — leave it
+            if self.want_usage and not self.usage_sent:
+                self.usage_sent = True
+                return f"data: {self._usage_json()}\n"        # own blank line follows
+            return ""                                         # client didn't ask → swallow
+        changed = False
+        for ch in obj["choices"]:
+            d = ch.get("delta") if isinstance(ch, dict) else None
+            if isinstance(d, dict):
+                for k in [k for k, v in d.items()
+                          if v is None or (k == "content" and v == "")]:
+                    del d[k]
+                    changed = True
+                if any(isinstance(d.get(k), str) and d[k]
+                       for k in ("content", "reasoning", "reasoning_content")):
+                    self.pieces += 1
+            if isinstance(ch, dict) and isinstance(ch.get("text"), str) and ch["text"]:
+                self.pieces += 1                              # legacy /v1/completions
+        if "usage" in obj and not self.want_usage:            # no flag → no usage anywhere
+            del obj["usage"]
+            changed = True
+        if not changed:
+            return line + "\n"
+        return "data: " + json.dumps(obj, ensure_ascii=False,
+                                     separators=(",", ":")) + "\n"
 
 
 @dataclass
@@ -383,15 +491,16 @@ class OpenAIAdapter(BackendAdapter):
     def _dispatch_stream(self, req: NormalizedRequest, call: _Call) -> StreamingResponse:
         ctx = self.ctx
         # Ask the backend to emit a final usage chunk so streamed calls record
-        # real tokens/cost instead of 0 (graceful: backends that ignore the
-        # field just yield no usage line → tokens stay 0, as before).
+        # real tokens/cost (graceful: backends that ignore the field just yield
+        # no usage line → the normalizer's estimates kick in). The client only
+        # sees that chunk if IT asked (call.fwd still holds its stream_options).
         body = {**call.fwd,
                 "stream_options": {**(call.fwd.get("stream_options") or {}), "include_usage": True}}
+        want_usage = bool((call.fwd.get("stream_options") or {}).get("include_usage"))
+        norm = _StreamNormalizer(want_usage, _estimate_prompt_tokens(call.fwd))
 
         async def generate():
             stream_status = 0
-            in_tok = out_tok = 0
-            buf = ""
             try:
                 async with _pooled_client(ctx) as client:
                     async with client.stream("POST", call.url, json=body,
@@ -401,15 +510,15 @@ class OpenAIAdapter(BackendAdapter):
                             logger.info(f"← [{self.name}] {req.path} HTTP {stream_status} "
                                         f"(stream open, {(time.monotonic() - call.started):.2f}s)")
                         async for chunk in resp.aiter_bytes():
-                            yield chunk
-                            buf += chunk.decode("utf-8", "ignore")
-                            while "\n" in buf:
-                                line, buf = buf.split("\n", 1)
-                                got = _sse_usage(line.strip())
-                                if got:
-                                    in_tok, out_tok = got
+                            out = norm.feed(chunk)
+                            if out:
+                                yield out
+                        tail = norm.flush()
+                        if tail:
+                            yield tail
             finally:
                 self._finish(call)
+            in_tok, out_tok = norm.tokens()
             self._record(req, call, stream_status, in_tok, out_tok)
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
