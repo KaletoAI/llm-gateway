@@ -2691,23 +2691,31 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     return "<tr>" + "".join(cells) + "</tr>"
 
 
-def _jobs_media_body() -> tuple[str, Optional[int]]:
+def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     """(body, refresh) — generation jobs (image/video/audio), newest first; excludes
-    parked-chat / background-response rows."""
+    parked-chat / background-response rows. Same user picker + row-filter input as
+    the call lists (`?user=` filters by job owner)."""
     if not jobs.is_active():
         return ("<h2>Media Jobs</h2><p class='hint'>Job store is off — set <code>image_models</code> "
                 "or <code>jobs.enabled: true</code> in config.</p>", None)
-    rows = jobs.recent(200, media_only=True)
-    if not rows:
+    user = (request.query_params.get("user") or "").strip() or None
+    rows = jobs.recent(200, media_only=True, owner=user)
+    if not rows and not user:
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>", None)
+    scope, bar = _user_filter_bar("/ui/jobs?sub=media", user,
+                                  [(o,) for o in jobs.owners()], store.get_ip_aliases())
     now = int(time.time())
     tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True, time_col=True)
                  for j in rows)
-    tbl = (f"<table><tr><th>time</th><th>id</th><th>task</th><th>alias</th><th>backend</th><th>status</th>"
-           f"<th>imgs</th><th>age</th><th>dur</th><th>owner</th><th></th></tr>{tr}</table>")
+    tbl = ((f"<table class='filterable'><tr><th>time</th><th>id</th><th>task</th><th>alias</th>"
+            f"<th>backend</th><th>status</th><th>imgs</th><th>age</th><th>dur</th><th>owner</th>"
+            f"<th></th></tr>{tr}</table>") if rows
+           else "<p class='muted'>no media jobs for this user</p>")
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
-    return (f"<h2>Media Jobs</h2>{tbl}{_JOB_TICK}", refresh)
+    head = (f"<h2>Media Jobs{scope} <span class='muted' style='font-weight:normal'>"
+            f"· last {len(rows)}</span></h2>{bar}")
+    return (f"{head}{tbl}{_JOB_TICK}{_FILTER_JS}", refresh)
 
 
 async def _calls_view_body(request: Request, voice: bool) -> str:
@@ -2739,7 +2747,7 @@ async def jobs_page(request: Request):
         title, body = "Voice Calls", await _calls_view_body(request, voice=True)
     else:
         sub = "media"
-        title, (body, refresh) = "Media Jobs", _jobs_media_body()
+        title, (body, refresh) = "Media Jobs", _jobs_media_body(request)
     return HTMLResponse(_page(title, body, "jobs", refresh=refresh, subnav=_subnav("jobs", sub)))
 
 

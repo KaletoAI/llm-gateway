@@ -114,17 +114,35 @@ def count_by_backend_since(ts: int) -> dict:
     return {r[0]: r[1] for r in rows if r[0]}
 
 
-def recent(limit: int = 20, media_only: bool = False) -> list:
+def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = None) -> list:
     """Most recent jobs (metadata only), newest first. `media_only` drops the
-    chat/response rows (those live under Statistic / the Responses API)."""
+    chat/response rows (those live under Statistic / the Responses API);
+    `owner` narrows to one job owner (the Media Jobs user filter)."""
     if not _active:
         return []
-    flt, args = (_MEDIA_FLT, _NON_MEDIA_TASKS) if media_only else ("", ())
+    conds, args = [], []
+    if media_only:
+        conds.append(f"task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))})")
+        args += _NON_MEDIA_TASKS
+    if owner is not None:
+        conds.append("owner = ?")
+        args.append(owner)
+    flt = f" WHERE {' AND '.join(conds)}" if conds else ""
     with _conn() as c:
         rows = c.execute(
             f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error "
             f"FROM jobs{flt} ORDER BY created DESC LIMIT ?", (*args, limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+def owners(media_only: bool = True) -> list:
+    """Distinct job owners, alphabetical — the Media Jobs user-picker options."""
+    if not _active:
+        return []
+    flt, args = (_MEDIA_FLT, _NON_MEDIA_TASKS) if media_only else ("", ())
+    with _conn() as c:
+        rows = c.execute(f"SELECT DISTINCT owner FROM jobs{flt} ORDER BY owner", args).fetchall()
+    return [r[0] for r in rows if r[0]]
 
 
 def neighbors(job_id: str, media_only: bool = True) -> tuple:
