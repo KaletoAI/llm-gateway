@@ -1669,6 +1669,60 @@ _GEN_FAILOVER_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.ReadEr
                         ConnectionError, TimeoutError)
 
 
+def _host_flag(host: str, key: str, default: bool) -> bool:
+    v = (hosts_meta.get(host) or {}).get(key)
+    return default if v is None else bool(v)
+
+
+def _shared_host(host: str) -> bool:
+    """A host running BOTH an LLM and a ComfyUI backend — they share its GPU."""
+    kinds = {bid.split(":", 1)[0] for bid in host_backends.get(host, ())}
+    return "comfyui" in kinds and len(kinds) > 1
+
+
+async def _free_comfy_vram(backend: dict, why: str) -> None:
+    """POST /free to a ComfyUI backend after its media job ended (fire-and-forget
+    via create_task). ComfyUI caches models in VRAM indefinitely; on a shared box
+    the next llama-swap load then aborts on that memory (phase 3, host plan).
+    Skipped while ANOTHER generation runs there — the free would drop its cache.
+    Policy: host flag `comfy_free_after_job`; absent = ON for shared hosts only
+    (a dedicated comfy box keeps its cache for speed)."""
+    bid = backend_id(backend)
+    host = backend_hosts.get(bid, "")
+    if not _host_flag(host, "comfy_free_after_job", _shared_host(host)):
+        return
+    if backend_inflight.get(bid, 0) > 0:
+        return
+    try:
+        await http_client.post(f"{backend['url'].rstrip('/')}/free",
+                               json={"unload_models": True, "free_memory": True}, timeout=10.0)
+        logger.info(f"host: freed ComfyUI VRAM on [{backend['name']}] after {why}")
+    except Exception as e:
+        logger.warning(f"host: /free on [{backend['name']}] failed: {e}")
+
+
+async def _unload_host_llms(backend: dict) -> None:
+    """Best-effort GET /unload on the LLM siblings of a ComfyUI backend's host
+    right before a media job runs there, so the generation doesn't start against
+    VRAM a loaded llama-swap model holds. Host flag `llm_unload_before_media`,
+    default OFF — llama-swap's TTL usually clears the model anyway (endpoint
+    verified on k12-gpu: llama-swap GET /unload → 200; other servers ignore it)."""
+    bid = backend_id(backend)
+    host = backend_hosts.get(bid, "")
+    if not _host_flag(host, "llm_unload_before_media", False):
+        return
+    for obid in host_backends.get(host, ()):
+        if not obid.startswith("openai:"):
+            continue
+        ob = next((x for x in backends if backend_id(x) == obid), None)
+        if ob and ob.get("url"):
+            try:
+                await http_client.get(f"{ob['url'].rstrip('/')}/unload", timeout=8.0)
+                logger.info(f"host: unloaded LLMs on [{ob['name']}] before media job")
+            except Exception:
+                pass
+
+
 async def _run_job(job_id: str, candidates: list, build_req) -> None:
     """Run a generation job, failing over to the next candidate on connection-type
     errors. Content errors are final (not retried). Stops at the first success."""
@@ -1679,10 +1733,12 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
         if adapter is None:
             continue
         try:
+            await _unload_host_llms(backend)         # opt-in host policy, no-op by default
             out = await adapter.generate(build_req(backend, cand))
             await asyncio.to_thread(jobs.complete, job_id, out.blobs, out.meta)
             if log_per_call:
                 logger.info(f"✓ job {job_id} done on [{backend['name']}] — {len(out.blobs)} artifact(s)")
+            asyncio.create_task(_free_comfy_vram(backend, "job done"))
             return
         except _GEN_FAILOVER_ERRORS as e:
             logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
@@ -1692,6 +1748,7 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
         except Exception as e:
             logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {e}")
             await asyncio.to_thread(jobs.fail, job_id, str(e))
+            asyncio.create_task(_free_comfy_vram(backend, "job failure"))
             return
     await asyncio.to_thread(jobs.fail, job_id,
                             f"all candidate backends unreachable (connection): {last}")
@@ -1725,6 +1782,8 @@ async def cancel_generation(job_id: str) -> bool:
     if t and not t.done():
         t.cancel()
     await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
+    if b:
+        asyncio.create_task(_free_comfy_vram(b, "cancel"))
     return True
 
 

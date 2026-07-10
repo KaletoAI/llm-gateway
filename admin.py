@@ -792,7 +792,8 @@ async def backends_page(request: Request):
     if editing or qp.get("new"):
         detail = _backend_form(editing, hosts)
     elif edit_host:
-        detail = _host_form(edit_host)
+        types = {b.get("type", "openai") for b in binfo if b.get("host") == edit_host}
+        detail = _host_form(edit_host, shared=("comfyui" in types and len(types) > 1))
     else:
         detail = ("<h2>Details</h2><p class='hint'>Select a backend's <b>Edit</b>, "
                   "or <b>+ New</b> to add one.</p>")
@@ -819,22 +820,32 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
         hm = meta.get(h) or {}
         label = hm.get("label", "")
         members = " · ".join(f"{b['name']} ({b['type']})" for b in by_host[h])
-        shared = len(by_host[h]) > 1
-        tag = _badge("shared", "warn", "several backends share this box (and its GPU/VRAM)") if shared else ""
+        types = {b.get("type", "openai") for b in by_host[h]}
+        shared = "comfyui" in types and len(types) > 1
+        tag = _badge("shared", "warn", "an LLM and a ComfyUI backend share this box (and its GPU/VRAM)") if shared else ""
         if hm.get("avoid_llm_during_media", True) is False:
             tag += " " + _badge("llm-avoid off", "warn",
                                 "chat routing does NOT step aside while this host generates media")
+        if hm.get("comfy_free_after_job", shared) != shared:      # explicit non-default only
+            tag += " " + _badge(f"free-vram {'on' if hm['comfy_free_after_job'] else 'off'}", "warn",
+                                "ComfyUI /free after each media job — non-default setting")
+        if hm.get("llm_unload_before_media"):
+            tag += " " + _badge("unload-llm", "warn",
+                                "this host's LLMs are unloaded before each media job")
         acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
         title = f"{_esc(h)}{(' — ' + _esc(label)) if label else ''} {tag}"
         rows += _item(title, members, acts, sel=(h == sel_host))
     return f'<div class="grouphdr" style="margin-top:18px">Hosts</div>{rows}'
 
 
-def _host_form(host: str) -> str:
+def _host_form(host: str, shared: bool) -> str:
     meta = (store.get_hosts() if store.is_active() else {}).get(host) or {}
     avoid = meta.get("avoid_llm_during_media", True)
+    free = meta.get("comfy_free_after_job", shared)     # default: on only when shared
+    unload = meta.get("llm_unload_before_media", False)
     return (f'<form action="/ui/backends/host-save" method="post">'
             f'<input type="hidden" name="host" value="{_esc(host)}">'
+            f'<input type="hidden" name="shared" value="{1 if shared else 0}">'
             f'<div class="formbar"><h2>Host {_esc(host)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
             + _field("label", _inp("label", meta.get("label", ""), placeholder="e.g. K12 box"))
@@ -844,9 +855,17 @@ def _host_form(host: str) -> str:
                                           "while this host's ComfyUI is generating, its LLM backends are "
                                           "tried LAST (never skipped) — a llama-swap model load would abort "
                                           "on the VRAM the generation holds"))
-            + "<p class='hint'>Only matters when LLM and ComfyUI backends share this box's GPU. "
-              "Candidates elsewhere win while a media job runs here; if this host is the only "
-              "option it is still used.</p>"
+            + _field("VRAM", _checkbox("comfy_free", free, "free ComfyUI VRAM after each media job",
+                                       "POST /free when a job ends — ComfyUI never releases its model "
+                                       "cache by itself; without this the next LLM load on this box can "
+                                       "abort. Costs the next media job its model reload.")
+                     + "<br>" + _checkbox("llm_unload", unload, "unload LLMs before media jobs",
+                                          "GET /unload on this host's LLM backends before a generation "
+                                          "starts (llama-swap). Rarely needed — the swap TTL usually "
+                                          "clears the model first."))
+            + f"<p class='hint'>Defaults: routing consideration ON · free-after-job "
+              f"{'ON (shared box)' if shared else 'OFF (dedicated box)'} · unload-before OFF. "
+              "All of it only matters when LLM and ComfyUI share this box's GPU.</p>"
             + "</form>")
 
 
@@ -855,19 +874,28 @@ async def host_save(request: Request):
     host = (f.get("host", "") or "").strip()
     if host and store.is_active():
         label = (f.get("label", "") or "").strip()
+        shared = f.get("shared") == "1"
         cur = dict(store.get_hosts().get(host) or {})
         if label:
             cur["label"] = label
         else:
             cur.pop("label", None)
-        if f.get("avoid_llm"):
-            cur.pop("avoid_llm_during_media", None)      # checked = the default → store nothing
-        else:
-            cur["avoid_llm_during_media"] = False
+        # flags store only the NON-default value (default: avoid on, free on-if-
+        # shared, unload off) — an untouched host keeps adapting to its defaults.
+        for form_key, store_key, default in (("avoid_llm", "avoid_llm_during_media", True),
+                                             ("comfy_free", "comfy_free_after_job", shared),
+                                             ("llm_unload", "llm_unload_before_media", False)):
+            val = bool(f.get(form_key))
+            if val == default:
+                cur.pop(store_key, None)
+            else:
+                cur[store_key] = val
         store.set_host(host, cur or None)      # empty meta → drop the entry
         _apply_hosts()                         # refresh main's request-path cache
         logger.info(f"ui: host '{host}' saved (label={'y' if label else 'n'}, "
-                    f"avoid_llm={'on' if f.get('avoid_llm') else 'OFF'})")
+                    f"avoid_llm={'on' if f.get('avoid_llm') else 'OFF'}, "
+                    f"comfy_free={'on' if f.get('comfy_free') else 'off'}, "
+                    f"llm_unload={'on' if f.get('llm_unload') else 'off'})")
     return RedirectResponse("/ui/backends", status_code=303)
 
 
