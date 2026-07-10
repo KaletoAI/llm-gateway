@@ -131,8 +131,10 @@ what they need via injected callables, staying hot-reload-safe.
   skips body parsing/stats blobs for non-text responses — via `route()`): all
   funnel through **`_dispatch_or_park()`** — `resolve_routes()` →
   ready vs busy split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the
-  first ready, failing over only on connection/timeout errors (HTTP error status
-  returned as-is). All busy → **park by default** (FIFO queue, per-alias `park_s`)
+  first ready, failing over on connection/timeout errors and on llama-swap's
+  "unable to start process" 502 (backend-local load failure, `_retryable_upstream_error`);
+  other HTTP error statuses return as-is. The adapter opens the upstream stream
+  BEFORE answering, so streamed upstream errors carry their real status too. All busy → **park by default** (FIFO queue, per-alias `park_s`)
   until a backend frees, else 503; no client field. Before dispatch,
   `_normalize_reasoning()` folds the client `reasoning`/`reasoning_effort` control
   to `off|on|None` and stashes it in `body["_reasoning"]`; the adapter strips all
@@ -190,6 +192,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   all that backend's models); image aliases are included; `?type=chat|image`.
 - **Alias/model-name collisions** (`alias_model_conflicts`): surfaced in `/health`
   + Routing tab, split `covered` vs actionable `shadowed`.
+- **Host coordination** (shared-GPU boxes; `docs/host-coordination-plan.md`):
+  backends group by physical box (`backend_host`: explicit `host` field, else URL
+  IP → `backend_hosts`/`host_backends`, shown in `/health` and the Backends tab's
+  Hosts panel). Per-host policies (store settings `hosts`, cached `hosts_meta`):
+  chat candidates on a host with a RUNNING media job sort LAST in `resolve_routes`
+  (never dropped; flag `avoid_llm_during_media`, default on); after a media job
+  ends, ComfyUI gets `POST /free` (`_free_comfy_vram`; default on for shared
+  hosts only — ComfyUI never frees VRAM itself, a llama-swap load would abort);
+  opt-in `llm_unload_before_media` GETs llama-swap `/unload` first.
 
 ### Auth / multi-user
 
