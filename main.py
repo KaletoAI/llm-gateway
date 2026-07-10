@@ -1106,12 +1106,27 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
                                     source=_source_of(request), stats_endpoint=stats_endpoint)
 
 
+def _retryable_upstream_error(resp) -> bool:
+    """A 502 whose body is llama-swap's "unable to start process" — the backend
+    is alive but can't load the model right now (VRAM held by another process on
+    the shared GPU, measured on k12-gpu). Backend-local by definition, so another
+    candidate may well serve the call — treated like connect/timeout in
+    _dispatch_over. Plain Response only (streams surface errors that way since
+    the adapter opens upstream before answering)."""
+    if getattr(resp, "status_code", 0) != 502:
+        return False
+    return b"unable to start process" in (getattr(resp, "body", b"") or b"")[:300]
+
+
 async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=None):
     """Forward to the first candidate, failing over to the next only on
-    connect/timeout. The first candidate's dispatch increments in-flight before
-    its first await, so a parked waiter claims that slot atomically here.
-    `stats_endpoint` overrides the recorded endpoint label (e.g. /v1/responses)."""
+    connect/timeout or a backend-local load failure (_retryable_upstream_error);
+    other HTTP errors return as-is. The first candidate's dispatch increments
+    in-flight before its first await, so a parked waiter claims that slot
+    atomically here. `stats_endpoint` overrides the recorded endpoint label
+    (e.g. /v1/responses)."""
     last_error: Exception = Exception("unknown")
+    last_resp = None
     for backend, real_model in candidates:
         cand_body = dict(body, model=real_model)  # per-candidate copy — the shared body stays untouched
         adapter = backend_adapters.get(backend_id(backend))
@@ -1125,10 +1140,17 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
                 body=cand_body, raw=request, stream=bool(body.get("stream")),
                 stats_endpoint=stats_endpoint, reasoning=body.get("_reasoning"),
             )
-            return await adapter.dispatch(req)
+            resp = await adapter.dispatch(req)
+            if _retryable_upstream_error(resp):
+                logger.warning(f"✗ [{backend['name']}] upstream can't start the model (502) — trying next")
+                last_resp = resp
+                continue
+            return resp
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             logger.warning(f"✗ [{backend['name']}] {e} — trying next")
             last_error = e
+    if last_resp is not None:                     # every candidate failed to load → the real 502
+        return last_resp
     raise HTTPException(503, f"All backends failed: {last_error}")
 
 

@@ -427,7 +427,7 @@ class OpenAIAdapter(BackendAdapter):
     async def dispatch(self, req: NormalizedRequest):
         call = self._prepare(req)                 # claims the in-flight slot
         if req.body.get("stream"):
-            return self._dispatch_stream(req, call)
+            return await self._dispatch_stream(req, call)
         return await self._dispatch_once(req, call)
 
     def _prepare(self, req: NormalizedRequest) -> _Call:
@@ -488,7 +488,7 @@ class OpenAIAdapter(BackendAdapter):
         ))
         return elapsed_ms
 
-    def _dispatch_stream(self, req: NormalizedRequest, call: _Call) -> StreamingResponse:
+    async def _dispatch_stream(self, req: NormalizedRequest, call: _Call) -> Response:
         ctx = self.ctx
         # Ask the backend to emit a final usage chunk so streamed calls record
         # real tokens/cost (graceful: backends that ignore the field just yield
@@ -499,27 +499,56 @@ class OpenAIAdapter(BackendAdapter):
         want_usage = bool((call.fwd.get("stream_options") or {}).get("include_usage"))
         norm = _StreamNormalizer(want_usage, _estimate_prompt_tokens(call.fwd))
 
-        async def generate():
-            stream_status = 0
+        # Open the upstream stream BEFORE building the client response: status +
+        # headers arrive first, so a backend that answers with an error (llama-swap
+        # "unable to start process" 502 when the model can't load) returns a plain
+        # Response with its REAL status — previously the SSE shell went out as
+        # HTTP 200 before upstream ever replied — and _dispatch_over can fail over
+        # on it. Connect/timeout raise into _dispatch_over's failover exactly like
+        # the non-stream path; every error exit releases the in-flight slot.
+        client_cm = _pooled_client(ctx)
+        client = None
+        try:
+            client = await client_cm.__aenter__()
+            stream_cm = client.stream("POST", call.url, json=body,
+                                      headers=call.headers, timeout=_CHAT_TIMEOUT)
+            resp = await stream_cm.__aenter__()
+        except BaseException:
+            if client is not None:
+                await client_cm.__aexit__(None, None, None)
+            self._finish(call)
+            raise
+        if call.log_on:
+            logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} "
+                        f"(stream open, {(time.monotonic() - call.started):.2f}s)")
+        if resp.status_code >= 400:               # error body, not SSE — real status through
             try:
-                async with _pooled_client(ctx) as client:
-                    async with client.stream("POST", call.url, json=body,
-                                             headers=call.headers, timeout=_CHAT_TIMEOUT) as resp:
-                        stream_status = resp.status_code
-                        if call.log_on:
-                            logger.info(f"← [{self.name}] {req.path} HTTP {stream_status} "
-                                        f"(stream open, {(time.monotonic() - call.started):.2f}s)")
-                        async for chunk in resp.aiter_bytes():
-                            out = norm.feed(chunk)
-                            if out:
-                                yield out
-                        tail = norm.flush()
-                        if tail:
-                            yield tail
+                err = await resp.aread()
             finally:
+                await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
+                self._finish(call)
+            self._record(req, call, resp.status_code, 0, 0,
+                         response_text=err.decode("utf-8", "ignore"))
+            return Response(content=err, status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type"),
+                            headers=call.rheaders)
+
+        async def generate():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    out = norm.feed(chunk)
+                    if out:
+                        yield out
+                tail = norm.flush()
+                if tail:
+                    yield tail
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
                 self._finish(call)
             in_tok, out_tok = norm.tokens()
-            self._record(req, call, stream_status, in_tok, out_tok)
+            self._record(req, call, resp.status_code, in_tok, out_tok)
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 
