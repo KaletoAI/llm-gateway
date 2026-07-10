@@ -667,11 +667,15 @@ def _image_fields(wf: dict) -> list:
 
 # ── Tab: Backends ───────────────────────────────────────────────────────────────
 
-def _backend_form(b: Optional[dict]) -> str:
+def _backend_form(b: Optional[dict], hosts: list) -> str:
     g = lambda k, d="": str((b or {}).get(k) if (b or {}).get(k) is not None else d)
     gb = lambda k: bool((b or {}).get(k))
     title = "Edit Backend" if b else "Add Backend"
     orig = f'<input type="hidden" name="orig" value="{_esc(_bid(b))}">' if b else ""
+    hlist = "".join(f'<option value="{_esc(h)}">' for h in hosts)
+    host_inp = (f'<input name="host" value="{_esc(g("host"))}" list="hostlist" '
+                f'placeholder="auto: URL host/IP" autocomplete="off">'
+                f'<datalist id="hostlist">{hlist}</datalist>')
     return (f'<form action="/ui/backends/save" method="post">{orig}'
             f'<div class="formbar"><h2>{title}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
@@ -682,6 +686,10 @@ def _backend_form(b: Optional[dict]) -> str:
               "models, which are discovered and routed like any other model. <b>comfyui</b> = workflow-based "
               "media generation.</p>"
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
+            + _field("host", host_inp)
+            + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
+              "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
+              "host/IP, which groups correctly for most setups.</p>"
             + _field("priority", _inp("priority", g("priority", "10"), typ="number"))
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
             + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
@@ -761,7 +769,8 @@ async def backends_page(request: Request):
         acts = _icon_acts(*acts_list)
         src = "" if b.get("source") == "ui" else " · config"
         flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local") if b.get(fl))
-        sub = f"{b['url']} · prio {b['priority']} · {b['models']} models{flags}{src}"
+        host = f" · host {b['host']}" if b.get("host") else ""
+        sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Image (comfyui), alphabetical within each
@@ -775,9 +784,14 @@ async def backends_page(request: Request):
     items = items or "<p class='muted'>No backends.</p>"
     list_html = (f'<div class="bar"><h2>Backends</h2>{_btn("+ New", "/ui/backends?new=1")}</div>'
                  f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
-                 f"editable copy that overrides it).</p>{items}")
+                 f"editable copy that overrides it).</p>{items}"
+                 + _hosts_panel(binfo, qp.get("host", "")))
+    hosts = sorted({b["host"] for b in binfo if b.get("host")})
+    edit_host = qp.get("host", "")
     if editing or qp.get("new"):
-        detail = _backend_form(editing)
+        detail = _backend_form(editing, hosts)
+    elif edit_host:
+        detail = _host_form(edit_host)
     else:
         detail = ("<h2>Details</h2><p class='hint'>Select a backend's <b>Edit</b>, "
                   "or <b>+ New</b> to add one.</p>")
@@ -785,6 +799,58 @@ async def backends_page(request: Request):
             f'<div class="col">{detail}</div></div>')
     draining_now = any(b.get("draining") for b in binfo)      # watch the count drain → offline
     return HTMLResponse(_page("Backends", body, "backends", refresh=4 if draining_now else None))
+
+
+def _hosts_panel(binfo: list, sel_host: str) -> str:
+    """Physical-box grouping under the backend list: one row per host with its
+    member backends. Membership is edited on the backend (its `host` field or the
+    URL IP); this panel edits the per-host extras — a label now, the shared-GPU
+    policy flags later (docs/host-coordination-plan.md)."""
+    by_host: dict = {}
+    for b in binfo:
+        if b.get("host"):
+            by_host.setdefault(b["host"], []).append(b)
+    if not by_host:
+        return ""
+    meta = store.get_hosts() if store.is_active() else {}
+    rows = ""
+    for h in sorted(by_host):
+        label = (meta.get(h) or {}).get("label", "")
+        members = " · ".join(f"{b['name']} ({b['type']})" for b in by_host[h])
+        shared = len(by_host[h]) > 1
+        tag = _badge("shared", "warn", "several backends share this box (and its GPU/VRAM)") if shared else ""
+        acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
+        title = f"{_esc(h)}{(' — ' + _esc(label)) if label else ''} {tag}"
+        rows += _item(title, members, acts, sel=(h == sel_host))
+    return f'<div class="grouphdr" style="margin-top:18px">Hosts</div>{rows}'
+
+
+def _host_form(host: str) -> str:
+    meta = (store.get_hosts() if store.is_active() else {}).get(host) or {}
+    return (f'<form action="/ui/backends/host-save" method="post">'
+            f'<input type="hidden" name="host" value="{_esc(host)}">'
+            f'<div class="formbar"><h2>Host {_esc(host)}</h2>'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
+            + _field("label", _inp("label", meta.get("label", ""), placeholder="e.g. K12 box"))
+            + "<p class='hint'>Display label for this physical box. Which backends belong to it is "
+              "set on each backend (its <b>host</b> field; blank = URL host/IP). Host-level "
+              "coordination flags (shared-GPU policies) land here in a later phase.</p>"
+            + "</form>")
+
+
+async def host_save(request: Request):
+    f = await _form(request)
+    host = (f.get("host", "") or "").strip()
+    if host and store.is_active():
+        label = (f.get("label", "") or "").strip()
+        cur = dict(store.get_hosts().get(host) or {})
+        if label:
+            cur["label"] = label
+        else:
+            cur.pop("label", None)
+        store.set_host(host, cur or None)      # empty meta → drop the entry
+        logger.info(f"ui: host '{host}' label={'set' if label else 'cleared'}")
+    return RedirectResponse("/ui/backends", status_code=303)
 
 
 async def backend_save(request: Request):
@@ -807,6 +873,11 @@ async def backend_save(request: Request):
         b["max_concurrent"] = int(mc)
     else:
         b.pop("max_concurrent", None)
+    host = (f.get("host", "") or "").strip()
+    if host:
+        b["host"] = host
+    else:
+        b.pop("host", None)                    # blank = derive from the URL host/IP
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
@@ -2146,9 +2217,11 @@ async def copy(request: Request):
 
 # ── Tab: Playground ─────────────────────────────────────────────────────────────
 
-# Reference images stick across generations: stashed in memory per (user, alias) so
-# the file-input (which the browser can't pre-fill) doesn't have to be re-picked each
-# time. A new upload replaces; the "clear" checkbox drops it. Lost on restart (fine).
+# Reference images stick across generations: stashed in memory PER USER (keyed by
+# slot name) so the file-input (which the browser can't pre-fill) doesn't have to be
+# re-picked each time — and so switching the model keeps them: same-named slots
+# carry over to the new alias (generate() filters to the alias's actual image
+# slots). A new upload replaces; the "clear" checkbox drops it. Lost on restart.
 _pg_images: dict = {}
 
 
@@ -2318,7 +2391,7 @@ async def playground_page(request: Request):
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the result here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
-    kept = set(_pg_images.get((_session_user(request) or "default", model), {}).keys())
+    kept = set(_pg_images.get(_session_user(request) or "default", {}).keys())
     poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
     return HTMLResponse(_page("Media Playground",
                               _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
@@ -2345,10 +2418,11 @@ async def generate(request: Request):
             body["params"][p] = _num(raw)
     # per-field image uploads (img__<param>); empty inputs fall back to the 8×8
     # placeholder downstream, so they're simply omitted here.
-    # reference images persist across generations (stash per user+alias); a new upload
-    # replaces, a checked clear__<param> drops the kept one.
+    # reference images persist across generations AND model switches (one stash per
+    # user, keyed by slot name — same-named slots carry over to another alias); a new
+    # upload replaces, a checked clear__<param> drops the kept one.
     user = _session_user(request) or "default"
-    stash = _pg_images.setdefault((user, model), {})
+    stash = _pg_images.setdefault(user, {})
     for k in f:
         if k.startswith("img__"):
             val = f.get(k)
@@ -2356,8 +2430,13 @@ async def generate(request: Request):
                 stash[k[len("img__"):]] = bytes(val)
         elif k.startswith("clear__"):
             stash.pop(k[len("clear__"):], None)
-    images = dict(stash)
     cand = (store.get(model) or [None])[0]
+    # only the slots this alias actually has ride along (the stash may carry other
+    # aliases' images); no mapping info → send everything, downstream ignores extras.
+    wf_i = (cand.get("workflow_json") if cand else {}) or {}
+    map_i = (cand.get("mapping") if cand else {}) or {}
+    slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
+    images = {p: v for p, v in stash.items() if p in slots} if slots else dict(stash)
     vals = {"model": model, "backend": force_bk, **submitted}
     # A REAL API call through POST /v1/generations (reference images as the API's
     # per-field base64 `images` dict) — the playground tests the API, bypassing nothing.
@@ -2899,7 +2978,7 @@ async def job_to_playground(job_id: str, request: Request):
         if val is not None and str(val) != "":
             q[f"p__{k}"] = str(val)
     user = _session_user(request) or "default"
-    stash = _pg_images.setdefault((user, alias), {})
+    stash = _pg_images.setdefault(user, {})
     for r in meta.get("input_images", []):
         ip = jobs.input_path(job_id, r.get("n"))
         if ip:
@@ -3976,6 +4055,7 @@ def register(app) -> None:
     app.add_api_route("/ui/logout", logout, methods=["GET"])
     app.add_api_route("/ui/backends", backends_page, methods=["GET"])
     app.add_api_route("/ui/backends/save", backend_save, methods=["POST"])
+    app.add_api_route("/ui/backends/host-save", host_save, methods=["POST"])
     app.add_api_route("/ui/backends/delete", backend_del, methods=["GET"])
     app.add_api_route("/ui/backends/drain", backend_drain, methods=["GET"])
     app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["GET"])
