@@ -1707,19 +1707,18 @@ def _map_del_btn(alias: str, qs: str) -> str:
                 icon=True, title="Remove")
 
 
-def _req_fields_rows(alias: str, wf: dict, mapping: dict) -> str:
+def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
     """Request fields: one row PER MAPPED param (dynamic — promoted from the
     Available fields list via →; NOT a fixed list). Rendered in mapping order (NOT
     sorted) so drag-to-reorder sticks; that order drives the Playground. node/field
-    stay editable, ∅ clears the workflow default, ✕ removes the param."""
+    stay editable, the `=` column EDITS the workflow default (the value a request
+    without this field runs with), ∅ clears it, ✕ removes the param."""
     rows = ""
     for p in mapping:
         m = mapping.get(p) or {}
         node, fld = m.get("node", ""), m.get("field", "")
         is_img = adapters.is_image_field(wf, node)
         cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
-        cur_disp = ("image upload" if is_img else
-                    "(linked)" if isinstance(cur, list) else ("" if cur is None else str(cur)))
         if is_img:
             mode = adapters.slot_empty_mode(m)
             eopts = [("placeholder", "8×8 if empty"), ("required", "required"),
@@ -1731,8 +1730,12 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict) -> str:
                         '8×8 black placeholder · required (error if missing) · disable the loader '
                         'node (drop it + its links, optional consumer runs without it)">'
                         + esel + '</select>')
+        elif isinstance(cur, list):
+            cur_cell = "(linked)"                        # wired to another node — not editable
+        elif node and fld and node in wf:
+            cur_cell = _value_control("default__" + p, node, fld, None, wf, oi)
         else:
-            cur_cell = _esc(cur_disp[:60])
+            cur_cell = ""                                # stale/incomplete binding — nothing to edit
         tag = " <span class='tag'>image</span>" if is_img else ""
         if node and node not in wf:                      # node vanished after a workflow update
             tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
@@ -1825,7 +1828,7 @@ async def _alias_editor(alias: str) -> str:
     mapped = ({(m["node"], m["field"]) for m in mapping.values()}
               | {(b["node"], b["field"]) for b in fixed})
 
-    req_rows = _req_fields_rows(alias, wf, mapping)
+    req_rows = _req_fields_rows(alias, wf, mapping, oi)
     pinned_block = await _pinned_block(alias, cands, fixed, wf, oi)
     pin_extra = _PIN_CSS_JS
 
@@ -1854,7 +1857,9 @@ async def _alias_editor(alias: str) -> str:
             f'<table class="reqf"><thead><tr><th>param</th>'
             f'<th title="Playground label / API field name (blank = param)">label</th>'
             f'<th>node</th><th>field</th>'
-            f'<th title="workflow default value">=</th><th></th></tr></thead>'
+            f'<th title="workflow default — used when a request omits the field '
+            f'(a seed field still gets a random value unless the request sends one)">=</th>'
+            f'<th></th></tr></thead>'
             f'<tbody id="reqfields">{req_rows}</tbody></table>'
             + pinned_block
             + '</form>' + pin_extra + _reorder_js(alias))
@@ -2055,6 +2060,33 @@ async def update(request: Request):
                 if emode in ("placeholder", "required", "disable"):
                     entry["on_empty"] = emode
                 mapping[p] = entry
+    # Editable workflow defaults (the "=" column): default__<param> writes the
+    # value a request-without-this-field runs with into the workflow JSON at the
+    # mapped node/field — on EVERY candidate (the workflow is backend-independent,
+    # same rule as field_clear). Coerced to the field's current type like pins
+    # (adapters._coerce); linked inputs are never touched; a blank only clears
+    # string fields (number/bool widgets never submit blank deliberately).
+    for key, val in f.items():
+        if not key.startswith("default__"):
+            continue
+        m = mapping.get(key[len("default__"):])
+        if not m:
+            continue
+        for c in cands:
+            w = c.get("workflow_json")
+            if not w or m["node"] not in w:
+                continue
+            inputs = w[m["node"]].setdefault("inputs", {})
+            old = inputs.get(m["field"])
+            if isinstance(old, list):                    # wired to another node — hands off
+                continue
+            if val == "":
+                if isinstance(old, str) and old:
+                    inputs[m["field"]] = ""
+                continue
+            new = adapters._coerce(val, old)
+            if new != old:
+                inputs[m["field"]] = new
     fixed = []
     for key, val in f.items():
         if key.startswith("fixed__") and val != "":
