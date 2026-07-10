@@ -1969,6 +1969,15 @@ async def _alias_editor(alias: str) -> str:
             + _backends_section(alias, cands)
             + _field("retries", _inp("retries", str(retries), typ="number"), short=True)
             + "<p class='hint'>Backends to try after the first on error. Blank = try all eligible · 0 = no failover.</p>"
+            + _field("fps", _inp("fps", str(next((c.get("fps") for c in cands
+                                                  if c.get("fps")), "") or ""), typ="number"), short=True)
+            + _field("frames raster", _inp("frames_snap", str(next((c.get("frames_snap") for c in cands
+                                                                    if c.get("frames_snap")), "") or ""),
+                                           typ="number"), short=True)
+            + "<p class='hint'>Video aliases: <b>fps</b> enables <code>params.seconds</code> → frames "
+              "(needs a request field named/labelled <code>frames</code>) and shows up in "
+              "<code>/v1/generations/&lt;alias&gt;/schema</code>. <b>frames raster</b> S snaps computed "
+              "frames onto S·k+1 (Wan: 4). Blank = off.</p>"
             + f'<h2>Request fields <span class="muted" style="font-weight:normal">— drag ⠿ to set Playground order</span></h2>'
             "<p class='hint'>label overrides the Playground label / external API field name (blank = param).</p>"
             f'<table class="reqf"><thead><tr><th>param</th>'
@@ -2231,6 +2240,14 @@ async def update(request: Request):
     retries = (f.get("retries", "") or "").strip()
     for c in cands:
         c["retries"] = retries
+    # video metadata (schema + seconds→frames), same per-candidate persistence
+    for key in ("fps", "frames_snap"):
+        v = (f.get(key, "") or "").strip()
+        for c in cands:
+            if v.isdigit() and int(v) > 0:
+                c[key] = int(v)
+            else:
+                c.pop(key, None)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name

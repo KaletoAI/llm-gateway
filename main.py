@@ -22,7 +22,8 @@ import jobs
 import reasoning
 import stats
 import store
-from adapters import AdapterContext, NormalizedRequest, image_params, make_adapter
+from adapters import (AdapterContext, NormalizedRequest, image_params, is_image_field,
+                      make_adapter, slot_empty_mode)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -1630,10 +1631,49 @@ def _gen_inputs_params(body: dict) -> tuple[dict, dict]:
         "negative_prompt": body.get("negative_prompt", ""),
     }
     params = dict(body.get("params") or {})
-    for k in ("width", "height", "steps", "cfg", "seed", "sampler", "scheduler"):
+    for k in ("width", "height", "steps", "cfg", "seed", "sampler", "scheduler", "seconds"):
         if k in body and k not in params:        # top-level convenience knobs
             params[k] = body[k]
     return inputs, params
+
+
+def _mapping_param(mapping: dict, name: str) -> Optional[str]:
+    """The mapping param whose EXTERNAL name (label, else param) is `name`."""
+    for p, m in (mapping or {}).items():
+        if p == name or ((m or {}).get("label") or "").strip().lower() == name:
+            return p
+    return None
+
+
+def _apply_seconds(params: dict, cand: dict) -> None:
+    """Video convenience: `seconds` → the alias's `frames` param, when the alias
+    declares `fps` (mapping editor). Explicit frames always win; `frames_snap: S`
+    rounds onto the S·k+1 raster (Wan). A mapping that itself exposes a param
+    named `seconds` is left alone; `seconds` without alias fps is a clear 400
+    instead of a silent ignore."""
+    if _mapping_param(cand.get("mapping") or {}, "seconds"):
+        return                                   # the workflow maps it directly
+    sec = params.pop("seconds", None)
+    if sec in (None, ""):
+        return
+    fps = cand.get("fps")
+    mapping = cand.get("mapping") or {}
+    fparam = _mapping_param(mapping, "frames")
+    if not fps or fparam is None:
+        raise HTTPException(400, f"'seconds' is not supported for this alias "
+                                 f"({'no fps configured' if not fps else 'no frames param'}) — send frames directly")
+    lbl = ((mapping.get(fparam) or {}).get("label") or "").strip()
+    if params.get(fparam) not in (None, "") or (lbl and params.get(lbl) not in (None, "")):
+        return                                   # explicit frames beats the convenience knob
+    try:
+        frames = max(1, round(float(sec) * float(fps)))
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"'seconds' must be a number (got {sec!r})")
+    snap = cand.get("frames_snap")
+    if snap:
+        s = max(1, int(snap))
+        frames = max(1, round((frames - 1) / s) * s + 1)
+    params[fparam] = frames
 
 
 async def _job_view(job_id: str, request: Request) -> dict:
@@ -1875,6 +1915,7 @@ async def run_generation(body: dict, request: Request,
 
     routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
+    _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
 
     def build_req(backend: dict, cand: dict) -> NormalizedRequest:
         return NormalizedRequest(
@@ -1947,6 +1988,58 @@ async def gen_alias_loras(alias: str, request: Request, authorization: Optional[
     for b, _ in await asyncio.to_thread(get_gen_routes, alias, include_busy=True):
         loras |= backend_loras.get(backend_id(b), set())
     return {"object": "list", "alias": alias, "loras": sorted(loras)}
+
+
+@app.get("/v1/generations/{alias}/schema")
+async def gen_alias_schema(alias: str, request: Request, authorization: Optional[str] = Header(None)):
+    """Self-description of a generation alias — enough for a client (or an agent)
+    to build a valid request without out-of-band docs: params under their EXTERNAL
+    names (label, else param; both are accepted on requests) with type + default
+    from the workflow, image slots with their empty behaviour, fps/frames raster,
+    and where to list valid LoRAs."""
+    await gate_request(authorization, request, alias)                # auth + allow-list
+    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
+        or image_models.get(alias)
+    if not cands:
+        raise HTTPException(404, f"generation alias '{alias}' not found")
+    cand = cands[0]
+    wf = cand.get("workflow_json") or {}
+    mapping = cand.get("mapping") or {}
+    params, images = [], []
+    for p, m in mapping.items():
+        m = m or {}
+        name = (m.get("label") or "").strip() or p
+        node, fld = m.get("node"), m.get("field")
+        if is_image_field(wf, node):
+            mode = slot_empty_mode(m)
+            images.append({"name": name, "on_empty": mode, "required": mode == "required"})
+            continue
+        cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
+        if isinstance(cur, list):                # linked to another node — no scalar default
+            cur = None
+        typ = ("bool" if isinstance(cur, bool) else
+               "int" if isinstance(cur, int) else
+               "float" if isinstance(cur, float) else "string")
+        entry: dict = {"name": name, "type": typ}
+        if name != p:
+            entry["param"] = p                   # legacy/internal name, also accepted
+        if cur is not None:
+            entry["default"] = cur
+        if name == "seed" or (p == "seed" and name == p):
+            entry["auto"] = "random unless sent"
+        params.append(entry)
+    out: dict = {"object": "generation.schema", "alias": alias,
+                 "backends": [c.get("backend") for c in cands],
+                 "params": params, "images": images,
+                 "modes": ["sync", "async"],
+                 "loras_url": f"/v1/generations/{alias}/loras"}
+    if cand.get("fps"):
+        out["fps"] = cand["fps"]
+        if cand.get("frames_snap"):
+            out["frames_snap"] = cand["frames_snap"]     # frames land on snap·k+1
+        if _mapping_param(mapping, "frames"):
+            out["seconds_supported"] = True              # params.seconds → frames via fps
+    return out
 
 
 async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:
