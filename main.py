@@ -132,7 +132,32 @@ def rebuild_backends() -> None:
     host_backends = {}
     for bid, h in backend_hosts.items():
         host_backends.setdefault(h, []).append(bid)
+    apply_hosts()
     rebuild_route_index()                  # backend set/enabled flags changed
+
+
+def apply_hosts() -> None:
+    """Refresh the per-host settings cache (labels + policy flags) from the store —
+    read on the request path by _media_busy_hosts, so no DB hit per request."""
+    global hosts_meta
+    hosts_meta = store.get_hosts() if store.is_active() else {}
+
+
+def _media_busy_hosts() -> set:
+    """Hosts whose ComfyUI backend is generating RIGHT NOW. Their LLM siblings
+    share the box's GPU — a llama-swap model (re)load then aborts on the VRAM
+    ComfyUI holds (measured on k12-gpu, see docs/host-coordination-plan.md).
+    resolve_routes sorts chat candidates on these hosts LAST (never drops them:
+    with alternatives the collision never happens, without them best effort +
+    the 502-failover still apply). Per-host opt-out: avoid_llm_during_media
+    false (Hosts editor); absent = on — it only ever bites shared boxes."""
+    out = set()
+    for bid, n in backend_inflight.items():
+        if n > 0 and bid.startswith("comfyui:"):
+            h = backend_hosts.get(bid)
+            if h and (hosts_meta.get(h) or {}).get("avoid_llm_during_media", True):
+                out.add(h)
+    return out
 
 
 def rebuild_virtual_models() -> None:
@@ -166,6 +191,7 @@ backend_loras: dict[str, set[str]] = {}                        # id → {lora fi
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
 backend_hosts: dict[str, str] = {}                             # bid → host (explicit `host` or URL IP)
 host_backends: dict[str, list] = {}                            # host → [bid, …] (rebuild_backends)
+hosts_meta: dict[str, dict] = {}                               # host → {label, avoid_llm_during_media, …}
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
 
 # ── Health / Discovery ────────────────────────────────────────────────────────
@@ -688,6 +714,12 @@ def resolve_routes(alias: str) -> tuple[list, list]:
         if not backend_healthy.get(backend_id(b)) or is_draining(b):
             continue
         (busy if backend_busy(b) else ready).append((b, real))
+    if len(ready) > 1:
+        # Shared-GPU consideration: candidates whose host is generating media go
+        # LAST (stable — priority order kept within both groups), never dropped.
+        mb = _media_busy_hosts()
+        if mb:
+            ready.sort(key=lambda br: backend_hosts.get(backend_id(br[0]), "") in mb)
     return ready, busy
 
 
@@ -2260,6 +2292,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            voice_lib_save=save_voice_ref, voice_lib_delete=delete_voice_ref,
            voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
            apply_voice_library=apply_voice_library,
+           apply_hosts=apply_hosts,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
 

@@ -119,6 +119,7 @@ _voice_lib_delete: Callable = None        # (name) → None
 _voice_lib_ship: Callable = None          # async (name) → (ok, msg)
 _voice_ship_config: Callable[[], tuple] = lambda: ([], "")   # → (hosts, dir)
 _apply_voice_library: Callable[[], None] = lambda: None
+_apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
 
@@ -815,10 +816,14 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
     meta = store.get_hosts() if store.is_active() else {}
     rows = ""
     for h in sorted(by_host):
-        label = (meta.get(h) or {}).get("label", "")
+        hm = meta.get(h) or {}
+        label = hm.get("label", "")
         members = " · ".join(f"{b['name']} ({b['type']})" for b in by_host[h])
         shared = len(by_host[h]) > 1
         tag = _badge("shared", "warn", "several backends share this box (and its GPU/VRAM)") if shared else ""
+        if hm.get("avoid_llm_during_media", True) is False:
+            tag += " " + _badge("llm-avoid off", "warn",
+                                "chat routing does NOT step aside while this host generates media")
         acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
         title = f"{_esc(h)}{(' — ' + _esc(label)) if label else ''} {tag}"
         rows += _item(title, members, acts, sel=(h == sel_host))
@@ -827,14 +832,21 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
 
 def _host_form(host: str) -> str:
     meta = (store.get_hosts() if store.is_active() else {}).get(host) or {}
+    avoid = meta.get("avoid_llm_during_media", True)
     return (f'<form action="/ui/backends/host-save" method="post">'
             f'<input type="hidden" name="host" value="{_esc(host)}">'
             f'<div class="formbar"><h2>Host {_esc(host)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
             + _field("label", _inp("label", meta.get("label", ""), placeholder="e.g. K12 box"))
             + "<p class='hint'>Display label for this physical box. Which backends belong to it is "
-              "set on each backend (its <b>host</b> field; blank = URL host/IP). Host-level "
-              "coordination flags (shared-GPU policies) land here in a later phase.</p>"
+              "set on each backend (its <b>host</b> field; blank = URL host/IP).</p>"
+            + _field("routing", _checkbox("avoid_llm", avoid, "avoid LLM routing during media jobs",
+                                          "while this host's ComfyUI is generating, its LLM backends are "
+                                          "tried LAST (never skipped) — a llama-swap model load would abort "
+                                          "on the VRAM the generation holds"))
+            + "<p class='hint'>Only matters when LLM and ComfyUI backends share this box's GPU. "
+              "Candidates elsewhere win while a media job runs here; if this host is the only "
+              "option it is still used.</p>"
             + "</form>")
 
 
@@ -848,8 +860,14 @@ async def host_save(request: Request):
             cur["label"] = label
         else:
             cur.pop("label", None)
+        if f.get("avoid_llm"):
+            cur.pop("avoid_llm_during_media", None)      # checked = the default → store nothing
+        else:
+            cur["avoid_llm_during_media"] = False
         store.set_host(host, cur or None)      # empty meta → drop the entry
-        logger.info(f"ui: host '{host}' label={'set' if label else 'cleared'}")
+        _apply_hosts()                         # refresh main's request-path cache
+        logger.info(f"ui: host '{host}' saved (label={'y' if label else 'n'}, "
+                    f"avoid_llm={'on' if f.get('avoid_llm') else 'OFF'})")
     return RedirectResponse("/ui/backends", status_code=303)
 
 
