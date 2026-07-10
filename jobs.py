@@ -145,6 +145,26 @@ def owners(media_only: bool = True) -> list:
     return [r[0] for r in rows if r[0]]
 
 
+def median_duration(alias: str, backend: Optional[str] = None, limit: int = 10) -> Optional[float]:
+    """Median runtime (s) of the last `limit` DONE jobs of an alias (optionally
+    narrowed to one backend) — the basis for the job view's progress/ETA estimate."""
+    if not _active:
+        return None
+    q = "SELECT updated - created FROM jobs WHERE status = 'done' AND alias = ?"
+    args: list = [alias]
+    if backend:
+        q += " AND backend = ?"
+        args.append(backend)
+    q += " ORDER BY created DESC LIMIT ?"
+    args.append(limit)
+    with _conn() as c:
+        vals = sorted(r[0] for r in c.execute(q, args) if r[0] is not None and r[0] >= 0)
+    if not vals:
+        return None
+    n = len(vals)
+    return float(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2)
+
+
 def neighbors(job_id: str, media_only: bool = True) -> tuple:
     """(newer_id, older_id) around a job in the media list's created-DESC order
     (rowid tiebreak) — drives the detail page's prev/next navigation. None at the

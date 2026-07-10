@@ -1700,6 +1700,19 @@ async def _job_view(job_id: str, request: Request) -> dict:
         "n": r["n"], "slot": r.get("slot"), "mime": r["mime"],
         "url": f"{base}/v1/jobs/{job_id}/input/{r['n']}",
     } for r in meta.get("input_images", [])]
+    # Live jobs get an honest progress estimate: elapsed vs the median runtime of
+    # the alias's recent done jobs (same backend when it has history). Capped at
+    # 0.97 — only completion says 100%. No history → elapsed only.
+    if job["status"] in ("queued", "running"):
+        elapsed = max(0, int(time.time()) - int(job.get("created") or 0))
+        view["elapsed_s"] = elapsed
+        if job["status"] == "running":
+            med = (await asyncio.to_thread(jobs.median_duration, job["alias"], job["backend"])
+                   or await asyncio.to_thread(jobs.median_duration, job["alias"]))
+            if med and med > 0:
+                view["progress"] = round(min(elapsed / med, 0.97), 2)
+                view["eta_s"] = max(0, int(med - elapsed))
+                view["progress_basis"] = "history-median"
     return view
 
 
