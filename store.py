@@ -491,6 +491,27 @@ def set_voice_entry(name: str, entry) -> None:
     set_settings({"voice_library": m})
 
 
+# ── Hosts (physical boxes backends run on) ─────────────────────────────────────
+# Backends group by host (explicit `host` field on the backend, else URL IP —
+# derived in main.backend_host). This map holds the per-host extras: a display
+# label now, the shared-GPU coordination flags later (host-coordination plan).
+
+def get_hosts() -> dict:
+    return get_setting("hosts") or {}
+
+
+def set_host(name: str, entry) -> None:
+    """Upsert (dict) or delete (None/empty) one host entry."""
+    m = get_hosts()
+    if entry:
+        m[name] = entry
+    elif name in m:
+        del m[name]
+    else:
+        return
+    set_settings({"hosts": m})
+
+
 # ── Reasoning rules (normalized thinking toggle) ────────────────────────────────
 # Ordered list of {match, backends[], adapter, param} — see reasoning.py. Stored as
 # one settings entry; first matching rule (model-glob × backend-set) wins.

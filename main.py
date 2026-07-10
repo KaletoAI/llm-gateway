@@ -8,6 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 import uvicorn
@@ -102,16 +103,35 @@ load_config()
 backends = list(config_backends)                              # store merges in once it's active (lifespan)
 
 
+def backend_host(b: dict) -> str:
+    """The physical box a backend runs on: the explicit `host` field, else the
+    URL's hostname/IP. Backends sharing an IP group automatically — k12/evo run
+    llama-swap AND ComfyUI on one GPU, and host-level policies (see
+    docs/host-coordination-plan.md) need to know they belong together."""
+    h = (b.get("host") or "").strip()
+    if h:
+        return h
+    try:
+        return urlparse(b.get("url") or "").hostname or b["name"]
+    except Exception:
+        return b["name"]
+
+
 def rebuild_backends() -> None:
     """Effective backend list = config backends, with UI-added (store) backends
     merged in by name (store overrides config for the same name). Re-sorted by
-    priority. Call after config reload or any store backend change."""
-    global backends
+    priority. Also rebuilds the host grouping maps. Call after config reload or
+    any store backend change."""
+    global backends, backend_hosts, host_backends
     merged = {backend_id(b): b for b in config_backends}
     if store.is_active():
         for b in store.list_backends():
             merged[backend_id(b)] = b      # store overrides config per (name, type)
     backends = sorted(merged.values(), key=lambda b: b.get("priority", _DEFAULT_PRIORITY))
+    backend_hosts = {backend_id(b): backend_host(b) for b in backends}
+    host_backends = {}
+    for bid, h in backend_hosts.items():
+        host_backends.setdefault(h, []).append(bid)
     rebuild_route_index()                  # backend set/enabled flags changed
 
 
@@ -144,6 +164,8 @@ backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
+backend_hosts: dict[str, str] = {}                             # bid → host (explicit `host` or URL IP)
+host_backends: dict[str, list] = {}                            # host → [bid, …] (rebuild_backends)
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
 
 # ── Health / Discovery ────────────────────────────────────────────────────────
@@ -2038,6 +2060,8 @@ def gateway_info() -> dict:
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")),
+            "host": backend_hosts.get(backend_id(b), ""),
+            "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
@@ -2259,6 +2283,10 @@ async def health():
             for b in backends
         },
         "virtual_models": virtual_models,
+        # Physical-box grouping (explicit `host` field or URL IP) — which backends
+        # share a machine/GPU. Basis for the host-level policies (see
+        # docs/host-coordination-plan.md).
+        "hosts": host_backends,
         # Aliases that shadow a real model on a backend they don't map (→ that
         # model is unreachable by its bare name). Empty list = no such conflict.
         "alias_model_conflicts": [c for c in alias_model_conflicts() if c["shadowed"]],
