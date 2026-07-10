@@ -23,7 +23,7 @@ import reasoning
 import stats
 import store
 from adapters import (AdapterContext, NormalizedRequest, image_params, is_image_field,
-                      make_adapter, slot_empty_mode)
+                      lora_counterpart, lora_groups, make_adapter, slot_empty_mode)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -1124,6 +1124,7 @@ adapter_ctx = AdapterContext(
     active_done=_active_done,
     apply_reasoning=_reasoning_apply,
     http_client=lambda: http_client,   # shared pool; callable so adapters never cache it
+    loras_of=lambda bid: backend_loras.get(bid, set()),
 )
 
 
@@ -1854,13 +1855,22 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
 
 
 def _requested_loras(body: dict) -> set:
-    """LoRA filenames a request asks for (lora_* params, top-level or in `params`),
-    excluding None/blank — used for LoRA-aware backend preference."""
+    """LoRA filenames a request asks for — used for LoRA-aware backend preference.
+    Sources: lora_* params (top-level or in `params`; also mapped names like
+    lora_02_172 and label aliases like lora1_high) and the `loras:[{name,…}]`
+    array incl. the high/low counterparts it will resolve to."""
     out = set()
     merged = {**body, **(body.get("params") or {})}
     for k, v in merged.items():
-        if isinstance(v, str) and v and v != "None" and re.match(r"^lora_0*\d+$", str(k)):
+        if isinstance(v, str) and v and v != "None" and re.match(r"^lora[_\d]", str(k)):
             out.add(v)
+    for e in (body.get("loras") or []):
+        n = str((e.get("name") if isinstance(e, dict) else e) or "").strip()
+        if n and n != "None":
+            out.add(n)
+            cp = lora_counterpart(n)
+            if cp:
+                out.add(cp)                    # eligibility needs both pair halves
     return out
 
 
@@ -1925,6 +1935,7 @@ async def run_generation(body: dict, request: Request,
             workflow=cand.get("workflow"), workflow_json=cand.get("workflow_json"),
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
+            loras=body.get("loras"),
         )
 
     first, cand0 = routes[0]
@@ -2028,11 +2039,17 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
         if name == "seed" or (p == "seed" and name == p):
             entry["auto"] = "random unless sent"
         params.append(entry)
+    kinds = sorted(k for _, k in lora_groups(wf, mapping) if k)
     out: dict = {"object": "generation.schema", "alias": alias,
                  "backends": [c.get("backend") for c in cands],
                  "params": params, "images": images,
                  "modes": ["sync", "async"],
-                 "loras_url": f"/v1/generations/{alias}/loras"}
+                 "loras_url": f"/v1/generations/{alias}/loras",
+                 "loras": {"list_url": f"/v1/generations/{alias}/loras",
+                           "request": "loras: [{name, strength}]",
+                           **({"paired_stacks": kinds,
+                               "note": "send ONE pair half; the counterpart is resolved server-side"}
+                              if len(kinds) > 1 else {})}}
     if cand.get("fps"):
         out["fps"] = cand["fps"]
         if cand.get("frames_snap"):

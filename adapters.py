@@ -170,6 +170,7 @@ class NormalizedRequest:
     fixed: list = field(default_factory=list)       # [{node, field, value}] admin-pinned (models, …)
     upload_image: Optional[bytes] = None            # legacy single reference image (back-compat)
     upload_images: dict = field(default_factory=dict)  # {param: bytes} per request-field image uploads
+    loras: Optional[list] = None                    # [{name, strength}] — pairs resolved server-side
 
 
 @dataclass
@@ -212,6 +213,9 @@ class AdapterContext:
     # Callable so hot paths always see the live instance; None → adapters fall back
     # to a transient per-call client, keeping non-main constructions valid.
     http_client: Callable[[], Optional[httpx.AsyncClient]] = lambda: None
+    # Installed LoRAs of a backend (discovery) — the `loras:[…]` pair resolution
+    # validates against this. Default empty = no validation (non-main constructions).
+    loras_of: Callable[[str], set] = lambda bid: set()
 
 
 @asynccontextmanager
@@ -816,6 +820,107 @@ def _format_comfy_error(messages) -> str:
 
 _LORA_SLOT_RE = re.compile(r"^lora_0*(\d+)$")          # rgthree stack: lora_01..lora_NN
 _STR_SLOT_RE = re.compile(r"^strength_0*(\d+)$")
+# standalone high/low token in a LoRA filename — '-HIGH.', '_High_', '-low-' …
+# but NOT substrings inside words ('Thigh Gap' carries no token).
+_LORA_TOKEN_RE = re.compile(r"(?i)(?<![a-z0-9])(high|low)(?![a-z0-9])")
+
+
+def lora_counterpart(name: str) -> Optional[str]:
+    """The other half of a high/low LoRA pair: the standalone high/low token in
+    the filename swapped case-preservingly (…-HIGH.safetensors ↔ …-LOW.…,
+    …-High-i2v_e70 ↔ …-Low-i2v_e70). None when the name carries no token."""
+    def swap(m):
+        t = m.group(1)
+        other = {"high": "low", "low": "high"}[t.lower()]
+        return other.upper() if t.isupper() else other.capitalize() if t[0].isupper() else other
+    new, n = _LORA_TOKEN_RE.subn(swap, name or "")
+    return new if n else None
+
+
+def _lora_kind(name: str) -> Optional[str]:
+    m = _LORA_TOKEN_RE.search(name or "")
+    return m.group(1).lower() if m else None
+
+
+def lora_groups(wf: dict, mapping: dict) -> list:
+    """The workflow's LoRA stack nodes as placement groups [(node_id, kind)].
+    kind 'high'/'low'/None comes from the node title (Wan: input_lora_high/_low),
+    else from a mapping label bound to that node ('lora1_high'), else None."""
+    groups = []
+    for nid, n in wf.items():
+        inp = n.get("inputs") or {}
+        if not any(_LORA_SLOT_RE.match(f) for f in inp):
+            continue
+        kind = _lora_kind(((n.get("_meta") or {}).get("title") or ""))
+        if kind is None:
+            for p, m in (mapping or {}).items():
+                if str((m or {}).get("node")) == str(nid) and _LORA_SLOT_RE.match(str((m or {}).get("field") or "")):
+                    kind = _lora_kind(((m or {}).get("label") or "")) or _lora_kind(p)
+                    if kind:
+                        break
+        groups.append((nid, kind))
+    return sorted(groups, key=lambda g: (len(g[0]), g[0]))
+
+
+def _free_stack_slots(wf: dict, nid: str) -> list:
+    """(lora_field, strength_field) pairs currently empty/'None' on one stack node."""
+    inp = wf.get(nid, {}).get("inputs") or {}
+    out = []
+    for f in sorted((f for f in inp if _LORA_SLOT_RE.match(f)),
+                    key=lambda f: int(_LORA_SLOT_RE.match(f).group(1))):
+        if inp.get(f) in (None, "", "None"):
+            idx = int(_LORA_SLOT_RE.match(f).group(1))
+            sf = next((s for s in (f"strength_{idx:02d}", f"strength_{idx}") if s in inp), None)
+            out.append((f, sf))
+    return out
+
+
+def _apply_lora_list(wf: dict, mapping: dict, loras: list, avail: set) -> list:
+    """The `loras: [{name, strength}]` request shape: place each logical LoRA into
+    EVERY stack group, resolving high/low pairs server-side — the client sends ONE
+    name, the group whose kind differs gets the token-swapped counterpart (checked
+    against the backend's installed set). Clients never learn the pairing. Raises
+    RuntimeError (→ job fails with the message) when a name/counterpart is not
+    installed or the stacks run out of free slots. Returns [(node, field, value)]."""
+    if not loras:
+        return []
+    groups = lora_groups(wf, mapping)
+    if not groups:
+        raise RuntimeError("this workflow has no LoRA stack")
+    free = {nid: _free_stack_slots(wf, nid) for nid, _ in groups}
+    placed = []
+    for entry in loras:
+        if isinstance(entry, str):
+            entry = {"name": entry}
+        name = str((entry or {}).get("name") or "").strip()
+        if not name or name == "None":
+            continue
+        strength = (entry or {}).get("strength", 1.0)
+        base_kind = _lora_kind(name)
+        counterpart = lora_counterpart(name)
+        for nid, kind in groups:
+            if kind is None or base_kind is None or kind == base_kind:
+                val = name                       # kindless file goes into every group as-is
+            else:
+                val = counterpart
+                if val is None or (avail and val not in avail):
+                    raise RuntimeError(f"LoRA pair incomplete: '{name}' needs a {kind} "
+                                       f"counterpart ('{counterpart or '?'}' is not installed)")
+            if avail and val not in avail:
+                raise RuntimeError(f"LoRA '{val}' is not installed on this backend")
+            slots = free.get(nid) or []
+            if not slots:
+                raise RuntimeError(f"no free LoRA slot left on stack node {nid}")
+            lf, sf = slots.pop(0)
+            inp = wf[nid].setdefault("inputs", {})
+            inp[lf] = val
+            if sf:
+                try:
+                    inp[sf] = float(strength)
+                except (TypeError, ValueError):
+                    inp[sf] = 1.0
+            placed.append((nid, lf, val))
+    return placed
 
 
 def _apply_lora_cascade(wf: dict, values: dict) -> list:
@@ -1101,7 +1206,10 @@ class ComfyUIAdapter(BackendAdapter):
             uploads[img_params[0]] = req.upload_image          # back-compat single upload
         for p in img_params:
             values.pop(p, None)
-        lora_placed = _apply_lora_cascade(wf, values)     # client loras → next free stack slots
+        # `loras:[{name,strength}]` first (pairs resolved per group), then the flat
+        # legacy lora_N params → remaining free slots.
+        lora_placed = _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
+        lora_placed += _apply_lora_cascade(wf, values)    # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
         autofilled = await self._autofill_empty_images(wf, mapping)
