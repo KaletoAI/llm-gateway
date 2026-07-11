@@ -142,6 +142,15 @@ Two layers, both optional:
 **Bootstrap-open → locked.** With no users *and* no master key, the gateway and
 console are fully open. Add an admin user (or set a master key) to lock it down.
 
+**Job ownership.** Generation jobs and background responses are owner-gated:
+`GET`/cancel of a job (and its result/input artifacts) is allowed only for its
+owner; admin/master see all. Authenticated calls are owned by the user. In
+bootstrap-open mode an anonymous caller is owned by its **client IP** (`ip:<addr>`),
+so keyless LAN services get a best-effort separation — each sees only its own
+jobs. This is convenience, **not** a security boundary (NAT/spoofing); for a real
+boundary give each service its own user + key. Legacy/`default`-owned jobs stay
+visible to everyone.
+
 ### Allow-list (what a key may use — and see)
 
 A user's allow-list can contain any mix of:

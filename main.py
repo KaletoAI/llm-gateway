@@ -581,13 +581,33 @@ async def gate_request(authorization: Optional[str], request: Request, model: Op
     return user
 
 
-def _check_owner(job: Optional[dict], user: Optional[dict], *, status: int, detail: str) -> None:
-    """Non-admin users may only touch their own jobs/responses; admin/master/anonymous
-    pass. `status` picks the flavor: jobs answer 403, background responses hide foreign
-    ids as 404 (no existence leak). Owner None/'default' (legacy/anonymous) is open."""
-    if not user or user.get("_master") or user.get("role") == "admin":
+def _request_owner(request: Request) -> str:
+    """Job/response owner attribution: the authenticated user, else — open mode
+    (no users, no master key) — the caller's IP as 'ip:<addr>'. IP owners give
+    keyless LAN services a best-effort separation (each sees only its own jobs);
+    NAT/spoofing means it is NOT a security boundary — per-service users + keys
+    are. No user and no client address → the legacy shared owner 'default'."""
+    u = getattr(request.state, "gw_user", None)
+    if u:
+        return u
+    ip = getattr(getattr(request, "client", None), "host", None)
+    return f"ip:{ip}" if ip else "default"
+
+
+def _check_owner(job: Optional[dict], user: Optional[dict], *, status: int, detail: str,
+                 anon_owner: Optional[str] = None) -> None:
+    """Non-admin users — and, in open mode, anonymous callers — may only touch
+    their own jobs/responses; admin/master pass. Anonymous identity is the caller
+    IP (`anon_owner`, see _request_owner). `status` picks the flavor: jobs answer
+    403, background responses hide foreign ids as 404 (no existence leak). Owner
+    None/'default' (legacy/shared) stays open to everyone."""
+    if user and (user.get("_master") or user.get("role") == "admin"):
         return
-    if job and job.get("owner") not in (user.get("name"), None, "default"):
+    owner = (job or {}).get("owner")
+    if owner in (None, "default"):
+        return
+    caller = user.get("name") if user else anon_owner
+    if job and owner != caller:
         raise HTTPException(status, detail)
 
 
@@ -1427,7 +1447,7 @@ async def _create_bg_response(alias, chat_body, request) -> JSONResponse:
         raise HTTPException(503, "background responses unavailable (job store off)")
     if len(_parked) >= max_parked:
         raise HTTPException(503, f"too many queued ({max_parked}) — retry later", headers={"Retry-After": "2"})
-    owner = getattr(request.state, "gw_user", None) or "default"
+    owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, "response", alias, "(background)", owner=owner)
     rid, created = f"{_RESP_PREFIX}{job_id}", int(time.time())
     body = dict(chat_body); body["stream"] = False     # background result is fetched, not streamed
@@ -1449,9 +1469,11 @@ async def _bg_job_for(response_id: str) -> dict:
     return job
 
 
-def _bg_owner_check(job: dict, user: Optional[dict]) -> None:
-    # non-admin users can only touch their own responses; hide others as 404 (no leak).
-    _check_owner(job, user, status=404, detail="response not found")
+def _bg_owner_check(job: dict, user: Optional[dict], request: Request) -> None:
+    # non-admin users (and, open mode, anonymous IPs) only touch their own
+    # responses; hide others as 404 (no leak).
+    _check_owner(job, user, status=404, detail="response not found",
+                 anon_owner=_request_owner(request))
 
 
 def _bg_view(response_id: str, job: dict) -> dict:
@@ -1520,7 +1542,7 @@ async def get_response(response_id: str, request: Request, authorization: Option
     """Poll a background response: queued → in_progress → completed | failed | cancelled."""
     user = authenticate(authorization)
     job = await _bg_job_for(response_id)
-    _bg_owner_check(job, user)
+    _bg_owner_check(job, user, request)
     return JSONResponse(_bg_view(response_id, job))
 
 
@@ -1529,7 +1551,7 @@ async def cancel_response(response_id: str, request: Request, authorization: Opt
     """Cancel a background response (no-op if already terminal)."""
     user = authenticate(authorization)
     job = await _bg_job_for(response_id)
-    _bg_owner_check(job, user)
+    _bg_owner_check(job, user, request)
     if job["status"] in ("queued", "running"):
         t = _bg_tasks.get(response_id)
         if t and not t.done():
@@ -1953,7 +1975,7 @@ async def run_generation(body: dict, request: Request,
 
     first, cand0 = routes[0]
     task = cand0.get("task", body.get("task", "text2img"))
-    owner = getattr(request.state, "gw_user", None) or "default"
+    owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
     # persist the request inputs so the job stays inspectable in the UI within its TTL
     ref_blobs = [(slot, data) for slot, data in (upload_images or {}).items() if data]
@@ -2073,11 +2095,15 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
 
 
 async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:
-    """A non-admin user may only touch their own jobs; admin/master/anonymous see all."""
+    """A caller may only touch its own jobs: non-admin users by name, and — open
+    mode — anonymous callers by IP (_check_owner does the matching). admin/master
+    see all; a 'default'/legacy-owned job stays open to everyone."""
     user = authenticate(authorization)
-    if user and not user.get("_master") and user.get("role") != "admin":
-        job = await asyncio.to_thread(jobs.get, job_id)
-        _check_owner(job, user, status=403, detail="not your job")
+    if user and (user.get("_master") or user.get("role") == "admin"):
+        return
+    job = await asyncio.to_thread(jobs.get, job_id)
+    _check_owner(job, user, status=403, detail="not your job",
+                 anon_owner=_request_owner(request))
 
 
 @app.get("/v1/jobs/{job_id}")
