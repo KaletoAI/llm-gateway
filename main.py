@@ -1970,7 +1970,7 @@ async def run_generation(body: dict, request: Request,
             workflow=cand.get("workflow"), workflow_json=cand.get("workflow_json"),
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
-            loras=body.get("loras"),
+            loras=body.get("loras"), output_node=(cand.get("output_node") or None),
         )
 
     first, cand0 = routes[0]

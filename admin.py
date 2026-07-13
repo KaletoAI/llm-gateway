@@ -643,7 +643,7 @@ def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) 
             o = [cur] + o
         flag = ' <span class="bad">(stale)</span>' if stale else ""
         return _select(name, o, cur) + flag
-    if cls in adapters._IMG_LOADER_CLASSES and field == "image":
+    if adapters.is_img_loader_class(cls) and field == "image":
         o = [(adapters.UPLOAD_SENTINEL, "playground upload (8×8 if empty)"),
              (adapters.PLACEHOLDER_SENTINEL, "8×8 placeholder (always)")]
         if cur and cur not in (adapters.PLACEHOLDER_SENTINEL, adapters.UPLOAD_SENTINEL):
@@ -663,7 +663,7 @@ def _boolean_fields(wf: dict) -> list:
 def _image_fields(wf: dict) -> list:
     return [{"node": nid, "field": "image", "value": (n.get("inputs") or {}).get("image", ""),
              "class": n.get("class_type", ""), "title": n.get("_meta", {}).get("title", "")}
-            for nid, n in wf.items() if n.get("class_type") in adapters._IMG_LOADER_CLASSES]
+            for nid, n in wf.items() if adapters.is_img_loader_class(n.get("class_type"))]
 
 
 # ── Tab: Backends ───────────────────────────────────────────────────────────────
@@ -1901,6 +1901,29 @@ def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, 
     return rows or "<p class='muted'>none pinned — add from Available fields below</p>"
 
 
+def _output_section(wf: dict, cands: list) -> str:
+    """Which node's artifacts a job returns — rendered under Pinned values.
+    Default (auto) keeps the legacy behaviour: every output-producing node, or
+    the node titled `output_final`. Workflows that export intermediate files
+    (Trellis: meshes at several nodes, the rigged model at one) pin the REAL
+    result node here — it producing nothing then fails the job instead of
+    silently returning leftovers."""
+    cur = next((str(c.get("output_node")) for c in cands if c.get("output_node")), "")
+    opts = ('<option value="">auto — every output node '
+            '(or the one titled "output_final")</option>')
+    for nid, n in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
+        title = ((n.get("_meta") or {}).get("title") or "")
+        lbl = f"{nid} — {n.get('class_type', '')}" + (f" “{title}”" if title else "")
+        opts += f'<option value="{_esc(nid)}"{" selected" if nid == cur else ""}>{_esc(lbl)}</option>'
+    if cur and cur not in wf:                        # keep a stale choice visible instead of silently clearing
+        opts += f'<option value="{_esc(cur)}" selected>{_esc(cur)} — (stale: node missing)</option>'
+    return ("<h2>Output</h2>"
+            "<p class='hint'>Which node's artifacts the job returns. <b>auto</b> collects from every "
+            "output-producing node. Pin the final node when the workflow also exports intermediates — "
+            "the job then fails clearly if that node produces nothing.</p>"
+            + _field("output node", f'<select name="output_node">{opts}</select>'))
+
+
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
     """Pinned values as per-backend tabs (primary edits; extras override values)."""
     primary_rows = _pin_tab_rows(alias, cands[0], True, fixed, wf, oi)
@@ -1988,6 +2011,7 @@ async def _alias_editor(alias: str) -> str:
             f'<th></th></tr></thead>'
             f'<tbody id="reqfields">{req_rows}</tbody></table>'
             + pinned_block
+            + _output_section(wf, cands)
             + '</form>' + pin_extra + _reorder_js(alias))
     return form, _available_fields(alias, wf, mapped, oi)
 
@@ -2248,6 +2272,13 @@ async def update(request: Request):
                 c[key] = int(v)
             else:
                 c.pop(key, None)
+    # explicit output node (Output section; blank = auto/legacy collection)
+    out_node = (f.get("output_node", "") or "").strip()
+    for c in cands:
+        if out_node:
+            c["output_node"] = out_node
+        else:
+            c.pop("output_node", None)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name
@@ -2937,6 +2968,10 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
         m, mk = (r.get("mime") or "").lower(), (r.get("kind") or "").lower()
         if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
+        elif mk == "file" or m.startswith("model/"):     # 3D/other file artifacts → download card
+            cells += (f"<a href='{src}' target='_blank' download style='display:inline-block;"
+                      f"padding:18px 22px;{_BOX_STYLE};text-decoration:none'>"
+                      f"⬇ artifact {r['n']} <span class='muted'>({_esc(r.get('mime') or 'file')})</span></a>")
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
     return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"

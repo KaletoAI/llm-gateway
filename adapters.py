@@ -171,6 +171,7 @@ class NormalizedRequest:
     upload_image: Optional[bytes] = None            # legacy single reference image (back-compat)
     upload_images: dict = field(default_factory=dict)  # {param: bytes} per request-field image uploads
     loras: Optional[list] = None                    # [{name, strength}] — pairs resolved server-side
+    output_node: Optional[str] = None               # alias setting: ONLY this node's artifacts count
 
 
 @dataclass
@@ -607,12 +608,53 @@ _MIME_BY_EXT = {
     ".gif": ("image/gif", "image"), ".mp4": ("video/mp4", "video"),
     ".webm": ("video/webm", "video"), ".wav": ("audio/wav", "audio"),
     ".mp3": ("audio/mpeg", "audio"), ".flac": ("audio/flac", "audio"),
+    # 3D artifacts (Trellis/rigging workflows) — kind "file" renders as download
+    ".glb": ("model/gltf-binary", "file"), ".gltf": ("model/gltf+json", "file"),
+    ".obj": ("model/obj", "file"), ".fbx": ("application/octet-stream", "file"),
+    ".ply": ("application/octet-stream", "file"), ".stl": ("model/stl", "file"),
 }
 
 
 def _mime_and_kind(filename: str) -> tuple[str, str]:
     return _MIME_BY_EXT.get(os.path.splitext(filename)[1].lower(),
                             ("application/octet-stream", "image"))
+
+
+def _view_params(item) -> Optional[tuple]:
+    """Map ONE item from a ComfyUI output list to (filename, /view params), or
+    None when it isn't a fetchable file. Two shapes seen in the wild:
+
+    - dict `{filename, subfolder?, type?}` — core save nodes (SaveImage/Video/…).
+    - str absolute/relative PATH — custom nodes emit the on-disk path instead
+      (UniRig's `fbx_file`: '/…/ComfyUI/output/x_mia.fbx'; Preview3D's `result`).
+      ComfyUI still serves it via /view by basename; the dir before an
+      output/temp/input segment becomes the subfolder + type. Only paths with a
+      known artifact extension are taken, so booleans/status strings are ignored."""
+    if isinstance(item, dict):
+        fn = item.get("filename")
+        if not fn:
+            return None
+        view = {"filename": fn, "type": item.get("type", "output")}
+        if item.get("subfolder"):
+            view["subfolder"] = item["subfolder"]
+        return fn, view
+    if isinstance(item, str) and item:
+        p = item.replace("\\", "/")
+        if os.path.splitext(p)[1].lower() not in _MIME_BY_EXT:   # not a recognised artifact
+            return None
+        typ, rel = "output", p.rsplit("/", 1)[-1]                # bare name → assume output dir
+        for t in ("output", "temp", "input"):
+            i = p.rfind(f"/{t}/")
+            if i != -1:
+                typ, rel = t, p[i + len(t) + 2:]
+                break
+        fn = rel.rsplit("/", 1)[-1]
+        sub = rel[:len(rel) - len(fn)].strip("/")
+        view = {"filename": fn, "type": typ}
+        if sub:
+            view["subfolder"] = sub
+        return fn, view
+    return None
 
 
 def _comfy_prompt_error(status: int, text: str, wf: dict, mapping: dict) -> str:
@@ -685,10 +727,18 @@ PLACEHOLDER_SENTINEL = "__gw_placeholder__"          # fixed-binding value → u
 UPLOAD_SENTINEL = "__gw_upload__"                    # fixed-binding value → use the playground upload
 
 
+def is_img_loader_class(cls) -> bool:
+    """Image-loader detection: the known core classes plus any class whose name
+    carries 'LoadImage' — custom node packs bring their own loaders (Trellis2's
+    Trellis2LoadImageWithTransparency) that must behave like LoadImage: upload
+    slot in playground/mapping, placeholder/required empty handling."""
+    return cls in _IMG_LOADER_CLASSES or "loadimage" in str(cls or "").lower()
+
+
 def is_image_field(wf: dict, node: str) -> bool:
     """True if a mapped node is an image-loader (its request field takes an uploaded
     image, not a scalar). Drives the per-field file inputs in the playground."""
-    return (wf or {}).get(node, {}).get("class_type") in _IMG_LOADER_CLASSES
+    return is_img_loader_class((wf or {}).get(node, {}).get("class_type"))
 
 
 def image_params(wf: dict, mapping: dict) -> list:
@@ -1162,7 +1212,7 @@ class ComfyUIAdapter(BackendAdapter):
         skip = {(m or {}).get("node") for m in (mapping or {}).values()
                 if slot_empty_mode(m) in ("required", "disable")}
         empty = [nid for nid, n in wf.items()
-                 if n.get("class_type") in _IMG_LOADER_CLASSES
+                 if is_img_loader_class(n.get("class_type"))
                  and not (n.get("inputs") or {}).get("image")
                  and nid not in skip]
         if not empty:
@@ -1242,7 +1292,10 @@ class ComfyUIAdapter(BackendAdapter):
                 if log_on:
                     logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
                 outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
-                blobs = await self._fetch_outputs(client, url, wf, outputs)
+                blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node)
+                if req.output_node and not blobs:
+                    raise RuntimeError(f"configured output node {req.output_node} produced "
+                                       f"no fetchable artifact (no filename in its outputs)")
         finally:
             self.ctx.inflight_dec(self.bid)
 
@@ -1295,35 +1348,50 @@ class ComfyUIAdapter(BackendAdapter):
         raise TimeoutError(f"ComfyUI timeout after {max_wait:.0f}s (prompt {prompt_id}); "
                            f"last poll error: {last_exc}")
 
-    async def _fetch_outputs(self, client, url, wf, outputs) -> list[GenBlob]:
-        final = _node_by_title(wf, "output_final")
-        targets = {final: outputs[final]} if (final and final in outputs) else outputs
+    async def _fetch_outputs(self, client, url, wf, outputs,
+                             output_node: Optional[str] = None) -> list[GenBlob]:
+        # Which node's artifacts count: the alias's explicit output node (mapping
+        # editor "Output" section) is authoritative — a workflow may export
+        # intermediate files from several nodes (Trellis: meshes at 33/36/50, the
+        # rigged model at 64), and only the configured one is the result. It
+        # producing nothing is an ERROR, not a fallback. Without the setting:
+        # the node titled `output_final`, else everything (legacy behaviour).
+        if output_node:
+            if output_node not in outputs:
+                raise RuntimeError(f"configured output node {output_node} produced no output "
+                                   f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
+            targets = {output_node: outputs[output_node]}
+        else:
+            final = _node_by_title(wf, "output_final")
+            targets = {final: outputs[final]} if (final and final in outputs) else outputs
         blobs: list[GenBlob] = []
         seen: set = set()
         for _nid, out in targets.items():
-            # Scan every list-valued output key (images / gifs / videos / audio / …),
-            # not just images+gifs, so core SaveVideo/SaveAudio artifacts are caught
-            # regardless of which key ComfyUI files them under. Only items that name a
-            # file (a /view-able artifact) are fetched; deduped by (filename, subfolder).
+            # Scan every list-valued output key (images / gifs / videos / audio /
+            # fbx_file / result / …), not just images+gifs, so SaveVideo/SaveAudio
+            # AND custom nodes that report an on-disk PATH (UniRig's `fbx_file`,
+            # Preview3D's `result`) are all caught regardless of the key. Two item
+            # shapes: a {filename, subfolder?, type?} dict (core save nodes) or a
+            # bare path string (custom nodes) — _view_params handles both and
+            # ignores non-file items (booleans, status strings). Deduped by
+            # (filename, subfolder).
             for _key, items in out.items():
                 if not isinstance(items, list):
                     continue
                 for item in items:
-                    if not isinstance(item, dict):
+                    parsed = _view_params(item)
+                    if parsed is None:
                         continue
-                    fn = item.get("filename")
-                    if not fn or (fn, item.get("subfolder", "")) in seen:
+                    fn, view = parsed
+                    if (fn, view.get("subfolder", "")) in seen:
                         continue
-                    seen.add((fn, item.get("subfolder", "")))
-                    view = {"filename": fn, "type": item.get("type", "output")}
-                    if item.get("subfolder"):
-                        view["subfolder"] = item["subfolder"]
+                    seen.add((fn, view.get("subfolder", "")))
                     r = await client.get(f"{url}/view", params=view)
                     if r.status_code != 200:
                         continue
                     mime, kind = _mime_and_kind(fn)
-                    if mime == "application/octet-stream":     # unknown ext → trust ComfyUI's format hint
-                        fmt = item.get("format")
+                    if mime == "application/octet-stream" and isinstance(item, dict):
+                        fmt = item.get("format")               # dict items carry a format hint
                         if isinstance(fmt, str) and "/" in fmt:
                             top = fmt.split("/", 1)[0].lower()
                             if top in ("video", "audio"):
