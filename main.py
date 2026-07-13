@@ -1713,7 +1713,7 @@ async def _job_view(job_id: str, request: Request) -> dict:
         return view
     base = str(request.base_url).rstrip("/")
     view["results"] = [{
-        "n": r["n"], "mime": r["mime"], "kind": r["kind"],
+        "n": r["n"], "mime": r["mime"], "kind": r["kind"], "name": r.get("name"),
         "url": f"{base}/v1/jobs/{job_id}/result/{r['n']}",
     } for r in job["results"]]
     meta = job.get("meta") or {}
@@ -2118,8 +2118,12 @@ async def get_job_result(job_id: str, n: int, request: Request, authorization: O
     rp = await asyncio.to_thread(jobs.result_path, job_id, n)
     if rp is None:
         raise HTTPException(404, f"result {n} of job '{job_id}' not found")
-    path, mime = rp
-    return FileResponse(path, media_type=mime)
+    path, mime, name = rp
+    headers = None
+    if name:                                            # suggest the original filename on download,
+        safe = name.replace('"', "").replace("\n", "")  # inline so images/video still preview
+        headers = {"Content-Disposition": f'inline; filename="{safe}"'}
+    return FileResponse(path, media_type=mime, headers=headers)
 
 
 @app.get("/v1/jobs/{job_id}/input/{n}")

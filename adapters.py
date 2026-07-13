@@ -176,10 +176,11 @@ class NormalizedRequest:
 
 @dataclass
 class GenBlob:
-    """One produced artifact (image/video/audio) as raw bytes + type hints."""
+    """One produced artifact (image/video/audio/file) as raw bytes + type hints."""
     data: bytes
     mime: str
-    kind: str                                       # "image" | "video" | "audio"
+    kind: str                                       # "image" | "video" | "audio" | "file"
+    name: Optional[str] = None                      # original ComfyUI filename (display/download)
 
 
 @dataclass
@@ -1397,7 +1398,7 @@ class ComfyUIAdapter(BackendAdapter):
                             if top in ("video", "audio"):
                                 kind = top
                                 mime = {"video": "video/mp4", "audio": "audio/mpeg"}[top]
-                    blobs.append(GenBlob(data=r.content, mime=mime, kind=kind))
+                    blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=fn))
         return blobs
 
 

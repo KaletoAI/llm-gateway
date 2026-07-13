@@ -225,11 +225,19 @@ def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
     os.makedirs(job_dir, exist_ok=True)
     manifest = []
     for n, blob in enumerate(blobs):
-        ext = _EXT_BY_MIME.get(blob.mime, ".bin")
+        # On-disk name stays index-based (stable, path-safe) but takes the REAL
+        # extension when the source named the artifact — so a Trellis .fbx lands
+        # as 0.fbx, not 0.bin. `name` carries the original for display/download.
+        orig = getattr(blob, "name", None)
+        oext = os.path.splitext(orig)[1].lower() if orig else ""
+        ext = oext or _EXT_BY_MIME.get(blob.mime, ".bin")
         fname = f"{n}{ext}"
         with open(os.path.join(job_dir, fname), "wb") as f:
             f.write(blob.data)
-        manifest.append({"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname})
+        entry = {"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname}
+        if orig:
+            entry["name"] = orig
+        manifest.append(entry)
     with _conn() as c:                              # one connection: read meta + update
         meta = {**_read_meta(c, job_id), **(meta or {})}   # keep inputs persisted at create time
         _mark_done(c, job_id, meta, manifest)
@@ -321,13 +329,14 @@ def _manifest_path(job_id: str, n: int, column: str, key: Optional[str]) -> Opti
         if isinstance(r, dict) and r.get("n") == n and r.get("filename"):
             path = os.path.join(_BLOB_DIR, job_id, r["filename"])
             if os.path.exists(path):
-                return path, r.get("mime")
+                return path, r.get("mime"), r.get("name")
     return None
 
 
 def input_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
     """(filesystem path, mime) for input reference image `n` of a job, or None."""
-    return _manifest_path(job_id, n, "meta_json", "input_images")
+    r = _manifest_path(job_id, n, "meta_json", "input_images")
+    return (r[0], r[1]) if r else None
 
 
 def get(job_id: str) -> Optional[dict]:
@@ -344,9 +353,10 @@ def get(job_id: str) -> Optional[dict]:
     return d
 
 
-def result_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
-    """(filesystem path, mime) for result `n` of a job, or None if absent (also for
-    inline-JSON results, e.g. a background response — those have no file)."""
+def result_path(job_id: str, n: int) -> Optional[tuple]:
+    """(filesystem path, mime, name) for result `n` of a job, or None if absent
+    (also for inline-JSON results, e.g. a background response — no file). `name`
+    is the original artifact filename (None when the source didn't provide one)."""
     return _manifest_path(job_id, n, "results_json", None)
 
 

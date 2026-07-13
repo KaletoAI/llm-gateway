@@ -2564,8 +2564,12 @@ async def result(job_id: str, n: int):
     rp = jobs.result_path(job_id, n)
     if rp is None:
         raise HTTPException(404, "result not found")
-    path, mime = rp
-    return FileResponse(path, media_type=mime)
+    path, mime, name = rp
+    headers = None
+    if name:
+        safe = name.replace('"', "").replace("\n", "")
+        headers = {"Content-Disposition": f'inline; filename="{safe}"'}
+    return FileResponse(path, media_type=mime, headers=headers)
 
 
 async def playground_status(job_id: str):
@@ -2969,9 +2973,11 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
         if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
         elif mk == "file" or m.startswith("model/"):     # 3D/other file artifacts → download card
-            cells += (f"<a href='{src}' target='_blank' download style='display:inline-block;"
+            label = r.get("name") or f"artifact {r['n']}"
+            dl = f' download="{_esc(r["name"])}"' if r.get("name") else " download"
+            cells += (f"<a href='{src}' target='_blank'{dl} style='display:inline-block;"
                       f"padding:18px 22px;{_BOX_STYLE};text-decoration:none'>"
-                      f"⬇ artifact {r['n']} <span class='muted'>({_esc(r.get('mime') or 'file')})</span></a>")
+                      f"⬇ {_esc(label)} <span class='muted'>({_esc(r.get('mime') or 'file')})</span></a>")
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
     return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
