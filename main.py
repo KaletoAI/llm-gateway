@@ -364,9 +364,12 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
         if changed:
             rebuild_route_index()          # model set changed → refresh routing candidates
-        if not backend_healthy.get(bid):
+        was_healthy = backend_healthy.get(bid, False)
+        if not was_healthy:
             logger.info(f"[{label}] UP  — {len(caps.models)} models, {len(caps.pricing)} priced")
         backend_healthy[bid] = True
+        if not was_healthy or changed:     # a backend came online / gained models →
+            _notify_slot_free()            # let parked calls re-evaluate and grab it
     except Exception as e:
         if backend_healthy.get(bid, True):
             logger.warning(f"[{label}] DOWN — {e}")
@@ -2317,9 +2320,13 @@ def gateway_info() -> dict:
 
 def apply_backend_change() -> None:
     """Re-merge config + store backends, rebind adapters, and kick an immediate
-    discovery — called by the UI after a backend is added/edited/deleted."""
+    discovery — called by the UI after a backend is added/edited/deleted/enabled.
+    Wakes the park queue so calls waiting on 'all busy' re-evaluate against the new
+    backend set now (a taken-offline backend drops out; a brought-online one is
+    grabbed once discovery marks it healthy — see refresh_backend)."""
     rebuild_backends()
     build_backend_adapters()
+    _notify_slot_free()
 
     async def _discover():
         await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
@@ -2338,6 +2345,7 @@ def begin_drain(bid: str) -> bool:
     _draining.add(bid)
     n = backend_inflight.get(bid, 0)
     logger.info(f"[{b['name']}] draining — {n} in-flight; goes offline when idle")
+    _notify_slot_free()                  # parked calls re-evaluate: this backend is out now
     if n <= 0:
         _finalize_drain(bid)
     return True
@@ -2350,6 +2358,7 @@ def cancel_drain(bid: str) -> bool:
     _draining.discard(bid)
     nm = next((x["name"] for x in backends if backend_id(x) == bid), bid)
     logger.info(f"[{nm}] drain cancelled — back in rotation")
+    _notify_slot_free()                  # back in rotation → parked calls can grab it now
     return True
 
 
