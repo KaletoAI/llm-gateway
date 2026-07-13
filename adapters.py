@@ -1254,6 +1254,14 @@ class ComfyUIAdapter(BackendAdapter):
         # via the scalar mapping — keep them out of _apply_mapping.
         img_params = image_params(wf, mapping)
         uploads = dict(req.upload_images or {})
+        # Label aliasing for image slots (same as scalar params above): the schema
+        # advertises a slot under its LABEL, so a client sends the image under the
+        # label (`input_image`); remap it to the param the upload path keys on
+        # (`image`), else the loader keeps its baked-in value.
+        for p in img_params:
+            lbl = ((mapping.get(p) or {}).get("label") or "").strip()
+            if lbl and lbl != p and lbl in uploads and p not in uploads:
+                uploads[p] = uploads.pop(lbl)
         if req.upload_image and len(img_params) == 1 and img_params[0] not in uploads:
             uploads[img_params[0]] = req.upload_image          # back-compat single upload
         for p in img_params:
