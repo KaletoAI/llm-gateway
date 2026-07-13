@@ -622,6 +622,80 @@ def _mime_and_kind(filename: str) -> tuple[str, str]:
                             ("application/octet-stream", "image"))
 
 
+def _image_dims(b: bytes) -> Optional[tuple]:
+    """(width, height) from a PNG or baseline-JPEG header, else None. Enough to
+    catch the 2x2 dummy — no image library needed."""
+    if b[:8] == b"\x89PNG\r\n\x1a\n" and len(b) >= 24:
+        w, h = struct.unpack(">II", b[16:24])
+        return int(w), int(h)
+    if b[:2] == b"\xff\xd8":                          # JPEG: scan for a SOF marker
+        i = 2
+        while i + 9 < len(b):
+            if b[i] != 0xFF:
+                i += 1
+                continue
+            marker = b[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                h, w = struct.unpack(">HH", b[i + 5:i + 9])
+                return int(w), int(h)
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            i += 2 + struct.unpack(">H", b[i + 2:i + 4])[0]
+    return None
+
+
+def _glb_texture_dims(data: bytes) -> Optional[list]:
+    """Dimensions of a GLB's embedded textures as [(w,h), …], or None if `data`
+    isn't a parseable glTF-binary. Reads the JSON + BIN chunks in pure Python and
+    pulls each image's PNG/JPEG header — the basis for the 2x2-dummy safety net."""
+    try:
+        if data[:4] != b"glTF" or len(data) < 20:
+            return None
+        off, json_chunk, bin_chunk = 12, None, None
+        while off + 8 <= len(data):
+            clen, ctype = struct.unpack_from("<I4s", data, off)
+            body = data[off + 8: off + 8 + clen]
+            if ctype == b"JSON":
+                json_chunk = body
+            elif ctype == b"BIN\x00":
+                bin_chunk = body
+            off += 8 + clen                          # chunkLength already includes padding
+        if json_chunk is None:
+            return None
+        gltf = json.loads(json_chunk)
+        bufviews = gltf.get("bufferViews") or []
+        dims = []
+        for im in (gltf.get("images") or []):
+            bv_i = im.get("bufferView")
+            if bv_i is None or bin_chunk is None or bv_i >= len(bufviews):
+                continue
+            bv = bufviews[bv_i]
+            start = bv.get("byteOffset", 0)
+            head = bin_chunk[start: start + min(bv.get("byteLength", 0), 4096)]
+            wh = _image_dims(head)
+            if wh:
+                dims.append(wh)
+        return dims
+    except Exception:
+        return None
+
+
+def _check_glb_not_dummy(blobs) -> None:
+    """Safety net: a GLB whose ONLY embedded texture is the 2x2 dummy is the known
+    texture-export node bug, not a result — fail the job clearly (raises, so it is
+    a final content error, never retried across backends)."""
+    for b in blobs:
+        if b.mime != "model/gltf-binary":
+            continue
+        dims = _glb_texture_dims(b.data)
+        if dims and max(max(w, h) for w, h in dims) <= 2:
+            w, h = dims[0]
+            raise RuntimeError(f"GLB '{b.name or 'output'}' carries only a {w}x{h} dummy texture "
+                               "(known texture-export node bug) — no real texture was embedded; "
+                               "treated as a failed generation")
+
+
 def _view_params(item) -> Optional[tuple]:
     """Map ONE item from a ComfyUI output list to (filename, /view params), or
     None when it isn't a fetchable file. Two shapes seen in the wild:
@@ -1307,6 +1381,7 @@ class ComfyUIAdapter(BackendAdapter):
                     extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
                     raise RuntimeError(f"configured output node {req.output_node} produced "
                                        f"no fetchable artifact{extra} (no matching file in its outputs)")
+                _check_glb_not_dummy(blobs)      # fail on the 2x2-dummy-texture export bug
         finally:
             self.ctx.inflight_dec(self.bid)
 

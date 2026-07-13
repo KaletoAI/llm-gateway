@@ -406,7 +406,7 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
     if m in ("model/gltf-binary", "model/gltf+json"):
         # <model-viewer> from the locally-bundled ES module (module URLs load once
         # even if the tag repeats). Needs an explicit box or it collapses.
-        box = style or "width:100%;max-width:720px;height:640px"
+        box = style or "width:720px;max-width:100%;height:640px"
         box += ";background:#0c0e12;border:1px solid #313a46;border-radius:10px"
         return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
                 f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
@@ -3016,7 +3016,7 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
         elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → inline 3D preview + download
             label = r.get("name") or f"artifact {r['n']}"
             dl = f' download="{_esc(r["name"])}"' if r.get("name") else " download"
-            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style='width:100%;max-width:720px;height:640px')}"
+            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style='width:720px;max-width:100%;height:640px')}"
                       f"<div><a href='{src}' target='_blank'{dl} style='display:inline-block;margin-top:6px;"
                       f"padding:8px 12px;{_BOX_STYLE};text-decoration:none'>⬇ {_esc(label)}</a></div></div>")
         elif mk == "file":                                # other file artifacts → download card
