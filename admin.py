@@ -1917,11 +1917,17 @@ def _output_section(wf: dict, cands: list) -> str:
         opts += f'<option value="{_esc(nid)}"{" selected" if nid == cur else ""}>{_esc(lbl)}</option>'
     if cur and cur not in wf:                        # keep a stale choice visible instead of silently clearing
         opts += f'<option value="{_esc(cur)}" selected>{_esc(cur)} — (stale: node missing)</option>'
+    cur_ext = next((str(c.get("output_ext")) for c in cands if c.get("output_ext")), "")
     return ("<h2>Output</h2>"
             "<p class='hint'>Which node's artifacts the job returns. <b>auto</b> collects from every "
             "output-producing node. Pin the final node when the workflow also exports intermediates — "
             "the job then fails clearly if that node produces nothing.</p>"
-            + _field("output node", f'<select name="output_node">{opts}</select>'))
+            + _field("output node", f'<select name="output_node">{opts}</select>')
+            + _field("deliver file type", _inp("output_ext", cur_ext, placeholder="as reported (e.g. glb)"), short=True)
+            + "<p class='hint'>Fetch the SIBLING file with this extension instead of the one the node "
+              "reports — some nodes register only one format but write several next to it (UniRig reports "
+              "the <code>.fbx</code> but also writes <code>.glb</code>). Blank = deliver what the node "
+              "reports. The job fails clearly if the sibling doesn't exist.</p>")
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
@@ -2279,6 +2285,13 @@ async def update(request: Request):
             c["output_node"] = out_node
         else:
             c.pop("output_node", None)
+    # deliver-as extension (fetch the sibling with this ext; blank = as reported)
+    out_ext = (f.get("output_ext", "") or "").strip().lstrip(".").lower()
+    for c in cands:
+        if out_ext:
+            c["output_ext"] = out_ext
+        else:
+            c.pop("output_ext", None)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name

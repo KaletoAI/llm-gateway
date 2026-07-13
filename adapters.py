@@ -172,6 +172,7 @@ class NormalizedRequest:
     upload_images: dict = field(default_factory=dict)  # {param: bytes} per request-field image uploads
     loras: Optional[list] = None                    # [{name, strength}] — pairs resolved server-side
     output_node: Optional[str] = None               # alias setting: ONLY this node's artifacts count
+    output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
 
 
 @dataclass
@@ -1293,10 +1294,11 @@ class ComfyUIAdapter(BackendAdapter):
                 if log_on:
                     logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
                 outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
-                blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node)
+                blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node, req.output_ext)
                 if req.output_node and not blobs:
+                    extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
                     raise RuntimeError(f"configured output node {req.output_node} produced "
-                                       f"no fetchable artifact (no filename in its outputs)")
+                                       f"no fetchable artifact{extra} (no matching file in its outputs)")
         finally:
             self.ctx.inflight_dec(self.bid)
 
@@ -1350,7 +1352,8 @@ class ComfyUIAdapter(BackendAdapter):
                            f"last poll error: {last_exc}")
 
     async def _fetch_outputs(self, client, url, wf, outputs,
-                             output_node: Optional[str] = None) -> list[GenBlob]:
+                             output_node: Optional[str] = None,
+                             output_ext: Optional[str] = None) -> list[GenBlob]:
         # Which node's artifacts count: the alias's explicit output node (mapping
         # editor "Output" section) is authoritative — a workflow may export
         # intermediate files from several nodes (Trellis: meshes at 33/36/50, the
@@ -1384,6 +1387,14 @@ class ComfyUIAdapter(BackendAdapter):
                     if parsed is None:
                         continue
                     fn, view = parsed
+                    if output_ext:
+                        # Deliver the SIBLING with this extension instead of the
+                        # reported file: UniRig registers only `fbx_file` but writes
+                        # <stem>.fbx AND <stem>.glb (+ a .fbm folder); the client
+                        # wants the textured .glb. Same basename, /view by basename.
+                        stem = fn[:-(len(fn.split(".")[-1]) + 1)] if "." in fn else fn
+                        fn = f"{stem}.{output_ext}"
+                        view = {**view, "filename": fn}
                     if (fn, view.get("subfolder", "")) in seen:
                         continue
                     seen.add((fn, view.get("subfolder", "")))
