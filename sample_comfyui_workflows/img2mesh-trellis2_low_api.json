@@ -1,0 +1,353 @@
+{
+  "47": {
+    "inputs": {
+      "value": "Test-Kai"
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    }
+  },
+  "58": {
+    "inputs": {
+      "image": "ComfyUI_temp_dqvgq_00001_.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image"
+    }
+  },
+  "61": {
+    "inputs": {
+      "value": true
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_remove_background"
+    }
+  },
+  "62": {
+    "inputs": {
+      "value": 20000
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_face_num"
+    }
+  },
+  "63": {
+    "inputs": {
+      "precision": "auto",
+      "attn_backend": "auto"
+    },
+    "class_type": "MIALoadModel",
+    "_meta": {
+      "title": "MIA: (Down)Load Model"
+    }
+  },
+  "64": {
+    "inputs": {
+      "fbx_name": [
+        "47",
+        0
+      ],
+      "no_fingers": [
+        "66",
+        0
+      ],
+      "use_normal": false,
+      "reset_to_rest": false,
+      "trimesh": [
+        "76",
+        0
+      ],
+      "model": [
+        "63",
+        0
+      ]
+    },
+    "class_type": "MIAAutoRig",
+    "_meta": {
+      "title": "MIA: Auto Rig"
+    }
+  },
+  "66": {
+    "inputs": {
+      "value": true
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_no_fingers"
+    }
+  },
+  "67": {
+    "inputs": {
+      "seed": 123456,
+      "pipeline_type": "512",
+      "sparse_structure_steps": 12,
+      "sparse_structure_guidance_strength": 6.5,
+      "sparse_structure_guidance_rescale": 0.2,
+      "sparse_structure_rescale_t": 4,
+      "shape_steps": 12,
+      "shape_guidance_strength": 6.5,
+      "shape_guidance_rescale": 0.2,
+      "shape_rescale_t": 4,
+      "texture_steps": 12,
+      "texture_guidance_strength": 3,
+      "texture_guidance_rescale": 0.2,
+      "texture_rescale_t": 3,
+      "max_num_tokens": 999999,
+      "max_views": 4,
+      "sparse_structure_resolution": 32,
+      "generate_texture_slat": false,
+      "sparse_structure_guidance_interval_start": 0.1,
+      "sparse_structure_guidance_interval_end": 1,
+      "shape_guidance_interval_start": 0.1,
+      "shape_guidance_interval_end": 1,
+      "texture_guidance_interval_start": 0,
+      "texture_guidance_interval_end": 0.9,
+      "use_tiled_decoder": true,
+      "sampler": "euler",
+      "fill_holes": true,
+      "hole_iterations": 1,
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 4,
+      "hole_fill_algorithm": "flood_fill",
+      "dino_foundation_cap": 1,
+      "keep_only_shell": true,
+      "pipeline": [
+        "82",
+        0
+      ],
+      "image": [
+        "83",
+        0
+      ]
+    },
+    "class_type": "Trellis2MeshWithVoxelAdvancedGenerator",
+    "_meta": {
+      "title": "Trellis2 - Mesh With Voxel Advanced Generator"
+    }
+  },
+  "68": {
+    "inputs": {
+      "filename_prefix": [
+        "74",
+        0
+      ],
+      "file_format": "obj",
+      "trimesh": [
+        "71",
+        0
+      ]
+    },
+    "class_type": "Trellis2ExportMesh",
+    "_meta": {
+      "title": "Trellis2 - Export Mesh"
+    }
+  },
+  "69": {
+    "inputs": {
+      "target_face_num": [
+        "62",
+        0
+      ],
+      "method": "Cumesh",
+      "mesh": [
+        "77",
+        0
+      ]
+    },
+    "class_type": "Trellis2SimplifyMesh",
+    "_meta": {
+      "title": "Trellis2 - Simplify Mesh"
+    }
+  },
+  "70": {
+    "inputs": {
+      "mesh": [
+        "69",
+        0
+      ]
+    },
+    "class_type": "Trellis2FillHolesWithMeshlib",
+    "_meta": {
+      "title": "Trellis2 - Fill Holes with Meshlib"
+    }
+  },
+  "71": {
+    "inputs": {
+      "reorient_vertices": "90 degrees",
+      "mesh": [
+        "70",
+        0
+      ]
+    },
+    "class_type": "Trellis2MeshWithVoxelToTrimesh",
+    "_meta": {
+      "title": "Trellis2 - Mesh With Voxel To Trimesh"
+    }
+  },
+  "72": {
+    "inputs": {
+      "seed": 123456,
+      "texture_steps": 12,
+      "texture_guidance_strength": 3,
+      "texture_guidance_rescale": 0.2,
+      "texture_rescale_t": 3,
+      "resolution": 1024,
+      "texture_size": 1024,
+      "texture_alpha_mode": "OPAQUE",
+      "double_side_material": false,
+      "texture_guidance_interval_start": 0,
+      "texture_guidance_interval_end": 0.9,
+      "max_views": 4,
+      "bake_on_vertices": false,
+      "use_custom_normals": false,
+      "mesh_cluster_threshold_cone_half_angle_rad": 60,
+      "sampler": "euler",
+      "inpainting": "telea",
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 4,
+      "dino_foundation_cap": 1,
+      "pipeline": [
+        "82",
+        0
+      ],
+      "image": [
+        "83",
+        0
+      ],
+      "trimesh": [
+        "73",
+        0
+      ]
+    },
+    "class_type": "Trellis2MeshTexturing",
+    "_meta": {
+      "title": "Trellis2 - Mesh Texturing"
+    }
+  },
+  "73": {
+    "inputs": {
+      "input_1": [
+        "71",
+        0
+      ],
+      "input_2": [
+        "68",
+        0
+      ]
+    },
+    "class_type": "Trellis2Continue",
+    "_meta": {
+      "title": "Trellis2 - Continue"
+    }
+  },
+  "74": {
+    "inputs": {
+      "string_a": [
+        "47",
+        0
+      ],
+      "string_b": "_WhiteMesh",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "75": {
+    "inputs": {
+      "string_a": [
+        "47",
+        0
+      ],
+      "string_b": "_Textured",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "76": {
+    "inputs": {
+      "trimesh": [
+        "72",
+        0
+      ]
+    },
+    "class_type": "Trellis2SmoothNormals",
+    "_meta": {
+      "title": "Trellis2 - Smooth Normals"
+    }
+  },
+  "77": {
+    "inputs": {
+      "remesh_band": 1,
+      "remesh_project": 0,
+      "dual_contouring_resolution": "Auto",
+      "remove_floaters": 0.03,
+      "remove_inner_faces": "512",
+      "mesh": [
+        "67",
+        0
+      ]
+    },
+    "class_type": "Trellis2Remesh",
+    "_meta": {
+      "title": "Trellis2 - Remesh"
+    }
+  },
+  "82": {
+    "inputs": {
+      "modelname": "microsoft/TRELLIS.2-4B",
+      "backend": "sdpa",
+      "device": "cuda",
+      "low_vram": true,
+      "keep_models_loaded": true,
+      "conv_backend": "flex_gemm",
+      "sparse_backend": "xformers",
+      "use_reconviagen": false
+    },
+    "class_type": "Trellis2LoadModel",
+    "_meta": {
+      "title": "Trellis2 - LoadModel"
+    }
+  },
+  "83": {
+    "inputs": {
+      "padding": 25,
+      "remove_background": [
+        "61",
+        0
+      ],
+      "max_size": 2048,
+      "image": [
+        "58",
+        2
+      ]
+    },
+    "class_type": "Trellis2PreProcessImage",
+    "_meta": {
+      "title": "Trellis2 - PreProcess Image"
+    }
+  },
+  "85": {
+    "inputs": {
+      "fbx_output_path": [
+        "64",
+        0
+      ],
+      "preview": ""
+    },
+    "class_type": "UniRigPreviewRiggedMesh",
+    "_meta": {
+      "title": "UniRig: Preview Rigged Mesh"
+    }
+  }
+}
