@@ -386,11 +386,15 @@ def _badge(text: str, kind: str = "muted", title: str = "") -> str:
     return f'<span class="badge {kind}"{t}>{_esc(text)}</span>'
 
 
+_MODELVIEWER_SRC = "/ui/static/model-viewer.min.js"   # bundled locally (no CDN); served by static_asset
+
+
 def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
                style: str = "", autoplay: bool = False) -> str:
     """Right media element for a generation artifact: <video> for video, <audio>
-    for audio, else <img>. The serving route sets the real content-type; mime/kind
-    here only pick the tag (unknown → <img>). `src` must already be escaped."""
+    for audio, <model-viewer> for glTF/GLB, else <img>. The serving route sets the
+    real content-type; mime/kind here only pick the tag (unknown → <img>). `src`
+    must already be escaped."""
     m, k = (mime or "").lower(), (kind or "").lower()
     c = f' class="{cls}"' if cls else ""
     s = f' style="{style}"' if style else ""
@@ -399,6 +403,15 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
         return f'<video{c}{s} src="{src}" controls loop muted playsinline preload="metadata"{ap}></video>'
     if k == "audio" or m.startswith("audio/"):
         return f'<audio{c}{s} src="{src}" controls preload="metadata"></audio>'
+    if m in ("model/gltf-binary", "model/gltf+json"):
+        # <model-viewer> from the locally-bundled ES module (module URLs load once
+        # even if the tag repeats). Needs an explicit box or it collapses.
+        box = style or "width:100%;max-width:520px;height:420px"
+        box += ";background:#0c0e12;border:1px solid #313a46;border-radius:10px"
+        return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
+                f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
+                f'shadow-intensity="1" interaction-prompt="none" '
+                f'ar-status="not-presenting"></model-viewer>')
     return f'<img{c}{s} src="{src}">'
 
 
@@ -2573,6 +2586,21 @@ async def generate(request: Request):
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
 
 
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+_STATIC_ALLOW = {"model-viewer.min.js": "text/javascript"}   # whitelist — no arbitrary path serving
+
+
+async def static_asset(name: str):
+    """Serve a bundled /ui static asset (model-viewer). Whitelisted names only —
+    no path traversal; long cache since the file is versioned by its content."""
+    mime = _STATIC_ALLOW.get(name)
+    path = os.path.join(_STATIC_DIR, name)
+    if not mime or not os.path.exists(path):
+        raise HTTPException(404, "not found")
+    return FileResponse(path, media_type=mime,
+                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
 async def result(job_id: str, n: int):
     rp = jobs.result_path(job_id, n)
     if rp is None:
@@ -2985,7 +3013,13 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
         m, mk = (r.get("mime") or "").lower(), (r.get("kind") or "").lower()
         if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
-        elif mk == "file" or m.startswith("model/"):     # 3D/other file artifacts → download card
+        elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → inline 3D preview + download
+            label = r.get("name") or f"artifact {r['n']}"
+            dl = f' download="{_esc(r["name"])}"' if r.get("name") else " download"
+            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style='width:100%;max-width:360px;height:320px')}"
+                      f"<div><a href='{src}' target='_blank'{dl} style='display:inline-block;margin-top:6px;"
+                      f"padding:8px 12px;{_BOX_STYLE};text-decoration:none'>⬇ {_esc(label)}</a></div></div>")
+        elif mk == "file":                                # other file artifacts → download card
             label = r.get("name") or f"artifact {r['n']}"
             dl = f' download="{_esc(r["name"])}"' if r.get("name") else " download"
             cells += (f"<a href='{src}' target='_blank'{dl} style='display:inline-block;"
@@ -4169,6 +4203,7 @@ def register(app) -> None:
     app.add_api_route("/ui", ui_root, methods=["GET"], include_in_schema=False)
     app.add_api_route("/ui/login", login_page, methods=["GET"])
     app.add_api_route("/ui/login", login_post, methods=["POST"])
+    app.add_api_route("/ui/static/{name}", static_asset, methods=["GET"])
     app.add_api_route("/ui/logout", logout, methods=["GET"])
     app.add_api_route("/ui/backends", backends_page, methods=["GET"])
     app.add_api_route("/ui/backends/save", backend_save, methods=["POST"])
