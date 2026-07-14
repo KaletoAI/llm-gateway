@@ -412,6 +412,9 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
                 f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
+    if k == "file":                                   # non-previewable artifact (fbx/obj/…) → download
+        return (f'<a{c} href="{src}" target="_blank" download style="display:inline-block;'
+                f'padding:18px 22px;{_BOX_STYLE};text-decoration:none">⬇ download</a>')
     return f'<img{c}{s} src="{src}">'
 
 
@@ -1940,6 +1943,7 @@ def _output_section(wf: dict, cands: list) -> str:
     if cur and cur not in wf:                        # keep a stale choice visible instead of silently clearing
         opts += f'<option value="{_esc(cur)}" selected>{_esc(cur)} — (stale: node missing)</option>'
     cur_ext = next((str(c.get("output_ext")) for c in cands if c.get("output_ext")), "")
+    cur_globs = next((c.get("output_globs") for c in cands if c.get("output_globs")), []) or []
     return ("<h2>Output</h2>"
             "<p class='hint'>Which node's artifacts the job returns. <b>auto</b> collects from every "
             "output-producing node. Pin the final node when the workflow also exports intermediates — "
@@ -1949,7 +1953,14 @@ def _output_section(wf: dict, cands: list) -> str:
             + "<p class='hint'>Fetch the SIBLING file with this extension instead of the one the node "
               "reports — some nodes register only one format but write several next to it (UniRig reports "
               "the <code>.fbx</code> but also writes <code>.glb</code>). Blank = deliver what the node "
-              "reports. The job fails clearly if the sibling doesn't exist.</p>")
+              "reports. The job fails clearly if the sibling doesn't exist.</p>"
+            + _field("output files", _textarea("output_globs", "\n".join(cur_globs), 3,
+                     "one glob per line, e.g.\n*_articulationxl.fbx\n*basecolor*.png\n*_mia.glb"), wide=True)
+            + "<p class='hint'><b>Multi-file delivery</b> (overrides the two fields above when set): deliver "
+              "EVERY file matching these globs, gathered across all output nodes — including a same-stem "
+              "sibling with a glob's extension (so <code>*_mia.glb</code> grabs the .glb written next to a "
+              "reported <code>_mia.fbx</code>). Unmatched globs are just absent, so a later split workflow "
+              "still works; the job fails only if nothing matches at all.</p>")
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
@@ -2314,6 +2325,13 @@ async def update(request: Request):
             c["output_ext"] = out_ext
         else:
             c.pop("output_ext", None)
+    # multi-file globs (one per line/comma; overrides node+ext when set)
+    globs = [g.strip() for g in re.split(r"[\r\n,]+", f.get("output_globs", "") or "") if g.strip()]
+    for c in cands:
+        if globs:
+            c["output_globs"] = globs
+        else:
+            c.pop("output_globs", None)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name

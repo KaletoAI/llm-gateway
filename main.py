@@ -1975,6 +1975,7 @@ async def run_generation(body: dict, request: Request,
             upload_images=dict(upload_images or {}), raw=request,
             loras=body.get("loras"), output_node=(cand.get("output_node") or None),
             output_ext=(cand.get("output_ext") or None),
+            output_globs=(cand.get("output_globs") or None),
         )
 
     first, cand0 = routes[0]

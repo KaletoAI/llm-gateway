@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import fnmatch
 import json
 import logging
 import os
@@ -173,6 +174,7 @@ class NormalizedRequest:
     loras: Optional[list] = None                    # [{name, strength}] — pairs resolved server-side
     output_node: Optional[str] = None               # alias setting: ONLY this node's artifacts count
     output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
+    output_globs: Optional[list] = None             # alias setting: deliver every file matching these globs
 
 
 @dataclass
@@ -1376,7 +1378,11 @@ class ComfyUIAdapter(BackendAdapter):
                 if log_on:
                     logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
                 outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
-                blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node, req.output_ext)
+                blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
+                                                  req.output_ext, req.output_globs)
+                if req.output_globs and not blobs:
+                    raise RuntimeError(f"no output file matched {req.output_globs} "
+                                       f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
                 if req.output_node and not blobs:
                     extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
                     raise RuntimeError(f"configured output node {req.output_node} produced "
@@ -1436,13 +1442,24 @@ class ComfyUIAdapter(BackendAdapter):
 
     async def _fetch_outputs(self, client, url, wf, outputs,
                              output_node: Optional[str] = None,
-                             output_ext: Optional[str] = None) -> list[GenBlob]:
-        # Which node's artifacts count: the alias's explicit output node (mapping
-        # editor "Output" section) is authoritative — a workflow may export
-        # intermediate files from several nodes (Trellis: meshes at 33/36/50, the
-        # rigged model at 64), and only the configured one is the result. It
-        # producing nothing is an ERROR, not a fallback. Without the setting:
-        # the node titled `output_final`, else everything (legacy behaviour).
+                             output_ext: Optional[str] = None,
+                             output_globs: Optional[list] = None) -> list[GenBlob]:
+        # Glob mode (multi-file): deliver EVERY file matching the alias's patterns,
+        # gathered across ALL output nodes. A workflow that rigs twice + bakes
+        # textures registers several files (…_articulationxl.fbx, …_basecolor_*.png,
+        # …_mia.fbx); the client wants a specific subset AND a sibling (…_mia.glb,
+        # written next to …_mia.fbx but not registered). For each reported file we
+        # also try its stem swapped to each glob's extension, so a glob picks up an
+        # on-disk sibling via /view. Unmatched globs are simply absent (a later
+        # split workflow producing only some files still works). Takes precedence
+        # over output_node/output_ext.
+        if output_globs:
+            return await self._fetch_by_globs(client, url, outputs, output_globs)
+        # Single-node mode: the alias's explicit output node (mapping editor
+        # "Output" section) is authoritative — a workflow may export intermediate
+        # files from several nodes, and only the configured one is the result. It
+        # producing nothing is an ERROR, not a fallback. Without the setting: the
+        # node titled `output_final`, else everything (legacy behaviour).
         if output_node:
             if output_node not in outputs:
                 raise RuntimeError(f"configured output node {output_node} produced no output "
@@ -1493,6 +1510,44 @@ class ComfyUIAdapter(BackendAdapter):
                                 kind = top
                                 mime = {"video": "video/mp4", "audio": "audio/mpeg"}[top]
                     blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=fn))
+        return blobs
+
+    async def _fetch_by_globs(self, client, url, outputs, globs) -> list[GenBlob]:
+        """Deliver every registered file (or a same-stem sibling) matching a glob.
+        Order follows the globs, so results come out predictable for the client."""
+        glob_exts = {g.rsplit(".", 1)[-1].lower() for g in globs if "." in g}
+        # collect (filename, view-params) candidates across all output nodes: the
+        # reported file plus its stem swapped to each requested extension (siblings).
+        cands: list = []
+        seen_cand: set = set()
+        for out in outputs.values():
+            for items in out.values():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    parsed = _view_params(item)
+                    if parsed is None:
+                        continue
+                    fn, view = parsed
+                    stem = fn[:-(len(fn.rsplit(".", 1)[-1]) + 1)] if "." in fn else fn
+                    for cfn in {fn, *(f"{stem}.{e}" for e in glob_exts)}:
+                        key = (cfn, view.get("subfolder", ""))
+                        if key not in seen_cand:
+                            seen_cand.add(key)
+                            cands.append((cfn, {**view, "filename": cfn}))
+        blobs, fetched = [], set()
+        for g in globs:                                  # glob order → stable result order
+            for cfn, view in cands:
+                if (cfn, view.get("subfolder", "")) in fetched:
+                    continue
+                if not fnmatch.fnmatch(cfn.lower(), g.lower()):
+                    continue
+                r = await client.get(f"{url}/view", params=view)
+                if r.status_code != 200:                 # sibling for this glob doesn't exist
+                    continue
+                fetched.add((cfn, view.get("subfolder", "")))
+                mime, kind = _mime_and_kind(cfn)
+                blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=cfn))
         return blobs
 
 
