@@ -124,12 +124,14 @@ receive what they need via injected callables, staying hot-reload-safe.
   `reasoning` always wins.
 - **`skinfix.py`** — pure-numpy skinning-weight repair for a rigged GLB, run once
   in the gateway before delivery (`repair(glb_bytes) → (new_bytes, stats)`). Auto-
-  riggers bind some vertices to the wrong bone (invisible in bind pose; the mesh
-  shatters when animated, error rate rising with resolution). Operates only on the
-  glTF `JOINTS_0`/`WEIGHTS_0` (bone segments from inverse-bind matrices; re-weights
-  vertices whose dominant bone is >2.5× farther than the nearest to the 3 nearest
-  segments; unifies UV-seam weights). A healthy model gets 0 corrections, so it is
-  safe to leave on. Gated per gen-alias by `repair_weights` (Output section);
+  riggers mis-bind vertices two ways (invisible in bind pose, ugly when animated):
+  a DRAG/spike (weight on a far bone) and a RING/web (a crotch/armpit vertex on BOTH
+  sibling limbs). Operates only on the glTF `JOINTS_0`/`WEIGHTS_0`, all local per
+  vertex (bone segments from inverse-bind matrices): drops weights on bones >2.5×
+  farther than the nearest segment, then keeps only a single skeleton **ancestor
+  chain** (a bone incompatible with a heavier kept bone — a sibling limb — is dropped),
+  seam-unifying first so the chain rule wins at a crotch-midline seam. Idempotent — a
+  healthy model gets 0 corrections, so it is safe to leave on. Gated per gen-alias by `repair_weights` (Output section);
   `main._maybe_repair_weights` applies it to every delivered `.glb` blob in
   `_run_job` and `_run_chain`.
 
