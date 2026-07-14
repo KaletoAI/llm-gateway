@@ -2641,17 +2641,20 @@ async def generate(request: Request):
 
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-_STATIC_ALLOW = {"model-viewer.min.js": "text/javascript"}   # whitelist — no arbitrary path serving
+_STATIC_MIME = {".js": "text/javascript", ".css": "text/css", ".wasm": "application/wasm",
+                ".json": "application/json"}   # served extensions (bundled JS libs)
 
 
-async def static_asset(name: str):
-    """Serve a bundled /ui static asset (model-viewer). Whitelisted names only —
-    no path traversal; long cache since the file is versioned by its content."""
-    mime = _STATIC_ALLOW.get(name)
-    path = os.path.join(_STATIC_DIR, name)
-    if not mime or not os.path.exists(path):
+async def static_asset(path: str):
+    """Serve a bundled /ui static asset (model-viewer, three.js + FBXLoader). Only
+    known JS/CSS extensions under the static dir; the resolved real path must stay
+    inside it (no traversal). Long immutable cache — files are content-versioned."""
+    ext = os.path.splitext(path)[1].lower()
+    full = os.path.realpath(os.path.join(_STATIC_DIR, path))
+    if (ext not in _STATIC_MIME or not full.startswith(_STATIC_DIR + os.sep)
+            or not os.path.isfile(full)):
         raise HTTPException(404, "not found")
-    return FileResponse(path, media_type=mime,
+    return FileResponse(full, media_type=_STATIC_MIME[ext],
                         headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
@@ -3055,33 +3058,84 @@ async def jobs_page(request: Request):
     return HTMLResponse(_page(title, body, "jobs", refresh=refresh, subnav=_subnav("jobs", sub)))
 
 
+# three.js FBX preview: the generic (UniRig) result is an FBX whose texture is only
+# a dead temp-path reference, so the sibling basecolor PNG is applied as the material
+# map. Import map + module init emitted ONCE per page (see _job_thumbs). All bundled
+# locally under /ui/static/three (no CDN).
+_FBX_VIEWER_JS = (
+    '<script type="importmap">{"imports":{"three":"/ui/static/three/three.module.min.js"}}</script>'
+    '<script type="module">'
+    "import * as THREE from 'three';"
+    "import { FBXLoader } from '/ui/static/three/jsm/loaders/FBXLoader.js';"
+    "import { OrbitControls } from '/ui/static/three/jsm/controls/OrbitControls.js';"
+    "document.querySelectorAll('.fbxview:not([data-init])').forEach(function(el){"
+    " el.dataset.init='1';"
+    " var W=el.clientWidth||480,H=el.clientHeight||420;"
+    " var sc=new THREE.Scene(); sc.background=new THREE.Color(0x0c0e12);"
+    " var cam=new THREE.PerspectiveCamera(45,W/H,0.1,1e5);"
+    " var rn=new THREE.WebGLRenderer({antialias:true}); rn.setPixelRatio(devicePixelRatio); rn.setSize(W,H);"
+    " el.appendChild(rn.domElement);"
+    " sc.add(new THREE.HemisphereLight(0xffffff,0x333344,2.2));"
+    " var dl=new THREE.DirectionalLight(0xffffff,1.4); dl.position.set(2,3,2); sc.add(dl);"
+    " var ct=new OrbitControls(cam,rn.domElement); ct.enableDamping=true;"
+    " var tex=null;"
+    " if(el.dataset.tex){tex=new THREE.TextureLoader().load(el.dataset.tex); tex.colorSpace=THREE.SRGBColorSpace; tex.flipY=false;}"
+    " new FBXLoader().load(el.dataset.src,function(o){"
+    "  o.traverse(function(c){ if(c.isMesh&&tex){ c.material=new THREE.MeshStandardMaterial({map:tex,roughness:0.85,metalness:0.0,side:THREE.DoubleSide}); }});"
+    "  var b=new THREE.Box3().setFromObject(o),s=b.getSize(new THREE.Vector3()),ce=b.getCenter(new THREE.Vector3());"
+    "  var md=Math.max(s.x,s.y,s.z)||1; o.position.sub(ce);"
+    "  cam.position.set(0,md*0.25,md*1.9); cam.near=md/200; cam.far=md*200; cam.updateProjectionMatrix();"
+    "  ct.target.set(0,0,0); ct.update(); sc.add(o);"
+    " },undefined,function(e){ el.innerHTML='<p style=\"padding:14px;color:#e89\">FBX-Vorschau fehlgeschlagen</p>'; });"
+    " (function loop(){ requestAnimationFrame(loop); ct.update(); rn.render(sc,cam); })();"
+    "});"
+    '</script>')
+
+
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     """Gallery of artifact thumbnails (kind = 'input'|'result'). Images link to the
-    full file; video/audio render an inline player (not wrapped in a link so their
-    controls stay clickable)."""
+    full file; video/audio play inline; GLB → <model-viewer>; FBX → a three.js 3D
+    viewer textured with the sibling basecolor PNG; other files → a download card."""
     base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
     style = "max-width:260px;max-height:260px;border:1px solid #313a46;border-radius:8px"
-    cells = ""
+    box3d = "width:720px;max-width:100%;height:640px"
+    # a basecolor/texture PNG to feed the FBX viewer (prefer one named *basecolor*)
+    tex_url = None
+    for r in entries:
+        if (r.get("mime") or "").startswith("image/"):
+            u = f"{base}{r['n']}"
+            if "basecolor" in (r.get("name") or "").lower():
+                tex_url = u
+                break
+            tex_url = tex_url or u
+    cells, has_fbx = "", False
     for r in entries:
         src = f"{base}{r['n']}"
         m, mk = (r.get("mime") or "").lower(), (r.get("kind") or "").lower()
+        name = r.get("name") or ""
+        dl = f' download="{_esc(name)}"' if name else " download"
+        label = name or f"artifact {r['n']}"
         if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
-        elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → inline 3D preview + download
-            label = r.get("name") or f"artifact {r['n']}"
-            dl = f' download="{_esc(r["name"])}"' if r.get("name") else " download"
-            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style='width:720px;max-width:100%;height:640px')}"
+        elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → <model-viewer> + download
+            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}"
+                      f"<div><a href='{src}' target='_blank'{dl} style='display:inline-block;margin-top:6px;"
+                      f"padding:8px 12px;{_BOX_STYLE};text-decoration:none'>⬇ {_esc(label)}</a></div></div>")
+        elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
+            has_fbx = True
+            tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
+            cells += (f'<div><div class="fbxview" data-src="{_esc(src)}"{tex_attr} '
+                      f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
                       f"<div><a href='{src}' target='_blank'{dl} style='display:inline-block;margin-top:6px;"
                       f"padding:8px 12px;{_BOX_STYLE};text-decoration:none'>⬇ {_esc(label)}</a></div></div>")
         elif mk == "file":                                # other file artifacts → download card
-            label = r.get("name") or f"artifact {r['n']}"
-            dl = f' download="{_esc(r["name"])}"' if r.get("name") else " download"
             cells += (f"<a href='{src}' target='_blank'{dl} style='display:inline-block;"
                       f"padding:18px 22px;{_BOX_STYLE};text-decoration:none'>"
                       f"⬇ {_esc(label)} <span class='muted'>({_esc(r.get('mime') or 'file')})</span></a>")
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
-    return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
+    out = f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
+    return out + _FBX_VIEWER_JS if has_fbx else out
 
 
 async def job_detail_page(job_id: str, request: Request):
@@ -4268,7 +4322,7 @@ def register(app) -> None:
     app.add_api_route("/ui", ui_root, methods=["GET"], include_in_schema=False)
     app.add_api_route("/ui/login", login_page, methods=["GET"])
     app.add_api_route("/ui/login", login_post, methods=["POST"])
-    app.add_api_route("/ui/static/{name}", static_asset, methods=["GET"])
+    app.add_api_route("/ui/static/{path:path}", static_asset, methods=["GET"])
     app.add_api_route("/ui/logout", logout, methods=["GET"])
     app.add_api_route("/ui/backends", backends_page, methods=["GET"])
     app.add_api_route("/ui/backends/save", backend_save, methods=["POST"])
