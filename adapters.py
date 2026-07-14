@@ -1285,6 +1285,25 @@ class ComfyUIAdapter(BackendAdapter):
         except Exception:
             return name
 
+    async def upload_input(self, data: bytes, name: str,
+                           content_type: str = "application/octet-stream") -> str:
+        """Upload an arbitrary file (a chain's intermediate mesh) into this backend's
+        ComfyUI input dir and return the stored name. Lets a two-stage chain relay
+        stage 1's mesh to a stage-2 backend that does NOT share disk — the successor
+        workflow then loads it from input/ by this name (overwrite=true, one slot)."""
+        url = self.backend["url"].rstrip("/")
+        async with _pooled_client(self.ctx) as c:
+            r = await c.post(f"{url}/upload/image",
+                             files={"image": (name, data, content_type)},
+                             data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"mesh upload to '{self.backend.get('name')}' failed "
+                               f"(HTTP {r.status_code}: {r.text[:200]})")
+        j = r.json() or {}
+        sub = (j.get("subfolder") or "").strip("/")
+        nm = j.get("name", name)
+        return f"{sub}/{nm}" if sub else nm
+
     async def _resolve_image_sentinels(self, fixed: list, upload: Optional[bytes]) -> list:
         """Replace image sentinels in fixed bindings with real uploaded names.
         A node pinned to the playground upload uses the uploaded image, or falls

@@ -306,7 +306,7 @@
   },
   "47": {
     "inputs": {
-      "value": "Test"
+      "value": "Test3"
     },
     "class_type": "PrimitiveString",
     "_meta": {
@@ -327,23 +327,6 @@
       "title": "Trellis2 - Simplify Mesh"
     }
   },
-  "50": {
-    "inputs": {
-      "filename_prefix": [
-        "55",
-        0
-      ],
-      "file_format": "glb",
-      "trimesh": [
-        "53",
-        0
-      ]
-    },
-    "class_type": "Trellis2ExportMesh",
-    "_meta": {
-      "title": "Trellis2 - Export Mesh"
-    }
-  },
   "53": {
     "inputs": {
       "trimesh": [
@@ -356,23 +339,9 @@
       "title": "Trellis2 - Smooth Normals"
     }
   },
-  "55": {
-    "inputs": {
-      "string_a": [
-        "47",
-        0
-      ],
-      "string_b": "textured",
-      "delimiter": "_"
-    },
-    "class_type": "StringConcatenate",
-    "_meta": {
-      "title": "Concatenate Text"
-    }
-  },
   "57": {
     "inputs": {
-      "seed": 361008368,
+      "seed": 1379186264,
       "texture_steps": 12,
       "texture_guidance_strength": 3,
       "texture_guidance_rescale": 0.2,
@@ -413,7 +382,7 @@
   },
   "58": {
     "inputs": {
-      "image": "Bianca Voss_1778280788_d60fd9f3_1.png"
+      "image": "0.png"
     },
     "class_type": "Trellis2LoadImageWithTransparency",
     "_meta": {
@@ -425,7 +394,7 @@
       "modelname": "microsoft/TRELLIS.2-4B",
       "backend": "sdpa",
       "device": "cuda",
-      "low_vram": true,
+      "low_vram": false,
       "keep_models_loaded": false,
       "conv_backend": "flex_gemm",
       "sparse_backend": "xformers",
@@ -438,7 +407,7 @@
   },
   "61": {
     "inputs": {
-      "value": false
+      "value": true
     },
     "class_type": "PrimitiveBoolean",
     "_meta": {
@@ -454,62 +423,90 @@
       "title": "input_face_num"
     }
   },
-  "63": {
+  "70": {
     "inputs": {
-      "precision": "auto",
-      "attn_backend": "auto"
+      "filename_prefix": [
+        "73",
+        0
+      ],
+      "images": [
+        "57",
+        1
+      ]
     },
-    "class_type": "MIALoadModel",
+    "class_type": "SaveImage",
     "_meta": {
-      "title": "MIA: (Down)Load Model"
+      "title": "Save Image"
     }
   },
-  "64": {
+  "71": {
     "inputs": {
-      "fbx_name": [
+      "filename_prefix": [
+        "72",
+        0
+      ],
+      "images": [
+        "57",
+        2
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "72": {
+    "inputs": {
+      "string_a": [
         "47",
         0
       ],
-      "no_fingers": [
-        "66",
-        0
-      ],
-      "use_normal": false,
-      "reset_to_rest": false,
-      "trimesh": [
-        "53",
-        0
-      ],
-      "model": [
-        "63",
-        0
-      ]
+      "string_b": "_metallic",
+      "delimiter": ""
     },
-    "class_type": "MIAAutoRig",
+    "class_type": "StringConcatenate",
     "_meta": {
-      "title": "MIA: Auto Rig"
+      "title": "Concatenate Text"
     }
   },
-  "66": {
+  "73": {
     "inputs": {
-      "value": true
+      "string_a": [
+        "47",
+        0
+      ],
+      "string_b": "_basecolor",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "80": {
+    "inputs": {
+      "value": false
     },
     "class_type": "PrimitiveBoolean",
     "_meta": {
       "title": "input_no_fingers"
     }
   },
-  "67": {
+  "82": {
     "inputs": {
-      "fbx_output_path": [
-        "64",
+      "filename_prefix": [
+        "47",
         0
       ],
-      "preview": ""
+      "file_format": "glb",
+      "trimesh": [
+        "53",
+        0
+      ]
     },
-    "class_type": "UniRigPreviewRiggedMesh",
+    "class_type": "Trellis2ExportMesh",
     "_meta": {
-      "title": "UniRig: Preview Rigged Mesh"
+      "title": "Output"
     }
   }
 }

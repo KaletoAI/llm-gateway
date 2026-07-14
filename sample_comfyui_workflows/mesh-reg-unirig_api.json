@@ -1,0 +1,78 @@
+{
+  "3": {
+    "inputs": {
+      "fbx_output_path": [
+        "7",
+        0
+      ],
+      "preview": ""
+    },
+    "class_type": "UniRigPreviewRiggedMesh",
+    "_meta": {
+      "title": "UniRig: Preview Rigged Mesh"
+    }
+  },
+  "4": {
+    "inputs": {
+      "file_path": ""
+    },
+    "class_type": "GeomPackLoadMeshPath",
+    "_meta": {
+      "title": "input_mesh_path"
+    }
+  },
+  "6": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    }
+  },
+  "7": {
+    "inputs": {
+      "skeleton_template": "articulationxl",
+      "fbx_name": [
+        "6",
+        0
+      ],
+      "target_face_count": [
+        "9",
+        0
+      ],
+      "debug": false,
+      "trimesh": [
+        "4",
+        0
+      ],
+      "model": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "UniRigAutoRig",
+    "_meta": {
+      "title": "UniRig: Auto Rig"
+    }
+  },
+  "8": {
+    "inputs": {
+      "precision": "auto",
+      "attn_backend": "auto"
+    },
+    "class_type": "UniRigLoadModel",
+    "_meta": {
+      "title": "UniRig: (Down)Load Model"
+    }
+  },
+  "9": {
+    "inputs": {
+      "value": 20000
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_face_num"
+    }
+  }
+}

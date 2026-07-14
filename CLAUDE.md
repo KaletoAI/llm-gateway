@@ -39,10 +39,10 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Nine self-contained Python files hold everything. `main.py` owns app state; the
+Ten self-contained Python files hold everything. `main.py` owns app state; the
 others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
-`responses_bridge`, `openai_image_bridge`) never import `main` — they receive
-what they need via injected callables, staying hot-reload-safe.
+`responses_bridge`, `openai_image_bridge`, `skinfix`) never import `main` — they
+receive what they need via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
   endpoints, auth/quotas, call parking, generation orchestration, the Responses
@@ -122,6 +122,16 @@ what they need via injected callables, staying hot-reload-safe.
   in the chat-alias editor) supplies off/on when the client sends nothing — so
   `tool`/`tool-thinking` can share one backend+model; an explicit client
   `reasoning` always wins.
+- **`skinfix.py`** — pure-numpy skinning-weight repair for a rigged GLB, run once
+  in the gateway before delivery (`repair(glb_bytes) → (new_bytes, stats)`). Auto-
+  riggers bind some vertices to the wrong bone (invisible in bind pose; the mesh
+  shatters when animated, error rate rising with resolution). Operates only on the
+  glTF `JOINTS_0`/`WEIGHTS_0` (bone segments from inverse-bind matrices; re-weights
+  vertices whose dominant bone is >2.5× farther than the nearest to the 3 nearest
+  segments; unifies UV-seam weights). A healthy model gets 0 corrections, so it is
+  safe to leave on. Gated per gen-alias by `repair_weights` (Output section);
+  `main._maybe_repair_weights` applies it to every delivered `.glb` blob in
+  `_run_job` and `_run_chain`.
 
 ### Request flow
 
@@ -150,6 +160,17 @@ what they need via injected callables, staying hot-reload-safe.
   `jobs.py` job runs via `adapter.generate()` (sync inline or async job-id). A
   running job can be cancelled (`cancel_generation` → ComfyUI `/interrupt` + task
   cancel).
+- **Workflow chains** (`_run_chain`): a gen alias's stage-1 config carries a
+  `successor` (`{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`);
+  stage 1 exports a mesh under a gateway-pinned filename (`gwchain_<jobid>`) and
+  ONLY stage 2's result is delivered (+ any `keep_from_mesh` files). Two hand-offs:
+  `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot
+  held across both — queue-isolated) and passes the mesh's absolute output path;
+  `relay: upload` lets the successor run on a **different** backend — the gateway
+  fetches the mesh (`/view`) and uploads it into the stage-2 backend's input dir
+  (`adapter.upload_input` → ComfyUI `/upload/image`), passing the stored name (the
+  successor's `mesh_param` must feed a load-from-input node). Cross-backend releases
+  the stage-1 slot once the mesh is in hand, then claims the stage-2 slot.
 
 ### Routing rules (`get_routes_for`/`get_gen_routes` + `alias_entry`)
 

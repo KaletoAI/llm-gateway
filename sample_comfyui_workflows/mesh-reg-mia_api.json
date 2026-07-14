@@ -1,0 +1,78 @@
+{
+  "1": {
+    "inputs": {
+      "precision": "auto",
+      "attn_backend": "auto"
+    },
+    "class_type": "MIALoadModel",
+    "_meta": {
+      "title": "MIA: (Down)Load Model"
+    }
+  },
+  "2": {
+    "inputs": {
+      "fbx_name": [
+        "6",
+        0
+      ],
+      "no_fingers": [
+        "5",
+        0
+      ],
+      "use_normal": false,
+      "reset_to_rest": false,
+      "trimesh": [
+        "4",
+        0
+      ],
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "MIAAutoRig",
+    "_meta": {
+      "title": "MIA: Auto Rig"
+    }
+  },
+  "3": {
+    "inputs": {
+      "fbx_output_path": [
+        "2",
+        0
+      ],
+      "preview": ""
+    },
+    "class_type": "UniRigPreviewRiggedMesh",
+    "_meta": {
+      "title": "UniRig: Preview Rigged Mesh"
+    }
+  },
+  "4": {
+    "inputs": {
+      "file_path": ""
+    },
+    "class_type": "GeomPackLoadMeshPath",
+    "_meta": {
+      "title": "input_mesh_path"
+    }
+  },
+  "5": {
+    "inputs": {
+      "value": false
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_no_fingers"
+    }
+  },
+  "6": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    }
+  }
+}

@@ -1,7 +1,7 @@
 {
   "47": {
     "inputs": {
-      "value": "Test-Kai"
+      "value": ""
     },
     "class_type": "PrimitiveString",
     "_meta": {
@@ -35,45 +35,9 @@
       "title": "input_face_num"
     }
   },
-  "63": {
-    "inputs": {
-      "precision": "auto",
-      "attn_backend": "auto"
-    },
-    "class_type": "MIALoadModel",
-    "_meta": {
-      "title": "MIA: (Down)Load Model"
-    }
-  },
-  "64": {
-    "inputs": {
-      "fbx_name": [
-        "47",
-        0
-      ],
-      "no_fingers": [
-        "66",
-        0
-      ],
-      "use_normal": false,
-      "reset_to_rest": false,
-      "trimesh": [
-        "76",
-        0
-      ],
-      "model": [
-        "63",
-        0
-      ]
-    },
-    "class_type": "MIAAutoRig",
-    "_meta": {
-      "title": "MIA: Auto Rig"
-    }
-  },
   "66": {
     "inputs": {
-      "value": true
+      "value": false
     },
     "class_type": "PrimitiveBoolean",
     "_meta": {
@@ -260,20 +224,6 @@
       "title": "Concatenate Text"
     }
   },
-  "75": {
-    "inputs": {
-      "string_a": [
-        "47",
-        0
-      ],
-      "string_b": "_Textured",
-      "delimiter": ""
-    },
-    "class_type": "StringConcatenate",
-    "_meta": {
-      "title": "Concatenate Text"
-    }
-  },
   "76": {
     "inputs": {
       "trimesh": [
@@ -308,7 +258,7 @@
       "modelname": "microsoft/TRELLIS.2-4B",
       "backend": "sdpa",
       "device": "cuda",
-      "low_vram": true,
+      "low_vram": false,
       "keep_models_loaded": true,
       "conv_backend": "flex_gemm",
       "sparse_backend": "xformers",
@@ -337,17 +287,81 @@
       "title": "Trellis2 - PreProcess Image"
     }
   },
-  "85": {
+  "90": {
     "inputs": {
-      "fbx_output_path": [
-        "64",
+      "string_a": [
+        "47",
         0
       ],
-      "preview": ""
+      "string_b": "_basecolor",
+      "delimiter": ""
     },
-    "class_type": "UniRigPreviewRiggedMesh",
+    "class_type": "StringConcatenate",
     "_meta": {
-      "title": "UniRig: Preview Rigged Mesh"
+      "title": "Concatenate Text"
+    }
+  },
+  "91": {
+    "inputs": {
+      "string_a": [
+        "47",
+        0
+      ],
+      "string_b": "_metallic",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "92": {
+    "inputs": {
+      "filename_prefix": [
+        "90",
+        0
+      ],
+      "images": [
+        "72",
+        1
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "93": {
+    "inputs": {
+      "filename_prefix": [
+        "91",
+        0
+      ],
+      "images": [
+        "72",
+        2
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "100": {
+    "inputs": {
+      "filename_prefix": [
+        "47",
+        0
+      ],
+      "file_format": "glb",
+      "trimesh": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "Trellis2ExportMesh",
+    "_meta": {
+      "title": "Output"
     }
   }
 }

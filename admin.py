@@ -1957,6 +1957,7 @@ def _output_section(wf: dict, cands: list) -> str:
     cur_cases = next((c.get("output_cases") for c in cands if c.get("output_cases")), []) or []
     globs_text = ("\n".join(f"{c.get('rig','')}: {', '.join(c.get('globs') or [])}" for c in cur_cases)
                   if cur_cases else "\n".join(cur_globs))
+    cur_repair = any(c.get("repair_weights") for c in cands)
     return ("<h2>Output</h2>"
             "<p class='hint'>Which node's artifacts the job returns. <b>auto</b> collects from every "
             "output-producing node. Pin the final node when the workflow also exports intermediates — "
@@ -1979,6 +1980,15 @@ def _output_section(wf: dict, cands: list) -> str:
               "<code>generic</code> → a rigged FBX + its basecolor PNG). Unmatched cases/globs are simply "
               "absent, so a split workflow still works; the job fails if nothing matches or validation "
               "fails (e.g. the 2×2-dummy-texture bug).</p>"
+            + "<h2 style='margin-top:18px'>Skin weights</h2>"
+            + _checkbox("repair_weights", cur_repair, "repair skin weights before delivery",
+                        "Fix mis-bound vertices in every delivered GLB")
+            + "<p class='hint'>Auto-riggers bind some vertices to the wrong bone — invisible in bind "
+              "pose, the mesh shatters when animated (the error rate rises with mesh resolution; a 287k-vert "
+              "model can have >20k bad vertices, a 56k Trellis mesh none). When on, the gateway re-weights "
+              "those vertices to the nearest bones and unifies UV-seam weights in every delivered "
+              "<code>.glb</code>, once per job (~6&nbsp;s for a high-res model). A healthy model gets 0 "
+              "corrections, so it's safe to leave on. Only <code>.glb</code> is touched (FBX passes through).</p>"
             + _chain_section(wf, cands))
 
 
@@ -1996,6 +2006,11 @@ def _chain_section(wf: dict, cands: list) -> str:
             lbl = f"{nid} — {cls}" + (f" “{title}”" if title else "")
             sel = " selected" if str(s.get("export_node")) == nid else ""
             node_opts += f'<option value="{_esc(nid)}"{sel}>{_esc(lbl)}</option>'
+    cur_relay = (s.get("relay") or "path").strip().lower()
+    relay_opts = "".join(
+        f'<option value="{v}"{" selected" if cur_relay == v else ""}>{lbl}</option>'
+        for v, lbl in (("path", "path — same backend, shared disk (default)"),
+                       ("upload", "upload — relay bytes to a stage-2 backend")))
     return ("<h2 style='margin-top:18px'>Chain (successor)</h2>"
             "<p class='hint'>Optional: run a second workflow after this one on the same backend and "
             "deliver only its result — e.g. mesh here, rigging as the successor. Needs the backend's "
@@ -2005,10 +2020,15 @@ def _chain_section(wf: dict, cands: list) -> str:
             + _field("mesh export node", f'<select name="chain_export_node">{node_opts}</select>')
             + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
                      placeholder="mesh_path"), short=True)
-            + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh path, "
-              "and passes it to the successor under the <b>mesh param</b> (default <code>mesh_path</code> — "
-              "must be a request field on the successor). This stage's other params (name, no_fingers, …) "
-              "are threaded to the successor by matching param name.</p>"
+            + _field("mesh hand-off", f'<select name="chain_relay">{relay_opts}</select>')
+            + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh, and passes "
+              "it to the successor under the <b>mesh param</b> (default <code>mesh_path</code> — must be a "
+              "request field on the successor). <b>Hand-off</b>: <code>path</code> keeps both stages on ONE "
+              "backend (shared disk) and passes the mesh's absolute output path. <code>upload</code> lets the "
+              "successor run on a DIFFERENT backend — the gateway fetches the mesh and uploads it into that "
+              "backend's <b>input</b> dir, passing the stored filename (the successor's mesh param must feed a "
+              "node that loads from input/, e.g. a Load-3D/upload node). This stage's other params (name, "
+              "no_fingers, …) are threaded to the successor by matching param name.</p>"
             + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
                      placeholder="e.g. *basecolor*.png"), short=True)
             + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
@@ -2382,6 +2402,13 @@ async def update(request: Request):
             c["output_ext"] = out_ext
         else:
             c.pop("output_ext", None)
+    # repair skin weights before delivery (per-alias; GLB only)
+    repair_on = f.get("repair_weights") in ("1", "on", "true")
+    for c in cands:
+        if repair_on:
+            c["repair_weights"] = True
+        else:
+            c.pop("repair_weights", None)
     # output files (overrides node+ext): 'rig: globs' lines → conditional cases,
     # plain glob lines → flat multi-file delivery.
     out_cases, out_flat = [], []
@@ -2406,9 +2433,11 @@ async def update(request: Request):
     # chain successor (blank alias → not a chain)
     succ_alias = (f.get("successor", "") or "").strip()
     keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
+    relay = (f.get("chain_relay", "") or "path").strip().lower()
     succ = ({"alias": succ_alias,
              "export_node": (f.get("chain_export_node", "") or "").strip(),
              "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "mesh_path",
+             **({"relay": relay} if relay == "upload" else {}),
              **({"keep_from_mesh": keep} if keep else {}),
              **({"rig": (f.get("chain_rig", "") or "").strip()} if (f.get("chain_rig", "") or "").strip() else {})}
             if succ_alias else None)

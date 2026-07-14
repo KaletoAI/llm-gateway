@@ -1,0 +1,387 @@
+{
+  "39": {
+    "inputs": {
+      "modelname": "TencentARC/Pixal3D-T",
+      "backend": "sdpa",
+      "device": "cuda",
+      "low_vram": true,
+      "keep_models_loaded": false,
+      "conv_backend": "flex_gemm",
+      "sparse_backend": "xformers",
+      "use_reconviagen": false
+    },
+    "class_type": "Trellis2LoadModel",
+    "_meta": {
+      "title": "Trellis2 - LoadModel"
+    }
+  },
+  "194": {
+    "inputs": {
+      "padding": 5,
+      "remove_background": [
+        "309",
+        0
+      ],
+      "max_size": 1024,
+      "image": [
+        "311",
+        2
+      ]
+    },
+    "class_type": "Trellis2PreProcessImage",
+    "_meta": {
+      "title": "Trellis2 - PreProcess Image"
+    }
+  },
+  "213": {
+    "inputs": {
+      "max_views": 1,
+      "pipeline": [
+        "39",
+        0
+      ],
+      "image": [
+        "194",
+        0
+      ]
+    },
+    "class_type": "Trellis2ImageCondGenerator",
+    "_meta": {
+      "title": "Trellis2 - ImageCond Generator"
+    }
+  },
+  "215": {
+    "inputs": {
+      "resolution": 512,
+      "shape_steps": 12,
+      "shape_guidance_strength": 7.5,
+      "shape_guidance_rescale": 0.5,
+      "shape_rescale_t": 3,
+      "shape_sampler": "euler",
+      "shape_guidance_interval_start": 0.6,
+      "shape_guidance_interval_end": 1,
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 2,
+      "dino_foundation_cap": 0.92,
+      "pipeline": [
+        "272",
+        2
+      ],
+      "image_cond": [
+        "213",
+        0
+      ],
+      "coords": [
+        "272",
+        0
+      ],
+      "image": [
+        "194",
+        0
+      ],
+      "moge_camera_config": [
+        "213",
+        3
+      ]
+    },
+    "class_type": "Trellis2ShapeGenerator",
+    "_meta": {
+      "title": "Trellis2 - Shape Generator"
+    }
+  },
+  "217": {
+    "inputs": {
+      "resolution": [
+        "300",
+        1
+      ],
+      "use_tiled_decoder": true,
+      "pipeline": [
+        "296",
+        1
+      ],
+      "shape_slat": [
+        "300",
+        0
+      ],
+      "texture_slat": [
+        "296",
+        0
+      ]
+    },
+    "class_type": "Trellis2DecodeLatents",
+    "_meta": {
+      "title": "Trellis2 - Decode Latents"
+    }
+  },
+  "218": {
+    "inputs": {
+      "target_face_num": [
+        "307",
+        0
+      ],
+      "method": "Cumesh",
+      "mesh": [
+        "301",
+        0
+      ]
+    },
+    "class_type": "Trellis2SimplifyMesh",
+    "_meta": {
+      "title": "Trellis2 - Simplify Mesh"
+    }
+  },
+  "272": {
+    "inputs": {
+      "seed": 1000,
+      "sparse_structure_steps": 12,
+      "sparse_structure_guidance_strength": 7.5,
+      "sparse_structure_guidance_rescale": 0.7,
+      "sparse_structure_rescale_t": 5,
+      "sparse_structure_sampler": "euler",
+      "sparse_structure_resolution": 32,
+      "sparse_structure_guidance_interval_start": 0.6,
+      "sparse_structure_guidance_interval_end": 1,
+      "fill_holes": false,
+      "hole_iterations": 1,
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 2,
+      "hole_fill_algorithm": "flood_fill",
+      "dino_foundation_cap": 0.92,
+      "keep_only_shell": false,
+      "pipeline": [
+        "213",
+        2
+      ],
+      "image_cond": [
+        "213",
+        0
+      ],
+      "image": [
+        "194",
+        0
+      ],
+      "moge_camera_config": [
+        "213",
+        3
+      ]
+    },
+    "class_type": "Trellis2SparseGenerator",
+    "_meta": {
+      "title": "Trellis2 - Sparse Generator"
+    }
+  },
+  "296": {
+    "inputs": {
+      "resolution": 1024,
+      "texture_steps": 12,
+      "texture_guidance_strength": 1,
+      "texture_guidance_rescale": 0,
+      "texture_rescale_t": 3,
+      "texture_sampler": "euler",
+      "texture_guidance_interval_start": 0.6,
+      "texture_guidance_interval_end": 0.9,
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 2,
+      "dino_foundation_cap": 0.92,
+      "from_resolution": [
+        "300",
+        1
+      ],
+      "pipeline": [
+        "300",
+        2
+      ],
+      "image_cond": [
+        "213",
+        1
+      ],
+      "shape_slat": [
+        "300",
+        0
+      ],
+      "image": [
+        "194",
+        0
+      ],
+      "moge_camera_config": [
+        "213",
+        3
+      ]
+    },
+    "class_type": "Trellis2TexSlatGenerator",
+    "_meta": {
+      "title": "Trellis2 - Tex Slat Generator"
+    }
+  },
+  "299": {
+    "inputs": {
+      "mesh": [
+        "218",
+        0
+      ]
+    },
+    "class_type": "Trellis2FillHolesWithMeshlib",
+    "_meta": {
+      "title": "Trellis2 - Fill Holes with Meshlib"
+    }
+  },
+  "300": {
+    "inputs": {
+      "from_resolution": [
+        "215",
+        1
+      ],
+      "to_resolution": 1536,
+      "sparse_structure_resolution": [
+        "272",
+        1
+      ],
+      "max_num_tokens": 999999,
+      "shape_steps": 12,
+      "shape_guidance_strength": 7.5,
+      "shape_guidance_rescale": 0.5,
+      "shape_rescale_t": 3,
+      "shape_sampler": "euler",
+      "shape_guidance_interval_start": 0.6,
+      "shape_guidance_interval_end": 1,
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 2,
+      "dino_foundation_cap": 0.92,
+      "pipeline": [
+        "215",
+        2
+      ],
+      "image_cond": [
+        "213",
+        1
+      ],
+      "shape_slat": [
+        "215",
+        0
+      ],
+      "image": [
+        "194",
+        0
+      ],
+      "moge_camera_config": [
+        "213",
+        3
+      ]
+    },
+    "class_type": "Trellis2ShapeCascadeGenerator",
+    "_meta": {
+      "title": "Trellis2 - Shape Cascade Generator"
+    }
+  },
+  "301": {
+    "inputs": {
+      "remesh_band": 1,
+      "remesh_project": 0,
+      "dual_contouring_resolution": "Auto",
+      "remove_floaters": true,
+      "remove_inner_faces": true,
+      "mesh": [
+        "217",
+        0
+      ]
+    },
+    "class_type": "Trellis2RemeshWithQuad",
+    "_meta": {
+      "title": "Trellis2 - Remesh With Quad"
+    }
+  },
+  "302": {
+    "inputs": {
+      "mesh_cluster_threshold_cone_half_angle_rad": 60,
+      "mesh_cluster_refine_iterations": 0,
+      "mesh_cluster_global_iterations": 1,
+      "mesh_cluster_smooth_strength": 1,
+      "texture_size": 2048,
+      "texture_alpha_mode": "OPAQUE",
+      "double_side_material": false,
+      "bake_on_vertices": false,
+      "use_custom_normals": true,
+      "inpainting": "telea",
+      "reorient_vertices": "None",
+      "mesh": [
+        "299",
+        0
+      ],
+      "bvh": [
+        "217",
+        1
+      ]
+    },
+    "class_type": "Trellis2UnWrapAndRasterizer",
+    "_meta": {
+      "title": "Trellis2 - UV Unwrap and Rasterize"
+    }
+  },
+  "306": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    }
+  },
+  "307": {
+    "inputs": {
+      "value": 50000
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_face_num"
+    }
+  },
+  "309": {
+    "inputs": {
+      "value": true
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_remove_background"
+    }
+  },
+  "310": {
+    "inputs": {
+      "value": false
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_no_fingers"
+    }
+  },
+  "311": {
+    "inputs": {
+      "image": "ComfyUI_temp_dqvgq_00001_.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image"
+    }
+  },
+  "312": {
+    "inputs": {
+      "filename_prefix": [
+        "306",
+        0
+      ],
+      "file_format": "glb",
+      "trimesh": [
+        "302",
+        0
+      ]
+    },
+    "class_type": "Trellis2ExportMesh",
+    "_meta": {
+      "title": "Output"
+    }
+  }
+}
