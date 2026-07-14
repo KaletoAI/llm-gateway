@@ -408,8 +408,21 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
         # even if the tag repeats). Needs an explicit box or it collapses.
         box = style or "width:720px;max-width:100%;height:640px"
         box += ";background:#0c0e12;border:1px solid #313a46;border-radius:10px"
-        return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
-                f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
+        head = f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
+        if autoplay and m == "model/gltf-binary":
+            # inspection view: play an injected idle so bad skin weights show (a spike
+            # shoots out, the crotch webs). A toggle pauses back to bind pose. No
+            # auto-rotate here — you want to watch the deformation, not the camera.
+            sep = "&" if "?" in src else "?"
+            mvid = "mv%d" % (abs(hash(src)) % 1000000)
+            return (head + f'<model-viewer id="{mvid}"{c} style="{box}" src="{src}{sep}anim=idle" '
+                    f'camera-controls autoplay animation-name="idle" shadow-intensity="1" '
+                    f'interaction-prompt="none" ar-status="not-presenting"></model-viewer>'
+                    f'<label class="ckbox" style="margin-top:6px;display:block"><input type="checkbox" '
+                    f'checked onchange="var m=document.getElementById(\'{mvid}\');'
+                    f'this.checked?m.play():m.pause();"> idle animation '
+                    f'<span class="muted">— reveals bad skin weights (spikes / crotch ring)</span></label>')
+        return (head + f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
     if k == "file":                                   # non-previewable artifact (fbx/obj/…) → download
@@ -2752,11 +2765,16 @@ async def static_asset(path: str):
                         headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
-async def result(job_id: str, n: int):
+async def result(job_id: str, n: int, anim: str = ""):
     rp = jobs.result_path(job_id, n)
     if rp is None:
         raise HTTPException(404, "result not found")
     path, mime, name = rp
+    if anim == "idle" and mime == "model/gltf-binary":   # preview-only: inject a diagnostic idle clip
+        import previewanim
+        with open(path, "rb") as fh:
+            data = previewanim.add_idle(fh.read())
+        return Response(content=data, media_type=mime)
     headers = None
     if name:
         safe = name.replace('"', "").replace("\n", "")
