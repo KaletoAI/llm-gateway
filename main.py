@@ -1842,6 +1842,97 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
                             f"all candidate backends unreachable (connection): {last}")
 
 
+async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
+                     succ: dict, body: dict, request, upload_images) -> None:
+    """Run a two-stage workflow chain on ONE backend, holding its slot across BOTH
+    stages so nothing from the queue runs between them (the dependent runs must be
+    back-to-back). Stage 1 (the client-facing mesh alias) exports a mesh under a
+    filename WE pin, so we know its path (approach 2). Stage 2 (the `successor`,
+    e.g. a rigger) is fed that mesh path + stage-1's threaded params, and ONLY its
+    result is delivered. Both stages must live on the same backend (shared disk).
+
+    successor config: {alias, export_node, mesh_param}. Backend needs comfy_output_dir."""
+    bid = backend_id(backend)
+    adapter = backend_adapters.get(bid)
+    outdir = (backend.get("comfy_output_dir") or "").rstrip("/")
+    succ_alias = (succ.get("alias") or "").strip()
+    export_node = str(succ.get("export_node") or "").strip()
+    mesh_param = (succ.get("mesh_param") or "mesh_path").strip()
+    if adapter is None or not outdir:
+        await asyncio.to_thread(jobs.fail, job_id, f"chain needs an adapter and a "
+                                f"comfy_output_dir on backend '{backend.get('name')}'")
+        return
+    s2 = next((c for c in ((await asyncio.to_thread(store.get, succ_alias)) or [])
+               if c.get("backend") == backend["name"]), None)
+    if s2 is None:
+        await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' is not "
+                                f"configured for backend '{backend['name']}'")
+        return
+    s1_wf = stage1_cand.get("workflow_json") or {}
+    if export_node not in s1_wf:
+        await asyncio.to_thread(jobs.fail, job_id, f"chain export node '{export_node}' "
+                                "is not in the mesh workflow")
+        return
+    ext = str(((s1_wf.get(export_node) or {}).get("inputs") or {}).get("file_format") or "glb")
+    inputs, params = _gen_inputs_params(body)
+    _apply_seconds(params, stage1_cand)
+    prefix = f"gwchain_{job_id}"
+    mesh_name = f"{prefix}_00001_.{ext}"                # ComfyUI's %05d counter, fresh prefix → 00001
+    mesh_path = f"{outdir}/{mesh_name}"
+
+    # Exclusive access: wait until the backend is free, then claim it and hold it for
+    # the whole chain. The last busy-check and the inc run with no await between them
+    # (the dispatch invariant), so the slot is claimed atomically.
+    deadline = time.monotonic() + async_park_timeout_s
+    while backend_busy(backend):
+        if time.monotonic() > deadline:
+            await asyncio.to_thread(jobs.fail, job_id, "chain: backend stayed busy past park time")
+            return
+        await asyncio.sleep(0.5)
+    _inflight_inc(bid)
+    await asyncio.to_thread(jobs.set_status, job_id, "running")
+    try:
+        # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
+        req1 = NormalizedRequest(
+            alias=alias, real_model=stage1_cand.get("model"),
+            task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
+            workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
+            node_mapping=stage1_cand.get("mapping") or {},
+            fixed=list(stage1_cand.get("fixed") or [])
+                 + [{"node": export_node, "field": "filename_prefix", "value": prefix}],
+            upload_images=dict(upload_images or {}), raw=request)
+        await adapter.generate(req1)
+        r = await http_client.get(f"{backend['url'].rstrip('/')}/view",
+                                  params={"filename": mesh_name, "type": "output"}, timeout=15.0)
+        if r.status_code != 200:
+            raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' (HTTP {r.status_code}) — "
+                               "check the export node / file_format")
+        # ── Stage 2: successor, fed the mesh path + stage-1 params (name, no_fingers, …) ──
+        s2_params = dict(params)
+        s2_params[mesh_param] = mesh_path
+        req2 = NormalizedRequest(
+            alias=succ_alias, real_model=s2.get("model"),
+            task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
+            workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
+            node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
+            raw=request, output_node=(s2.get("output_node") or None),
+            output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
+            output_cases=(s2.get("output_cases") or None))
+        out2 = await adapter.generate(req2)
+        await asyncio.to_thread(jobs.complete, job_id, out2.blobs,
+                                {**out2.meta, "backend": backend["name"], "chain": [alias, succ_alias]})
+        if log_per_call:
+            logger.info(f"✓ chain job {job_id} on [{backend['name']}] ({alias}→{succ_alias}) "
+                        f"— {len(out2.blobs)} artifact(s)")
+        asyncio.create_task(_free_comfy_vram(backend, "chain done"))
+    except Exception as e:
+        logger.warning(f"✗ chain job {job_id} [{backend['name']}] ({alias}→{succ_alias}) failed: {e}")
+        await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}")
+        asyncio.create_task(_free_comfy_vram(backend, "chain failure"))
+    finally:
+        _inflight_dec(bid)
+
+
 _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
 
 
@@ -2002,6 +2093,18 @@ async def run_generation(body: dict, request: Request,
         cands = ", ".join(b["name"] for b, _ in routes)
         logger.info(f"→ generation '{alias}' ({task}) job {job_id} mode={mode}"
                     f"{' PARKED' if parked else ''} candidates=[{cands}]")
+
+    # Workflow chain: stage 1 has a `successor` → run both stages back-to-back on one
+    # backend (queue-isolated), deliver only stage 2. The chain waits for the backend
+    # itself, so parked/ready both route here.
+    succ = cand0.get("successor")
+    if succ and (succ.get("alias") or "").strip():
+        runner = _run_chain(job_id, first, cand0, alias, succ, body, request, upload_images)
+        if mode == "async":
+            _spawn_gen(job_id, runner)
+            return {"job_id": job_id, "status": "queued"}
+        await runner
+        return await _job_view(job_id, request)
 
     if parked:
         if mode == "async":                              # queue and hand back a job id

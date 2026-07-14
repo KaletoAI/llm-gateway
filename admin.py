@@ -719,6 +719,11 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + _field("priority", _inp("priority", g("priority", "10"), typ="number"))
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
             + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
+            + _field("comfy output dir", _inp("comfy_output_dir", g("comfy_output_dir"),
+                     placeholder="e.g. /home/kai/ComfyUI/output"))
+            + "<p class='hint' style='margin:-4px 0 10px'>Absolute path to this ComfyUI's <b>output</b> "
+              "directory — only needed for <b>workflow chains</b> (a successor stage reads the previous "
+              "stage's mesh by full path from here). Leave blank otherwise.</p>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
             + _field("discovery filters",
@@ -949,6 +954,11 @@ async def backend_save(request: Request):
         b["host"] = host
     else:
         b.pop("host", None)                    # blank = derive from the URL host/IP
+    cod = (f.get("comfy_output_dir", "") or "").strip().rstrip("/")
+    if cod:
+        b["comfy_output_dir"] = cod
+    else:
+        b.pop("comfy_output_dir", None)
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
@@ -1968,7 +1978,37 @@ def _output_section(wf: dict, cands: list) -> str:
               "(<code>mixamo</code> → validated as a 52-joint humanoid GLB with embedded texture; "
               "<code>generic</code> → a rigged FBX + its basecolor PNG). Unmatched cases/globs are simply "
               "absent, so a split workflow still works; the job fails if nothing matches or validation "
-              "fails (e.g. the 2×2-dummy-texture bug).</p>")
+              "fails (e.g. the 2×2-dummy-texture bug).</p>"
+            + _chain_section(wf, cands))
+
+
+def _chain_section(wf: dict, cands: list) -> str:
+    """Workflow chain: this alias is stage 1 (the client interface); on success the
+    gateway runs a `successor` alias on the SAME backend, feeding it this stage's
+    exported mesh (by full path) + this stage's params, and delivers ONLY the
+    successor's result. Both runs are back-to-back (queue-isolated)."""
+    s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
+    node_opts = '<option value="">— export node —</option>'
+    for nid, n in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
+        cls = n.get("class_type", "")
+        if "export" in cls.lower() or "save" in cls.lower():
+            title = ((n.get("_meta") or {}).get("title") or "")
+            lbl = f"{nid} — {cls}" + (f" “{title}”" if title else "")
+            sel = " selected" if str(s.get("export_node")) == nid else ""
+            node_opts += f'<option value="{_esc(nid)}"{sel}>{_esc(lbl)}</option>'
+    return ("<h2 style='margin-top:18px'>Chain (successor)</h2>"
+            "<p class='hint'>Optional: run a second workflow after this one on the same backend and "
+            "deliver only its result — e.g. mesh here, rigging as the successor. Needs the backend's "
+            "<b>comfy output dir</b> set. Leave the successor blank for a normal single-stage alias.</p>"
+            + _field("successor alias", _inp("successor", s.get("alias", ""),
+                     placeholder="e.g. mesh-reg-mia"), short=True)
+            + _field("mesh export node", f'<select name="chain_export_node">{node_opts}</select>')
+            + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
+                     placeholder="mesh_path"), short=True)
+            + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh path, "
+              "and passes it to the successor under the <b>mesh param</b> (default <code>mesh_path</code> — "
+              "must be a request field on the successor). This stage's other params (name, no_fingers, …) "
+              "are threaded to the successor by matching param name.</p>")
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
@@ -2354,6 +2394,17 @@ async def update(request: Request):
             c["output_cases"] = out_cases
         elif out_flat:
             c["output_globs"] = out_flat
+    # chain successor (blank alias → not a chain)
+    succ_alias = (f.get("successor", "") or "").strip()
+    succ = ({"alias": succ_alias,
+             "export_node": (f.get("chain_export_node", "") or "").strip(),
+             "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "mesh_path"}
+            if succ_alias else None)
+    for c in cands:
+        if succ:
+            c["successor"] = succ
+        else:
+            c.pop("successor", None)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name
