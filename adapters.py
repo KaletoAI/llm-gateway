@@ -175,6 +175,7 @@ class NormalizedRequest:
     output_node: Optional[str] = None               # alias setting: ONLY this node's artifacts count
     output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
     output_globs: Optional[list] = None             # alias setting: deliver every file matching these globs
+    output_cases: Optional[list] = None             # alias setting: [{rig, globs}] — first detected case wins
 
 
 @dataclass
@@ -647,10 +648,11 @@ def _image_dims(b: bytes) -> Optional[tuple]:
     return None
 
 
-def _glb_texture_dims(data: bytes) -> Optional[list]:
-    """Dimensions of a GLB's embedded textures as [(w,h), …], or None if `data`
-    isn't a parseable glTF-binary. Reads the JSON + BIN chunks in pure Python and
-    pulls each image's PNG/JPEG header — the basis for the 2x2-dummy safety net."""
+def _glb_info(data: bytes) -> Optional[dict]:
+    """Parse a GLB in pure Python (JSON + BIN chunks): `{texture_dims:[(w,h),…],
+    mixamorig_joints:int, skins:int, meshes:int}`, or None if `data` isn't a
+    parseable glTF-binary. Backs the delivery validation (2x2 dummy, 52-joint
+    mixamorig skin, embedded texture present)."""
     try:
         if data[:4] != b"glTF" or len(data) < 20:
             return None
@@ -678,15 +680,25 @@ def _glb_texture_dims(data: bytes) -> Optional[list]:
             wh = _image_dims(head)
             if wh:
                 dims.append(wh)
-        return dims
+        joints = sum(1 for n in (gltf.get("nodes") or [])
+                     if str(n.get("name", "")).lower().startswith("mixamorig"))
+        return {"texture_dims": dims, "mixamorig_joints": joints,
+                "skins": len(gltf.get("skins") or []), "meshes": len(gltf.get("meshes") or [])}
     except Exception:
         return None
 
 
+def _glb_texture_dims(data: bytes) -> Optional[list]:
+    """Embedded-texture dimensions of a GLB (thin wrapper over _glb_info)."""
+    info = _glb_info(data)
+    return info["texture_dims"] if info is not None else None
+
+
 def _check_glb_not_dummy(blobs) -> None:
-    """Safety net: a GLB whose ONLY embedded texture is the 2x2 dummy is the known
-    texture-export node bug, not a result — fail the job clearly (raises, so it is
-    a final content error, never retried across backends)."""
+    """Safety net for the flat/single-file modes: a GLB whose ONLY embedded texture
+    is the 2x2 dummy is the known texture-export node bug, not a result — fail the
+    job clearly (raises → final content error, never retried across backends).
+    Case mode runs the fuller _validate_delivery instead."""
     for b in blobs:
         if b.mime != "model/gltf-binary":
             continue
@@ -696,6 +708,54 @@ def _check_glb_not_dummy(blobs) -> None:
             raise RuntimeError(f"GLB '{b.name or 'output'}' carries only a {w}x{h} dummy texture "
                                "(known texture-export node bug) — no real texture was embedded; "
                                "treated as a failed generation")
+
+
+_SIZE_LIMIT_MB = 30                                  # web-suitability guideline (warn, not fail)
+
+
+def validate_delivery(blobs: list, rig: Optional[str]) -> list:
+    """Gate a case-mode delivery before reporting success (returns warnings; raises
+    on hard failure). Per the character-model spec:
+    - mixamo (humanoid): a valid GLB with a mixamorig skin and a real embedded
+      texture; a 2x2 texture is the known node bug → fail.
+    - generic (non-humanoid): a rigged FBX AND its basecolor PNG (the FBX only
+      references the texture by a temp path, so the PNG must ship with it).
+    - both: files over ~30 MB warn (web-suitability guideline, not a hard fail).
+    Orientation/scale are the client's to normalise — not checked."""
+    warnings = []
+    for b in blobs:
+        mb = len(b.data) / (1024 * 1024)
+        if mb > _SIZE_LIMIT_MB:
+            warnings.append(f"{b.name} is {mb:.0f} MB (> {_SIZE_LIMIT_MB} MB guideline)")
+    if rig == "mixamo":
+        glb = next((b for b in blobs if b.mime == "model/gltf-binary"), None)
+        if glb is None:
+            raise RuntimeError("humanoid (mixamo) result: no GLB was delivered")
+        info = _glb_info(glb.data)
+        if info is None:
+            raise RuntimeError(f"humanoid result '{glb.name}': not a valid GLB")
+        if info["skins"] == 0 or info["mixamorig_joints"] == 0:
+            raise RuntimeError(f"humanoid result '{glb.name}': no mixamorig skin "
+                               f"(skins={info['skins']}, mixamorig joints={info['mixamorig_joints']})")
+        dims = info["texture_dims"]
+        if not dims:
+            raise RuntimeError(f"humanoid result '{glb.name}': no embedded texture")
+        if max(max(w, h) for w, h in dims) <= 2:
+            raise RuntimeError(f"humanoid result '{glb.name}': embedded texture is a 2x2 dummy "
+                               "(known node bug) — no result")
+        if info["mixamorig_joints"] < 50:
+            warnings.append(f"{glb.name}: {info['mixamorig_joints']} mixamorig joints (expected ~52)")
+    elif rig == "generic":
+        fbx = next((b for b in blobs if (b.name or "").lower().endswith(".fbx")), None)
+        png = next((b for b in blobs if (b.mime or "").startswith("image/")), None)
+        if fbx is None:
+            raise RuntimeError("non-humanoid (generic) result: no rigged FBX was delivered")
+        if not (fbx.data[:23].find(b"Kaydara FBX") != -1 or fbx.data[:4] == b"; FB"):
+            warnings.append(f"{fbx.name}: does not look like an FBX (magic missing)")
+        if png is None:
+            raise RuntimeError("non-humanoid (generic) result: no basecolor PNG — the FBX only "
+                               "references its texture by a temp path, so the PNG must ship with it")
+    return warnings
 
 
 def _view_params(item) -> Optional[tuple]:
@@ -1378,16 +1438,25 @@ class ComfyUIAdapter(BackendAdapter):
                 if log_on:
                     logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
                 outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
-                blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
-                                                  req.output_ext, req.output_globs)
-                if req.output_globs and not blobs:
-                    raise RuntimeError(f"no output file matched {req.output_globs} "
-                                       f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
-                if req.output_node and not blobs:
-                    extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
-                    raise RuntimeError(f"configured output node {req.output_node} produced "
-                                       f"no fetchable artifact{extra} (no matching file in its outputs)")
-                _check_glb_not_dummy(blobs)      # fail on the 2x2-dummy-texture export bug
+                rig, warnings = None, []
+                if req.output_cases:                 # conditional case delivery (+ rig + validation)
+                    blobs, rig = await self._fetch_by_cases(client, url, outputs, req.output_cases)
+                    if not blobs:
+                        raise RuntimeError(f"no output case matched (rigs: "
+                                           f"{[c.get('rig') for c in req.output_cases]}; nodes with "
+                                           f"outputs: {', '.join(sorted(outputs)) or 'none'})")
+                    warnings = validate_delivery(blobs, rig)
+                else:
+                    blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
+                                                      req.output_ext, req.output_globs)
+                    if req.output_globs and not blobs:
+                        raise RuntimeError(f"no output file matched {req.output_globs} "
+                                           f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
+                    if req.output_node and not blobs:
+                        extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
+                        raise RuntimeError(f"configured output node {req.output_node} produced "
+                                           f"no fetchable artifact{extra} (no matching file in its outputs)")
+                    _check_glb_not_dummy(blobs)  # 2x2-dummy safety net (case mode does it in validate)
         finally:
             self.ctx.inflight_dec(self.bid)
 
@@ -1397,6 +1466,8 @@ class ComfyUIAdapter(BackendAdapter):
         return GenOutput(blobs=blobs, meta={
             "backend": bname, "workflow": req.workflow,
             "elapsed_ms": elapsed_ms, **summary,
+            **({"rig": rig} if rig else {}),
+            **({"warnings": warnings} if warnings else {}),
         })
 
     async def _poll(self, client, url, prompt_id, poll_interval, max_wait, started) -> dict:
@@ -1511,6 +1582,23 @@ class ComfyUIAdapter(BackendAdapter):
                                 mime = {"video": "video/mp4", "audio": "audio/mpeg"}[top]
                     blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=fn))
         return blobs
+
+    async def _fetch_by_cases(self, client, url, outputs, cases) -> tuple:
+        """Conditional delivery: pick the FIRST case whose detect file (its first
+        glob) actually exists in this run, then deliver all of that case's globs.
+        Two riggers may share a workflow (humanoid MIA vs non-humanoid UniRig) or
+        live in split workflows — either way exactly one case's detect file is
+        present, so the client gets that case's files + its rig type. Returns
+        (blobs, rig)."""
+        for case in cases:
+            globs = case.get("globs") or []
+            if not globs:
+                continue
+            if not await self._fetch_by_globs(client, url, outputs, globs[:1]):
+                continue                              # detect file absent → this case didn't run
+            blobs = await self._fetch_by_globs(client, url, outputs, globs)
+            return blobs, case.get("rig")
+        return [], None
 
     async def _fetch_by_globs(self, client, url, outputs, globs) -> list[GenBlob]:
         """Deliver every registered file (or a same-stem sibling) matching a glob.

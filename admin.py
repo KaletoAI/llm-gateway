@@ -1944,6 +1944,9 @@ def _output_section(wf: dict, cands: list) -> str:
         opts += f'<option value="{_esc(cur)}" selected>{_esc(cur)} — (stale: node missing)</option>'
     cur_ext = next((str(c.get("output_ext")) for c in cands if c.get("output_ext")), "")
     cur_globs = next((c.get("output_globs") for c in cands if c.get("output_globs")), []) or []
+    cur_cases = next((c.get("output_cases") for c in cands if c.get("output_cases")), []) or []
+    globs_text = ("\n".join(f"{c.get('rig','')}: {', '.join(c.get('globs') or [])}" for c in cur_cases)
+                  if cur_cases else "\n".join(cur_globs))
     return ("<h2>Output</h2>"
             "<p class='hint'>Which node's artifacts the job returns. <b>auto</b> collects from every "
             "output-producing node. Pin the final node when the workflow also exports intermediates — "
@@ -1954,13 +1957,18 @@ def _output_section(wf: dict, cands: list) -> str:
               "reports — some nodes register only one format but write several next to it (UniRig reports "
               "the <code>.fbx</code> but also writes <code>.glb</code>). Blank = deliver what the node "
               "reports. The job fails clearly if the sibling doesn't exist.</p>"
-            + _field("output files", _textarea("output_globs", "\n".join(cur_globs), 3,
-                     "one glob per line, e.g.\n*_articulationxl.fbx\n*basecolor*.png\n*_mia.glb"), wide=True)
-            + "<p class='hint'><b>Multi-file delivery</b> (overrides the two fields above when set): deliver "
-              "EVERY file matching these globs, gathered across all output nodes — including a same-stem "
-              "sibling with a glob's extension (so <code>*_mia.glb</code> grabs the .glb written next to a "
-              "reported <code>_mia.fbx</code>). Unmatched globs are just absent, so a later split workflow "
-              "still works; the job fails only if nothing matches at all.</p>")
+            + _field("output files", _textarea("output_globs", globs_text, 4,
+                     "plain globs (deliver all), or 'rig: globs' lines for conditional cases:\n"
+                     "mixamo: *_mia.glb\ngeneric: *_articulationxl.fbx, *basecolor*.png"), wide=True)
+            + "<p class='hint'><b>Multi-file delivery</b> (overrides the two fields above). Plain glob lines "
+              "deliver EVERY match across all output nodes, including a same-stem sibling with a glob's "
+              "extension (so <code>*_mia.glb</code> grabs the .glb next to a reported <code>_mia.fbx</code>). "
+              "<br><b>Cases</b> — <code>rig: glob, glob</code> per line: the FIRST case whose first glob "
+              "actually exists wins, and only its files ship, tagged with that <b>rig</b> type "
+              "(<code>mixamo</code> → validated as a 52-joint humanoid GLB with embedded texture; "
+              "<code>generic</code> → a rigged FBX + its basecolor PNG). Unmatched cases/globs are simply "
+              "absent, so a split workflow still works; the job fails if nothing matches or validation "
+              "fails (e.g. the 2×2-dummy-texture bug).</p>")
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
@@ -2325,13 +2333,27 @@ async def update(request: Request):
             c["output_ext"] = out_ext
         else:
             c.pop("output_ext", None)
-    # multi-file globs (one per line/comma; overrides node+ext when set)
-    globs = [g.strip() for g in re.split(r"[\r\n,]+", f.get("output_globs", "") or "") if g.strip()]
-    for c in cands:
-        if globs:
-            c["output_globs"] = globs
+    # output files (overrides node+ext): 'rig: globs' lines → conditional cases,
+    # plain glob lines → flat multi-file delivery.
+    out_cases, out_flat = [], []
+    for line in re.split(r"[\r\n]+", f.get("output_globs", "") or ""):
+        line = line.strip()
+        if not line:
+            continue
+        if ":" in line and not line.startswith("*"):
+            label, _, rest = line.partition(":")
+            gl = [g.strip() for g in rest.split(",") if g.strip()]
+            if gl:
+                out_cases.append({"rig": label.strip().lower(), "globs": gl})
         else:
-            c.pop("output_globs", None)
+            out_flat += [g.strip() for g in line.split(",") if g.strip()]
+    for c in cands:
+        c.pop("output_globs", None)
+        c.pop("output_cases", None)
+        if out_cases:
+            c["output_cases"] = out_cases
+        elif out_flat:
+            c["output_globs"] = out_flat
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name
@@ -2489,8 +2511,13 @@ def _job_result_html(job_id: str, job: Optional[dict]):
         src = f"/ui/playground/result/{_esc(job_id)}/{r['n']}"
         cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True)}</div>")
     imgs = "".join(cells)
+    meta = job.get("meta") or {}
+    tags = ""
+    if meta.get("rig"):
+        tags += " · " + _badge(f"rig: {meta['rig']}", "ok" if meta["rig"] == "mixamo" else "warn")
+    wrn = ("<p class='hint'>⚠ " + "; ".join(_esc(w) for w in meta["warnings"]) + "</p>") if meta.get("warnings") else ""
     return (f"<h2>Result</h2><p>✓ done · job {_esc(job_id)} · "
-            f"backend {_esc(job.get('backend'))}</p>{imgs or '<p class=muted>No artifacts.</p>'}"), None
+            f"backend {_esc(job.get('backend'))}{tags}</p>{wrn}{imgs or '<p class=muted>No artifacts.</p>'}"), None
 
 
 async def playground_page(request: Request):

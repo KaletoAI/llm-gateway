@@ -1717,9 +1717,18 @@ async def _job_view(job_id: str, request: Request) -> dict:
     base = str(request.base_url).rstrip("/")
     view["results"] = [{
         "n": r["n"], "mime": r["mime"], "kind": r["kind"], "name": r.get("name"),
+        "sha256": r.get("sha256"),
         "url": f"{base}/v1/jobs/{job_id}/result/{r['n']}",
     } for r in job["results"]]
     meta = job.get("meta") or {}
+    # Client-facing delivery metadata: rig type (mixamo → shared anim library
+    # applies; generic → procedural idle), any web-suitability warnings, and the
+    # workflow identity (the alias) — see the character-model spec.
+    if meta.get("rig"):
+        view["rig"] = meta["rig"]
+    if meta.get("warnings"):
+        view["warnings"] = meta["warnings"]
+    view["workflow"] = job["alias"]
     view["inputs"] = meta.get("inputs")
     view["input_images"] = [{
         "n": r["n"], "slot": r.get("slot"), "mime": r["mime"],
@@ -1976,6 +1985,7 @@ async def run_generation(body: dict, request: Request,
             loras=body.get("loras"), output_node=(cand.get("output_node") or None),
             output_ext=(cand.get("output_ext") or None),
             output_globs=(cand.get("output_globs") or None),
+            output_cases=(cand.get("output_cases") or None),
         )
 
     first, cand0 = routes[0]

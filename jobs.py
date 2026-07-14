@@ -15,6 +15,7 @@ job-ownership checks slot in without a migration.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -234,7 +235,8 @@ def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
         fname = f"{n}{ext}"
         with open(os.path.join(job_dir, fname), "wb") as f:
             f.write(blob.data)
-        entry = {"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname}
+        entry = {"n": n, "mime": blob.mime, "kind": blob.kind, "filename": fname,
+                 "sha256": hashlib.sha256(blob.data).hexdigest()}
         if orig:
             entry["name"] = orig
         manifest.append(entry)
