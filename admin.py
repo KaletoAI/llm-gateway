@@ -581,8 +581,11 @@ async def _fetch_oi_class(client, url: str, cls: str):
             for fn, fspec in (spec.get(section) or {}).items():
                 if not (isinstance(fspec, list) and fspec):
                     continue
-                if isinstance(fspec[0], list):                      # combo → options list
+                if isinstance(fspec[0], list):                      # combo (old form) → options list
                     fields[fn] = fspec[0]
+                elif fspec[0] == "COMBO" and len(fspec) > 1 and isinstance(fspec[1], dict) \
+                        and isinstance(fspec[1].get("options"), list):
+                    fields[fn] = list(fspec[1]["options"])          # combo (new form: ["COMBO", {options}])
                 elif fspec[0] in ("FLOAT", "INT") and len(fspec) > 1 and isinstance(fspec[1], dict):
                     c = fspec[1]                                    # numeric → discovery constraints
                     fields[fn] = {"_num": fspec[0], "default": c.get("default"),
@@ -592,15 +595,21 @@ async def _fetch_oi_class(client, url: str, cls: str):
         return cls, None
 
 
-async def _object_info(backend_name: str, wf: dict) -> dict:
-    """Per-class /object_info for the workflow's loader nodes. Fetches the uncached
-    classes **in parallel** (was sequential → slow editor open) and caches them with
-    a short TTL, so re-opening an alias is instant."""
+async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = None) -> dict:
+    """Per-class /object_info for the workflow's loader nodes PLUS every mapped node
+    (a request field may be a combo/number on any node — e.g. UniRigAutoRig's
+    skeleton_template — and those need widget metadata too). Fetches uncached classes
+    in parallel and caches them with a short TTL, so re-opening an alias is instant."""
     url = _backend_url(backend_name)
     if not url:
         return {}
     classes = {n.get("class_type", "") for n in wf.values()
                if any(h in (n.get("class_type", "") or "").lower() for h in _LOADER_HINTS)}
+    for m in (mapping or {}).values():                # mapped nodes' combos/numbers → widgets
+        cls = (wf.get((m or {}).get("node")) or {}).get("class_type", "")
+        if cls:
+            classes.add(cls)
+    classes.discard("")
     now = time.monotonic()
     out: dict = {}
     missing = []
@@ -1981,7 +1990,7 @@ async def _alias_editor(alias: str) -> str:
         except Exception:
             wf = {}
     wf = wf or {}
-    oi = await _object_info(cand.get("backend", ""), wf)
+    oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping"))
     mapping = cand.get("mapping") or {}
     fixed = cand.get("fixed") or []
     mapped = ({(m["node"], m["field"]) for m in mapping.values()}
@@ -2145,7 +2154,7 @@ async def field_clear(request: Request):
         if m and wf and m.get("node") in wf:
             node, field = m["node"], m["field"]
             cls = wf.get(node, {}).get("class_type", "")
-            opts = (await _object_info(cand.get("backend", ""), wf)).get(cls, {}).get(field)
+            opts = (await _object_info(cand.get("backend", ""), wf, cand.get("mapping"))).get(cls, {}).get(field)
             if isinstance(opts, list):                   # authoritative: does the combo offer "None"?
                 none_ok = "None" in opts
             else:                                        # oi unreachable → fall back to a lora name/class hint
@@ -2393,7 +2402,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             dv = defaults.get(p)
             node, field = (m or {}).get("node"), (m or {}).get("field")
             opts = (oi or {}).get((wf.get(node) or {}).get("class_type", ""), {}).get(field)
-            if opts and _is_model_field(opts, dv):       # combo/model field (lora_name, …) → dropdown
+            if isinstance(opts, list) and opts:          # ANY combo (model, skeleton_template, …) → dropdown
                 cur = v(p) or (str(dv) if dv is not None else "")
                 o = list(opts)
                 if cur and cur not in o:
@@ -2510,7 +2519,7 @@ async def playground_page(request: Request):
     else:
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the result here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
-    oi = await _object_info(cand.get("backend", ""), wf) if cand else {}
+    oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping")) if cand else {}
     kept = set(_pg_images.get(_session_user(request) or "default", {}).keys())
     poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
     return HTMLResponse(_page("Media Playground",
@@ -3120,6 +3129,17 @@ async def job_to_playground(job_id: str, request: Request):
     alias = job.get("alias", "")
     meta = job.get("meta") or {}
     inp = meta.get("inputs") or {}
+    # Stored params/slots are keyed by the EXTERNAL name (a mapping label, e.g.
+    # "remove background"), because a client sends them under the schema's label.
+    # The playground reads p__<param>/img__<param>, so translate external→param;
+    # else nothing lands (this was the "Send to Playground does nothing" for mesh).
+    mapping = ((store.get(alias) or [{}])[0]).get("mapping") or {}
+    ext2param = {}
+    for p, m in mapping.items():
+        ext2param[p] = p
+        lbl = ((m or {}).get("label") or "").strip()
+        if lbl:
+            ext2param[lbl] = p
     q = {"sub": "media", "model": alias}
     if inp.get("prompt"):
         q["p__prompt"] = inp["prompt"]
@@ -3127,7 +3147,7 @@ async def job_to_playground(job_id: str, request: Request):
         q["p__negative_prompt"] = inp["negative_prompt"]
     for k, val in (inp.get("params") or {}).items():
         if val is not None and str(val) != "":
-            q[f"p__{k}"] = str(val)
+            q[f"p__{ext2param.get(k, k)}"] = str(val)
     user = _session_user(request) or "default"
     stash = _pg_images.setdefault(user, {})
     for r in meta.get("input_images", []):
@@ -3135,7 +3155,7 @@ async def job_to_playground(job_id: str, request: Request):
         if ip:
             try:
                 with open(ip[0], "rb") as fh:
-                    stash[r.get("slot")] = fh.read()
+                    stash[ext2param.get(r.get("slot"), r.get("slot"))] = fh.read()
             except OSError:
                 pass
     return RedirectResponse(f"/ui/playground?{urlencode(q)}", status_code=303)
