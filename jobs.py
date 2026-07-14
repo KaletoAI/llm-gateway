@@ -59,10 +59,14 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
                 error        TEXT,
                 result_count INTEGER NOT NULL DEFAULT 0,
                 results_json TEXT,
-                meta_json    TEXT
+                meta_json    TEXT,
+                stage        TEXT
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)")
+        cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "stage" not in cols:                # migrate existing DBs (multi-stage progress, e.g. "1/2")
+            c.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
     logger.info(f"jobs: store at {_DB_PATH}, blobs in {_BLOB_DIR}/ (default ttl {_DEFAULT_TTL}s)")
     n = reconcile_orphans()
     if n:
@@ -131,7 +135,7 @@ def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = Non
     flt = f" WHERE {' AND '.join(conds)}" if conds else ""
     with _conn() as c:
         rows = c.execute(
-            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error "
+            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error, stage "
             f"FROM jobs{flt} ORDER BY created DESC LIMIT ?", (*args, limit)).fetchall()
     return [dict(r) for r in rows]
 
@@ -210,9 +214,17 @@ def set_status(job_id: str, status: str) -> None:
                   (status, int(time.time()), job_id))
 
 
+def set_stage(job_id: str, stage: Optional[str]) -> None:
+    """Set a job's sub-stage label (e.g. "1/2" for a multi-stage chain), shown next
+    to `running` in the UI. Cleared (None) when the job leaves the running state."""
+    with _conn() as c:
+        c.execute("UPDATE jobs SET stage=?, updated=? WHERE id=?",
+                  (stage, int(time.time()), job_id))
+
+
 def fail(job_id: str, error: str) -> None:
     with _conn() as c:
-        c.execute("UPDATE jobs SET status='failed', error=?, updated=? WHERE id=?",
+        c.execute("UPDATE jobs SET status='failed', error=?, stage=NULL, updated=? WHERE id=?",
                   (str(error), int(time.time()), job_id))
 
 
@@ -256,7 +268,7 @@ def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
 def _mark_done(c, job_id: str, meta: dict, results: list) -> None:
     """The one done-UPDATE. Re-points `backend` to where the job actually ran
     (meta['backend']) — after a failover that differs from the create() value."""
-    sets = "status='done', error=NULL, updated=?, result_count=?, results_json=?, meta_json=?"
+    sets = "status='done', error=NULL, stage=NULL, updated=?, result_count=?, results_json=?, meta_json=?"
     args = [int(time.time()), len(results), json.dumps(results), json.dumps(meta)]
     if meta.get("backend"):
         sets += ", backend=?"

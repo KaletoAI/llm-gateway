@@ -1926,11 +1926,13 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
     # 1's backend (shared disk). Upload relay picks the successor alias's best candidate
     # — preferring stage 1's backend if it is itself one (keeps the fast in-process path).
     if relay == "upload":
-        cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # [(backend, cand)], busy incl.
+        cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
         if not cands2:
             await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
-                                    "healthy candidate backend for the upload relay")
+                                    "enabled+healthy candidate backend for the upload relay")
             return
+        # take an ALLOWED successor candidate, PREFERRING the same backend as stage 1 (shared box is fine);
+        # if the successor isn't allowed on stage 1's backend, use its best other candidate.
         backend2, s2 = next((bc for bc in cands2 if backend_id(bc[0]) == bid), None) or cands2[0]
     else:
         backend2 = backend
@@ -1966,6 +1968,7 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
     held = bid
     active = backend                                    # backend to free VRAM on
     await asyncio.to_thread(jobs.set_status, job_id, "running")
+    await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
     try:
         # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
         req1 = NormalizedRequest(
@@ -2020,6 +2023,7 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
             raw=request, output_node=(s2.get("output_node") or None),
             output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
             output_cases=(s2.get("output_cases") or None))
+        await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
         out2 = await adapter2.generate(req2)
         blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
         meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}

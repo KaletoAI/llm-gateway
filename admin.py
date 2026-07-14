@@ -2027,8 +2027,10 @@ def _chain_section(wf: dict, cands: list) -> str:
               "backend (shared disk) and passes the mesh's absolute output path. <code>upload</code> lets the "
               "successor run on a DIFFERENT backend — the gateway fetches the mesh and uploads it into that "
               "backend's <b>input</b> dir, passing the stored filename (the successor's mesh param must feed a "
-              "node that loads from input/, e.g. a Load-3D/upload node). This stage's other params (name, "
-              "no_fingers, …) are threaded to the successor by matching param name.</p>"
+              "node that loads from input/, e.g. a Load-3D/upload node). Stage 2 runs on an <b>allowed</b> "
+              "successor candidate, preferring the same backend as stage 1; so only list the successor on "
+              "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
+              "threaded to the successor by matching param name.</p>"
             + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
                      placeholder="e.g. *basecolor*.png"), short=True)
             + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
@@ -3052,6 +3054,14 @@ _JOB_TICK = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=
 _JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
 
 
+def _job_status_text(j: dict) -> str:
+    """Status label with the multi-stage sub-step appended while running — a chain in
+    stage 1 shows 'running 1/2', in stage 2 'running 2/2'. Single-stage jobs are plain."""
+    st = j.get("status") or ""
+    stg = j.get("stage")
+    return f"{st} {stg}" if st == "running" and stg else st
+
+
 def _job_dur_cell(j: dict, now: int) -> str:
     """Duration cell: fixed for finished jobs, JS-ticking (`.jdur` + _JOB_TICK) while
     running, em-dash while queued. Shared by Media Jobs and the dashboard."""
@@ -3077,7 +3087,7 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     if task_col:
         cells.append(f"<td>{_esc(j.get('task'))}</td>")
     cells += [f"<td>{_esc(j.get('alias'))}</td>", f"<td>{_esc(j.get('backend'))}</td>",
-              f"<td><span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></td>"]
+              f"<td><span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(j))}</span></td>"]
     if count_col:
         cells.append(f"<td class='muted'>{j.get('result_count') or 0}</td>")
     cells += [f"<td class='muted'>{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
@@ -3271,7 +3281,7 @@ async def job_detail_page(job_id: str, request: Request):
     if not inbox:
         inbox = "<p class='muted'>No stored inputs (job predates this feature).</p>"
     if st in ("queued", "running"):
-        outbox = f"<p>⏳ <b>{_esc(st)}</b> · this view auto-updates</p>"
+        outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
     elif st == "failed":
         outbox = f"<p class='bad'>✗ failed</p><pre class='err'>{_esc(job.get('error'))}</pre>"
     elif job.get("results"):
@@ -3292,7 +3302,7 @@ async def job_detail_page(job_id: str, request: Request):
     nav = ((_btn("‹ Prev", f"/ui/job/{_esc(newer)}", "secondary", title="Newer job") if newer else "")
            + (_btn("Next ›", f"/ui/job/{_esc(older)}", "secondary", title="Older job") if older else ""))
     page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
-            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(st)}</span></h2>"
+            f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(job))}</span></h2>"
             f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
             f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"

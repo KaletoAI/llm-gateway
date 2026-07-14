@@ -1,24 +1,27 @@
 """Skinning-weight repair for a rigged GLB, run in the gateway before delivery.
 
-Auto-riggers bind some vertices to wrong bones (a foot vertex to the head bone, a
-sleeve vertex to the spine). It's invisible in bind pose but the mesh shatters when
-animated. The error rate rises with mesh resolution (Trellis 56-59k verts: none;
-Pixal3D Bianca 287k verts: >20k). Fixing it client-side would cost millions of
-distance ops on every page load per character; doing it once here is cheap.
+Auto-riggers mis-bind vertices two ways, both invisible in bind pose but ugly once
+animated: a DRAG/SPIKE (a weight on a bone far from the vertex — a shin vertex partly
+weighted to the foot bone shoots out when the ankle turns) and a RING/WEB (a crotch or
+armpit vertex weighted to BOTH sibling limbs — it stretches into a web when the legs
+spread). The error rate rises with mesh resolution (a 148k-vert Bianca had ~2700 both-
+leg vertices; a 57k Trellis mesh a handful). Fixing it client-side would cost millions
+of distance ops on every page load per character; doing it once here is cheap.
 
-Pure numpy on the glTF data — no 3D engine. Only JOINTS_0/WEIGHTS_0 change; a healthy
-model gets 0 corrections, so it is safe to always run.
+Pure numpy on the glTF data — no 3D engine. Only JOINTS_0/WEIGHTS_0 change.
 
-Method (verified client-side):
-  1. Bone segments: from each bone's world position (inverse bind matrix) to its
-     first child bone; childless bones stay a point.
-  2. Detect: per vertex, distance to every segment. The highest-weight bone is
-     "dominant"; if its segment is >~2.5x farther than the nearest, the vertex is
-     mis-bound.
-  3. Re-weight the mis-bound: the 3 nearest segments, inverse-distance, normalized.
-  4. Seam unification: vertices at the same position (rounded 1e-4) must share
-     weights, else the UV seams tear — sum the group's weights, keep the top 4,
-     normalize.
+Method (all local, per vertex — the skeleton hierarchy is the ground truth, NOT geometric
+neighbours, which cross the left/right gap where two limbs touch in space):
+  1. Bone segments: from each bone's world position (inverse bind matrix) to its first
+     child bone; childless bones stay a point.
+  2. Drop DRAG: any weight on a bone whose segment is >~2.5x farther than the nearest
+     segment (a long-range pull). At-joint blends survive — there both bones are close.
+  3. Drop RING: keep only a single ancestor chain of bones (Hips→UpLeg→Leg→Foot). Walking
+     the remaining weights high→low, a bone is dropped if it is incompatible (neither an
+     ancestor nor a descendant) of a heavier kept bone — i.e. a sibling limb. Renormalize;
+     a vertex left with nothing is pinned rigidly to its single nearest bone.
+  4. Seam unification (run BEFORE 2-3 so the chain enforcement has the last word): UV-seam
+     twins at the same rounded position share one weight set, else the seam tears.
 """
 import json
 import struct
@@ -27,7 +30,9 @@ import numpy as np
 
 _CT = {5120: "<i1", 5121: "<u1", 5122: "<i2", 5123: "<u2", 5125: "<u4", 5126: "<f4"}
 _NC = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
-_MISWEIGHT_RATIO = 2.5
+_MISWEIGHT_RATIO = 2.5      # a weighted bone this much farther than the nearest → mis-bound
+_WEIGHT_MIN = 0.15          # a weight below this doesn't count toward "reach" (noise)
+_MIN_REACH_FRAC = 0.03      # ignore reaches under this fraction of the bbox diagonal
 _SEAM_ROUND = 1e-4
 
 
@@ -108,6 +113,79 @@ def _seg_dist(pos, a, b, ab, ab_len2):
     return np.linalg.norm(pos - (a + t[:, None] * ab), axis=1)
 
 
+def _bone_compat(gltf, skin):
+    """(J,J) bool: bones a,b are 'compatible' iff one is an ancestor of the other in the
+    skeleton — i.e. they lie on a single root→leaf chain (Hips→UpLeg→Leg→Foot). Sibling
+    limbs (LeftUpLeg vs RightUpLeg) are INCOMPATIBLE: a vertex weighted to both stretches
+    into a ring/web when they animate apart, which no geometric test near the crotch can
+    see (both are close there). The tree is the ground truth for that."""
+    joints = skin["joints"]
+    J = len(joints)
+    pos_in = {node: i for i, node in enumerate(joints)}
+    parent = [-1] * J
+    for i, node in enumerate(joints):
+        for ch in (gltf["nodes"][node].get("children") or []):
+            if ch in pos_in:
+                parent[pos_in[ch]] = i
+    anc = [set() for _ in range(J)]
+    for i in range(J):
+        x = i
+        seen = 0
+        while x != -1 and seen <= J:                 # seen guard: never loop on a malformed skeleton
+            anc[i].add(x)
+            x = parent[x]
+            seen += 1
+    compat = np.zeros((J, J), dtype=bool)
+    for a in range(J):
+        for b in range(J):
+            compat[a, b] = (a in anc[b]) or (b in anc[a])
+    return compat
+
+
+def _repair_weights(jnt, wgt, dist, near, compat, scale):
+    """Fix mis-bound vertices locally, in place. Two defects, one pass:
+      • drag/spike — a weight on a bone far from the vertex (> ratio x nearest): dropped.
+      • ring/web — weights spanning two incompatible bones (sibling limbs): the weaker
+        branch is dropped, keeping a single ancestor chain (greedy, weight-descending).
+    A vertex left empty (all its weight was on wrong-and-far bones) is pinned rigidly to
+    the single nearest bone — safe, it cannot spike. Returns the changed-vertex mask."""
+    V = jnt.shape[0]
+    rows = np.arange(V)
+    wj = dist[rows[:, None], jnt]                     # (V,4) segment distance to each carried bone
+    far = ((wgt > 1e-6)                               # a real weight on a bone this vertex is nowhere near:
+           & (wj > _MISWEIGHT_RATIO * np.maximum(near[:, None], 1e-9))   # a long-range drag → drop it (at-
+           & (wj > _MIN_REACH_FRAC * scale))          # joint blends stay: there both bones are close, not far
+    w = np.where(far, 0.0, wgt)                       # drop weights on far bones
+    order = np.argsort(-w, axis=1)                    # process weights high→low
+    js = np.take_along_axis(jnt, order, axis=1)
+    ws = np.take_along_axis(w, order, axis=1)
+    keep = np.zeros((V, 4), dtype=bool)
+    keep[:, 0] = ws[:, 0] > 0
+    for i in range(1, 4):                             # keep slot i iff compatible with every kept slot < i
+        comp = ws[:, i] > 0
+        for k in range(i):
+            comp &= (~keep[:, k]) | compat[js[:, i], js[:, k]]
+        keep[:, i] = comp
+    dropped = (ws > 0) & ~keep
+    ws = np.where(keep, ws, 0.0)
+    tot = ws.sum(axis=1)
+    empty = tot <= 1e-8                               # nothing left → rigid nearest bone
+    if empty.any():
+        nn = np.argmin(dist[empty], axis=1)
+        js[empty] = 0; ws[empty] = 0.0
+        js[empty, 0] = nn; ws[empty, 0] = 1.0
+        tot = ws.sum(axis=1)
+    ws = ws / np.maximum(tot[:, None], 1e-9)
+    applied = far.any(axis=1) | dropped.any(axis=1) | empty      # any weight actually moved → write it
+    jnt[applied] = js[applied]
+    wgt[applied] = ws[applied].astype(np.float32)
+    # "corrected" counts only MEANINGFUL repairs — a significant weight dropped for being
+    # far, a cross-branch weight removed, or a vertex re-pinned — not the tiny long-range
+    # falloff trims that also happen (they barely change the vertex).
+    meaningful = (far & (wgt >= _WEIGHT_MIN)).any(axis=1) | dropped.any(axis=1) | empty
+    return meaningful
+
+
 def _unify_seams(pos, jnt, wgt):
     """Vertices at the same rounded position get one shared weight set (top-4,
     normalized). Returns the number of vertices whose weights actually changed."""
@@ -163,8 +241,9 @@ def repair(data: bytes):
             if skin_idx is None:
                 continue
             if skin_idx not in seg_cache:
-                seg_cache[skin_idx] = _bone_geometry(gltf, io, skins[skin_idx])
-            seg_a, seg_b = seg_cache[skin_idx]
+                seg_cache[skin_idx] = (_bone_geometry(gltf, io, skins[skin_idx]),
+                                       _bone_compat(gltf, skins[skin_idx]))
+            (seg_a, seg_b), compat = seg_cache[skin_idx]
             J = seg_a.shape[0]
             ab = seg_b - seg_a
             ab_len2 = np.einsum("ij,ij->i", ab, ab)
@@ -183,25 +262,15 @@ def repair(data: bytes):
                 dist = np.empty((V, J), dtype=np.float32)
                 for j in range(J):
                     dist[:, j] = _seg_dist(pos, seg_a[j], seg_b[j], ab[j], ab_len2[j])
-                dom_local = np.argmax(wgt, axis=1)
-                dom_joint = jnt[np.arange(V), dom_local]
-                dom_dist = dist[np.arange(V), dom_joint]
                 near_dist = dist.min(axis=1)
-                mis = dom_dist > _MISWEIGHT_RATIO * np.maximum(near_dist, 1e-9)
-                idx = np.where(mis)[0]
-                if len(idx):
-                    order = np.argsort(dist[idx], axis=1)[:, :3]        # 3 nearest joints
-                    d3 = np.take_along_axis(dist[idx], order, axis=1)
-                    inv = 1.0 / np.maximum(d3, 1e-9)
-                    w3 = inv / inv.sum(axis=1, keepdims=True)
-                    nj = np.zeros((len(idx), 4), dtype=jnt.dtype)
-                    nw = np.zeros((len(idx), 4), dtype=np.float32)
-                    nj[:, :3] = order
-                    nw[:, :3] = w3
-                    jnt[idx] = nj
-                    wgt[idx] = nw
-                corrected += int(len(idx))
+                scale = float(np.linalg.norm(pos.max(axis=0) - pos.min(axis=0)))
+                # Unify UV-seam twins FIRST, then repair — so the chain/branch enforcement
+                # is the LAST word and a crotch-midline seam can't merge the two legs back
+                # together. Fix drag/spike (weight on a far bone) AND ring/web (weights
+                # across two sibling limbs) in one local pass.
                 seams += _unify_seams(pos, jnt, wgt)
+                changed = _repair_weights(jnt, wgt, dist, near_dist, compat, scale)
+                corrected += int(changed.sum())
                 # write back (clip joint indices to the accessor's integer type)
                 io.write(ji, jnt)
                 io.write(wi, wgt)
