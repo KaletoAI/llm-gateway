@@ -23,7 +23,8 @@ import reasoning
 import stats
 import store
 from adapters import (AdapterContext, NormalizedRequest, image_params, is_image_field,
-                      lora_counterpart, lora_groups, make_adapter, slot_empty_mode)
+                      lora_counterpart, lora_groups, make_adapter, slot_empty_mode,
+                      validate_delivery)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -1858,6 +1859,8 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
     succ_alias = (succ.get("alias") or "").strip()
     export_node = str(succ.get("export_node") or "").strip()
     mesh_param = (succ.get("mesh_param") or "mesh_path").strip()
+    keep_globs = [g.strip() for g in (succ.get("keep_from_mesh") or []) if g.strip()]
+    chain_rig = (succ.get("rig") or "").strip() or None
     if adapter is None or not outdir:
         await asyncio.to_thread(jobs.fail, job_id, f"chain needs an adapter and a "
                                 f"comfy_output_dir on backend '{backend.get('name')}'")
@@ -1901,7 +1904,14 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
             fixed=list(stage1_cand.get("fixed") or [])
                  + [{"node": export_node, "field": "filename_prefix", "value": prefix}],
             upload_images=dict(upload_images or {}), raw=request)
-        await adapter.generate(req1)
+        out1 = await adapter.generate(req1)
+        # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
+        # PNG — the mesh/texturing stage bakes it; the UniRig fbx only references its
+        # texture) travel from stage 1 into the final delivery.
+        import fnmatch
+        mesh_extras = [b for b in (out1.blobs or [])
+                       if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
+                                             for g in keep_globs)]
         r = await http_client.get(f"{backend['url'].rstrip('/')}/view",
                                   params={"filename": mesh_name, "type": "output"}, timeout=15.0)
         if r.status_code != 200:
@@ -1919,11 +1929,17 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
             output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
             output_cases=(s2.get("output_cases") or None))
         out2 = await adapter.generate(req2)
-        await asyncio.to_thread(jobs.complete, job_id, out2.blobs,
-                                {**out2.meta, "backend": backend["name"], "chain": [alias, succ_alias]})
+        blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
+        meta = {**out2.meta, "backend": backend["name"], "chain": [alias, succ_alias]}
+        if chain_rig:                                # validate the COMBINED delivery at chain level
+            warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
+            meta["rig"] = chain_rig
+            if warnings:
+                meta["warnings"] = warnings
+        await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
         if log_per_call:
             logger.info(f"✓ chain job {job_id} on [{backend['name']}] ({alias}→{succ_alias}) "
-                        f"— {len(out2.blobs)} artifact(s)")
+                        f"— {len(blobs)} artifact(s)")
         asyncio.create_task(_free_comfy_vram(backend, "chain done"))
     except Exception as e:
         logger.warning(f"✗ chain job {job_id} [{backend['name']}] ({alias}→{succ_alias}) failed: {e}")

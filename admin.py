@@ -2008,7 +2008,16 @@ def _chain_section(wf: dict, cands: list) -> str:
             + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh path, "
               "and passes it to the successor under the <b>mesh param</b> (default <code>mesh_path</code> — "
               "must be a request field on the successor). This stage's other params (name, no_fingers, …) "
-              "are threaded to the successor by matching param name.</p>")
+              "are threaded to the successor by matching param name.</p>"
+            + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
+                     placeholder="e.g. *basecolor*.png"), short=True)
+            + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
+                     placeholder="blank · mixamo · generic"), short=True)
+            + "<p class='hint'><b>keep from this stage</b>: globs for files THIS (mesh) stage produces that "
+              "must ship with the successor's result — e.g. the <code>*basecolor*.png</code> the texturing "
+              "bakes here (the UniRig fbx only references its texture). <b>delivered rig type</b>: set "
+              "<code>generic</code>/<code>mixamo</code> to tag + validate the COMBINED delivery at the chain "
+              "level (generic needs fbx + basecolor). Blank = trust the successor's own output config.</p>")
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
@@ -2396,9 +2405,12 @@ async def update(request: Request):
             c["output_globs"] = out_flat
     # chain successor (blank alias → not a chain)
     succ_alias = (f.get("successor", "") or "").strip()
+    keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
     succ = ({"alias": succ_alias,
              "export_node": (f.get("chain_export_node", "") or "").strip(),
-             "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "mesh_path"}
+             "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "mesh_path",
+             **({"keep_from_mesh": keep} if keep else {}),
+             **({"rig": (f.get("chain_rig", "") or "").strip()} if (f.get("chain_rig", "") or "").strip() else {})}
             if succ_alias else None)
     for c in cands:
         if succ:
