@@ -1812,32 +1812,6 @@ async def _unload_host_llms(backend: dict) -> None:
                 pass
 
 
-async def _maybe_repair_weights(blobs: list, enabled: bool) -> dict:
-    """When enabled, repair mis-bound skin weights in every GLB blob, in place.
-    Auto-riggers bind some vertices to the wrong bone (a sleeve vertex to the spine)
-    — invisible in bind pose, the mesh shatters when animated. Pure numpy over the
-    glTF data (~6s for a 287k-vert model, once per job); a healthy model gets 0
-    corrections, so it never degrades a good rig. Returns aggregate stats."""
-    if not enabled:
-        return {}
-    import skinfix
-    agg = {"corrected": 0, "seams": 0, "vertices": 0}
-    for b in blobs:
-        if b.mime != "model/gltf-binary":
-            continue
-        new, st = await asyncio.to_thread(skinfix.repair, b.data)
-        if st.get("reason"):
-            logger.warning(f"skinfix: {b.name or '?'} skipped — {st['reason']}")
-            continue
-        if st.get("corrected") or st.get("seams"):
-            b.data = new
-            for k in agg:
-                agg[k] += int(st.get(k, 0))
-            logger.info(f"skinfix: {b.name or '?'} — {st['corrected']} reweighted, "
-                        f"{st['seams']} seams unified ({st.get('vertices', 0)} verts)")
-    return agg
-
-
 async def _run_job(job_id: str, candidates: list, build_req) -> None:
     """Run a generation job, failing over to the next candidate on connection-type
     errors. Content errors are final (not retried). Stops at the first success."""
@@ -1850,9 +1824,6 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
         try:
             await _unload_host_llms(backend)         # opt-in host policy, no-op by default
             out = await adapter.generate(build_req(backend, cand))
-            rep = await _maybe_repair_weights(out.blobs, bool(cand.get("repair_weights")))
-            if rep.get("corrected") or rep.get("seams"):
-                out.meta["skinfix"] = rep
             await asyncio.to_thread(jobs.complete, job_id, out.blobs, out.meta)
             if log_per_call:
                 logger.info(f"✓ job {job_id} done on [{backend['name']}] — {len(out.blobs)} artifact(s)")
@@ -2037,10 +2008,6 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
         meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
         if cross:
             meta["chain_backends"] = [backend["name"], backend2["name"]]
-        rep = await _maybe_repair_weights(
-            blobs, bool(stage1_cand.get("repair_weights") or s2.get("repair_weights")))
-        if rep.get("corrected") or rep.get("seams"):
-            meta["skinfix"] = rep
         if chain_rig:                                # validate the COMBINED delivery at chain level
             warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
             meta["rig"] = chain_rig

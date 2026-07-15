@@ -41,7 +41,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 Ten self-contained Python files hold everything. `main.py` owns app state; the
 others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
-`responses_bridge`, `openai_image_bridge`, `skinfix`) never import `main` — they
+`responses_bridge`, `openai_image_bridge`, `previewanim`) never import `main` — they
 receive what they need via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
@@ -122,18 +122,10 @@ receive what they need via injected callables, staying hot-reload-safe.
   in the chat-alias editor) supplies off/on when the client sends nothing — so
   `tool`/`tool-thinking` can share one backend+model; an explicit client
   `reasoning` always wins.
-- **`skinfix.py`** — pure-numpy skinning-weight repair for a rigged GLB, run once
-  in the gateway before delivery (`repair(glb_bytes) → (new_bytes, stats)`). Auto-
-  riggers mis-bind vertices two ways (invisible in bind pose, ugly when animated):
-  a DRAG/spike (weight on a far bone) and a RING/web (a crotch/armpit vertex on BOTH
-  sibling limbs). Operates only on the glTF `JOINTS_0`/`WEIGHTS_0`, all local per
-  vertex (bone segments from inverse-bind matrices): drops weights on bones >2.5×
-  farther than the nearest segment, then keeps only a single skeleton **ancestor
-  chain** (a bone incompatible with a heavier kept bone — a sibling limb — is dropped),
-  seam-unifying first so the chain rule wins at a crotch-midline seam. Idempotent — a
-  healthy model gets 0 corrections, so it is safe to leave on. Gated per gen-alias by `repair_weights` (Output section);
-  `main._maybe_repair_weights` applies it to every delivered `.glb` blob in
-  `_run_job` and `_run_chain`.
+- **`previewanim.py`** — injects a short looping idle animation into a rigged GLB for
+  the `/ui` inspection view ONLY (`add_idle(glb) → glb`), so bad skin weights show as
+  spikes/rings once it deforms. Pure struct/json on the glTF binary, append-only; the
+  result route applies it on `?anim=idle`, never to the delivered file.
 
 ### Request flow
 
