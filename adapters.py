@@ -715,6 +715,40 @@ def _check_glb_not_dummy(blobs) -> None:
 _SIZE_LIMIT_MB = 30                                  # web-suitability guideline (warn, not fail)
 
 
+def normalize_delivery(blobs: list, rig: Optional[str]) -> None:
+    """Fix known mesh-pipeline artifacts IN PLACE, before validation.
+
+    generic (FBX + separate texture PNGs): the bake writes the textures
+    V-flipped relative to the FBX UVs — a native consumer (the /ui preview,
+    the 3D client, a DCC import) sees the mapping mirrored; only GL-style
+    loaders that flip images on upload happen to render it right. The gateway
+    is the ONE place that corrects this, so every consumer renders the pair
+    as delivered, without client-side compensation. All PNGs of a generic
+    delivery share the FBX's UV set (basecolor, metallic, …), so all are
+    flipped. A blob flag guards against double application (the adapter
+    normalizes case deliveries, the chain level normalizes the combined one).
+    A failed flip delivers the original bytes instead of failing the job.
+    """
+    if rig != "generic":
+        return
+    for b in blobs:
+        if getattr(b, "_v_flipped", False):
+            continue
+        if not (b.name or "").lower().endswith(".png"):
+            continue
+        try:
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(b.data))
+            buf = io.BytesIO()
+            img.transpose(Image.FLIP_TOP_BOTTOM).save(buf, format="PNG")
+            b.data = buf.getvalue()
+            b._v_flipped = True
+        except Exception as e:
+            logger.warning(f"normalize_delivery: texture flip failed for "
+                           f"'{b.name}' — delivering unflipped: {e}")
+
+
 def validate_delivery(blobs: list, rig: Optional[str]) -> list:
     """Gate a case-mode delivery before reporting success (returns warnings; raises
     on hard failure). Per the character-model spec:
@@ -1485,6 +1519,7 @@ class ComfyUIAdapter(BackendAdapter):
                         have = {b.name for b in blobs}
                         blobs += [b for b in await self._fetch_by_globs(client, url, outputs, req.output_globs)
                                   if b.name not in have]
+                    normalize_delivery(blobs, rig)   # e.g. V-flip generic texture PNGs
                     warnings = validate_delivery(blobs, rig)
                 else:
                     blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,

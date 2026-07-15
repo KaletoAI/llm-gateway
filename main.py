@@ -24,8 +24,8 @@ import reasoning
 import stats
 import store
 from adapters import (AdapterContext, NormalizedRequest, image_params, is_image_field,
-                      lora_counterpart, lora_groups, make_adapter, slot_empty_mode,
-                      validate_delivery)
+                      lora_counterpart, lora_groups, make_adapter, normalize_delivery,
+                      slot_empty_mode, validate_delivery)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -2116,6 +2116,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             if cross:
                 meta["chain_backends"] = [backend["name"], backend2["name"]]
             if chain_rig:                                # validate the COMBINED delivery at chain level
+                normalize_delivery(blobs, chain_rig)     # e.g. V-flip generic texture PNGs (flip-once flagged)
                 warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
                 meta["rig"] = chain_rig
                 if warnings:
