@@ -355,6 +355,25 @@ def _select(name: str, options: list, selected=None) -> str:
     return f'<select name="{_esc(name)}">{opts}</select>'
 
 
+_TASK_OPTIONS = ("text2img", "img2img", "img2vid", "img2mesh", "mesh2rig", "text2audio")
+# JS that shows the Video section (fps/frames) only for a video task, driven by the
+# task dropdown; matched loosely so img2vid / img2video / text2video all count.
+_TASK_VIDEO_JS = ("var v=document.getElementById('gw-video');"
+                  "if(v)v.style.display=/vid/i.test(this.value)?'':'none';")
+
+
+def _task_select(current: str = "text2img", onchange: str = "") -> str:
+    """The `task` dropdown. Routing is convention-free (task is a label/hint), but the
+    editor keys field visibility on it (video → fps/frames). Preserves an unlisted
+    stored value so a custom task is never silently dropped."""
+    cur = (current or "text2img").strip()
+    opts = list(_TASK_OPTIONS) + ([cur] if cur and cur not in _TASK_OPTIONS else [])
+    body = "".join(f'<option value="{_esc(o)}"{" selected" if o == cur else ""}>{_esc(o)}</option>'
+                   for o in opts)
+    oc = f' onchange="{onchange}"' if onchange else ""
+    return f'<select name="task"{oc}>{body}</select>'
+
+
 def _inp(name: str, value="", placeholder: str = "", typ: str = "text") -> str:
     return (f'<input type="{typ}" name="{_esc(name)}" value="{_esc(value)}" '
             f'placeholder="{_esc(placeholder)}">')
@@ -1641,7 +1660,7 @@ def _register_form() -> str:
             "later ComfyUI-GUI edits. You'll map fields after registering.</p>"
             + _field("alias", _inp("alias", placeholder="flux"))
             + _field("backend", _select("backend", backend_opts))
-            + _field("task", _inp("task", "text2img"))
+            + _field("task", _task_select())
             + _field("API JSON file", '<input type="file" name="workflow_file" accept=".json,application/json">')
             + _field("…or share path", _inp("workflow_path", placeholder="/mnt/share/flux_api.json"))
             + "</form>")
@@ -2094,11 +2113,14 @@ async def _alias_editor(alias: str) -> str:
     pin_extra = _PIN_CSS_JS
 
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
+    cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "text2img"
+    is_video = "vid" in cur_task.lower()
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}'
             f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}</div>'
             + _field("alias name", _inp("new_alias", alias), short=True)
+            + _field("task", _task_select(cur_task, _TASK_VIDEO_JS), short=True)
             + '<h2 style="margin-top:18px">Update workflow</h2>'
             + "<p class='hint'>Replace the ComfyUI API JSON — request fields + pinned values are kept; "
               "bindings whose node vanished are flagged <span class='badge bad'>stale</span> in Request fields.</p>"
@@ -2113,15 +2135,18 @@ async def _alias_editor(alias: str) -> str:
             + _backends_section(alias, cands)
             + _field("retries", _inp("retries", str(retries), typ="number"), short=True)
             + "<p class='hint'>Backends to try after the first on error. Blank = try all eligible · 0 = no failover.</p>"
+            + f'<div id="gw-video" style="display:{"" if is_video else "none"}">'
+            + '<h2 style="margin-top:18px">Video</h2>'
             + _field("fps", _inp("fps", str(next((c.get("fps") for c in cands
                                                   if c.get("fps")), "") or ""), typ="number"), short=True)
             + _field("frames raster", _inp("frames_snap", str(next((c.get("frames_snap") for c in cands
                                                                     if c.get("frames_snap")), "") or ""),
                                            typ="number"), short=True)
-            + "<p class='hint'>Video aliases: <b>fps</b> enables <code>params.seconds</code> → frames "
+            + "<p class='hint'><b>fps</b> enables <code>params.seconds</code> → frames "
               "(needs a request field named/labelled <code>frames</code>) and shows up in "
               "<code>/v1/generations/&lt;alias&gt;/schema</code>. <b>frames raster</b> S snaps computed "
               "frames onto S·k+1 (Wan: 4). Blank = off.</p>"
+            + '</div>'
             + f'<h2>Request fields <span class="muted" style="font-weight:normal">— drag ⠿ to set Playground order</span></h2>'
             "<p class='hint'>label overrides the Playground label / external API field name (blank = param).</p>"
             f'<table class="reqf"><thead><tr><th>param</th>'
@@ -2313,6 +2338,10 @@ async def update(request: Request):
     if not alias or not cands:
         raise HTTPException(404, "alias not found")
     cand = cands[0]
+    task = (f.get("task", "") or "").strip()          # task dropdown (blank keeps the stored value)
+    if task:
+        for c in cands:
+            c["task"] = task
     # Request fields are dynamic: one node__<param>/field__<param> pair per mapped
     # param the editor rendered (no fixed list). Slice after the prefix so param
     # names may themselves contain underscores.
