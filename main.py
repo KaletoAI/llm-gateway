@@ -2013,7 +2013,15 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
             mesh_ref = mesh_path                        # shared-disk absolute path
 
         # ── Stage 2: successor, fed the mesh + stage-1 params (name, no_fingers, …) ──
-        s2_params = dict(params)
+        # Thread stage-1 params to the successor keyed by their mapping LABEL, never by
+        # the raw/node-based field name. A client field like `value` (or `value_307`) is
+        # tied to a specific node id that changes when the workflow is rebuilt, and a
+        # generic `value` from stage 1 would otherwise collide with the successor's own
+        # `value` param — clobbering the mesh path (seen: face-num 100000 landed on the
+        # mesh-load node). Labels are the stable, unique public names.
+        s1_map = stage1_cand.get("mapping") or {}
+        label_of = {p: (((m or {}).get("label") or "").strip() or p) for p, m in s1_map.items()}
+        s2_params = {label_of.get(k, k): v for k, v in params.items()}
         s2_params[mesh_param] = mesh_ref
         req2 = NormalizedRequest(
             alias=succ_alias, real_model=s2.get("model"),

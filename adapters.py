@@ -1006,6 +1006,16 @@ def _format_comfy_error(messages) -> str:
         return str(messages)[:600]
 
 
+def _prompt_in_queue(queue: dict, prompt_id: str) -> bool:
+    """Is `prompt_id` still running or pending in a ComfyUI /queue response? Each entry
+    is [number, prompt_id, prompt, extra, …]; the id sits at index 1."""
+    for key in ("queue_running", "queue_pending"):
+        for item in (queue.get(key) or []):
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id:
+                return True
+    return False
+
+
 _LORA_SLOT_RE = re.compile(r"^lora_0*(\d+)$")          # rgthree stack: lora_01..lora_NN
 _STR_SLOT_RE = re.compile(r"^strength_0*(\d+)$")
 # standalone high/low token in a LoRA filename — '-HIGH.', '_High_', '-low-' …
@@ -1498,6 +1508,7 @@ class ComfyUIAdapter(BackendAdapter):
         grace = float(self.backend.get("disconnect_grace", 30))
         deadline = time.monotonic() + max_wait
         last_ok = time.monotonic()
+        gone_since = None
         last_exc = None
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
@@ -1507,14 +1518,33 @@ class ComfyUIAdapter(BackendAdapter):
                 if hr.status_code != 200:
                     continue
                 hist = hr.json()
-                if prompt_id not in hist:
-                    continue
-                entry = hist[prompt_id]
-                status = entry.get("status", {})
-                if status.get("status_str") == "error":
-                    raise RuntimeError(f"ComfyUI: {_format_comfy_error(status.get('messages'))}")
-                return entry.get("outputs", {})
-            except RuntimeError:
+                if prompt_id in hist:
+                    entry = hist[prompt_id]
+                    status = entry.get("status", {})
+                    if status.get("status_str") == "error":
+                        raise RuntimeError(f"ComfyUI: {_format_comfy_error(status.get('messages'))}")
+                    return entry.get("outputs", {})
+                # Not done yet. Confirm it's still queued/running — if ComfyUI restarted,
+                # the prompt is gone from BOTH history and queue, yet /history keeps
+                # answering 200 (so the disconnect-grace never fires). Detecting the
+                # vanished prompt fails fast instead of polling out the full max_wait.
+                still = None
+                try:
+                    qr = await client.get(f"{url}/queue")
+                    if qr.status_code == 200:
+                        still = _prompt_in_queue(qr.json(), prompt_id)
+                except Exception:
+                    still = None                # unknown → leave the gone-timer as is
+                if still is True:
+                    gone_since = None
+                elif still is False:
+                    gone_since = gone_since or time.monotonic()
+                    if time.monotonic() - gone_since > grace:
+                        raise ConnectionError(
+                            f"ComfyUI prompt {prompt_id} gone from history AND queue for "
+                            f">{grace:.0f}s — ComfyUI likely restarted mid-job")
+                continue
+            except (RuntimeError, ConnectionError):
                 raise
             except Exception as e:
                 last_exc = e
