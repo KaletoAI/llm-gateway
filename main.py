@@ -2280,8 +2280,10 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
                "int" if isinstance(cur, int) else
                "float" if isinstance(cur, float) else "string")
         entry: dict = {"name": name, "type": typ}
-        if name != p:
-            entry["param"] = p                   # legacy/internal name, also accepted
+        # Advertise ONLY the LABEL (`name`). The internal param key can be node-based
+        # (`value_307`) and changes when the workflow is rebuilt, so it must never be a
+        # public field — the adapter still accepts it on input, but clients bind to the
+        # stable label. Set a label on every param for a fully node-id-free schema.
         if cur is not None:
             entry["default"] = cur
         if name == "seed" or (p == "seed" and name == p):

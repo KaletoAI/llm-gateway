@@ -1,0 +1,52 @@
+{
+  "5": {
+    "inputs": {
+      "value": false
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_no_fingers"
+    }
+  },
+  "7": {
+    "inputs": {
+      "input_model_path": [
+        "9",
+        0
+      ],
+      "no_fingers": [
+        "5",
+        0
+      ],
+      "use_normals": false,
+      "weight_postprocess": true,
+      "animation_file": ""
+    },
+    "class_type": "MakeItAnimatableRig",
+    "_meta": {
+      "title": "Make-It-Animatable (Auto-Rig Mesh)"
+    }
+  },
+  "9": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_mesh_path"
+    }
+  },
+  "11": {
+    "inputs": {
+      "model_file": [
+        "7",
+        0
+      ],
+      "image": ""
+    },
+    "class_type": "Preview3D",
+    "_meta": {
+      "title": "Preview 3D & Animation"
+    }
+  }
+}
