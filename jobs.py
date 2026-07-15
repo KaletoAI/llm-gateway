@@ -19,11 +19,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
 from typing import Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +224,14 @@ def set_stage(job_id: str, stage: Optional[str]) -> None:
                   (stage, int(time.time()), job_id))
 
 
+def set_backend(job_id: str, backend: str) -> None:
+    """Re-point a live job's `backend` to where it currently runs — a chain hand-off
+    moves a job to another backend mid-run, and cancel/UI target this column."""
+    with _conn() as c:
+        c.execute("UPDATE jobs SET backend=?, updated=? WHERE id=?",
+                  (backend, int(time.time()), job_id))
+
+
 def fail(job_id: str, error: str) -> None:
     with _conn() as c:
         c.execute("UPDATE jobs SET status='failed', error=?, stage=NULL, updated=? WHERE id=?",
@@ -372,6 +382,19 @@ def result_path(job_id: str, n: int) -> Optional[tuple]:
     (also for inline-JSON results, e.g. a background response — no file). `name`
     is the original artifact filename (None when the source didn't provide one)."""
     return _manifest_path(job_id, n, "results_json", None)
+
+
+def content_disposition(name: str, disposition: str = "inline") -> str:
+    """Content-Disposition value carrying an artifact's original filename. Response
+    headers are latin-1: a non-ASCII or control character in the quoted filename
+    would 500 the response (and CR/LF would allow header injection), so the quoted
+    fallback is reduced to safe ASCII and the real name travels RFC-5987-encoded
+    in `filename*` (which browsers prefer when present)."""
+    ascii_name = re.sub(r"[^\x20-\x7e]+", "_", name).replace('"', "_").replace("\\", "_").strip() or "file"
+    value = f'{disposition}; filename="{ascii_name}"'
+    if ascii_name != name:
+        value += f"; filename*=UTF-8''{quote(name, safe='')}"
+    return value
 
 
 def _delete(job_id: str) -> None:

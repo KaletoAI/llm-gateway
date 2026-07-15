@@ -355,11 +355,12 @@ def _select(name: str, options: list, selected=None) -> str:
     return f'<select name="{_esc(name)}">{opts}</select>'
 
 
-_TASK_OPTIONS = ("text2img", "img2img", "img2vid", "img2mesh", "mesh2rig", "text2audio")
+_TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "img2mesh", "mesh2rig", "text2audio")
 # JS that shows the Video section (fps/frames) only for a video task, driven by the
 # task dropdown; matched loosely so img2vid / img2video / text2video all count.
 _TASK_VIDEO_JS = ("var v=document.getElementById('gw-video');"
-                  "if(v)v.style.display=/vid/i.test(this.value)?'':'none';")
+                  "if(v){var f=v.querySelector('input[name=fps]');"
+                  "v.style.display=(/vid/i.test(this.value)||(f&&f.value))?'':'none';}")
 
 
 def _task_select(current: str = "text2img", onchange: str = "") -> str:
@@ -1987,8 +1988,8 @@ def _output_section(wf: dict, cands: list) -> str:
     cur_ext = next((str(c.get("output_ext")) for c in cands if c.get("output_ext")), "")
     cur_globs = next((c.get("output_globs") for c in cands if c.get("output_globs")), []) or []
     cur_cases = next((c.get("output_cases") for c in cands if c.get("output_cases")), []) or []
-    globs_text = ("\n".join(f"{c.get('rig','')}: {', '.join(c.get('globs') or [])}" for c in cur_cases)
-                  if cur_cases else "\n".join(cur_globs))
+    globs_text = "\n".join([f"{c.get('rig','')}: {', '.join(c.get('globs') or [])}" for c in cur_cases]
+                           + list(cur_globs))        # cases and plain globs coexist
     return ("<h2>Output</h2>"
             "<p class='hint'>Which node's artifacts the job returns. <b>auto</b> collects from every "
             "output-producing node. Pin the final node when the workflow also exports intermediates — "
@@ -2008,9 +2009,10 @@ def _output_section(wf: dict, cands: list) -> str:
               "<br><b>Cases</b> — <code>rig: glob, glob</code> per line: the FIRST case whose first glob "
               "actually exists wins, and only its files ship, tagged with that <b>rig</b> type "
               "(<code>mixamo</code> → validated as a 52-joint humanoid GLB with embedded texture; "
-              "<code>generic</code> → a rigged FBX + its basecolor PNG). Unmatched cases/globs are simply "
-              "absent, so a split workflow still works; the job fails if nothing matches or validation "
-              "fails (e.g. the 2×2-dummy-texture bug).</p>"
+              "<code>generic</code> → a rigged FBX + its basecolor PNG). Plain glob lines may be MIXED "
+              "with cases — they ship unconditionally on top of the matched case. Unmatched cases/globs "
+              "are simply absent, so a split workflow still works; the job fails if nothing matches or "
+              "validation fails (e.g. the 2×2-dummy-texture bug).</p>"
             + _chain_section(wf, cands))
 
 
@@ -2020,14 +2022,22 @@ def _chain_section(wf: dict, cands: list) -> str:
     exported mesh (by full path) + this stage's params, and delivers ONLY the
     successor's result. Both runs are back-to-back (queue-isolated)."""
     s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
+    cur_exp = str(s.get("export_node") or "")
     node_opts = '<option value="">— export node —</option>'
+    listed = False
     for nid, n in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
         cls = n.get("class_type", "")
-        if "export" in cls.lower() or "save" in cls.lower():
+        # shortlist writer-ish classes, but ALWAYS include the stored choice — a
+        # custom writer class without export/save in its name would otherwise render
+        # unselected and the next unrelated Save would silently clear it.
+        if "export" in cls.lower() or "save" in cls.lower() or nid == cur_exp:
             title = ((n.get("_meta") or {}).get("title") or "")
             lbl = f"{nid} — {cls}" + (f" “{title}”" if title else "")
-            sel = " selected" if str(s.get("export_node")) == nid else ""
+            sel = " selected" if cur_exp == nid else ""
+            listed = listed or cur_exp == nid
             node_opts += f'<option value="{_esc(nid)}"{sel}>{_esc(lbl)}</option>'
+    if cur_exp and not listed:                       # keep a stale choice visible instead of silently clearing
+        node_opts += f'<option value="{_esc(cur_exp)}" selected>{_esc(cur_exp)} — (stale: node missing)</option>'
     cur_relay = (s.get("relay") or "path").strip().lower()
     relay_opts = "".join(
         f'<option value="{v}"{" selected" if cur_relay == v else ""}>{lbl}</option>'
@@ -2114,7 +2124,10 @@ async def _alias_editor(alias: str) -> str:
 
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "text2img"
-    is_video = "vid" in cur_task.lower()
+    # video aliases registered before the task dropdown carry the old free-text
+    # default ('text2img') yet have fps configured — configured fps must never
+    # render its own editor fields invisible.
+    is_video = "vid" in cur_task.lower() or any(c.get("fps") for c in cands)
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}'
@@ -2455,7 +2468,7 @@ async def update(request: Request):
         c.pop("output_cases", None)
         if out_cases:
             c["output_cases"] = out_cases
-        elif out_flat:
+        if out_flat:                       # plain globs may accompany cases: unconditional extras
             c["output_globs"] = out_flat
     # chain successor (blank alias → not a chain)
     succ_alias = (f.get("successor", "") or "").strip()
@@ -2789,8 +2802,7 @@ async def result(job_id: str, n: int, anim: str = ""):
         return Response(content=data, media_type=mime)
     headers = None
     if name:
-        safe = name.replace('"', "").replace("\n", "")
-        headers = {"Content-Disposition": f'inline; filename="{safe}"'}
+        headers = {"Content-Disposition": jobs.content_disposition(name)}
     return FileResponse(path, media_type=mime, headers=headers)
 
 

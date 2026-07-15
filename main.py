@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import calendar
+import fnmatch
 import json
 import logging
 import re
@@ -1859,11 +1860,17 @@ async def _wait_and_hold(backend: dict, job_id: str, label: str) -> bool:
     return True
 
 
-async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
-                     succ: dict, body: dict, request, upload_images) -> None:
+async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
+                     upload_images, force: str = "", eligible: Optional[set] = None) -> None:
     """Run a two-stage workflow chain: stage 1 (the client-facing mesh alias) exports
     a mesh under a filename WE pin, and stage 2 (the `successor`, e.g. a rigger) is fed
     that mesh + stage-1's threaded params; ONLY stage 2's result is delivered.
+
+    Stage 1 gets the same routing guarantees as a plain generation: candidates are
+    re-resolved while parked (fresh health/busy, `force`/LoRA-`eligible` kept), a
+    misconfigured candidate is skipped for the next one, and a connection-type error
+    fails over. Stage-2/hand-off errors are FINAL — once the mesh is in hand the chain
+    never restarts stage 1 elsewhere.
 
     Two hand-off modes (`relay`):
       • `path` (default) — both stages on the SAME backend (shared disk); stage 2 gets
@@ -1872,160 +1879,273 @@ async def _run_chain(job_id: str, backend: dict, stage1_cand: dict, alias: str,
       • `upload` — CROSS-backend: the gateway fetches stage 1's mesh (/view), then
         uploads it into stage 2's backend input dir and passes the stored name. Stage 2
         may run on a DIFFERENT backend (e.g. mesh on dx10-02, rig on a UniRig box). The
-        stage-1 slot is released once its mesh is in hand, then the stage-2 slot is
-        claimed — the two stages are on different backends, so they need not be atomic.
+        stage-1 slot is released (and its ComfyUI VRAM freed) once its mesh is in hand,
+        then the stage-2 slot is claimed — different backends, so they need not be atomic.
 
     successor config: {alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}."""
-    bid = backend_id(backend)
-    adapter = backend_adapters.get(bid)
-    outdir = (backend.get("comfy_output_dir") or "").rstrip("/")
     succ_alias = (succ.get("alias") or "").strip()
     export_node = str(succ.get("export_node") or "").strip()
     mesh_param = (succ.get("mesh_param") or "mesh_path").strip()
     keep_globs = [g.strip() for g in (succ.get("keep_from_mesh") or []) if g.strip()]
     chain_rig = (succ.get("rig") or "").strip() or None
     relay = (succ.get("relay") or "path").strip().lower()      # "path" (shared disk) | "upload" (relay bytes)
-    if adapter is None:
-        await asyncio.to_thread(jobs.fail, job_id, f"chain needs an adapter on backend "
-                                f"'{backend.get('name')}'")
-        return
-    if relay == "path" and not outdir:
-        await asyncio.to_thread(jobs.fail, job_id, f"chain (path relay) needs a "
-                                f"comfy_output_dir on backend '{backend.get('name')}'")
-        return
-    # Resolve the stage-2 (successor) backend + candidate. Path relay pins it to stage
-    # 1's backend (shared disk). Upload relay picks the successor alias's best candidate
-    # — preferring stage 1's backend if it is itself one (keeps the fast in-process path).
-    if relay == "upload":
-        cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
-        if not cands2:
-            await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
-                                    "enabled+healthy candidate backend for the upload relay")
-            return
-        # take an ALLOWED successor candidate, PREFERRING the same backend as stage 1 (shared box is fine);
-        # if the successor isn't allowed on stage 1's backend, use its best other candidate.
-        backend2, s2 = next((bc for bc in cands2 if backend_id(bc[0]) == bid), None) or cands2[0]
-    else:
-        backend2 = backend
-        s2 = next((c for c in ((await asyncio.to_thread(store.get, succ_alias)) or [])
-                   if c.get("backend") == backend["name"]), None)
-        if s2 is None:
-            await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' is not "
-                                    f"configured for backend '{backend['name']}'")
-            return
-    bid2 = backend_id(backend2)
-    adapter2 = backend_adapters.get(bid2)
-    if adapter2 is None:
-        await asyncio.to_thread(jobs.fail, job_id, f"successor backend "
-                                f"'{backend2.get('name')}' has no adapter")
-        return
-    s1_wf = stage1_cand.get("workflow_json") or {}
-    if export_node not in s1_wf:
-        await asyncio.to_thread(jobs.fail, job_id, f"chain export node '{export_node}' "
-                                "is not in the mesh workflow")
-        return
-    ext = str(((s1_wf.get(export_node) or {}).get("inputs") or {}).get("file_format") or "glb")
     inputs, params = _gen_inputs_params(body)
-    _apply_seconds(params, stage1_cand)
     prefix = f"gwchain_{job_id}"
-    mesh_name = f"{prefix}_00001_.{ext}"                # ComfyUI's %05d counter, fresh prefix → 00001
-    mesh_path = f"{outdir}/{mesh_name}"
-    cross = relay == "upload" and bid2 != bid
 
-    # Claim stage 1's backend (atomic busy-check + inc). `held` tracks which slot we owe
-    # a decrement, so the finally never over/under-counts across the hand-off.
-    if not await _wait_and_hold(backend, job_id, "stage 1"):
-        return
-    held = bid
-    active = backend                                    # backend to free VRAM on
-    await asyncio.to_thread(jobs.set_status, job_id, "running")
-    await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
-    try:
-        # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
-        req1 = NormalizedRequest(
-            alias=alias, real_model=stage1_cand.get("model"),
-            task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
-            workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
-            node_mapping=stage1_cand.get("mapping") or {},
-            fixed=list(stage1_cand.get("fixed") or [])
-                 + [{"node": export_node, "field": "filename_prefix", "value": prefix}],
-            upload_images=dict(upload_images or {}), raw=request)
-        out1 = await adapter.generate(req1)
-        # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
-        # PNG — the mesh/texturing stage bakes it; the UniRig fbx only references its
-        # texture) travel from stage 1 into the final delivery.
-        import fnmatch
-        mesh_extras = [b for b in (out1.blobs or [])
-                       if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
-                                             for g in keep_globs)]
-        r = await http_client.get(f"{backend['url'].rstrip('/')}/view",
-                                  params={"filename": mesh_name, "type": "output"}, timeout=30.0)
-        if r.status_code != 200:
-            raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' (HTTP {r.status_code}) — "
-                               "check the export node / file_format")
-        mesh_bytes = r.content
+    async def stage2_for(backend: dict) -> tuple:
+        """(successor candidate on `backend`, skip reason) for the path relay. Store
+        first, `image_models` config fallback — the same order as _gen_routes."""
+        cands = (await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None
+        if cands is None:
+            cands = image_models.get(succ_alias, [])
+        s2 = next((c for c in cands if c.get("backend") == backend["name"]), None)
+        if s2 is None:
+            return None, f"successor '{succ_alias}' is not configured for backend '{backend['name']}'"
+        return s2, None
 
-        # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
-        if cross:
-            # cross-backend: stage 1 is done — release its slot, then claim stage 2's and
-            # upload the mesh into its input dir (released first, so no A-holds-waits-B cycle).
-            _inflight_dec(held); held = None
-            if not await _wait_and_hold(backend2, job_id, "stage 2"):
+    async def usable(backend: dict) -> tuple:
+        """(s2, outdir, skip reason) — whether this stage-1 candidate can run the
+        chain. s2/outdir are only resolved for the path relay (stage 2 pinned here)."""
+        if backend_adapters.get(backend_id(backend)) is None:
+            return None, "", f"chain needs an adapter on backend '{backend.get('name')}'"
+        if relay != "path":
+            return None, "", None
+        outdir = (backend.get("comfy_output_dir") or "").rstrip("/")
+        if not outdir:
+            return None, "", (f"chain (path relay) needs a comfy_output_dir on backend "
+                              f"'{backend.get('name')}'")
+        s2, why = await stage2_for(backend)
+        return s2, outdir, why
+
+    deadline = time.monotonic() + async_park_timeout_s
+    tried: set = set()                       # stage-1 backends that failed with a connection error
+    skip_reason = None
+    while True:
+        cur = await asyncio.to_thread(jobs.get, job_id)
+        if not cur or cur.get("status") not in ("queued", "running"):
+            return                           # cancelled (or externally finished) meanwhile
+        ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per attempt
+        ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+        if eligible is not None:
+            ready = [r for r in ready if r[0].get("name") in eligible]
+            allc = [r for r in allc if r[0].get("name") in eligible]
+        ready = [r for r in ready if r[0].get("name") not in tried]
+        allc = [r for r in allc if r[0].get("name") not in tried]
+        if not allc:
+            await asyncio.to_thread(jobs.fail, job_id,
+                                    skip_reason or f"chain: no healthy backend for '{alias}'"
+                                    + (f" on '{force}'" if force else ""))
+            return
+
+        # pick the first READY candidate that satisfies the chain's per-backend needs
+        picked = None
+        for backend, cand in ready:
+            s2p, outdir, why = await usable(backend)
+            if why:
+                skip_reason = why
+                continue
+            picked = (backend, cand, s2p, outdir)
+            break
+        if picked is None:
+            # nothing ready is usable — park while a usable candidate is merely busy
+            waitable = False
+            for backend, _cand in allc:
+                _s2, _out, why = await usable(backend)
+                if why is None:
+                    waitable = True
+                    break
+                skip_reason = why
+            if not waitable:
+                await asyncio.to_thread(jobs.fail, job_id,
+                                        skip_reason or f"chain: no usable backend for '{alias}'")
                 return
-            held = bid2
-            active = backend2
-            mesh_ref = await adapter2.upload_input(mesh_bytes, mesh_name)
-            if log_per_call:
-                logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
-                            f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
-        elif relay == "upload":
-            mesh_ref = await adapter2.upload_input(mesh_bytes, mesh_name)   # same backend, upload node
-        else:
-            mesh_ref = mesh_path                        # shared-disk absolute path
+            if time.monotonic() > deadline:
+                await asyncio.to_thread(jobs.fail, job_id,
+                                        f"chain: all usable backends stayed busy past park "
+                                        f"time ({async_park_timeout_s:.0f}s)")
+                return
+            await asyncio.sleep(2.0)
+            continue
 
-        # ── Stage 2: successor, fed the mesh + stage-1 params (name, no_fingers, …) ──
-        # Thread stage-1 params to the successor keyed by their mapping LABEL, never by
-        # the raw/node-based field name. A client field like `value` (or `value_307`) is
-        # tied to a specific node id that changes when the workflow is rebuilt, and a
-        # generic `value` from stage 1 would otherwise collide with the successor's own
-        # `value` param — clobbering the mesh path (seen: face-num 100000 landed on the
-        # mesh-load node). Labels are the stable, unique public names.
-        s1_map = stage1_cand.get("mapping") or {}
-        label_of = {p: (((m or {}).get("label") or "").strip() or p) for p, m in s1_map.items()}
-        s2_params = {label_of.get(k, k): v for k, v in params.items()}
-        s2_params[mesh_param] = mesh_ref
-        req2 = NormalizedRequest(
-            alias=succ_alias, real_model=s2.get("model"),
-            task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
-            workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
-            node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
-            raw=request, output_node=(s2.get("output_node") or None),
-            output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
-            output_cases=(s2.get("output_cases") or None))
-        await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
-        out2 = await adapter2.generate(req2)
-        blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
-        meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
-        if cross:
-            meta["chain_backends"] = [backend["name"], backend2["name"]]
-        if chain_rig:                                # validate the COMBINED delivery at chain level
-            warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
-            meta["rig"] = chain_rig
-            if warnings:
-                meta["warnings"] = warnings
-        await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
-        if log_per_call:
-            route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
-            logger.info(f"✓ chain job {job_id} on [{route}] ({alias}→{succ_alias}) "
-                        f"— {len(blobs)} artifact(s)")
-        asyncio.create_task(_free_comfy_vram(active, "chain done"))
-    except Exception as e:
-        logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-        await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}")
-        asyncio.create_task(_free_comfy_vram(active, "chain failure"))
-    finally:
-        if held is not None:
-            _inflight_dec(held)
+        backend, stage1_cand, s2, outdir = picked
+        bid = backend_id(backend)
+        adapter = backend_adapters[bid]
+        # Resolve the stage-2 (successor) backend + candidate. Path relay pinned it to
+        # stage 1's backend above (shared disk). Upload relay picks the successor
+        # alias's best candidate — preferring stage 1's backend if it is itself one
+        # (keeps the fast in-process path).
+        if relay == "upload":
+            cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
+            if not cands2:
+                await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
+                                        "enabled+healthy candidate backend for the upload relay")
+                return
+            backend2, s2 = next((bc for bc in cands2 if backend_id(bc[0]) == bid), None) or cands2[0]
+        else:
+            backend2 = backend
+        bid2 = backend_id(backend2)
+        adapter2 = backend_adapters.get(bid2)
+        if adapter2 is None:
+            await asyncio.to_thread(jobs.fail, job_id, f"successor backend "
+                                    f"'{backend2.get('name')}' has no adapter")
+            return
+        # `mesh_param` must be a request field of the successor (accepted under param
+        # OR label, exactly like any incoming value) — _apply_mapping silently drops
+        # unknown params, so stage 2 would otherwise run on the workflow's baked-in
+        # mesh path and deliver a stale/WRONG mesh as a "done" job.
+        if not any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
+                   for p, m in (s2.get("mapping") or {}).items()):
+            await asyncio.to_thread(jobs.fail, job_id,
+                                    f"chain mesh param '{mesh_param}' is not a request field "
+                                    f"(param or label) of successor '{succ_alias}' — map the "
+                                    f"successor's mesh-load input or fix 'successor mesh param'")
+            return
+        s1_wf = stage1_cand.get("workflow_json") or {}
+        if export_node not in s1_wf:
+            await asyncio.to_thread(jobs.fail, job_id, f"chain export node '{export_node}' "
+                                    "is not in the mesh workflow")
+            return
+        # The mesh filename's extension is what ComfyUI will WRITE: the export node's
+        # file_format as the adapter effectively applies it — a mapped request param
+        # overrides the raw workflow value, an admin pin (per-backend `fixed`) beats
+        # both (mirrors _apply_mapping/_apply_fixed precedence).
+        ext = str(((s1_wf.get(export_node) or {}).get("inputs") or {}).get("file_format") or "glb")
+        for p, m in (stage1_cand.get("mapping") or {}).items():
+            m = m or {}
+            if str(m.get("node")) == export_node and m.get("field") == "file_format":
+                v = params.get(p)
+                if v in (None, "") and (m.get("label") or "").strip():
+                    v = params.get((m.get("label") or "").strip())
+                if v not in (None, ""):
+                    ext = str(v)
+        for fx in (stage1_cand.get("fixed") or []):
+            if (str(fx.get("node")) == export_node and fx.get("field") == "file_format"
+                    and fx.get("value") not in (None, "")):
+                ext = str(fx["value"])
+        mesh_name = f"{prefix}_00001_.{ext}"        # ComfyUI's %05d counter, fresh prefix → 00001
+        cross = relay == "upload" and bid2 != bid
+
+        # Claim the stage-1 slot: the busy-check and inc run with no await between them
+        # (the dispatch invariant); the awaits above may have let someone else claim it.
+        if backend_busy(backend):
+            await asyncio.sleep(0.5)
+            continue
+        _inflight_inc(bid)
+        # `held` tracks which slot we owe a decrement, so the per-attempt finally never
+        # over/under-counts across the hand-off. `active` = backend to free VRAM on.
+        held = bid
+        active = backend
+        s1_done = False                             # mesh in hand → stage-2 errors are final
+        await asyncio.to_thread(jobs.set_status, job_id, "running")
+        await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
+        await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
+        try:
+            _apply_seconds(params, stage1_cand)     # no-op re-derive (endpoint validated it)
+            await _unload_host_llms(backend)        # opt-in host policy, no-op by default
+            # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
+            req1 = NormalizedRequest(
+                alias=alias, real_model=stage1_cand.get("model"),
+                task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
+                workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
+                node_mapping=stage1_cand.get("mapping") or {},
+                fixed=list(stage1_cand.get("fixed") or [])
+                     + [{"node": export_node, "field": "filename_prefix", "value": prefix}],
+                upload_images=dict(upload_images or {}), raw=request,
+                loras=body.get("loras"), slot_held=True)
+            out1 = await adapter.generate(req1)
+            # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
+            # PNG — the mesh/texturing stage bakes it; the UniRig fbx only references its
+            # texture) travel from stage 1 into the final delivery.
+            mesh_extras = [b for b in (out1.blobs or [])
+                           if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
+                                                 for g in keep_globs)]
+            r = await http_client.get(f"{backend['url'].rstrip('/')}/view",
+                                      params={"filename": mesh_name, "type": "output"}, timeout=30.0)
+            if r.status_code != 200:
+                raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' (HTTP {r.status_code}) — "
+                                   "check the export node / file_format")
+            mesh_bytes = r.content
+            s1_done = True
+
+            # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
+            if cross:
+                # cross-backend: stage 1 is done — release its slot AND free its VRAM (it
+                # stops being `active`, so the end-of-chain free would never reach it),
+                # then claim stage 2's and upload the mesh into its input dir (released
+                # first, so no A-holds-waits-B cycle).
+                _inflight_dec(held); held = None
+                asyncio.create_task(_free_comfy_vram(backend, "chain stage 1 done"))
+                if not await _wait_and_hold(backend2, job_id, "stage 2"):
+                    return
+                held = bid2
+                active = backend2
+                await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
+                mesh_ref = await adapter2.upload_input(mesh_bytes, mesh_name)
+                if log_per_call:
+                    logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
+                                f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
+            elif relay == "upload":
+                mesh_ref = await adapter2.upload_input(mesh_bytes, mesh_name)   # same backend, upload node
+            else:
+                mesh_ref = f"{outdir}/{mesh_name}"          # shared-disk absolute path
+
+            # ── Stage 2: successor, fed the mesh + stage-1 params (name, no_fingers, …) ──
+            # Thread stage-1 params to the successor keyed by their mapping LABEL, never by
+            # the raw/node-based field name. A client field like `value` (or `value_307`) is
+            # tied to a specific node id that changes when the workflow is rebuilt, and a
+            # generic `value` from stage 1 would otherwise collide with the successor's own
+            # `value` param — clobbering the mesh path (seen: face-num 100000 landed on the
+            # mesh-load node). Labels are the stable, unique public names.
+            s1_map = stage1_cand.get("mapping") or {}
+            label_of = {p: (((m or {}).get("label") or "").strip() or p) for p, m in s1_map.items()}
+            s2_params = {label_of.get(k, k): v for k, v in params.items()}
+            s2_params[mesh_param] = mesh_ref
+            req2 = NormalizedRequest(
+                alias=succ_alias, real_model=s2.get("model"),
+                task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
+                workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
+                node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
+                raw=request, output_node=(s2.get("output_node") or None),
+                output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
+                output_cases=(s2.get("output_cases") or None), slot_held=True)
+            await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
+            await _unload_host_llms(backend2)
+            out2 = await adapter2.generate(req2)
+            blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
+            meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
+            if cross:
+                meta["chain_backends"] = [backend["name"], backend2["name"]]
+            if chain_rig:                                # validate the COMBINED delivery at chain level
+                warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
+                meta["rig"] = chain_rig
+                if warnings:
+                    meta["warnings"] = warnings
+            await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
+            if log_per_call:
+                route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
+                logger.info(f"✓ chain job {job_id} on [{route}] ({alias}→{succ_alias}) "
+                            f"— {len(blobs)} artifact(s)")
+            asyncio.create_task(_free_comfy_vram(active, "chain done"))
+            return
+        except _GEN_FAILOVER_ERRORS as e:
+            if s1_done:                              # mesh already relayed — a stage-2 loss is final
+                logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
+                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}")
+                asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+                return
+            logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] connection issue "
+                           f"({type(e).__name__}: {e}) — failing over")
+            tried.add(backend["name"])
+            asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
+            continue
+        except Exception as e:
+            logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
+            await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}")
+            asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+            return
+        finally:
+            if held is not None:
+                _inflight_dec(held)
 
 
 _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
@@ -2189,12 +2309,12 @@ async def run_generation(body: dict, request: Request,
         logger.info(f"→ generation '{alias}' ({task}) job {job_id} mode={mode}"
                     f"{' PARKED' if parked else ''} candidates=[{cands}]")
 
-    # Workflow chain: stage 1 has a `successor` → run both stages back-to-back on one
-    # backend (queue-isolated), deliver only stage 2. The chain waits for the backend
-    # itself, so parked/ready both route here.
+    # Workflow chain: stage 1 has a `successor` → run both stages back-to-back,
+    # deliver only stage 2. The chain resolves/parks/fails over its stage-1 backend
+    # itself (keeping the force pin + LoRA eligibility), so parked/ready both route here.
     succ = cand0.get("successor")
     if succ and (succ.get("alias") or "").strip():
-        runner = _run_chain(job_id, first, cand0, alias, succ, body, request, upload_images)
+        runner = _run_chain(job_id, alias, succ, body, request, upload_images, force, eligible)
         if mode == "async":
             _spawn_gen(job_id, runner)
             return {"job_id": job_id, "status": "queued"}
@@ -2336,8 +2456,7 @@ async def get_job_result(job_id: str, n: int, request: Request, authorization: O
     path, mime, name = rp
     headers = None
     if name:                                            # suggest the original filename on download,
-        safe = name.replace('"', "").replace("\n", "")  # inline so images/video still preview
-        headers = {"Content-Disposition": f'inline; filename="{safe}"'}
+        headers = {"Content-Disposition": jobs.content_disposition(name)}   # inline so media still previews
     return FileResponse(path, media_type=mime, headers=headers)
 
 

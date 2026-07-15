@@ -176,6 +176,8 @@ class NormalizedRequest:
     output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
     output_globs: Optional[list] = None             # alias setting: deliver every file matching these globs
     output_cases: Optional[list] = None             # alias setting: [{rig, globs}] — first detected case wins
+    slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
+                                                    # generate() must not inc/dec it a second time
 
 
 @dataclass
@@ -780,7 +782,11 @@ def _view_params(item) -> Optional[tuple]:
         p = item.replace("\\", "/")
         if os.path.splitext(p)[1].lower() not in _MIME_BY_EXT:   # not a recognised artifact
             return None
-        typ, rel = "output", p.rsplit("/", 1)[-1]                # bare name → assume output dir
+        # Default when no output/temp/input segment names the dir type: an absolute
+        # path is reduced to its basename (best guess — /view can't take its dirs),
+        # but a RELATIVE path is already output-relative, so its dirs are the subfolder.
+        typ = "output"
+        rel = p.rsplit("/", 1)[-1] if (p.startswith("/") or ":" in p.split("/", 1)[0]) else p
         for t in ("output", "temp", "input"):
             i = p.rfind(f"/{t}/")
             if i != -1:
@@ -1446,7 +1452,8 @@ class ComfyUIAdapter(BackendAdapter):
 
         poll_interval = float(b.get("poll_interval", 1.0))
         max_wait = float(b.get("max_wait", 600))
-        self.ctx.inflight_inc(self.bid)
+        if not req.slot_held:            # a chain claims the slot itself and holds it across stages
+            self.ctx.inflight_inc(self.bid)
         started = time.monotonic()
         log_on = self.ctx.log_enabled()
         try:
@@ -1474,6 +1481,10 @@ class ComfyUIAdapter(BackendAdapter):
                         raise RuntimeError(f"no output case matched (rigs: "
                                            f"{[c.get('rig') for c in req.output_cases]}; nodes with "
                                            f"outputs: {', '.join(sorted(outputs)) or 'none'})")
+                    if req.output_globs:             # plain glob lines mixed with cases: unconditional extras
+                        have = {b.name for b in blobs}
+                        blobs += [b for b in await self._fetch_by_globs(client, url, outputs, req.output_globs)
+                                  if b.name not in have]
                     warnings = validate_delivery(blobs, rig)
                 else:
                     blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
@@ -1487,7 +1498,8 @@ class ComfyUIAdapter(BackendAdapter):
                                            f"no fetchable artifact{extra} (no matching file in its outputs)")
                     _check_glb_not_dummy(blobs)  # 2x2-dummy safety net (case mode does it in validate)
         finally:
-            self.ctx.inflight_dec(self.bid)
+            if not req.slot_held:
+                self.ctx.inflight_dec(self.bid)
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if log_on:
@@ -1607,19 +1619,33 @@ class ComfyUIAdapter(BackendAdapter):
                     if parsed is None:
                         continue
                     fn, view = parsed
+                    # With output_ext, prefer the SIBLING with that extension over the
+                    # reported file: UniRig registers only `fbx_file` but writes
+                    # <stem>.fbx AND <stem>.glb (+ a .fbm folder); the client wants
+                    # the textured .glb. A reported file WITHOUT such a sibling (the
+                    # basecolor PNG next to the mesh) still ships itself — swapping
+                    # it away would silently drop it from the delivery.
+                    tries = [(fn, view)]
                     if output_ext:
-                        # Deliver the SIBLING with this extension instead of the
-                        # reported file: UniRig registers only `fbx_file` but writes
-                        # <stem>.fbx AND <stem>.glb (+ a .fbm folder); the client
-                        # wants the textured .glb. Same basename, /view by basename.
                         stem = fn[:-(len(fn.split(".")[-1]) + 1)] if "." in fn else fn
-                        fn = f"{stem}.{output_ext}"
-                        view = {**view, "filename": fn}
-                    if (fn, view.get("subfolder", "")) in seen:
-                        continue
-                    seen.add((fn, view.get("subfolder", "")))
-                    r = await client.get(f"{url}/view", params=view)
-                    if r.status_code != 200:
+                        sib = f"{stem}.{output_ext}"
+                        if sib != fn:
+                            tries.insert(0, (sib, {**view, "filename": sib}))
+                    r = None
+                    for fn, view in tries:
+                        key = (fn, view.get("subfolder", ""))
+                        if key in seen:          # already delivered/probed for an earlier item
+                            r = None
+                            break
+                        seen.add(key)
+                        r = await client.get(f"{url}/view", params=view)
+                        if r.status_code == 200:
+                            break
+                        if r.status_code != 404:   # only "no such file" may probe on — a backend
+                            raise RuntimeError(    # error must not silently shrink the delivery
+                                f"/view '{fn}' → HTTP {r.status_code}")
+                        r = None
+                    if r is None:
                         continue
                     mime, kind = _mime_and_kind(fn)
                     if mime == "application/octet-stream" and isinstance(item, dict):
@@ -1638,14 +1664,20 @@ class ComfyUIAdapter(BackendAdapter):
         Two riggers may share a workflow (humanoid MIA vs non-humanoid UniRig) or
         live in split workflows — either way exactly one case's detect file is
         present, so the client gets that case's files + its rig type. Returns
-        (blobs, rig)."""
+        (blobs, rig).
+
+        A case is fetched ONCE and the detect condition checked on the result —
+        a separate detect probe would download the (often large) detect file
+        twice per job. A /view failure that is not a plain 404 raises inside
+        _fetch_by_globs, so a transiently unreachable file fails the job loudly
+        instead of silently selecting the wrong case."""
         for case in cases:
             globs = case.get("globs") or []
             if not globs:
                 continue
-            if not await self._fetch_by_globs(client, url, outputs, globs[:1]):
-                continue                              # detect file absent → this case didn't run
             blobs = await self._fetch_by_globs(client, url, outputs, globs)
+            if not any(fnmatch.fnmatch((b.name or "").lower(), globs[0].lower()) for b in blobs):
+                continue                              # detect file absent → this case didn't run
             return blobs, case.get("rig")
         return [], None
 
@@ -1680,8 +1712,11 @@ class ComfyUIAdapter(BackendAdapter):
                 if not fnmatch.fnmatch(cfn.lower(), g.lower()):
                     continue
                 r = await client.get(f"{url}/view", params=view)
-                if r.status_code != 200:                 # sibling for this glob doesn't exist
+                if r.status_code == 404:                 # sibling for this glob doesn't exist
                     continue
+                if r.status_code != 200:                 # a backend error is not "file absent" —
+                    raise RuntimeError(                  # it must not shrink or mis-detect a delivery
+                        f"/view '{cfn}' → HTTP {r.status_code}")
                 fetched.add((cfn, view.get("subfolder", "")))
                 mime, kind = _mime_and_kind(cfn)
                 blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=cfn))

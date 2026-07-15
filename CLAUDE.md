@@ -71,7 +71,12 @@ receive what they need via injected callables, staying hot-reload-safe.
   `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
   rejections are translated to readable per-node errors (node title, class,
   field, offending request param) via `_comfy_prompt_error`; raw body stays the
-  fallback.
+  fallback. Artifact delivery: a `/view` 404 means "file absent" (probe on), any
+  OTHER status raises — a backend error must never silently shrink a delivery;
+  `output_ext` prefers the same-stem sibling but ships the reported file when the
+  sibling is missing; `output_cases` fetches a case ONCE and checks the detect
+  glob on the result; plain `output_globs` may accompany cases as unconditional
+  extras. A relative `/view` path keeps its dirs as the subfolder (`_view_params`).
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
@@ -157,14 +162,23 @@ receive what they need via injected callables, staying hot-reload-safe.
 - **Workflow chains** (`_run_chain`): a gen alias's stage-1 config carries a
   `successor` (`{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`);
   stage 1 exports a mesh under a gateway-pinned filename (`gwchain_<jobid>`) and
-  ONLY stage 2's result is delivered (+ any `keep_from_mesh` files). Two hand-offs:
+  ONLY stage 2's result is delivered (+ any `keep_from_mesh` files). Stage 1 gets
+  the normal routing guarantees: candidates re-resolved while parked (force pin +
+  LoRA eligibility kept), misconfigured candidates skipped, connection errors fail
+  over (stage-2/hand-off errors are FINAL); `mesh_param` is validated against the
+  successor's mapping (param or label) and the mesh extension honors pins/mapped
+  params on the export node's `file_format`. The job row's `backend` is re-pointed
+  at claim and hand-off (`jobs.set_backend`) so cancel interrupts the LIVE backend.
+  Chain stages run with `slot_held` (the chain claims the one slot itself — no
+  double count). Two hand-offs:
   `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot
   held across both — queue-isolated) and passes the mesh's absolute output path;
   `relay: upload` lets the successor run on a **different** backend — the gateway
   fetches the mesh (`/view`) and uploads it into the stage-2 backend's input dir
   (`adapter.upload_input` → ComfyUI `/upload/image`), passing the stored name (the
   successor's `mesh_param` must feed a load-from-input node). Cross-backend releases
-  the stage-1 slot once the mesh is in hand, then claims the stage-2 slot.
+  the stage-1 slot AND frees its ComfyUI VRAM once the mesh is in hand, then claims
+  the stage-2 slot.
 
 ### Routing rules (`get_routes_for`/`get_gen_routes` + `alias_entry`)
 
