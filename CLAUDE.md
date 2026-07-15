@@ -174,11 +174,14 @@ receive what they need via injected callables, staying hot-reload-safe.
   `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot
   held across both — queue-isolated) and passes the mesh's absolute output path;
   `relay: upload` lets the successor run on a **different** backend — the gateway
-  fetches the mesh (`/view`) and uploads it into the stage-2 backend's input dir
-  (`adapter.upload_input` → ComfyUI `/upload/image`), passing the stored name (the
-  successor's `mesh_param` must feed a load-from-input node). Cross-backend releases
-  the stage-1 slot AND frees its ComfyUI VRAM once the mesh is in hand, then claims
-  the stage-2 slot.
+  fetches the mesh (`/view`), uploads it into the stage-2 backend's input dir
+  (`adapter.upload_input` → ComfyUI `/upload/image`) and passes the file's
+  **absolute input-dir path** (backend `comfy_input_dir`, blank = derived from
+  `comfy_output_dir`'s `…/input` sibling) — the successor consumes it exactly like
+  a path hand-off; only with no input dir known does the bare stored name go over
+  (then a load-from-input node is required). Cross-backend releases the stage-1
+  slot AND frees its ComfyUI VRAM once the mesh is in hand, then claims the
+  stage-2 slot.
 
 ### Routing rules (`get_routes_for`/`get_gen_routes` + `alias_entry`)
 

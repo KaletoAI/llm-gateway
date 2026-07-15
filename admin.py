@@ -757,6 +757,12 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + "<p class='hint' style='margin:-4px 0 10px'>Absolute path to this ComfyUI's <b>output</b> "
               "directory — only needed for <b>workflow chains</b> (a successor stage reads the previous "
               "stage's mesh by full path from here). Leave blank otherwise.</p>"
+            + _field("comfy input dir", _inp("comfy_input_dir", g("comfy_input_dir"),
+                     placeholder="blank = derived: output dir's …/input sibling"))
+            + "<p class='hint' style='margin:-4px 0 10px'>Absolute path to this ComfyUI's <b>input</b> "
+              "directory — used by chain <b>upload</b> hand-offs: the relayed mesh lands here and the "
+              "successor gets its full path. Blank = derived from the output dir "
+              "(<code>…/output</code> → <code>…/input</code>).</p>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
             + _field("discovery filters",
@@ -992,6 +998,11 @@ async def backend_save(request: Request):
         b["comfy_output_dir"] = cod
     else:
         b.pop("comfy_output_dir", None)
+    cid = (f.get("comfy_input_dir", "") or "").strip().rstrip("/")
+    if cid:
+        b["comfy_input_dir"] = cid
+    else:
+        b.pop("comfy_input_dir", None)         # blank = derive from the output dir
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
@@ -2057,9 +2068,10 @@ def _chain_section(wf: dict, cands: list) -> str:
               "it to the successor under the <b>mesh param</b> (default <code>mesh_path</code> — must be a "
               "request field on the successor). <b>Hand-off</b>: <code>path</code> keeps both stages on ONE "
               "backend (shared disk) and passes the mesh's absolute output path. <code>upload</code> lets the "
-              "successor run on a DIFFERENT backend — the gateway fetches the mesh and uploads it into that "
-              "backend's <b>input</b> dir, passing the stored filename (the successor's mesh param must feed a "
-              "node that loads from input/, e.g. a Load-3D/upload node). Stage 2 runs on an <b>allowed</b> "
+              "successor run on a DIFFERENT backend — the gateway fetches the mesh, uploads it into that "
+              "backend's <b>input</b> dir and passes its absolute path there (the backend's <b>comfy input "
+              "dir</b>, blank = derived from the output dir), so the successor loads it exactly like a path "
+              "hand-off — no special loader needed. Stage 2 runs on an <b>allowed</b> "
               "successor candidate, preferring the same backend as stage 1; so only list the successor on "
               "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
               "threaded to the successor by matching param name.</p>"

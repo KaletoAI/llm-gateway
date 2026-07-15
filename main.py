@@ -1860,6 +1860,30 @@ async def _wait_and_hold(backend: dict, job_id: str, label: str) -> bool:
     return True
 
 
+def _comfy_input_dir(backend: dict) -> str:
+    """The absolute path of a ComfyUI backend's input directory (as the ComfyUI
+    process sees it): explicit `comfy_input_dir`, else derived as the sibling of
+    `comfy_output_dir` (…/output → …/input — ComfyUI's standard layout).
+    '' when neither is known."""
+    d = (backend.get("comfy_input_dir") or "").rstrip("/")
+    if d:
+        return d
+    out = (backend.get("comfy_output_dir") or "").rstrip("/")
+    if out.endswith("/output"):
+        return out[:-len("output")] + "input"
+    return ""
+
+
+def _input_path_ref(backend: dict, stored: str) -> str:
+    """What the successor's mesh param receives after an upload hand-off: the
+    uploaded file's ABSOLUTE path in the stage-2 backend's input dir, so the
+    successor loads it exactly like a path hand-off (no special loader needed).
+    Falls back to the bare stored name when no input dir is known — only a
+    load-from-input node can resolve that."""
+    indir = _comfy_input_dir(backend)
+    return f"{indir}/{stored}" if indir else stored
+
+
 async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                      upload_images, force: str = "", eligible: Optional[set] = None) -> None:
     """Run a two-stage workflow chain: stage 1 (the client-facing mesh alias) exports
@@ -1876,11 +1900,15 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
       • `path` (default) — both stages on the SAME backend (shared disk); stage 2 gets
         the mesh's absolute output path. Backend needs comfy_output_dir. The one slot is
         held across both stages so nothing from the queue runs between them.
-      • `upload` — CROSS-backend: the gateway fetches stage 1's mesh (/view), then
-        uploads it into stage 2's backend input dir and passes the stored name. Stage 2
-        may run on a DIFFERENT backend (e.g. mesh on dx10-02, rig on a UniRig box). The
-        stage-1 slot is released (and its ComfyUI VRAM freed) once its mesh is in hand,
-        then the stage-2 slot is claimed — different backends, so they need not be atomic.
+      • `upload` — CROSS-backend: the gateway fetches stage 1's mesh (/view), uploads
+        it into stage 2's backend input dir and passes its ABSOLUTE PATH there
+        (`comfy_input_dir`, else derived from comfy_output_dir's …/input sibling) — the
+        successor consumes it exactly like a path hand-off, no special loader needed.
+        Only when no input dir is known does the bare stored name go over (a
+        load-from-input node can still resolve that). Stage 2 may run on a DIFFERENT
+        backend (e.g. mesh on dx10-02, rig on a UniRig box). The stage-1 slot is
+        released (and its ComfyUI VRAM freed) once its mesh is in hand, then the
+        stage-2 slot is claimed — different backends, so they need not be atomic.
 
     successor config: {alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}."""
     succ_alias = (succ.get("alias") or "").strip()
@@ -2080,12 +2108,12 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 held = bid2
                 active = backend2
                 await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
-                mesh_ref = await adapter2.upload_input(mesh_bytes, mesh_name)
+                mesh_ref = _input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
                 if log_per_call:
                     logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
                                 f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
-            elif relay == "upload":
-                mesh_ref = await adapter2.upload_input(mesh_bytes, mesh_name)   # same backend, upload node
+            elif relay == "upload":                         # same backend, still via input dir
+                mesh_ref = _input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
             else:
                 mesh_ref = f"{outdir}/{mesh_name}"          # shared-disk absolute path
 
