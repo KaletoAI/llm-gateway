@@ -2135,7 +2135,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
                 raw=request, output_node=(s2.get("output_node") or None),
                 output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
-                output_cases=(s2.get("output_cases") or None), slot_held=True)
+                output_cases=(s2.get("output_cases") or None),
+                texture_format=(s2.get("texture_format") or None), slot_held=True)
             await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
             await _unload_host_llms(backend2)
             out2 = await adapter2.generate(req2)
@@ -2144,7 +2145,9 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             if cross:
                 meta["chain_backends"] = [backend["name"], backend2["name"]]
             if chain_rig:                                # validate the COMBINED delivery at chain level
-                normalize_delivery(blobs, chain_rig)     # e.g. V-flip generic texture PNGs (flip-once flagged)
+                # V-flip (+ optional jpeg) textures — normalize-once flagged; the knob
+                # lives on the CLIENT-FACING (stage-1) alias, covering kept stage-1 files too
+                normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
                 warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
                 meta["rig"] = chain_rig
                 if warnings:
@@ -2321,6 +2324,7 @@ async def run_generation(body: dict, request: Request,
             output_ext=(cand.get("output_ext") or None),
             output_globs=(cand.get("output_globs") or None),
             output_cases=(cand.get("output_cases") or None),
+            texture_format=(cand.get("texture_format") or None),
         )
 
     first, cand0 = routes[0]

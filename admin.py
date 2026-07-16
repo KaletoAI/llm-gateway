@@ -1980,6 +1980,14 @@ def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, 
     return rows or "<p class='muted'>none pinned — add from Available fields below</p>"
 
 
+def _tf_opts(cands: list) -> str:
+    """Options for the delivered-texture-format select (blank = as produced)."""
+    cur = next((str(c.get("texture_format")) for c in cands if c.get("texture_format")), "")
+    return "".join(
+        f'<option value="{v}"{" selected" if cur == v else ""}>{lbl}</option>'
+        for v, lbl in (("", "as produced (png)"), ("jpeg", "jpeg — smaller, no alpha")))
+
+
 def _output_section(wf: dict, cands: list) -> str:
     """Which node's artifacts a job returns — rendered under Pinned values.
     Default (auto) keeps the legacy behaviour: every output-producing node, or
@@ -2011,6 +2019,11 @@ def _output_section(wf: dict, cands: list) -> str:
               "reports — some nodes register only one format but write several next to it (UniRig reports "
               "the <code>.fbx</code> but also writes <code>.glb</code>). Blank = deliver what the node "
               "reports. The job fails clearly if the sibling doesn't exist.</p>"
+            + _field("deliver textures as", f'<select name="texture_format">{_tf_opts(cands)}</select>', short=True)
+            + "<p class='hint'>For <b>generic</b>-rig deliveries: <b>jpeg</b> transcodes the baked texture "
+              "PNGs to JPEG (quality 90) at delivery — ComfyUI has no JPEG export, so the gateway shrinks "
+              "the multi-MB bake here. A texture with a real alpha channel keeps PNG. On a chain set this "
+              "on the client-facing (stage-1) alias.</p>"
             + _field("output files", _textarea("output_globs", globs_text, 4,
                      "plain globs (deliver all), or 'rig: globs' lines for conditional cases:\n"
                      "mixamo: *_mia.glb\ngeneric: *_articulationxl.fbx, *basecolor*.png"), wide=True)
@@ -2461,6 +2474,13 @@ async def update(request: Request):
             c["output_ext"] = out_ext
         else:
             c.pop("output_ext", None)
+    # delivered texture format (generic-rig deliveries; blank = as produced)
+    tf = (f.get("texture_format", "") or "").strip().lower()
+    for c in cands:
+        if tf in ("jpeg", "jpg"):
+            c["texture_format"] = "jpeg"
+        else:
+            c.pop("texture_format", None)
     # output files (overrides node+ext): 'rig: globs' lines → conditional cases,
     # plain glob lines → flat multi-file delivery.
     out_cases, out_flat = [], []

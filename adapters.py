@@ -176,6 +176,7 @@ class NormalizedRequest:
     output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
     output_globs: Optional[list] = None             # alias setting: deliver every file matching these globs
     output_cases: Optional[list] = None             # alias setting: [{rig, globs}] — first detected case wins
+    texture_format: Optional[str] = None            # alias setting: "jpeg" transcodes generic texture PNGs
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
 
@@ -715,7 +716,8 @@ def _check_glb_not_dummy(blobs) -> None:
 _SIZE_LIMIT_MB = 30                                  # web-suitability guideline (warn, not fail)
 
 
-def normalize_delivery(blobs: list, rig: Optional[str]) -> None:
+def normalize_delivery(blobs: list, rig: Optional[str],
+                       texture_format: Optional[str] = None) -> None:
     """Fix known mesh-pipeline artifacts IN PLACE, before validation.
 
     generic (FBX + separate texture PNGs): the bake writes the textures
@@ -727,26 +729,45 @@ def normalize_delivery(blobs: list, rig: Optional[str]) -> None:
     delivery share the FBX's UV set (basecolor, metallic, …), so all are
     flipped. A blob flag guards against double application (the adapter
     normalizes case deliveries, the chain level normalizes the combined one).
-    A failed flip delivers the original bytes instead of failing the job.
+    A failed normalize delivers the original bytes instead of failing the job.
+
+    `texture_format="jpeg"` (alias Output option) additionally transcodes the
+    flipped texture PNGs to JPEG (quality 90) in the same decode pass —
+    ComfyUI has no JPEG export, so the gateway is the one place to shrink a
+    multi-MB bake for delivery. A texture with a REAL alpha channel keeps PNG
+    (JPEG has none). The FBX references its texture by a temp path anyway
+    (clients re-bind by delivered name), so the extension change is safe.
     """
     if rig != "generic":
         return
     for b in blobs:
-        if getattr(b, "_v_flipped", False):
+        if getattr(b, "_normalized", False):
             continue
         if not (b.name or "").lower().endswith(".png"):
             continue
         try:
             import io
             from PIL import Image
-            img = Image.open(io.BytesIO(b.data))
+            img = Image.open(io.BytesIO(b.data)).transpose(Image.FLIP_TOP_BOTTOM)
+            fmt = "PNG"
+            if (texture_format or "").lower() in ("jpg", "jpeg"):
+                if img.mode == "P" and "transparency" in img.info:
+                    img = img.convert("RGBA")
+                translucent = ("A" in img.getbands()
+                               and img.getchannel("A").getextrema()[0] < 255)
+                if not translucent:
+                    img = img.convert("RGB")
+                    fmt = "JPEG"
             buf = io.BytesIO()
-            img.transpose(Image.FLIP_TOP_BOTTOM).save(buf, format="PNG")
+            img.save(buf, format=fmt, **({"quality": 90} if fmt == "JPEG" else {}))
             b.data = buf.getvalue()
-            b._v_flipped = True
+            if fmt == "JPEG":
+                b.name = b.name[:-len(".png")] + ".jpg"
+                b.mime = "image/jpeg"
+            b._normalized = True
         except Exception as e:
-            logger.warning(f"normalize_delivery: texture flip failed for "
-                           f"'{b.name}' — delivering unflipped: {e}")
+            logger.warning(f"normalize_delivery: texture normalize failed for "
+                           f"'{b.name}' — delivering as produced: {e}")
 
 
 def validate_delivery(blobs: list, rig: Optional[str]) -> list:
@@ -1519,7 +1540,7 @@ class ComfyUIAdapter(BackendAdapter):
                         have = {b.name for b in blobs}
                         blobs += [b for b in await self._fetch_by_globs(client, url, outputs, req.output_globs)
                                   if b.name not in have]
-                    normalize_delivery(blobs, rig)   # e.g. V-flip generic texture PNGs
+                    normalize_delivery(blobs, rig, req.texture_format)   # V-flip (+ optional jpeg) textures
                     warnings = validate_delivery(blobs, rig)
                 else:
                     blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,

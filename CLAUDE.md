@@ -77,6 +77,9 @@ receive what they need via injected callables, staying hot-reload-safe.
   sibling is missing; `output_cases` fetches a case ONCE and checks the detect
   glob on the result; plain `output_globs` may accompany cases as unconditional
   extras. A relative `/view` path keeps its dirs as the subfolder (`_view_params`).
+  `normalize_delivery` (case mode + chain level, normalize-once flagged) V-flips
+  generic texture PNGs and — alias Output option `texture_format: jpeg` —
+  transcodes them to JPEG q90 (real alpha keeps PNG; ComfyUI has no JPEG export).
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
