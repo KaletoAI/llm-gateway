@@ -409,6 +409,18 @@ def _badge(text: str, kind: str = "muted", title: str = "") -> str:
 _MODELVIEWER_SRC = "/ui/static/model-viewer.min.js"   # bundled locally (no CDN); served by static_asset
 
 
+def _dl_card(src: str, label: str = "download", *, dl: str = " download",
+             mime: str = "", compact: bool = False, cls: str = "") -> str:
+    """A download anchor for a non-inline job artifact. `compact` = the small card shown
+    under a 3D viewer (GLB/FBX); default = a standalone card. `mime` adds a type hint;
+    `dl` is the download attribute (a suggested filename, or bare `download`)."""
+    c = f' class="{cls}"' if cls else ""
+    hint = f" <span class='muted'>({_esc(mime)})</span>" if mime else ""
+    pad = "margin-top:6px;padding:8px 12px" if compact else "padding:18px 22px"
+    return (f'<a{c} href="{src}" target="_blank"{dl} style="display:inline-block;'
+            f'{pad};{_BOX_STYLE};text-decoration:none">⬇ {_esc(label)}{hint}</a>')
+
+
 def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
                style: str = "", autoplay: bool = False) -> str:
     """Right media element for a generation artifact: <video> for video, <audio>
@@ -446,8 +458,7 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
     if k == "file":                                   # non-previewable artifact (fbx/obj/…) → download
-        return (f'<a{c} href="{src}" target="_blank" download style="display:inline-block;'
-                f'padding:18px 22px;{_BOX_STYLE};text-decoration:none">⬇ download</a>')
+        return _dl_card(src, cls=cls)
     return f'<img{c}{s} src="{src}">'
 
 
@@ -3310,19 +3321,15 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
         elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → <model-viewer> + download
             cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}"
-                      f"<div><a href='{src}' target='_blank'{dl} style='display:inline-block;margin-top:6px;"
-                      f"padding:8px 12px;{_BOX_STYLE};text-decoration:none'>⬇ {_esc(label)}</a></div></div>")
+                      f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
             has_fbx = True
             tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
             cells += (f'<div><div class="fbxview" data-src="{_esc(src)}"{tex_attr} '
                       f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
-                      f"<div><a href='{src}' target='_blank'{dl} style='display:inline-block;margin-top:6px;"
-                      f"padding:8px 12px;{_BOX_STYLE};text-decoration:none'>⬇ {_esc(label)}</a></div></div>")
+                      f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif mk == "file":                                # other file artifacts → download card
-            cells += (f"<a href='{src}' target='_blank'{dl} style='display:inline-block;"
-                      f"padding:18px 22px;{_BOX_STYLE};text-decoration:none'>"
-                      f"⬇ {_esc(label)} <span class='muted'>({_esc(r.get('mime') or 'file')})</span></a>")
+            cells += _dl_card(src, label, dl=dl, mime=(r.get("mime") or "file"))
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
     out = f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"

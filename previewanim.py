@@ -45,21 +45,15 @@ def _bone_key(name) -> str:
 
 def _parse(glb: bytes):
     """(gltf-dict, BIN bytearray, had_bin_chunk) or None. `had_bin_chunk` lets the
-    caller refuse to corrupt a GLB whose buffer 0 is external (no BIN chunk)."""
-    if glb[:4] != b"glTF":
+    caller refuse to corrupt a GLB whose buffer 0 is external (no BIN chunk). Reuses
+    the shared GLB chunk-walk from adapters (imported lazily — this module stays a
+    dependency-free leaf at import time; the parse itself is main-free)."""
+    from adapters import glb_chunks
+    parsed = glb_chunks(glb)
+    if parsed is None:
         return None
-    off, jc, bc = 12, None, None
-    while off + 8 <= len(glb):
-        clen, ctype = struct.unpack_from("<I4s", glb, off)
-        s = off + 8
-        if ctype == b"JSON":
-            jc = glb[s:s + clen]
-        elif ctype == b"BIN\x00":
-            bc = glb[s:s + clen]
-        off = s + clen
-    if jc is None:
-        return None
-    return json.loads(jc), bytearray(bc or b""), bc is not None
+    gltf, bc = parsed
+    return gltf, bytearray(bc or b""), bc is not None
 
 
 def _build(gltf: dict, binb: bytearray) -> bytes:

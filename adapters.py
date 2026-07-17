@@ -666,11 +666,11 @@ def _image_dims(b: bytes) -> Optional[tuple]:
     return None
 
 
-def _glb_info(data: bytes) -> Optional[dict]:
-    """Parse a GLB in pure Python (JSON + BIN chunks): `{texture_dims:[(w,h),…],
-    mixamorig_joints:int, skins:int, meshes:int}`, or None if `data` isn't a
-    parseable glTF-binary. Backs the delivery validation (2x2 dummy, 52-joint
-    mixamorig skin, embedded texture present)."""
+def glb_chunks(data: bytes) -> Optional[tuple]:
+    """Walk a glTF-binary into `(json-dict, BIN-bytes-or-None)`, or None if `data`
+    isn't a parseable GLB. `bin` is None when the file carries no BIN chunk (buffer 0
+    is external). The shared pure leaf under `_glb_info` (delivery validation) and
+    `previewanim` (idle preview) — no gateway state, importable by either."""
     try:
         if data[:4] != b"glTF" or len(data) < 20:
             return None
@@ -685,7 +685,21 @@ def _glb_info(data: bytes) -> Optional[dict]:
             off += 8 + clen                          # chunkLength already includes padding
         if json_chunk is None:
             return None
-        gltf = json.loads(json_chunk)
+        return json.loads(json_chunk), bin_chunk
+    except Exception:
+        return None
+
+
+def _glb_info(data: bytes) -> Optional[dict]:
+    """Parse a GLB (via `glb_chunks`) into `{texture_dims:[(w,h),…], embedded_images:int,
+    mixamorig_joints:int, skins:int, meshes:int}`, or None if `data` isn't a parseable
+    glTF-binary. Backs the delivery validation (2x2 dummy, 52-joint mixamorig skin,
+    embedded texture present)."""
+    parsed = glb_chunks(data)
+    if parsed is None:
+        return None
+    try:
+        gltf, bin_chunk = parsed
         bufviews = gltf.get("bufferViews") or []
         dims, embedded_images = [], 0
         for im in (gltf.get("images") or []):
@@ -711,10 +725,11 @@ def _glb_info(data: bytes) -> Optional[dict]:
         return None
 
 
-def _glb_texture_dims(data: bytes) -> Optional[list]:
-    """Embedded-texture dimensions of a GLB (thin wrapper over _glb_info)."""
-    info = _glb_info(data)
-    return info["texture_dims"] if info is not None else None
+def _is_dummy(dims) -> bool:
+    """True when a GLB's readable embedded-texture dims are ALL the tell-tale ≤2 px
+    export-node stub (the known bug). Empty/None dims (no readable image) → not a
+    positive dummy verdict — presence is judged separately (`embedded_images`)."""
+    return bool(dims) and max(max(w, h) for w, h in dims) <= 2
 
 
 def _check_glb_not_dummy(blobs) -> None:
@@ -725,8 +740,9 @@ def _check_glb_not_dummy(blobs) -> None:
     for b in blobs:
         if b.mime != "model/gltf-binary":
             continue
-        dims = _glb_texture_dims(b.data)
-        if dims and max(max(w, h) for w, h in dims) <= 2:
+        info = _glb_info(b.data)
+        dims = info["texture_dims"] if info else None
+        if _is_dummy(dims):
             w, h = dims[0]
             raise RuntimeError(f"GLB '{b.name or 'output'}' carries only a {w}x{h} dummy texture "
                                "(known texture-export node bug) — no real texture was embedded; "
@@ -816,8 +832,7 @@ def validate_delivery(blobs: list, rig: Optional[str]) -> list:
                                f"(skins={info['skins']}, mixamorig joints={info['mixamorig_joints']})")
         if info["embedded_images"] == 0:             # presence is separate from readable dims:
             raise RuntimeError(f"humanoid result '{glb.name}': no embedded texture")
-        dims = info["texture_dims"]                  # a WebP/KTX2 texture is present but may be unreadable
-        if dims and max(max(w, h) for w, h in dims) <= 2:
+        if _is_dummy(info["texture_dims"]):          # a WebP/KTX2 texture is present but may be unreadable
             raise RuntimeError(f"humanoid result '{glb.name}': embedded texture is a 2x2 dummy "
                                "(known node bug) — no result")
         if info["mixamorig_joints"] < 50:
@@ -1363,15 +1378,21 @@ class ComfyUIAdapter(BackendAdapter):
             return copy.deepcopy(req.workflow_json)            # never mutate the stored one
         return self._load_workflow(req.workflow)
 
-    async def _upload_image(self, client: httpx.AsyncClient, data: bytes, name: str) -> str:
-        """Upload an image to ComfyUI's input dir under a fixed, reused name
-        (overwrite=true), so playground uploads never accumulate — one slot, no
-        garbage (ComfyUI has no delete-input API). Returns the stored name."""
+    async def _post_upload(self, client: httpx.AsyncClient, data: bytes, name: str,
+                           content_type: str):
+        """The one ComfyUI `/upload/image` POST (overwrite=true → one reused slot, no
+        garbage; ComfyUI has no delete-input API). Returns the raw response; callers
+        apply their own success/subfolder + error policy."""
         url = self.backend["url"].rstrip("/")
+        return await client.post(f"{url}/upload/image",
+                                 files={"image": (name, data, content_type)},
+                                 data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
+
+    async def _upload_image(self, client: httpx.AsyncClient, data: bytes, name: str) -> str:
+        """Upload a playground reference image; best-effort (returns the intended name
+        on any failure so a generation still proceeds with the placeholder)."""
         try:
-            r = await client.post(f"{url}/upload/image",
-                                  files={"image": (name, data, "image/png")},
-                                  data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
+            r = await self._post_upload(client, data, name, "image/png")
             return (r.json() or {}).get("name", name) if r.status_code == 200 else name
         except Exception:
             return name
@@ -1381,12 +1402,10 @@ class ComfyUIAdapter(BackendAdapter):
         """Upload an arbitrary file (a chain's intermediate mesh) into this backend's
         ComfyUI input dir and return the stored name. Lets a two-stage chain relay
         stage 1's mesh to a stage-2 backend that does NOT share disk — the successor
-        workflow then loads it from input/ by this name (overwrite=true, one slot)."""
-        url = self.backend["url"].rstrip("/")
+        workflow then loads it from input/ by this name (overwrite=true, one slot).
+        Raises on failure (a lost mesh must fail the chain, not run stage 2 blind)."""
         async with _pooled_client(self.ctx) as c:
-            r = await c.post(f"{url}/upload/image",
-                             files={"image": (name, data, content_type)},
-                             data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
+            r = await self._post_upload(c, data, name, content_type)
         if r.status_code != 200:
             raise RuntimeError(f"mesh upload to '{self.backend.get('name')}' failed "
                                f"(HTTP {r.status_code}: {r.text[:200]})")
@@ -1394,6 +1413,35 @@ class ComfyUIAdapter(BackendAdapter):
         sub = (j.get("subfolder") or "").strip("/")
         nm = j.get("name", name)
         return f"{sub}/{nm}" if sub else nm
+
+    # ── Chain hand-off primitives (keep ComfyUI's filename/output conventions out of
+    #    main._run_chain so chains stay adapter-agnostic; siblings of upload_input) ──
+    @staticmethod
+    def export_pin(node: str, prefix: str) -> dict:
+        """The `fixed` pin that makes an export/save node write under a known prefix."""
+        return {"node": node, "field": "filename_prefix", "value": prefix}
+
+    @staticmethod
+    def pinned_output_name(prefix: str, ext: str) -> str:
+        """The file an export node writes for `filename_prefix=prefix`: ComfyUI's %05d
+        counter, and a fresh prefix always yields `_00001_`."""
+        return f"{prefix}_00001_.{ext}"
+
+    async def fetch_output(self, name: str, *, want_bytes: bool = True) -> Optional[bytes]:
+        """Fetch a produced output file from ComfyUI /view by name. Returns its bytes
+        (want_bytes), or b"" for an existence-only check (a cheap 1-byte Range GET — the
+        caller only needs to know the file is there); None if absent (404); raises on any
+        other status (a backend error must not read as 'file missing')."""
+        url = self.backend["url"].rstrip("/")
+        headers = None if want_bytes else {"Range": "bytes=0-0"}
+        async with _pooled_client(self.ctx) as c:
+            r = await c.get(f"{url}/view", params={"filename": name, "type": "output"},
+                            headers=headers, timeout=30.0)
+        if r.status_code in (200, 206):
+            return r.content if want_bytes else b""
+        if r.status_code == 404:
+            return None
+        raise RuntimeError(f"/view '{name}' → HTTP {r.status_code}")
 
     async def _resolve_image_sentinels(self, fixed: list, upload: Optional[bytes]) -> list:
         """Replace image sentinels in fixed bindings with real uploaded names.

@@ -1724,13 +1724,12 @@ async def _job_view(job_id: str, request: Request) -> dict:
     } for r in job["results"]]
     meta = job.get("meta") or {}
     # Client-facing delivery metadata: rig type (mixamo → shared anim library
-    # applies; generic → procedural idle), any web-suitability warnings, and the
-    # workflow identity (the alias) — see the character-model spec.
+    # applies; generic → procedural idle) and any web-suitability warnings — see the
+    # character-model spec. The workflow identity is already `view["alias"]`.
     if meta.get("rig"):
         view["rig"] = meta["rig"]
     if meta.get("warnings"):
         view["warnings"] = meta["warnings"]
-    view["workflow"] = job["alias"]
     view["inputs"] = meta.get("inputs")
     view["input_images"] = [{
         "n": r["n"], "slot": r.get("slot"), "mime": r["mime"],
@@ -1885,7 +1884,8 @@ def _input_path_ref(backend: dict, stored: str) -> str:
 
 
 async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
-                     upload_images, force: str = "", eligible: Optional[set] = None) -> None:
+                     upload_images, inputs: dict, params: dict,
+                     force: str = "", eligible: Optional[set] = None) -> None:
     """Run a two-stage workflow chain: stage 1 (the client-facing mesh alias) exports
     a mesh under a filename WE pin, and stage 2 (the `successor`, e.g. a rigger) is fed
     that mesh + stage-1's threaded params; ONLY stage 2's result is delivered.
@@ -1917,7 +1917,9 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     keep_globs = [g.strip() for g in (succ.get("keep_from_mesh") or []) if g.strip()]
     chain_rig = (succ.get("rig") or "").strip() or None
     relay = (succ.get("relay") or "path").strip().lower()      # "path" (shared disk) | "upload" (relay bytes)
-    inputs, params = _gen_inputs_params(body)
+    # inputs/params come pre-computed from the endpoint (one _gen_inputs_params +
+    # _apply_seconds pass, which also raised any 400); the per-attempt _apply_seconds
+    # below then re-derives for failover freshness (a no-op once seconds is resolved).
     prefix = f"gwchain_{job_id}"
 
     async def stage2_for(backend: dict) -> tuple:
@@ -2050,7 +2052,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             if (str(fx.get("node")) == export_node and fx.get("field") == "file_format"
                     and fx.get("value") not in (None, "")):
                 ext = str(fx["value"])
-        mesh_name = f"{prefix}_00001_.{ext}"        # ComfyUI's %05d counter, fresh prefix → 00001
+        mesh_name = adapter.pinned_output_name(prefix, ext)   # backend names the export file
         cross = relay == "upload" and bid2 != bid
 
         # Claim the stage-1 slot: the busy-check and inc run with no await between them
@@ -2077,7 +2079,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
                 node_mapping=stage1_cand.get("mapping") or {},
                 fixed=list(stage1_cand.get("fixed") or [])
-                     + [{"node": export_node, "field": "filename_prefix", "value": prefix}],
+                     + [adapter.export_pin(export_node, prefix)],
                 upload_images=dict(upload_images or {}), raw=request,
                 loras=body.get("loras"), slot_held=True)
             out1 = await adapter.generate(req1)
@@ -2088,18 +2090,15 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                            if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
                                                  for g in keep_globs)]
             # The path relay only needs the mesh to EXIST on the shared disk (stage 2
-            # reads it by absolute path) — a 1-byte Range GET confirms that without
-            # transferring 30–100 MB. Only the upload relay actually needs the bytes.
+            # reads it by absolute path); only the upload relay needs the bytes. The
+            # adapter fetches (existence-only = cheap 1-byte Range GET; bytes otherwise),
+            # keeping ComfyUI's /view out of the router.
             need_bytes = relay == "upload"
-            r = await http_client.get(
-                f"{backend['url'].rstrip('/')}/view",
-                params={"filename": mesh_name, "type": "output"},
-                headers=None if need_bytes else {"Range": "bytes=0-0"}, timeout=30.0)
-            ok = (200,) if need_bytes else (200, 206)
-            if r.status_code not in ok:
-                raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' (HTTP {r.status_code}) — "
+            mesh = await adapter.fetch_output(mesh_name, want_bytes=need_bytes)
+            if mesh is None:
+                raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' — "
                                    "check the export node / file_format")
-            mesh_bytes = r.content if need_bytes else None
+            mesh_bytes = mesh if need_bytes else None
             s1_done = True
 
             # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
@@ -2356,7 +2355,8 @@ async def run_generation(body: dict, request: Request,
     # itself (keeping the force pin + LoRA eligibility), so parked/ready both route here.
     succ = cand0.get("successor")
     if succ and (succ.get("alias") or "").strip():
-        runner = _run_chain(job_id, alias, succ, body, request, upload_images, force, eligible)
+        runner = _run_chain(job_id, alias, succ, body, request, upload_images,
+                            inputs, params, force, eligible)
         if mode == "async":
             _spawn_gen(job_id, runner)
             return {"job_id": job_id, "status": "queued"}

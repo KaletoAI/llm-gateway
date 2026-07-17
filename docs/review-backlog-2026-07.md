@@ -60,29 +60,28 @@ schwersten Root-Causes sind bereits gefixt (Commit `c4b73ad`), 2 wurden widerleg
    ✓ `need_bytes = relay == "upload"`; path-Modus prüft Existenz per 1-Byte-Range-GET
    (200/206), Bytes nur beim upload-Relay geholt.
 
-## C — Duplikation / Altitude (Cleanup)
+## C — Duplikation / Altitude (Cleanup) — ✓ ERLEDIGT
 
-10. **adapters.py:1298 — `upload_input` dupliziert `_upload_image`** (zwei Kopien
-    des `/upload/image`-POSTs; eine soll an die andere delegieren).
-11. **adapters.py:691 — 2×2-Dummy-Prädikat doppelt** (`_check_glb_not_dummy` vs.
-    `validate_delivery`) + Single-Use-Wrapper `_glb_texture_dims` → ein
-    gemeinsames `_is_dummy(dims)`.
-12. **previewanim.py:34 — GLB-Chunk-Walk re-implementiert** (`_parse` vs.
-    `adapters._glb_info`) → eine gemeinsame Leaf-Helper-Funktion (Import-Richtung
-    beachten: beide dürfen kein `main` importieren).
-13. **main.py:1931 — ComfyUI-Protokoll leckt in `main._run_chain`**
-    (`filename_prefix`, `_00001_`-Konvention, roher `/view`-Fetch) → als
-    Adapter-Methode kapseln (Geschwister von `upload_input`), damit Chains
-    adapter-agnostisch bleiben.
-14. **main.py:1928 — `_gen_inputs_params`/`_apply_seconds` doppelt berechnet**
-    (run_generation UND _run_chain). Achtung: die Chain-Wiederholung von
-    `_apply_seconds` pro Attempt ist Absicht (Failover-Frische) — prüfen, ob
-    Durchreichen der fertigen inputs/params die Semantik hält.
-15. **main.py:1734 — `view['workflow']` dupliziert `view['alias']`** im
-    Job-View-Payload; admin.py:3254 — vier fast identische Download-Karten-
-    HTML-Blöcke → ein `_download_card()`-Helper.
+10. ~~**adapters.py:1298 — `upload_input` dupliziert `_upload_image`**~~
+    ✓ Beide POSTs delegieren an einen gemeinsamen `_post_upload` (roher `/upload/image`-POST);
+    Success/Subfolder + Fehlerpolitik bleiben je Aufrufer.
+11. ~~**adapters.py:691 — 2×2-Dummy-Prädikat doppelt**~~
+    ✓ Gemeinsames `_is_dummy(dims)`; Single-Use-Wrapper `_glb_texture_dims` entfernt
+    (`_check_glb_not_dummy` nutzt `_glb_info` direkt).
+12. ~~**previewanim.py:34 — GLB-Chunk-Walk re-implementiert**~~
+    ✓ Gemeinsamer Leaf `adapters.glb_chunks` (pure, kein `main`); `_glb_info` und
+    `previewanim._parse` (lazy import) nutzen ihn.
+13. ~~**main.py:1931 — ComfyUI-Protokoll leckt in `main._run_chain`**~~
+    ✓ Als ComfyUIAdapter-Methoden gekapselt (`export_pin`, `pinned_output_name`,
+    `fetch_output`, Geschwister von `upload_input`); `main` ruft nur noch adapter-agnostisch.
+14. ~~**main.py:1928 — `_gen_inputs_params`/`_apply_seconds` doppelt berechnet**~~
+    ✓ Endpoint berechnet einmal, reicht `inputs`/`params` in `_run_chain` durch (fps/mapping
+    sind alias-weit → identisch); per-Attempt `_apply_seconds` bleibt als Failover-No-op.
+15. ~~**main.py:1734 — `view['workflow']` dup; admin.py — Download-Karten**~~
+    ✓ Redundantes `view['workflow']` entfernt (Consumer nutzen `alias`); vier Download-Karten
+    → ein `_dl_card()`-Helper (`_media_tag` file + `_job_thumbs` GLB/FBX/other).
 
 ## Abschluss
 
-Am Ende: `py_compile` über alle Module, App-Import-Check, erledigte Punkte in
-dieser Datei abhaken, EIN Commit (oder einer je Abschnitt). Nicht deployen.
+Alle 15 Findings verifiziert (keiner hinfällig) und gefixt. `py_compile` + App-Import +
+Helfer-Smoke-Tests grün. Drei Commits (A/B/C). Nicht deployt — der User deployt selbst.
