@@ -1599,6 +1599,11 @@ class ComfyUIAdapter(BackendAdapter):
         last_ok = time.monotonic()
         gone_since = None
         last_exc = None
+        # The vanished-prompt /queue probe only needs to fire a few times within the
+        # grace window (not every 1 s tick) — checking ~3× per grace still detects a
+        # restart within grace + one interval, at a fraction of the request load.
+        queue_every = max(poll_interval, grace / 3)
+        last_queue_check = 0.0
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
             try:
@@ -1617,13 +1622,18 @@ class ComfyUIAdapter(BackendAdapter):
                 # the prompt is gone from BOTH history and queue, yet /history keeps
                 # answering 200 (so the disconnect-grace never fires). Detecting the
                 # vanished prompt fails fast instead of polling out the full max_wait.
+                # Throttled: a skipped tick leaves `still = None` (unknown), so the
+                # gone-timer carries over exactly as an errored probe would.
                 still = None
-                try:
-                    qr = await client.get(f"{url}/queue")
-                    if qr.status_code == 200:
-                        still = _prompt_in_queue(qr.json(), prompt_id)
-                except Exception:
-                    still = None                # unknown → leave the gone-timer as is
+                now = time.monotonic()
+                if now - last_queue_check >= queue_every:
+                    last_queue_check = now
+                    try:
+                        qr = await client.get(f"{url}/queue")
+                        if qr.status_code == 200:
+                            still = _prompt_in_queue(qr.json(), prompt_id)
+                    except Exception:
+                        still = None            # unknown → leave the gone-timer as is
                 if still is True:
                     gone_since = None
                 elif still is False:

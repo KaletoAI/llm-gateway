@@ -49,18 +49,16 @@ schwersten Root-Causes sind bereits gefixt (Commit `c4b73ad`), 2 wurden widerleg
 7. ~~**admin.py:2788 — `?anim=idle` blockiert den Event-Loop.**~~
    ✓ `jobs.result_path` + File-Read + `add_idle` laufen über `asyncio.to_thread`.
 
-## B — Effizienz
+## B — Effizienz — ✓ ERLEDIGT
 
-8. **adapters.py:1533 — `/queue`-Poll auf jedem Tick.**
-   Die Vanished-Prompt-Erkennung GETtet `/queue` bei jedem Poll (1 s) über die
-   gesamte Laufzeit — ~600 Extra-Requests pro 10-min-Job, doppelte Poll-Last.
-   Die Grace ist 30 s; alle 5–10 Ticks reicht.
+8. ~~**adapters.py:1533 — `/queue`-Poll auf jedem Tick.**~~
+   ✓ `/queue`-Probe gedrosselt auf ~3× pro Grace-Fenster (`queue_every = max(poll_interval,
+   grace/3)`); ein übersprungener Tick lässt `still = None` (unknown) → Gone-Timer trägt
+   unverändert weiter.
 
-9. **main.py:1961 — path-Relay lädt das Mesh komplett, braucht aber nur Existenz.**
-   Seit `ed19146` braucht das upload-Relay die Bytes wirklich; im path-Relay
-   werden 30–100 MB nur für den HTTP-200-Check transferiert und bleiben über
-   die ganze Stage-2-Laufzeit referenziert. Fix: im path-Modus Existenz billig
-   prüfen (Range-/Head-artig oder kleiner Range-GET), Bytes nur bei upload.
+9. ~~**main.py:1961 — path-Relay lädt das Mesh komplett, braucht aber nur Existenz.**~~
+   ✓ `need_bytes = relay == "upload"`; path-Modus prüft Existenz per 1-Byte-Range-GET
+   (200/206), Bytes nur beim upload-Relay geholt.
 
 ## C — Duplikation / Altitude (Cleanup)
 

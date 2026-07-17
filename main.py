@@ -2087,12 +2087,19 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             mesh_extras = [b for b in (out1.blobs or [])
                            if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
                                                  for g in keep_globs)]
-            r = await http_client.get(f"{backend['url'].rstrip('/')}/view",
-                                      params={"filename": mesh_name, "type": "output"}, timeout=30.0)
-            if r.status_code != 200:
+            # The path relay only needs the mesh to EXIST on the shared disk (stage 2
+            # reads it by absolute path) — a 1-byte Range GET confirms that without
+            # transferring 30–100 MB. Only the upload relay actually needs the bytes.
+            need_bytes = relay == "upload"
+            r = await http_client.get(
+                f"{backend['url'].rstrip('/')}/view",
+                params={"filename": mesh_name, "type": "output"},
+                headers=None if need_bytes else {"Range": "bytes=0-0"}, timeout=30.0)
+            ok = (200,) if need_bytes else (200, 206)
+            if r.status_code not in ok:
                 raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' (HTTP {r.status_code}) — "
                                    "check the export node / file_format")
-            mesh_bytes = r.content
+            mesh_bytes = r.content if need_bytes else None
             s1_done = True
 
             # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
