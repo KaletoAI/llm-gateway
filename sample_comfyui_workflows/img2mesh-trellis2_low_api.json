@@ -161,7 +161,10 @@
       "texture_guidance_rescale": 0.2,
       "texture_rescale_t": 3,
       "resolution": 1024,
-      "texture_size": 1024,
+      "texture_size": [
+        "102",
+        0
+      ],
       "texture_alpha_mode": "OPAQUE",
       "double_side_material": false,
       "texture_guidance_interval_start": 0,
@@ -362,6 +365,28 @@
     "class_type": "Trellis2ExportMesh",
     "_meta": {
       "title": "Output"
+    }
+  },
+  "101": {
+    "inputs": {
+      "model_file": [
+        "100",
+        0
+      ],
+      "image": ""
+    },
+    "class_type": "Preview3D",
+    "_meta": {
+      "title": "Preview 3D & Animation"
+    }
+  },
+  "102": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_texture_resolution"
     }
   }
 }

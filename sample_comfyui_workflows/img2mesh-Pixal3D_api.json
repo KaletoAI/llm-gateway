@@ -301,7 +301,10 @@
       "mesh_cluster_refine_iterations": 0,
       "mesh_cluster_global_iterations": 1,
       "mesh_cluster_smooth_strength": 1,
-      "texture_size": 2048,
+      "texture_size": [
+        "318",
+        0
+      ],
       "texture_alpha_mode": "OPAQUE",
       "double_side_material": false,
       "bake_on_vertices": false,
@@ -382,6 +385,88 @@
     "class_type": "Trellis2ExportMesh",
     "_meta": {
       "title": "Output"
+    }
+  },
+  "313": {
+    "inputs": {
+      "filename_prefix": [
+        "314",
+        0
+      ],
+      "images": [
+        "302",
+        1
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "314": {
+    "inputs": {
+      "string_a": [
+        "306",
+        0
+      ],
+      "string_b": "_basecolor",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "315": {
+    "inputs": {
+      "filename_prefix": [
+        "316",
+        0
+      ],
+      "images": [
+        "302",
+        2
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "316": {
+    "inputs": {
+      "string_a": [
+        "306",
+        0
+      ],
+      "string_b": "_metallic",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "317": {
+    "inputs": {
+      "model_file": [
+        "312",
+        0
+      ],
+      "image": ""
+    },
+    "class_type": "Preview3D",
+    "_meta": {
+      "title": "Preview 3D & Animation"
+    }
+  },
+  "318": {
+    "inputs": {
+      "value": 2048
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_texture_resolution"
     }
   }
 }

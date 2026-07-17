@@ -508,5 +508,18 @@
     "_meta": {
       "title": "Output"
     }
+  },
+  "83": {
+    "inputs": {
+      "model_file": [
+        "82",
+        0
+      ],
+      "image": ""
+    },
+    "class_type": "Preview3D",
+    "_meta": {
+      "title": "Preview 3D & Animation"
+    }
   }
 }
