@@ -2136,7 +2136,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 raw=request, output_node=(s2.get("output_node") or None),
                 output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
                 output_cases=(s2.get("output_cases") or None),
-                texture_format=(s2.get("texture_format") or None), slot_held=True)
+                texture_format=(s2.get("texture_format") or None),
+                dummy_check=(s2.get("dummy_check") is not False), slot_held=True)
             await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
             await _unload_host_llms(backend2)
             out2 = await adapter2.generate(req2)
@@ -2325,6 +2326,7 @@ async def run_generation(body: dict, request: Request,
             output_globs=(cand.get("output_globs") or None),
             output_cases=(cand.get("output_cases") or None),
             texture_format=(cand.get("texture_format") or None),
+            dummy_check=(cand.get("dummy_check") is not False),   # default on; alias opt-out
         )
 
     first, cand0 = routes[0]

@@ -177,6 +177,8 @@ class NormalizedRequest:
     output_globs: Optional[list] = None             # alias setting: deliver every file matching these globs
     output_cases: Optional[list] = None             # alias setting: [{rig, globs}] — first detected case wins
     texture_format: Optional[str] = None            # alias setting: "jpeg" transcodes generic texture PNGs
+    dummy_check: bool = True                         # alias setting: flat-mode 2x2-dummy safety net (opt-out
+                                                    # for workflows that legitimately export a 1x1/2x2 texture)
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
 
@@ -629,8 +631,9 @@ def _mime_and_kind(filename: str) -> tuple[str, str]:
 
 
 def _image_dims(b: bytes) -> Optional[tuple]:
-    """(width, height) from a PNG or baseline-JPEG header, else None. Enough to
-    catch the 2x2 dummy — no image library needed."""
+    """(width, height) from a PNG, baseline-JPEG or WebP header, else None. Enough to
+    catch the 2x2 dummy — no image library needed. None means "format not recognised"
+    (unknown ≠ absent — the caller tracks image PRESENCE separately)."""
     if b[:8] == b"\x89PNG\r\n\x1a\n" and len(b) >= 24:
         w, h = struct.unpack(">II", b[16:24])
         return int(w), int(h)
@@ -648,6 +651,18 @@ def _image_dims(b: bytes) -> Optional[tuple]:
                 i += 2
                 continue
             i += 2 + struct.unpack(">H", b[i + 2:i + 4])[0]
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP" and len(b) >= 20:   # WebP (VP8/VP8L/VP8X)
+        fmt = b[12:16]
+        if fmt == b"VP8X" and len(b) >= 30:          # extended: 24-bit width-1/height-1
+            w = 1 + int.from_bytes(b[24:27], "little")
+            h = 1 + int.from_bytes(b[27:30], "little")
+            return w, h
+        if fmt == b"VP8 " and len(b) >= 30:          # lossy: 14-bit dims after the start code
+            return (int.from_bytes(b[26:28], "little") & 0x3FFF,
+                    int.from_bytes(b[28:30], "little") & 0x3FFF)
+        if fmt == b"VP8L" and len(b) >= 25:          # lossless: 14-bit dims packed after the 0x2f sig
+            bits = int.from_bytes(b[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
     return None
 
 
@@ -672,21 +687,26 @@ def _glb_info(data: bytes) -> Optional[dict]:
             return None
         gltf = json.loads(json_chunk)
         bufviews = gltf.get("bufferViews") or []
-        dims = []
+        dims, embedded_images = [], 0
         for im in (gltf.get("images") or []):
             bv_i = im.get("bufferView")
             if bv_i is None or bin_chunk is None or bv_i >= len(bufviews):
                 continue
+            embedded_images += 1                     # an embedded texture IS present…
             bv = bufviews[bv_i]
             start = bv.get("byteOffset", 0)
-            head = bin_chunk[start: start + min(bv.get("byteLength", 0), 4096)]
+            # …readable dims are a bonus (2x2-dummy check): a 64 KB window clears a
+            # large EXIF/ICC preamble before a JPEG SOF; an unrecognised format (KTX2,
+            # …) yields no dims but still counts as present above.
+            head = bin_chunk[start: start + min(bv.get("byteLength", 0), 65536)]
             wh = _image_dims(head)
             if wh:
                 dims.append(wh)
         joints = sum(1 for n in (gltf.get("nodes") or [])
                      if str(n.get("name", "")).lower().startswith("mixamorig"))
-        return {"texture_dims": dims, "mixamorig_joints": joints,
-                "skins": len(gltf.get("skins") or []), "meshes": len(gltf.get("meshes") or [])}
+        return {"texture_dims": dims, "embedded_images": embedded_images,
+                "mixamorig_joints": joints, "skins": len(gltf.get("skins") or []),
+                "meshes": len(gltf.get("meshes") or [])}
     except Exception:
         return None
 
@@ -794,10 +814,10 @@ def validate_delivery(blobs: list, rig: Optional[str]) -> list:
         if info["skins"] == 0 or info["mixamorig_joints"] == 0:
             raise RuntimeError(f"humanoid result '{glb.name}': no mixamorig skin "
                                f"(skins={info['skins']}, mixamorig joints={info['mixamorig_joints']})")
-        dims = info["texture_dims"]
-        if not dims:
+        if info["embedded_images"] == 0:             # presence is separate from readable dims:
             raise RuntimeError(f"humanoid result '{glb.name}': no embedded texture")
-        if max(max(w, h) for w, h in dims) <= 2:
+        dims = info["texture_dims"]                  # a WebP/KTX2 texture is present but may be unreadable
+        if dims and max(max(w, h) for w, h in dims) <= 2:
             raise RuntimeError(f"humanoid result '{glb.name}': embedded texture is a 2x2 dummy "
                                "(known node bug) — no result")
         if info["mixamorig_joints"] < 50:
@@ -1552,7 +1572,8 @@ class ComfyUIAdapter(BackendAdapter):
                         extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
                         raise RuntimeError(f"configured output node {req.output_node} produced "
                                            f"no fetchable artifact{extra} (no matching file in its outputs)")
-                    _check_glb_not_dummy(blobs)  # 2x2-dummy safety net (case mode does it in validate)
+                    if req.dummy_check:          # 2x2-dummy safety net (case mode does it in validate);
+                        _check_glb_not_dummy(blobs)  # opt-out for legit 1x1/2x2 constant-colour exports
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
@@ -1755,7 +1776,11 @@ class ComfyUIAdapter(BackendAdapter):
                         continue
                     fn, view = parsed
                     stem = fn[:-(len(fn.rsplit(".", 1)[-1]) + 1)] if "." in fn else fn
-                    for cfn in {fn, *(f"{stem}.{e}" for e in glob_exts)}:
+                    # reported file first, then its siblings in sorted-extension order —
+                    # a DETERMINISTIC candidate order (a set literal would hash-shuffle,
+                    # so a wildcard-ext glob like *_mia.??? could pick a different
+                    # "result 0" per process).
+                    for cfn in [fn, *(f"{stem}.{e}" for e in sorted(glob_exts))]:
                         key = (cfn, view.get("subfolder", ""))
                         if key not in seen_cand:
                             seen_cand.add(key)

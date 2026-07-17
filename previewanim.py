@@ -31,7 +31,21 @@ _PERIOD = 4.0          # seconds per loop
 _NKEY = 17             # keyframes (LINEAR between)
 
 
+def _bone_key(name) -> str:
+    """Normalise a node name to its bare Mixamo bone key for the _IDLE lookup. Strips a
+    namespace prefix (`Armature:mixamorig:Hips`) AND the `mixamorig` prefix in all its
+    common FBX→GLB spellings — `mixamorig:Hips`, `mixamorig_Hips`, `mixamorigHips` —
+    which the colon-split alone would miss (leaving `mixamorighips` ≠ `hips`)."""
+    nm = (name or "").split(":")[-1].lower()
+    for pre in ("mixamorig_", "mixamorig"):
+        if nm.startswith(pre):
+            return nm[len(pre):]
+    return nm
+
+
 def _parse(glb: bytes):
+    """(gltf-dict, BIN bytearray, had_bin_chunk) or None. `had_bin_chunk` lets the
+    caller refuse to corrupt a GLB whose buffer 0 is external (no BIN chunk)."""
     if glb[:4] != b"glTF":
         return None
     off, jc, bc = 12, None, None
@@ -45,7 +59,7 @@ def _parse(glb: bytes):
         off = s + clen
     if jc is None:
         return None
-    return json.loads(jc), bytearray(bc or b"")
+    return json.loads(jc), bytearray(bc or b""), bc is not None
 
 
 def _build(gltf: dict, binb: bytearray) -> bytes:
@@ -81,14 +95,20 @@ def add_idle(glb: bytes) -> bytes:
         parsed = _parse(glb)
         if parsed is None:
             return glb
-        gltf, binb = parsed
+        gltf, binb, had_bin = parsed
         nodes = gltf.get("nodes") or []
-        if not (gltf.get("skins") and nodes and gltf.get("buffers")):
+        bufs = gltf.get("buffers") or []
+        if not (gltf.get("skins") and nodes and bufs):
+            return glb
+        # We only ever append into buffer 0 as the embedded BIN chunk. If buffer 0 is
+        # external (has a `uri`) or the file carries no BIN chunk, appending would point
+        # the new accessors at the wrong bytes and clobber buffer 0's byteLength — so
+        # return the original untouched (the preview just plays no idle clip).
+        if not had_bin or bufs[0].get("uri"):
             return glb
         by_name = {}
         for i, n in enumerate(nodes):
-            nm = (n.get("name") or "").split(":")[-1].lower()
-            by_name.setdefault(nm, i)
+            by_name.setdefault(_bone_key(n.get("name")), i)
         targets = [(by_name[b.lower()], ax, amp, ph) for b, ax, amp, ph in _IDLE
                    if b.lower() in by_name]
         if not targets:

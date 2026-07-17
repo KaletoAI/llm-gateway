@@ -2024,6 +2024,12 @@ def _output_section(wf: dict, cands: list) -> str:
               "PNGs to JPEG (quality 90) at delivery — ComfyUI has no JPEG export, so the gateway shrinks "
               "the multi-MB bake here. A texture with a real alpha channel keeps PNG. On a chain set this "
               "on the client-facing (stage-1) alias.</p>"
+            + _field("texture check", _checkbox("dummy_check",
+                     all(c.get("dummy_check") is not False for c in cands),
+                     "fail on a 2×2-dummy texture (known export-node bug)"))
+            + "<p class='hint'>On by default: a flat (non-case) GLB whose only embedded texture is a "
+              "2×2 dummy is treated as a failed generation. <b>Uncheck</b> for a workflow that legitimately "
+              "exports a 1×1/2×2 constant-colour texture (uniform models).</p>"
             + _field("output files", _textarea("output_globs", globs_text, 4,
                      "plain globs (deliver all), or 'rig: globs' lines for conditional cases:\n"
                      "mixamo: *_mia.glb\ngeneric: *_articulationxl.fbx, *basecolor*.png"), wide=True)
@@ -2481,6 +2487,13 @@ async def update(request: Request):
             c["texture_format"] = "jpeg"
         else:
             c.pop("texture_format", None)
+    # flat-mode 2x2-dummy safety net: on by default (drop the key); unchecked → opt out
+    dummy_on = "dummy_check" in f
+    for c in cands:
+        if dummy_on:
+            c.pop("dummy_check", None)
+        else:
+            c["dummy_check"] = False
     # output files (overrides node+ext): 'rig: globs' lines → conditional cases,
     # plain glob lines → flat multi-file delivery.
     out_cases, out_flat = [], []
@@ -2804,7 +2817,7 @@ async def generate(request: Request):
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
 
 
-_STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+_STATIC_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"))
 _STATIC_MIME = {".js": "text/javascript", ".css": "text/css", ".wasm": "application/wasm",
                 ".json": "application/json"}   # served extensions (bundled JS libs)
 
@@ -2823,14 +2836,16 @@ async def static_asset(path: str):
 
 
 async def result(job_id: str, n: int, anim: str = ""):
-    rp = jobs.result_path(job_id, n)
+    rp = await asyncio.to_thread(jobs.result_path, job_id, n)
     if rp is None:
         raise HTTPException(404, "result not found")
     path, mime, name = rp
     if anim == "idle" and mime == "model/gltf-binary":   # preview-only: inject a diagnostic idle clip
         import previewanim
-        with open(path, "rb") as fh:
-            data = previewanim.add_idle(fh.read())
+        def _read_and_anim():                            # file read + full GLB rebuild (30 MB) off-loop —
+            with open(path, "rb") as fh:                 # otherwise it stalls chat streams and /v1 dispatch
+                return previewanim.add_idle(fh.read())
+        data = await asyncio.to_thread(_read_and_anim)
         return Response(content=data, media_type=mime)
     headers = None
     if name:

@@ -21,50 +21,33 @@ schwersten Root-Causes sind bereits gefixt (Commit `c4b73ad`), 2 wurden widerleg
   User deployt selbst.
 - Reihenfolge: Abschnitt A vor B vor C.
 
-## A — Robustheit (können Jobs/Features real brechen)
+## A — Robustheit (können Jobs/Features real brechen) — ✓ ERLEDIGT
 
-1. **adapters.py:679 — GLB-Textur-Erkennung kennt nur PNG + Baseline-JPEG (erste 4 KB).**
-   Ein valides humanoid-GLB mit WebP/KTX2-Textur (oder JPEG mit >4 KB
-   EXIF/ICC-Präambel vor dem SOF-Marker) liefert `texture_dims=[]` →
-   `validate_delivery` failt einen korrekten Job mit „no embedded texture".
-   Fix-Richtung: Formate ergänzen bzw. Scan-Fenster vergrößern; unbekanntes
-   Format sollte „unbekannt", nicht „keine Textur" bedeuten.
+1. ~~**adapters.py:679 — GLB-Textur-Erkennung kennt nur PNG + Baseline-JPEG (erste 4 KB).**~~
+   ✓ `_glb_info` zählt jetzt `embedded_images` separat von lesbaren Dims (Präsenz ≠
+   Dims); `validate_delivery` prüft Präsenz darüber, Scan-Fenster 4 KB→64 KB,
+   `_image_dims` kann zusätzlich WebP (VP8/VP8L/VP8X). Unbekannt (KTX2) → present-but-unknown,
+   kein „no embedded texture" mehr.
 
-2. **adapters.py:1488 — 2×2-Dummy-Check ohne Opt-out im Flat-Modus.**
-   `_check_glb_not_dummy` läuft bei JEDER Non-Case-Delivery; ein Workflow, der
-   legitim eine 1×1-Konstantfarb-Textur exportiert (übliches Exporter-Muster für
-   unifarbene Modelle), failt immer. Fix-Richtung: per-Alias-Opt-out oder Check
-   nur bei rig-getaggten Deliveries.
+2. ~~**adapters.py:1488 — 2×2-Dummy-Check ohne Opt-out im Flat-Modus.**~~
+   ✓ Per-Alias-Opt-out `dummy_check` (NormalizedRequest-Feld, default on; Output-Checkbox
+   „texture check"); flat-Mode `_check_glb_not_dummy` nur noch wenn `req.dummy_check`.
 
-3. **admin.py:2762/2772/2773 — abspath/realpath-Mismatch in `static_asset` (EIN Root-Cause).**
-   `_STATIC_DIR` wird mit `abspath` gebaut, der Request-Pfad mit `realpath`
-   verglichen — liegt irgendein Symlink im Installationspfad, 404t jedes
-   gebundelte Asset (model-viewer/three.js) und alle 3D-Previews sind leer.
-   Fix: `_STATIC_DIR = os.path.realpath(...)`, beide Seiten kanonisch.
+3. ~~**admin.py:2762/2772/2773 — abspath/realpath-Mismatch in `static_asset`.**~~
+   ✓ `_STATIC_DIR = os.path.realpath(...)` — beide Seiten kanonisch.
 
-4. **previewanim.py:86 — `add_idle` nimmt Buffer 0 = BIN-Chunk an.**
-   Bei einem GLB, dessen buffer 0 eine `uri` trägt (valides glTF-binary ohne
-   BIN-Chunk), zeigen die injizierten Accessors in den falschen Buffer und
-   `byteLength` wird geclobbert → korruptes GLB im Preview statt Fallback aufs
-   Original. Fix: Guard, im Zweifel unverändert zurückgeben.
+4. ~~**previewanim.py:86 — `add_idle` nimmt Buffer 0 = BIN-Chunk an.**~~
+   ✓ Guard: `_parse` liefert `had_bin`; `add_idle` gibt unverändert zurück, wenn kein
+   BIN-Chunk ODER buffer[0] eine `uri` trägt.
 
-5. **previewanim.py:90 — Bone-Lookup verfehlt kolonlose Mixamo-Namen.**
-   `mixamorigHips`/`mixamorig_Hips` (häufige FBX→GLB-Form) matchen das
-   `split(':')`-Suffix-Schema nicht → `add_idle` gibt das GLB unverändert
-   zurück, die Idle-Preview spielt nichts — genau der Fall, für den das Feature
-   gebaut wurde. Fix: auch `mixamorig`-Präfix (mit/ohne `:`/`_`) strippen.
+5. ~~**previewanim.py:90 — Bone-Lookup verfehlt kolonlose Mixamo-Namen.**~~
+   ✓ Neuer `_bone_key` strippt `mixamorig`-Präfix in allen Schreibweisen (`:`/`_`/keins).
 
-6. **adapters.py:1670 — nichtdeterministische Delivery-Reihenfolge bei Glob-Siblings.**
-   Kandidaten kommen aus einem Set-Literal (`{fn, *siblings}`) — Hash-Ordnung.
-   Matcht ein Glob mit Wildcard-Extension (`*_mia.???`) fbx UND glb, wechselt
-   „result 0" je nach Prozess. Fix: deterministisch sortieren (Sibling vor/nach
-   Original definiert).
+6. ~~**adapters.py:1670 — nichtdeterministische Delivery-Reihenfolge bei Glob-Siblings.**~~
+   ✓ Set-Literal → geordnete Liste: reported file zuerst, Siblings nach `sorted(glob_exts)`.
 
-7. **admin.py:2788 — `?anim=idle` blockiert den Event-Loop.**
-   File-Read + `previewanim.add_idle` (komplettes GLB-Rebuild, 30-MB-Artefakte)
-   laufen synchron im Loop — währenddessen stehen Chat-Streams und /v1 still.
-   Fix: `asyncio.to_thread` (auch der `jobs.result_path`-Read daneben;
-   `main.get_job_result` macht es bereits so).
+7. ~~**admin.py:2788 — `?anim=idle` blockiert den Event-Loop.**~~
+   ✓ `jobs.result_path` + File-Read + `add_idle` laufen über `asyncio.to_thread`.
 
 ## B — Effizienz
 
