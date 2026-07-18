@@ -49,6 +49,11 @@ model_prefix: true
 # /v1/responses/{id} -> cancel POST /v1/responses/{id}/cancel. The background
 # worker parks in the same queue, up to:
 # async_park_timeout_s: 600
+# A parked generation job whose backends briefly ALL go unhealthy (e.g. a busy
+# ComfyUI dropping its discovery poll mid-render) rides out the flap for this long
+# before it's declared "no healthy backend"; a genuinely-offline alias still fails
+# after it (not the full park deadline).
+# park_health_grace_s: 90
 
 # Optional call-stats sink: SQLite DB; the dashboard is built into the /ui console
 # (Statistic tab) — no separate server/port anymore. When enabled, every call is

@@ -292,6 +292,12 @@ def _active_done(token) -> None:
 # (`alias_park_s`), else the global default below; 0 disables parking for an alias.
 park_timeout_s: float = 60.0            # global default park time (Server tab); per-alias overrides in alias_park_s
 async_park_timeout_s: float = 600.0
+# How long a parked generation job rides out a poll that finds ZERO candidates before
+# giving up. A job only parks because it HAD candidates (all busy), so an empty poll is
+# a transient health flap — a busy ComfyUI routinely drops its /object_info discovery
+# poll mid-generation and is briefly marked DOWN. Covers a multi-cycle flap (observed
+# ~30 s) without hanging a genuinely-offline alias to the full park deadline.
+park_health_grace_s: float = 90.0
 max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
@@ -2224,8 +2230,15 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
     """Hold a generation job until a backend frees (polls backend-busy), then run it —
     so a busy backend queues instead of 503'ing (async/playground). `eligible` keeps
     the LoRA constraint through the park: the job waits for a LoRA-capable backend
-    instead of spilling to whichever frees first."""
+    instead of spilling to whichever frees first.
+
+    A poll that finds ZERO candidates is NOT an immediate fail: the job only parked
+    because it HAD candidates (all busy), so an empty poll is a transient health flap
+    (a busy ComfyUI drops its /object_info discovery poll mid-generation and is briefly
+    marked DOWN). Ride it out for `park_health_grace_s`; only if EVERY candidate stays
+    gone that long is the alias treated as having no healthy backend."""
     deadline = time.monotonic() + async_park_timeout_s
+    unhealthy_since = None                       # when the candidate set first went empty (flap timer)
     while True:
         ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per poll
         ready, allc = _force_filter(ready, force), _force_filter(allc, force)
@@ -2235,11 +2248,17 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
         if ready:
             await _run_job(job_id, ready, build_req)
             return
-        if not allc:
-            await asyncio.to_thread(jobs.fail, job_id,
-                                    f"no healthy backend for '{alias}'" + (f" on '{force}'" if force else ""))
-            return
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if allc:                                 # candidates exist but are busy → keep parking
+            unhealthy_since = None
+        else:                                    # all candidates transiently unhealthy → grace, not fail
+            unhealthy_since = unhealthy_since or now
+            if now - unhealthy_since > park_health_grace_s:
+                await asyncio.to_thread(jobs.fail, job_id,
+                                        f"no healthy backend for '{alias}' (all candidates down for "
+                                        f">{park_health_grace_s:.0f}s)" + (f" on '{force}'" if force else ""))
+                return
+        if now > deadline:
             await asyncio.to_thread(jobs.fail, job_id,
                                     f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
             return
@@ -2778,7 +2797,7 @@ def apply_server_settings() -> None:
     next restart (the stats server is built once at startup). The gateway listening
     port is set by the launch command, so it is informational here."""
     global api_key, log_per_call, model_prefix, max_concurrent_default, health_check_interval
-    global park_timeout_s, async_park_timeout_s, max_parked
+    global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked
     s = store.get_settings() if store.is_active() else {}
     if "api_key" in s:
         api_key = s["api_key"] or None
@@ -2801,6 +2820,11 @@ def apply_server_settings() -> None:
     if "async_park_timeout_s" in s:
         try:
             async_park_timeout_s = float(s["async_park_timeout_s"])
+        except (TypeError, ValueError):
+            pass
+    if "park_health_grace_s" in s:
+        try:
+            park_health_grace_s = float(s["park_health_grace_s"])
         except (TypeError, ValueError):
             pass
     if "max_parked" in s:
