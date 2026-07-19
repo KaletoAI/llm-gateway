@@ -68,6 +68,10 @@ receive what they need via injected callables, staying hot-reload-safe.
   auto-random seed keys on that effective name (`''` counts as unset);
   `_apply_lora_cascade` drops client LoRAs into free stack slots; `_apply_fixed`
   applies admin pins (the API can't override a pinned `(node,field)`);
+  `_apply_bypass` runs LAST (per-backend `bypass` node ids): ComfyUI mode-4 —
+  remove each node and reconnect its consumers to the same-typed input (k-th
+  same-typed output → k-th same-typed link input, via cached `/object_info`
+  slot types; single-link fallback when types are unknown);
   `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
   rejections are translated to readable per-node errors (node title, class,
   field, offending request param) via `_comfy_prompt_error`; raw body stays the
@@ -268,8 +272,9 @@ requests `include_usage` upstream); a backend that reports zeros/nothing
   `reasoning.py` and `responses_bridge.py` must stay pure (no `main`/`adapters`
   imports) — they're called on the request path.
 - Generation: workflow + mapping are **backend-independent** (shared across an
-  alias's candidates); only **pinned values** (`fixed`) are per-backend. A pinned
-  `(node,field)` is authoritative — never overridden by an API request param.
+  alias's candidates); **pinned values** (`fixed`) AND **per-node bypass**
+  (`bypass`: node ids) are per-backend. A pinned `(node,field)` is authoritative —
+  never overridden by an API request param.
 - Single instance only; verify with compile + a route/render check; restart the
   one instance when the user says idle. Never commit `config.yaml`, `store.db`
   (+ `secret.key`), `stats.db*`, `jobs.db*`, `jobs/`, `voiceref/`, `*.key`.

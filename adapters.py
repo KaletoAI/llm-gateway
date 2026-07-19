@@ -179,6 +179,8 @@ class NormalizedRequest:
     texture_format: Optional[str] = None            # alias setting: "jpeg" transcodes generic texture PNGs
     dummy_check: bool = True                         # alias setting: flat-mode 2x2-dummy safety net (opt-out
                                                     # for workflows that legitimately export a 1x1/2x2 texture)
+    bypass: list = field(default_factory=list)      # per-backend node ids to bypass (ComfyUI mode-4: remove
+                                                    # the node, rewire consumers to its same-typed input)
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
 
@@ -1007,6 +1009,73 @@ def _prune_node(wf: dict, nid: str) -> None:
                 inp.pop(fld, None)
 
 
+def _is_link(v) -> bool:
+    """An input value that is a wired link `[src_node_id, src_slot]` (vs a literal)."""
+    return isinstance(v, list) and len(v) == 2 and not isinstance(v[0], (list, dict))
+
+
+def _bypass_passthrough(wf: dict, nid: str, out_slot: int, node_types: dict):
+    """The link `[src, slot]` that ComfyUI mode-4 passes through a bypassed node for its
+    output slot `out_slot`, or None (→ consumer disconnected). Rule: the out_slot is the
+    k-th output of its type T; it maps to the k-th LINK-valued input of type T (both in
+    the node's declared socket order). Fallback when the class has no known types: a node
+    with exactly one link input passes it through type-free; otherwise None."""
+    node = wf.get(nid) or {}
+    inputs = node.get("inputs") or {}
+    types = node_types.get(node.get("class_type"))
+    link_fields = [f for f, v in inputs.items() if _is_link(v)]
+    if not types:                                    # unknown class → single-link passthrough only
+        return inputs[link_fields[0]] if len(link_fields) == 1 else None
+    outs = types.get("out") or []
+    if out_slot >= len(outs):
+        return None
+    T = outs[out_slot]
+    if not T:
+        return None
+    k = sum(1 for s in range(out_slot) if outs[s] == T)   # this output's index among type-T outputs
+    same_type_link_inputs = [f for f in types.get("in", {})
+                             if types["in"][f] == T and f in inputs and _is_link(inputs[f])]
+    return inputs[same_type_link_inputs[k]] if k < len(same_type_link_inputs) else None
+
+
+def _apply_bypass(wf: dict, bypass_ids: list, node_types: dict) -> list:
+    """Bypass nodes (ComfyUI mode 4): remove each and rewire its consumers to the input
+    that passes through (type-matched), following chains of bypassed nodes. Stale/absent
+    ids are skipped. An input that resolves to nothing is dropped (the consuming socket
+    must be optional, else ComfyUI errors — same contract as _prune_node). Returns the
+    ids actually applied. Pure: `node_types` is injected (adapter owns the cache/fetch)."""
+    byp = [n for n in (str(x) for x in bypass_ids) if n in wf]
+    if not byp:
+        return []
+    byp_set = set(byp)
+
+    def resolve(nid: str, slot: int, seen: frozenset):
+        if nid not in byp_set:
+            return [nid, slot]
+        if (nid, slot) in seen:                      # bypass cycle → give up (disconnect)
+            return None
+        src = _bypass_passthrough(wf, nid, slot, node_types)
+        if not _is_link(src):
+            return None
+        return resolve(str(src[0]), src[1], seen | {(nid, slot)})
+
+    for mid, node in wf.items():
+        if mid in byp_set:
+            continue
+        inp = node.get("inputs")
+        if not isinstance(inp, dict):
+            continue
+        for fld in [k for k, v in inp.items() if _is_link(v) and str(v[0]) in byp_set]:
+            r = resolve(str(inp[fld][0]), inp[fld][1], frozenset())
+            if r is None:
+                inp.pop(fld, None)                   # unresolved → drop (ComfyUI parity)
+            else:
+                inp[fld] = r
+    for nid in byp:
+        wf.pop(nid, None)
+    return byp
+
+
 def _img_slug(s: str) -> str:
     """A safe, stable per-param input filename so each image field reuses one slot."""
     keep = "".join(ch if ch.isalnum() else "_" for ch in (s or "img"))
@@ -1336,6 +1405,31 @@ def _comfy_loras(object_info: dict) -> set[str]:
     return out
 
 
+def _node_type_entry(info: dict) -> dict:
+    """Reduce ONE /object_info class entry to `{"out":[type|None,…], "in":{field:type}}`.
+    Only string type tokens (data links: IMAGE/LATENT/MODEL/…) are kept — combo/enum
+    specs (a list, or "COMBO") are never wired links, so they carry no passthrough type.
+    Input order is required-then-optional = the node's socket order (dict order preserved),
+    which the bypass rewiring relies on for the k-th-same-type pairing."""
+    outs = [t if isinstance(t, str) else None for t in (info.get("output") or [])]
+    ins: dict = {}
+    inp = info.get("input") or {}
+    for section in ("required", "optional"):
+        for field_name, spec in (inp.get(section) or {}).items():
+            t = spec[0] if isinstance(spec, list) and spec and isinstance(spec[0], str) else None
+            if t and t != "COMBO":
+                ins[field_name] = t
+    return {"out": outs, "in": ins}
+
+
+def _comfy_node_types(object_info: dict) -> dict:
+    """`{class: {"out":[type],"in":{field:type}}}` for every class in /object_info —
+    the slot-type map the bypass rewiring needs. Built once at discovery from the same
+    fetch as _comfy_models/_comfy_loras (no extra request)."""
+    return {cls: _node_type_entry(info) for cls, info in (object_info or {}).items()
+            if isinstance(info, dict)}
+
+
 def _gen_values(req: NormalizedRequest) -> dict:
     """Flatten a request's logical generation values into one {param: value} dict
     the mapping can draw from: inputs (prompt/negative), params (width/steps/…),
@@ -1356,12 +1450,40 @@ class ComfyUIAdapter(BackendAdapter):
 
     type = "comfyui"
 
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self._node_types: dict = {}      # {class: {"out":[type],"in":{field:type}}} — bypass slot types
+
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         url = self.backend["url"].rstrip("/")
         resp = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
         resp.raise_for_status()
         oi = resp.json()
+        self._node_types = _comfy_node_types(oi)      # cache slot types for bypass (free — same fetch)
         return Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
+
+    async def _node_types_for(self, wf: dict, bypass_ids: list) -> dict:
+        """Slot types for the classes of the nodes about to be bypassed. Uses the
+        discovery cache; lazily fetches per-class /object_info/{class} for any class the
+        cache lacks (a generate() before the first discovery). A failed fetch just leaves
+        that class absent → _apply_bypass falls back to its single-link heuristic."""
+        need = {(wf.get(str(n)) or {}).get("class_type") for n in bypass_ids}
+        need = {c for c in need if c and c not in self._node_types}
+        if not need:
+            return self._node_types
+        url = self.backend["url"].rstrip("/")
+        async with _pooled_client(self.ctx) as c:
+            for cls in need:
+                try:
+                    r = await c.get(f"{url}/object_info/{cls}", timeout=_COMFY_DISCOVERY_TIMEOUT)
+                    if r.status_code == 200:
+                        info = (r.json() or {}).get(cls)
+                        if isinstance(info, dict):
+                            self._node_types[cls] = _node_type_entry(info)
+                except Exception as e:
+                    logger.warning(f"[{self.name}] object_info for bypass class '{cls}' "
+                                   f"unavailable ({type(e).__name__}) — single-link fallback")
+        return self._node_types
 
     def _load_workflow(self, path: Optional[str]) -> dict:
         if not path:
@@ -1567,11 +1689,16 @@ class ComfyUIAdapter(BackendAdapter):
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
         autofilled = await self._autofill_empty_images(wf, mapping)
+        # Bypass LAST — after every injection, so it rewires the FINAL link graph
+        # (remove each bypassed node, reconnect consumers to its same-typed input).
+        bypassed = _apply_bypass(wf, req.bypass or [],
+                                 await self._node_types_for(wf, req.bypass or []))
         summary = {"applied": sorted(applied.keys()),
                    "seed": values.get(seed_param) if seed_param else None,
                    "fixed": sorted(fixed_applied.keys()),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
-                   "images": sorted(img_applied), "autofilled_images": autofilled}
+                   "images": sorted(img_applied), "autofilled_images": autofilled,
+                   **({"bypassed": bypassed} if bypassed else {})}
 
         poll_interval = float(b.get("poll_interval", 1.0))
         max_wait = float(b.get("max_wait", 600))

@@ -1841,7 +1841,9 @@ async def update_workflow(request: Request):
     store.upsert(alias, cands)
     mapping = base_mapping
     stale = [p for p, m in mapping.items() if (m or {}).get("node") not in wf]
-    logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}")
+    stale_byp = sorted({str(n) for c in cands for n in (c.get("bypass") or []) if str(n) not in wf})
+    logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}"
+                + (f"; {len(stale_byp)} stale bypass node(s): {stale_byp}" if stale_byp else ""))
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
 
 
@@ -2139,6 +2141,53 @@ async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict
             f'<div class="ptabs">{tabs}</div>{panels}')
 
 
+def _bypass_block(alias: str, cands: list, wf: dict) -> str:
+    """Per-backend node bypass as a node×backend checkbox grid (ComfyUI mode-4: the node
+    is removed and its consumers reconnect to its same-typed input). The managed node set
+    is the UNION of every candidate's `bypass`; a hidden `bypass_nodes` field carries it
+    so `update` rebuilds each backend's list from present/absent checkboxes."""
+    managed = sorted({str(n) for c in cands for n in (c.get("bypass") or [])},
+                     key=lambda n: (len(n), n))
+    out_nodes = {str(c.get("output_node")) for c in cands if c.get("output_node")}
+    hdr = "".join(f"<th>{_esc(str(c.get('backend')))}</th>" for c in cands)
+    rows = ""
+    for nid in managed:
+        node = wf.get(nid) or {}
+        title = (node.get("_meta") or {}).get("title", "")
+        label = f"<code>{_esc(nid)}</code> {_esc(node.get('class_type', ''))}" + (f" · {_esc(title)}" if title else "")
+        if nid not in wf:
+            label += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
+        elif nid in out_nodes:
+            label += " <span class='badge bad' title='this is the output node — bypassing it yields no result'>output!</span>"
+        cells = "".join(
+            f"<td style='text-align:center'><input type='checkbox' value='1' "
+            f"name='byp__{_esc(str(c.get('backend')))}__{_esc(nid)}'"
+            f"{' checked' if nid in {str(x) for x in (c.get('bypass') or [])} else ''}></td>"
+            for c in cands)
+        rm = _btn("⊘", f"/ui/mapping/bypass-del?alias={_esc(alias)}&node={_esc(nid)}",
+                  "danger", sm=True, icon=True, title="Remove from bypass")
+        rows += f"<tr><td>{label}</td>{cells}<td class='acts'>{rm}</td></tr>"
+    body = (f"<table class='pins'><tr><th>node</th>{hdr}<th></th></tr>{rows}</table>"
+            if managed else "<p class='muted'>No nodes bypassed — add one below.</p>")
+    avail = [nid for nid in sorted(wf, key=lambda n: (len(n), n)) if nid not in set(managed)]
+    add_sel = ""
+    if avail:
+        def _opt(nid):
+            t = ((wf[nid] or {}).get("_meta") or {}).get("title", "")
+            return (f"<option value='{_esc(nid)}'>{_esc(nid)} — {_esc((wf[nid] or {}).get('class_type', ''))}"
+                    + (f" · {_esc(t)}" if t else "") + "</option>")
+        add_sel = ('<select class="addsel" onchange="if(this.value)location.href=\'/ui/mapping/bypass-add?alias='
+                   f"{_esc(alias)}&amp;node='+encodeURIComponent(this.value)\">"
+                   f'<option value="">+ Bypass a node…</option>{"".join(_opt(n) for n in avail)}</select>')
+    return (f"<input type='hidden' name='bypass_nodes' value='{_esc(','.join(managed))}'>"
+            "<h2 style='margin-top:18px'>Bypass "
+            "<span class='muted' style='font-weight:normal'>— skip a node per backend</span></h2>"
+            "<p class='hint'>Remove a node from the graph on the checked backends (ComfyUI bypass): its "
+            "consumers reconnect to the node's same-typed input. Use for a post-process/switch node some "
+            "backends should skip. A <b>required</b> downstream input left unconnected makes ComfyUI error.</p>"
+            f"{body}{add_sel}")
+
+
 async def _alias_editor(alias: str) -> str:
     """The alias editor as a single-column fragment for the master-detail right
     side (request fields + pinned values in one form, available fields below)."""
@@ -2212,6 +2261,7 @@ async def _alias_editor(alias: str) -> str:
             f'<th></th></tr></thead>'
             f'<tbody id="reqfields">{req_rows}</tbody></table>'
             + pinned_block
+            + _bypass_block(alias, cands, wf)
             + _output_section(wf, cands)
             + '</form>' + pin_extra + _reorder_js(alias))
     return form, _available_fields(alias, wf, mapped, oi)
@@ -2280,6 +2330,38 @@ async def edit_del(request: Request):
             cand["fixed"] = [b for b in (cand.get("fixed") or [])
                              if not (b["node"] == node and b["field"] == fld)]
         store.upsert(alias, cands)
+    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+
+
+async def bypass_add(request: Request):
+    """Add a node to the bypass set — defaults to bypassed on the PRIMARY backend (so it
+    joins the union and appears in the grid); toggle per backend + Save afterwards."""
+    alias, node = _qp(request, "alias"), _qp(request, "node")
+    cands = store.get(alias)
+    if cands and node:
+        bl = [str(x) for x in (cands[0].get("bypass") or [])]
+        if node not in bl:
+            cands[0]["bypass"] = bl + [node]
+            store.upsert(alias, cands)
+    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+
+
+async def bypass_del(request: Request):
+    """Drop a node from the bypass set on EVERY backend (else the union re-adds it)."""
+    alias, node = _qp(request, "alias"), _qp(request, "node")
+    cands = store.get(alias)
+    if cands and node:
+        changed = False
+        for c in cands:
+            bl = [x for x in (c.get("bypass") or []) if str(x) != node]
+            if len(bl) != len(c.get("bypass") or []):
+                changed = True
+                if bl:
+                    c["bypass"] = bl
+                else:
+                    c.pop("bypass", None)
+        if changed:
+            store.upsert(alias, cands)
     return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
 
 
@@ -2464,6 +2546,15 @@ async def update(request: Request):
         bn = c.get("backend")
         c["fixed"] = [{"node": b["node"], "field": b["field"],
                        "value": ovr.get((bn, b["node"], b["field"]), b["value"])} for b in fixed]
+    # per-backend node bypass: a byp__<backend>__<node> checkbox grid. The hidden
+    # bypass_nodes (union managed set) is authoritative — an unchecked (=absent) box clears.
+    managed_byp = [n for n in (f.get("bypass_nodes", "") or "").split(",") if n]
+    for c in cands:
+        bl = [n for n in managed_byp if f.get(f"byp__{c.get('backend')}__{n}")]
+        if bl:
+            c["bypass"] = bl
+        else:
+            c.pop("bypass", None)
     # retries is a per-alias setting (blank = try all) — keep it on every candidate so
     # it survives whichever backend is removed first.
     retries = (f.get("retries", "") or "").strip()
@@ -4547,6 +4638,8 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/field-del", edit_del, methods=["GET"])
     app.add_api_route("/ui/mapping/cand-add", cand_add, methods=["GET"])
     app.add_api_route("/ui/mapping/cand-del", cand_del, methods=["GET"])
+    app.add_api_route("/ui/mapping/bypass-add", bypass_add, methods=["GET"])
+    app.add_api_route("/ui/mapping/bypass-del", bypass_del, methods=["GET"])
     app.add_api_route("/ui/mapping/field-order", field_order, methods=["GET"])
     app.add_api_route("/ui/mapping/update", update, methods=["POST"])
     app.add_api_route("/ui/mapping/export", mapping_export, methods=["GET"])

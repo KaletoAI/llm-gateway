@@ -2086,6 +2086,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 node_mapping=stage1_cand.get("mapping") or {},
                 fixed=list(stage1_cand.get("fixed") or [])
                      + [adapter.export_pin(export_node, prefix)],
+                bypass=(stage1_cand.get("bypass") or []),
                 upload_images=dict(upload_images or {}), raw=request,
                 loras=body.get("loras"), slot_held=True)
             out1 = await adapter.generate(req1)
@@ -2149,7 +2150,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
                 output_cases=(s2.get("output_cases") or None),
                 texture_format=(s2.get("texture_format") or None),
-                dummy_check=(s2.get("dummy_check") is not False), slot_held=True)
+                dummy_check=(s2.get("dummy_check") is not False),
+                bypass=(s2.get("bypass") or []), slot_held=True)
             await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
             await _unload_host_llms(backend2)
             out2 = await adapter2.generate(req2)
@@ -2352,6 +2354,7 @@ async def run_generation(body: dict, request: Request,
             output_cases=(cand.get("output_cases") or None),
             texture_format=(cand.get("texture_format") or None),
             dummy_check=(cand.get("dummy_check") is not False),   # default on; alias opt-out
+            bypass=(cand.get("bypass") or []),                    # per-backend node bypass
         )
 
     first, cand0 = routes[0]
