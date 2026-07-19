@@ -3441,28 +3441,66 @@ async def job_detail_page(job_id: str, request: Request):
     inp = meta.get("inputs") or {}
     prompt, neg = inp.get("prompt") or "", inp.get("negative_prompt") or ""
     params = inp.get("params") or {}
-    prows = "".join(f"<tr><td><code>{_esc(k)}</code></td><td>{_esc(str(v))}</td></tr>" for k, v in params.items())
+    # candidate for the backend this job ran on → mapping (param→node), pinned (fixed),
+    # bypass set and workflow. Params + pinned that target a BYPASSED node are struck
+    # (they had no effect — the node was removed); a bypassed node with no param/pin is
+    # listed separately. Bypass comes from the alias config (matches the pinned source).
+    cand = {}
+    if store.is_active():
+        cs = store.get(job["alias"]) or []
+        cand = next((x for x in cs if x.get("backend") == job["backend"]), cs[0] if cs else None) or {}
+    mapping = cand.get("mapping") or {}
+    pinned = cand.get("fixed") or []
+    wf = cand.get("workflow_json") or {}
+    bypassed = {str(x) for x in (cand.get("bypass") or [])}
+    covered = set()                          # bypassed nodes surfaced (struck) via a param/pin
+    _STRIKE = " style='text-decoration:line-through;opacity:.55'"
+
+    def _byp(nid):                           # (td-style, tag) if node is bypassed, marking it covered
+        if nid and nid in bypassed:
+            covered.add(nid)
+            return _STRIKE, " <span class='muted'>· bypassed</span>"
+        return "", ""
+
+    def _param_node(key):                    # the node a params-table key maps to (param OR label)
+        for p, m in mapping.items():
+            if p == key or ((m or {}).get("label") or "").strip() == key:
+                return str((m or {}).get("node"))
+        return None
+
+    prow = []
+    for k, v in params.items():
+        s, tag = _byp(_param_node(k))
+        prow.append(f"<tr><td{s}><code>{_esc(k)}</code></td><td{s}>{_esc(str(v))}{tag}</td></tr>")
+    prows = "".join(prow)
+    frow = []
+    for b in pinned:
+        s, tag = _byp(str(b.get("node")))
+        frow.append(f"<tr><td{s}><code>{_esc(b.get('field'))}</code></td>"
+                    f"<td{s}>{_esc(str(b.get('value')))}{tag}</td></tr>")
+    frows = "".join(frow)
     in_imgs = meta.get("input_images", [])
     inbox = ""
     if prompt:
         inbox += f"<h3>Prompt</h3><pre class='chatout'>{_esc(prompt)}</pre>"
     if neg:
         inbox += f"<h3>Negative</h3><pre class='chatout'>{_esc(neg)}</pre>"
-    # request params + the alias's pinned values (for the backend this job ran on) side
-    # by side — quick overview of the full effective input.
-    pinned = []
-    if store.is_active():
-        cs = store.get(job["alias"]) or []
-        c = next((x for x in cs if x.get("backend") == job["backend"]), cs[0] if cs else None)
-        pinned = (c or {}).get("fixed") or []
-    frows = "".join(f"<tr><td><code>{_esc(b.get('field'))}</code></td>"
-                    f"<td>{_esc(str(b.get('value')))}</td></tr>" for b in pinned)
     ptbl = f"<h3>Params</h3><table>{prows}</table>" if prows else ""
     ftbl = (f"<h3>Pinned values <span class='muted' style='font-weight:normal'>· {_esc(job['backend'])}</span></h3>"
             f"<table>{frows}</table>") if frows else ""
     if ptbl or ftbl:
         inbox += (f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
                   f"<div>{ptbl}</div><div>{ftbl}</div></div>")
+    # bypassed nodes with no param/pin of their own → list them as skipped
+    extra_byp = sorted((n for n in bypassed if n not in covered), key=lambda n: (len(n), n))
+    if extra_byp:
+        def _byp_li(nid):
+            n = wf.get(nid) or {}
+            t = (n.get("_meta") or {}).get("title", "")
+            cls = n.get("class_type", "") or "(stale — not in workflow)"
+            return f"<li><code>{_esc(nid)}</code> {_esc(cls)}" + (f" · {_esc(t)}" if t else "") + "</li>"
+        inbox += ("<h3>Bypassed nodes <span class='muted' style='font-weight:normal'>· skipped, no param/pin</span></h3>"
+                  f"<ul class='muted' style='margin:4px 0 0 18px'>{''.join(_byp_li(n) for n in extra_byp)}</ul>")
     if in_imgs:
         inbox += f"<h3>Reference images</h3>{_job_thumbs(job_id, 'input', in_imgs)}"
     if not inbox:
