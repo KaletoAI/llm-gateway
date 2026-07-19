@@ -2160,7 +2160,7 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
         elif nid in out_nodes:
             label += " <span class='badge bad' title='this is the output node — bypassing it yields no result'>output!</span>"
         cells = "".join(
-            f"<td style='text-align:center'><input type='checkbox' value='1' "
+            f"<td><input type='checkbox' value='1' "
             f"name='byp__{_esc(str(c.get('backend')))}__{_esc(nid)}'"
             f"{' checked' if nid in {str(x) for x in (c.get('bypass') or [])} else ''}></td>"
             for c in cands)
