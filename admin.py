@@ -789,6 +789,12 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "id (without the <code>backend/</code> prefix). Several local backends sharing a model id "
               "then collapse into one entry that routes by priority and fails over — an implicit "
               "cross-backend alias.</p>"
+            + _field("route by speed",
+                     _checkbox("route_speed", gb("route_speed"), "route_speed"))
+            + "<p class='hint'><b>route_speed</b>: every bare model id this backend serves routes "
+              "fastest-first by measured throughput (tok/s) instead of priority — one switch for the "
+              "whole catalog (hundreds of ids). Chat aliases are unaffected (they keep their own per-alias "
+              "routing). A <code>backend/model</code> pin still forces this backend.</p>"
             + "</div></form>")
 
 
@@ -849,7 +855,7 @@ async def backends_page(request: Request):
                               "Delete", f"Remove backend {b['name']} ({b['type']})?"))
         acts = _icon_acts(*acts_list)
         src = "" if b.get("source") == "ui" else " · config"
-        flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local") if b.get(fl))
+        flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local", "route_speed") if b.get(fl))
         host = f" · host {b['host']}" if b.get("host") else ""
         sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
@@ -1017,7 +1023,7 @@ async def backend_save(request: Request):
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
-    for flag in ("chat_only", "serverless_only", "local"):
+    for flag in ("chat_only", "serverless_only", "local", "route_speed"):
         if f.get(flag):
             b[flag] = True
         else:
@@ -1138,23 +1144,49 @@ def _route_status(r: dict) -> str:
 
 
 def _host_chip(h: dict) -> str:
-    """A backend chip in the models table, coloured by health/busy."""
+    """A backend chip in the models table, coloured by health/busy. Shows measured
+    throughput (tok/s) once known — the signal the `speed` routing mode ranks on."""
     if not h.get("healthy"):
         kind, suffix = "bad", " down"
     elif h.get("busy"):
         kind, suffix = "warn", " busy"
     else:
         kind, suffix = "ok", ""
-    return f'<span class="badge {kind}">{_esc(h["backend"])} · p{h.get("priority")}{suffix}</span>'
+    tps = h.get("tps") or 0
+    spd = f" · {tps:g} tok/s" if tps else ""
+    return f'<span class="badge {kind}">{_esc(h["backend"])} · p{h.get("priority")}{spd}{suffix}</span>'
 
 
-def _models_table(models: list) -> str:
+def _models_table(models: list, show_mode: bool = False) -> str:
+    """Bare model id → hosting backends. With show_mode, a per-model priority⇄speed
+    routing toggle (chat routing only — the LLM-models sub-tab). Shadowed ids route
+    via their alias, so their mode is edited in the chat-alias editor, not here."""
+    rmode = store.get_route_mode() if show_mode else {}
     rows = ""
     for m in models:
         chips = " ".join(_host_chip(h) for h in m["hosts"]) or '<span class="muted">none</span>'
         sh = _badge("shadowed by alias", "warn") if m.get("shadowed_by_alias") else ""
-        rows += f'<tr><td><code>{_esc(m["model"])}</code>{sh}</td><td>{chips}</td></tr>'
-    return (f'<table><tr><th>model</th><th>backends (priority order)</th></tr>{rows}</table>'
+        extra = ""
+        if show_mode:
+            if m.get("shadowed_by_alias"):
+                extra = "<td class='muted'>via alias</td>"
+            elif any(h.get("route_speed") for h in m["hosts"]):
+                # whole-backend route_speed forces speed for this bare id → managed on the
+                # Backends tab; no per-model toggle (it could only clear an explicit override,
+                # which can't override the backend flag anyway).
+                extra = (f"<td class='acts'>{_badge('speed', 'ok')} "
+                         "<span class='muted'>via backend</span></td>")
+            else:
+                mid = m["model"]
+                cur = rmode.get(mid) or ""
+                nxt = "" if cur == "speed" else "speed"
+                href = f'/ui/routing/rmode?model={quote(mid, safe="")}&mode={nxt}'
+                badge = _badge("speed", "ok") if cur == "speed" else _badge("priority")
+                label = "→ priority" if cur == "speed" else "→ speed"
+                extra = f"<td class='acts'>{badge} {_btn(label, href, 'secondary', sm=True)}</td>"
+        rows += f'<tr><td><code>{_esc(m["model"])}</code>{sh}</td><td>{chips}</td>{extra}</tr>'
+    head = "<th>model</th><th>backends (priority order)</th>" + ("<th>routing</th>" if show_mode else "")
+    return (f'<table><tr>{head}</tr>{rows}</table>'
             if rows else "<p class='muted'>none discovered yet</p>")
 
 
@@ -1259,8 +1291,12 @@ async def routing_page(request: Request):
         title, body = "LLM models", (
             "<h2>LLM models → backends</h2>"
             "<p class='hint'>A bare model id routes to these in priority order, failing over. "
-            "<b>shadowed by alias</b> = a chat alias of the same name intercepts the bare id.</p>"
-            + _models_table([m for m in on_llm if not _is_image_model(m["model"])]))
+            "<b>shadowed by alias</b> = a chat alias of the same name intercepts the bare id "
+            "(set its routing in the alias editor). <b>routing = speed</b> orders ready backends "
+            "fastest-first by measured throughput (tok/s shown on each chip), priority as tiebreak. "
+            "<b>via backend</b> = a hosting backend's <code>route_speed</code> flag (Backends tab) "
+            "switches all its bare ids to speed at once — no per-model toggle then.</p>"
+            + _models_table([m for m in on_llm if not _is_image_model(m["model"])], show_mode=True))
     elif sub == "gen":
         title, body = "Media aliases", _routing_gen_body(bmeta)
     elif sub == "image":
@@ -1386,6 +1422,15 @@ def _chat_editor(alias: str) -> str:
                    "<b>auto</b> = model default; an explicit client <code>reasoning</code> field always wins. "
                    "Lets e.g. <code>tool</code> (off) and <code>tool-thinking</code> (auto/on) share one "
                    "backend+model.</p>")
+    cur_rm = store.get_route_mode().get(alias) or ""
+    rm_opts = "".join(f'<option value="{v}"{" selected" if cur_rm == v else ""}>{_esc(lbl)}</option>'
+                      for v, lbl in (("", "priority (default)"), ("speed", "speed")))
+    rmode_field = (_field("routing", f'<select name="route_mode">{rm_opts}</select>', short=True)
+                   + "<p class='hint' style='margin:-4px 0 10px'>How ready backends are ordered for this "
+                     "alias. <b>priority</b> = configured order (default). <b>speed</b> = fastest first by "
+                     "measured throughput (tok/s, shown in <a href='/ui/routing?sub=llm'>LLM models</a> "
+                     "and <code>/health</code>), priority as the tiebreak; unmeasured backends are probed "
+                     "first. Failover order follows the same ranking.</p>")
     cur_voice = store.get_alias_voice().get(alias) or {}
     voice_field = (_field("voice default", _inp("voice_ref", cur_voice.get("voice", ""),
                           placeholder="backend-side reference, e.g. voices/kai-ref.wav"))
@@ -1400,7 +1445,7 @@ def _chat_editor(alias: str) -> str:
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
-            + park_field + rsn_field + voice_field
+            + park_field + rsn_field + rmode_field + voice_field
             + "<h2>Backends</h2>"
             + "<p class='hint'>Assign backends to this alias, pick the model on each, and optionally "
               "override that backend's global priority for this alias only. Tried in priority order "
@@ -1443,6 +1488,7 @@ async def chat_save(request: Request):
             value[bn] = m
     park_s = (f.get("park_s", "") or "").strip()
     rsn = (f.get("reasoning", "") or "").strip()
+    rmode = (f.get("route_mode", "") or "").strip()
     if not alias or not value:
         return RedirectResponse(f"/ui/mapping?cedit={orig}" if orig else "/ui/mapping", status_code=303)
     if orig and orig != alias and store.get_chat_alias(orig) is not None:
@@ -1450,14 +1496,16 @@ async def chat_save(request: Request):
         store.set_alias_park(orig, None)      # drop the old name's overrides
         store.set_alias_reasoning(orig, None)
         store.set_alias_voice(orig, None)
+        store.set_route_mode(orig, None)
     store.upsert_chat_alias(alias, value)
     store.set_alias_park(alias, park_s if park_s != "" else None)   # blank → global default
     store.set_alias_reasoning(alias, rsn)                           # 'auto'/blank clears
     store.set_alias_voice(alias, {"voice": f.get("voice_ref", ""),  # blank fields clear
                                   "ref_text": f.get("voice_ref_text", "")})
+    store.set_route_mode(alias, rmode)                              # only 'speed' persists, else clears
     _apply_chat_aliases()
     logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'}, "
-                f"reasoning={rsn or 'auto'})")
+                f"reasoning={rsn or 'auto'}, routing={rmode or 'priority'})")
     return RedirectResponse("/ui/mapping", status_code=303)
 
 
@@ -1491,9 +1539,23 @@ async def chat_del(request: Request):
         store.set_alias_park(alias, None)     # drop the alias's overrides with it
         store.set_alias_reasoning(alias, None)
         store.set_alias_voice(alias, None)
+        store.set_route_mode(alias, None)
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
     return RedirectResponse("/ui/mapping", status_code=303)
+
+
+async def rmode_toggle(request: Request):
+    """Set/clear the routing mode of a bare model id (LLM models sub-tab). 'speed'
+    sets it, anything else clears (→ priority default). Aliases set their mode in the
+    chat-alias editor instead."""
+    model = _qp(request, "model")
+    mode = _qp(request, "mode")
+    if model:
+        store.set_route_mode(model, mode)
+        _apply_chat_aliases()             # → rebuild_virtual_models reloads route_mode
+        logger.info(f"ui: route mode '{model}' = {mode or 'priority'}")
+    return RedirectResponse("/ui/routing?sub=llm", status_code=303)
 
 
 # ── Tab: Chat Playground ────────────────────────────────────────────────────────
@@ -4660,6 +4722,7 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["GET"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
+    app.add_api_route("/ui/routing/rmode", rmode_toggle, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])
     app.add_api_route("/ui/chat/save", chat_save, methods=["POST"])
     app.add_api_route("/ui/chat/badd", chat_badd, methods=["GET"])

@@ -450,6 +450,37 @@ def set_alias_reasoning(alias: str, mode) -> None:
     set_settings({"alias_reasoning": m})
 
 
+# ── Per-key routing mode (priority vs speed) ─────────────────────────────────────
+# One settings dict {name: "speed"} where `name` is a chat alias OR a bare model id
+# (both are routing keys). Absent = "priority" (the default). "speed" makes
+# resolve_routes reorder ready candidates fastest-first by measured throughput.
+
+def get_route_mode() -> dict:
+    return get_setting("route_mode") or {}
+
+
+def set_route_mode(key: str, mode) -> None:
+    """Set/clear a routing key's mode. Only 'speed' is stored; anything else clears
+    the override (→ priority default)."""
+    m = get_route_mode()
+    if mode == "speed":
+        m[key] = "speed"
+    elif key in m:
+        del m[key]
+    else:
+        return
+    set_settings({"route_mode": m})
+
+
+def rename_route_mode(old: str, new: str) -> None:
+    if old == new:
+        return
+    m = get_route_mode()
+    if old in m:
+        m[new] = m.pop(old)
+        set_settings({"route_mode": m})
+
+
 def get_alias_voice() -> dict:
     return get_setting("alias_voice") or {}
 

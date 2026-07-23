@@ -218,6 +218,11 @@ class AdapterContext:
     # streamed-finally. Default no-ops so non-main constructions stay valid.
     active_register: Callable[[dict], Any] = lambda meta: None
     active_done: Callable[[Any], None] = lambda token: None
+    # Speed-routing signal: fold a completed call's throughput into the backend's
+    # tok/s EWMA — (bid, out_tok, duration_ms, status). Default no-op keeps non-main
+    # constructions valid; the guard (200-only, min tokens) lives in main._note_speed.
+    note_speed: Callable[[str, int, int, int], None] = \
+        lambda bid, out_tok, dur_ms, status: None
     # Normalized reasoning toggle: (backend, model, requested, payload) -> (payload, control).
     # Default no-op (auto) so non-main constructions stay valid.
     apply_reasoning: Callable[[dict, Optional[str], Optional[str], dict], Any] = \
@@ -494,6 +499,7 @@ class OpenAIAdapter(BackendAdapter):
         """Fire-and-forget stats row for this dispatch; returns the elapsed ms."""
         ctx = self.ctx
         elapsed_ms = int((time.monotonic() - call.started) * 1000)
+        ctx.note_speed(self.bid, out_tok, elapsed_ms, status)   # speed-routing EWMA (guarded in main)
         asyncio.create_task(ctx.record_call(
             duration_ms=elapsed_ms, backend=self.name, source=call.source,
             alias=req.alias, model=call.real_model, endpoint=(req.stats_endpoint or req.path),

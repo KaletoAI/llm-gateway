@@ -168,7 +168,7 @@ def rebuild_virtual_models() -> None:
     entries merged over them by alias (store overrides config for the same name).
     Also refreshes the per-alias park times and reasoning defaults. Call after
     config reload or any store chat-alias change."""
-    global virtual_models, alias_park_s, alias_reasoning, alias_voice
+    global virtual_models, alias_park_s, alias_reasoning, alias_voice, route_mode
     merged = dict(config_virtual_models)
     if store.is_active():
         merged.update(store.list_chat_aliases())
@@ -179,6 +179,10 @@ def rebuild_virtual_models() -> None:
     alias_park_s = park
     alias_reasoning = store.get_alias_reasoning() if store.is_active() else {}
     alias_voice = store.get_alias_voice() if store.is_active() else {}
+    rm = dict(config.get("route_mode") or {}) if isinstance(config, dict) else {}
+    if store.is_active():
+        rm.update(store.get_route_mode())
+    route_mode = rm
     apply_voice_library()
     apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
     rebuild_route_index()                  # alias mappings changed
@@ -193,6 +197,7 @@ backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
 backend_hosts: dict[str, str] = {}                             # bid → host (explicit `host` or URL IP)
+backend_tps: dict[str, float] = {}                             # bid → EWMA output tok/s (speed routing; runtime-only, resets on restart)
 host_backends: dict[str, list] = {}                            # host → [bid, …] (rebuild_backends)
 hosts_meta: dict[str, dict] = {}                               # host → {label, avoid_llm_during_media, …}
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
@@ -260,6 +265,26 @@ def _inflight_dec(name: str) -> None:
     _notify_slot_free()
 
 
+# ── Speed signal (throughput EWMA) ──────────────────────────────────────────────
+# Per-backend generation throughput in output tokens/sec, folded from each completed
+# call. Powers the opt-in `speed` routing mode (resolve_routes reorders ready
+# candidates fastest-first). Runtime-only — no persistence; unmeasured backends fall
+# back to priority order (sorted first so they get probed once, see resolve_routes).
+_TPS_ALPHA = 0.3                        # EWMA weight of the newest sample (higher = more reactive)
+_TPS_MIN_TOKENS = 16                    # ignore tiny completions — fixed overhead dominates their tok/s
+
+
+def _note_speed(bid: str, out_tok: int, duration_ms: int, status: int) -> None:
+    """Fold one completed dispatch into a backend's tok/s EWMA. Only successful
+    text generations with enough tokens count; TTS/embeddings (0 tokens) and errors
+    are skipped. Called synchronously from the adapter's stats path (loop thread)."""
+    if status != 200 or out_tok < _TPS_MIN_TOKENS or duration_ms <= 0:
+        return
+    tps = out_tok / (duration_ms / 1000.0)
+    prev = backend_tps.get(bid)
+    backend_tps[bid] = tps if prev is None else _TPS_ALPHA * tps + (1 - _TPS_ALPHA) * prev
+
+
 # ── Live LLM-call registry (dashboard "running calls") ────────────────────────
 # Currently-running chat/completions/embeddings forwards, so the console can show
 # what's in flight right now. Registered when dispatch starts, dropped on
@@ -302,6 +327,7 @@ max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
 alias_voice: dict = {}                  # alias → {voice, ref_text} TTS defaults (store). Client wins.
+route_mode: dict = {}                   # routing key (alias OR bare model id) → "speed" (config+store); absent → priority
 voice_library: dict = {}                # name → {ref_text, file, remote, shipped} (store voice_library)
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
@@ -698,14 +724,21 @@ _backend_names: set = set()            # all backend names — split_backend_pre
 _llm_backends: list = []               # enabled non-ComfyUI backends, priority order
 _comfy_backends: list = []             # enabled ComfyUI backends (generation routing)
 _route_index: dict = {}                # alias/model-id → [(backend, real_model)] pre-sorted
+# Routing keys whose ready-candidates sort fastest-first (speed mode). Precomputed here so
+# resolve_routes only does an O(1) membership test. Union of: explicit per-key speed
+# (route_mode "speed" — aliases and bare ids) and every bare model id served by a backend
+# with the per-backend `route_speed` flag. Aliases are governed by route_mode ONLY — the
+# backend flag never leaks into alias routing (the `mid not in virtual_models` guard below).
+_speed_keys: set = set()
 
 
 def rebuild_route_index() -> None:
-    global _backend_names, _llm_backends, _comfy_backends, _route_index
+    global _backend_names, _llm_backends, _comfy_backends, _route_index, _speed_keys
     _backend_names = {b["name"] for b in backends}
     _llm_backends = [b for b in enabled_backends() if b.get("type", "openai") != "comfyui"]
     _comfy_backends = [b for b in enabled_backends() if b.get("type") == "comfyui"]
     index: dict[str, list] = {}
+    speed_keys = {k for k, v in route_mode.items() if v == "speed"}   # explicit per-key overrides
     for alias in virtual_models:                       # aliases (they shadow same-named real ids)
         for b in _llm_backends:
             real, prio = alias_entry(alias, b["name"])
@@ -713,11 +746,15 @@ def rebuild_route_index() -> None:
                 index.setdefault(alias, []).append(
                     (prio if prio is not None else b["priority"], b, real))
     for b in _llm_backends:                            # bare model ids → pass-through routing
+        speed_backend = bool(b.get("route_speed"))     # whole-backend speed switch (bare ids only)
         for mid in backend_models.get(backend_id(b), set()):
             if mid not in virtual_models:
                 index.setdefault(mid, []).append((b["priority"], b, mid))
+                if speed_backend:
+                    speed_keys.add(mid)
     _route_index = {k: [(b, r) for _, b, r in sorted(rows, key=lambda x: x[0])]
                     for k, rows in index.items()}
+    _speed_keys = speed_keys
 
 
 def resolve_routes(alias: str) -> tuple[list, list]:
@@ -747,8 +784,16 @@ def resolve_routes(alias: str) -> tuple[list, list]:
             continue
         (busy if backend_busy(b) else ready).append((b, real))
     if len(ready) > 1:
+        # Speed routing (opt-in per alias / bare model id / whole backend via route_speed):
+        # reorder ready candidates fastest-first by measured throughput. Unmeasured backends
+        # sort FIRST (inf) so each is probed once; priority is the stable tiebreak (ready came
+        # pre-sorted). Cold start (all unmeasured) ⇒ identical to priority routing. `_speed_keys`
+        # is precomputed in rebuild_route_index (explicit route_mode ∪ route_speed backends).
+        if alias in _speed_keys:
+            ready.sort(key=lambda br: -backend_tps.get(backend_id(br[0]), float("inf")))
         # Shared-GPU consideration: candidates whose host is generating media go
-        # LAST (stable — priority order kept within both groups), never dropped.
+        # LAST (stable — priority/speed order kept within both groups), never dropped.
+        # Runs after the speed sort so the shared-GPU guarantee stays dominant.
         mb = _media_busy_hosts()
         if mb:
             ready.sort(key=lambda br: backend_hosts.get(backend_id(br[0]), "") in mb)
@@ -843,6 +888,8 @@ def routing_snapshot() -> dict:
                 "priority": b["priority"],
                 "healthy": healthy,
                 "busy": healthy and backend_busy(b),
+                "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
+                "route_speed": bool(b.get("route_speed")),
             })
     models = []
     for mid, hosts in sorted(model_hosts.items(), key=lambda kv: kv[0].lower()):
@@ -1150,6 +1197,7 @@ adapter_ctx = AdapterContext(
     cost_usd=_cost_usd,
     source_of=_source_of,
     record_call=stats.record_call,
+    note_speed=_note_speed,
     log_enabled=lambda: log_per_call,
     active_register=_active_register,
     active_done=_active_done,
@@ -2701,7 +2749,7 @@ def gateway_info() -> dict:
             "models": len(backend_models.get(backend_id(b), set())), "url": b["url"],
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
-            "local": bool(b.get("local")),
+            "local": bool(b.get("local")), "route_speed": bool(b.get("route_speed")),
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
@@ -2764,7 +2812,8 @@ def set_backend_enabled(bid: str, on: bool) -> bool:
         return False
     entry = dict(store.get_backend(b["name"], b.get("type", "openai")) or
                  {k: b[k] for k in ("name", "type", "url", "priority", "max_concurrent",
-                                    "api_key", "chat_only", "serverless_only", "local") if k in b})
+                                    "api_key", "chat_only", "serverless_only", "local",
+                                    "route_speed") if k in b})
     entry.update({"name": b["name"], "type": b.get("type", "openai"), "enabled": bool(on)})
     store.upsert_backend(entry)
     logger.info(f"[{b['name']}] {'enabled' if on else 'disabled'} via console")
@@ -2932,6 +2981,8 @@ async def health():
                 "inflight": backend_inflight.get(backend_id(b), 0),
                 "max_concurrent": backend_max_concurrent(b),
                 "priority": b["priority"],
+                "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
+                "route_speed": bool(b.get("route_speed")),
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
             }
             for b in backends
