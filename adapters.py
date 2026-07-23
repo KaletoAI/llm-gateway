@@ -1746,7 +1746,7 @@ class ComfyUIAdapter(BackendAdapter):
                 else:
                     blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
                                                       req.output_ext, req.output_globs)
-                    if req.output_globs and not blobs:
+                    if req.output_globs and not req.output_node and not blobs:
                         raise RuntimeError(f"no output file matched {req.output_globs} "
                                            f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
                     if req.output_node and not blobs:
@@ -1851,9 +1851,11 @@ class ComfyUIAdapter(BackendAdapter):
         # written next to …_mia.fbx but not registered). For each reported file we
         # also try its stem swapped to each glob's extension, so a glob picks up an
         # on-disk sibling via /view. Unmatched globs are simply absent (a later
-        # split workflow producing only some files still works). Takes precedence
-        # over output_node/output_ext.
-        if output_globs:
+        # split workflow producing only some files still works). Without an
+        # output_node the globs ARE the delivery; with one, the node stays
+        # authoritative and the globs ship as unconditional extras (appended
+        # below) — same semantics as globs mixed with output_cases.
+        if output_globs and not output_node:
             return await self._fetch_by_globs(client, url, outputs, output_globs)
         # Single-node mode: the alias's explicit output node (mapping editor
         # "Output" section) is authoritative — a workflow may export intermediate
@@ -1924,6 +1926,15 @@ class ComfyUIAdapter(BackendAdapter):
                                 kind = top
                                 mime = {"video": "video/mp4", "audio": "audio/mpeg"}[top]
                     blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=fn))
+        # output_node + output_globs: glob extras on top of the node's result (e.g.
+        # the metallic PNG a SaveImage bakes next to a Preview3D-delivered GLB).
+        # Only on a delivered node result — an empty one stays empty so the caller's
+        # "output node produced no fetchable artifact" error fires instead of a
+        # partial extras-only delivery.
+        if output_globs and blobs:
+            have = {b.name for b in blobs}
+            blobs += [b for b in await self._fetch_by_globs(client, url, outputs, output_globs)
+                      if b.name not in have]
         return blobs
 
     async def _fetch_by_cases(self, client, url, outputs, cases) -> tuple:

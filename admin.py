@@ -2108,9 +2108,12 @@ def _output_section(wf: dict, cands: list) -> str:
             + _field("output files", _textarea("output_globs", globs_text, 4,
                      "plain globs (deliver all), or 'rig: globs' lines for conditional cases:\n"
                      "mixamo: *_mia.glb\ngeneric: *_articulationxl.fbx, *basecolor*.png"), wide=True)
-            + "<p class='hint'><b>Multi-file delivery</b> (overrides the two fields above). Plain glob lines "
-              "deliver EVERY match across all output nodes, including a same-stem sibling with a glob's "
-              "extension (so <code>*_mia.glb</code> grabs the .glb next to a reported <code>_mia.fbx</code>). "
+            + "<p class='hint'><b>Multi-file delivery</b>. Plain glob lines deliver EVERY match across all "
+              "output nodes, including a same-stem sibling with a glob's extension (so <code>*_mia.glb</code> "
+              "grabs the .glb next to a reported <code>_mia.fbx</code>). Without an <b>output node</b> the "
+              "globs replace it as the whole delivery; WITH one, the node's result stays authoritative and "
+              "plain globs ship as unconditional extras on top (e.g. a baked <code>*metallic*.png</code> "
+              "next to the node's GLB). "
               "<br><b>Cases</b> — <code>rig: glob, glob</code> per line: the FIRST case whose first glob "
               "actually exists wins, and only its files ship, tagged with that <b>rig</b> type "
               "(<code>mixamo</code> → validated as a 52-joint humanoid GLB with embedded texture; "
@@ -2658,8 +2661,9 @@ async def update(request: Request):
             c.pop("dummy_check", None)
         else:
             c["dummy_check"] = False
-    # output files (overrides node+ext): 'rig: globs' lines → conditional cases,
-    # plain glob lines → flat multi-file delivery.
+    # output files: 'rig: globs' lines → conditional cases, plain glob lines →
+    # multi-file delivery (the whole delivery without an output node; extras on
+    # top of the node's result with one).
     out_cases, out_flat = [], []
     for line in re.split(r"[\r\n]+", f.get("output_globs", "") or ""):
         line = line.strip()
