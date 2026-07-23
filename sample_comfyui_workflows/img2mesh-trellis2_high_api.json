@@ -116,7 +116,7 @@
   "39": {
     "inputs": {
       "remesh_band": 1,
-      "resolution": 1024,
+      "resolution": 128,
       "remove_floaters": true,
       "remove_inner_faces": true,
       "mesh": [
@@ -315,7 +315,10 @@
   },
   "49": {
     "inputs": {
-      "target_face_num": 20000,
+      "target_face_num": [
+        "62",
+        0
+      ],
       "method": "Cumesh",
       "mesh": [
         "39",
@@ -347,7 +350,10 @@
       "texture_guidance_rescale": 0.2,
       "texture_rescale_t": 3,
       "resolution": 1024,
-      "texture_size": 2048,
+      "texture_size": [
+        "84",
+        0
+      ],
       "texture_alpha_mode": "OPAQUE",
       "double_side_material": true,
       "texture_guidance_interval_start": 0,
@@ -520,6 +526,15 @@
     "class_type": "Preview3D",
     "_meta": {
       "title": "Preview 3D & Animation"
+    }
+  },
+  "84": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_texture_resolution"
     }
   }
 }

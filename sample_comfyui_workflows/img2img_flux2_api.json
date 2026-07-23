@@ -13,7 +13,7 @@
   },
   "61": {
     "inputs": {
-      "value": "a candid full-body photo with natural light and high detail of a single woman Kira standing, Kira is 26 years young female, short athletic frame, light skin, large breasts, round perfect breasts, small butt, blonde medium hair, blue eyes, Kira is naked, standing with one hand on hip, weight shifted to one leg, shoulder slightly raised, chin up, bright focused eyes, slight knowing smile, head tilted, inspired engaged expression"
+      "value": ""
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
@@ -22,7 +22,7 @@
   },
   "63": {
     "inputs": {
-      "value": "illustration, anime, cgi, 3d render, painting, airbrushed skin, plastic skin, smooth flawless skin, overexposed, glossy, fantasy, studio lighting, posed, cartoon, drawing, sketch, watermark, signature, text, logo, deformed, blurry, low quality"
+      "value": ""
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
@@ -284,26 +284,9 @@
       "title": "ColorMatchV2"
     }
   },
-  "311": {
-    "inputs": {
-      "boolean": true,
-      "on_true": [
-        "305",
-        0
-      ],
-      "on_false": [
-        "308",
-        0
-      ]
-    },
-    "class_type": "Switch any [Crystools]",
-    "_meta": {
-      "title": "true-diffusion_false-gguf"
-    }
-  },
   "312": {
     "inputs": {
-      "image": "8x8.png"
+      "image": "1781011414.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -344,7 +327,7 @@
       "lora_04": "None",
       "strength_04": 1,
       "model": [
-        "311",
+        "320",
         0
       ],
       "clip": [
@@ -380,6 +363,22 @@
     "class_type": "ComfyMathExpression",
     "_meta": {
       "title": "Math Expression"
+    }
+  },
+  "320": {
+    "inputs": {
+      "any_01": [
+        "305",
+        0
+      ],
+      "any_02": [
+        "308",
+        0
+      ]
+    },
+    "class_type": "Any Switch (rgthree)",
+    "_meta": {
+      "title": "Any Switch (rgthree)"
     }
   },
   "276:119": {

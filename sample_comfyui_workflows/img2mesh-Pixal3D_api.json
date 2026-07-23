@@ -12,7 +12,7 @@
     },
     "class_type": "Trellis2LoadModel",
     "_meta": {
-      "title": "Trellis2 - LoadModel"
+      "title": "Load Model"
     }
   },
   "194": {
@@ -37,7 +37,7 @@
     "inputs": {
       "max_views": 1,
       "pipeline": [
-        "39",
+        "320",
         0
       ],
       "image": [
@@ -363,7 +363,7 @@
   },
   "311": {
     "inputs": {
-      "image": "ComfyUI_temp_dqvgq_00001_.png"
+      "image": "1784443662.png"
     },
     "class_type": "Trellis2LoadImageWithTransparency",
     "_meta": {
@@ -467,6 +467,36 @@
     "class_type": "PrimitiveInt",
     "_meta": {
       "title": "input_texture_resolution"
+    }
+  },
+  "319": {
+    "inputs": {
+      "modelname": "Pixal3D-GGUF",
+      "model_format": "GGUF Q4_K_M",
+      "backend": "sdpa",
+      "device": "cuda",
+      "low_vram": true,
+      "keep_models_loaded": false
+    },
+    "class_type": "Trellis2LoadModel_GGUF",
+    "_meta": {
+      "title": "Load GGUF"
+    }
+  },
+  "320": {
+    "inputs": {
+      "any_01": [
+        "319",
+        0
+      ],
+      "any_02": [
+        "39",
+        0
+      ]
+    },
+    "class_type": "Any Switch (rgthree)",
+    "_meta": {
+      "title": "Any Switch (rgthree)"
     }
   }
 }
