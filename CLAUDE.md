@@ -58,7 +58,11 @@ receive what they need via injected callables, staying hot-reload-safe.
   chat SSE is rewritten to strict OpenAI shape by `_StreamNormalizer` — no
   null-valued delta keys, the terminal usage chunk only for clients that sent
   `stream_options.include_usage`; strict clients like Hermes abort on the raw
-  LocalAI shape) and
+  LocalAI shape; a backend's `stream_reasoning_as_content` model-globs relabel
+  stream `reasoning` deltas as `content` — LocalAI marks EVERY delta as
+  reasoning when the rendered prompt contains a thinking marker, e.g. Gemma-4's
+  pre-closed `<|channel>thought` tail, although the model can only emit plain
+  answer text then) and
   `ComfyUIAdapter` (`type: comfyui`; `discover()` via `/object_info` →
   models + **installed LoRAs**; `generate()` submits a parametrised workflow,
   polls `/history`, fetches `/view`). `AdapterContext` injects app services.

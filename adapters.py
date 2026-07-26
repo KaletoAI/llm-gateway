@@ -327,9 +327,17 @@ class _StreamNormalizer:
     across network chunks survives. `flush()` returns the unterminated tail
     (error bodies aren't newline-framed)."""
 
-    def __init__(self, want_usage: bool, prompt_estimate: int):
+    def __init__(self, want_usage: bool, prompt_estimate: int,
+                 reasoning_as_content: bool = False):
         self.want_usage = want_usage
         self.prompt_est = prompt_estimate
+        # LocalAI mislabels EVERY stream delta as `reasoning` when the rendered
+        # prompt contains a thinking marker (e.g. Gemma-4's pre-closed
+        # `<|channel>thought\n<channel|>` tail) — even though the model, with its
+        # thought channel pre-closed, can only produce plain answer text. For
+        # (backend, model)s flagged via the backend's `stream_reasoning_as_content`
+        # globs those deltas ARE the content, so they are relabeled here.
+        self.reasoning_as_content = reasoning_as_content
         self.buf = b""
         self.in_tok = self.out_tok = 0      # best backend-reported usage so far
         self.pieces = 0                     # content-bearing deltas ≈ completion tokens
@@ -395,6 +403,17 @@ class _StreamNormalizer:
         for ch in obj["choices"]:
             d = ch.get("delta") if isinstance(ch, dict) else None
             if isinstance(d, dict):
+                if self.reasoning_as_content:
+                    moved = ""
+                    for k in ("reasoning", "reasoning_content"):
+                        if k in d:
+                            v = d.pop(k)
+                            changed = True
+                            if isinstance(v, str):
+                                moved += v
+                    if moved:
+                        c = d.get("content")
+                        d["content"] = (c + moved) if isinstance(c, str) else moved
                 for k in [k for k, v in d.items()
                           if v is None or (k == "content" and v == "")]:
                     del d[k]
@@ -520,7 +539,10 @@ class OpenAIAdapter(BackendAdapter):
         body = {**call.fwd,
                 "stream_options": {**(call.fwd.get("stream_options") or {}), "include_usage": True}}
         want_usage = bool((call.fwd.get("stream_options") or {}).get("include_usage"))
-        norm = _StreamNormalizer(want_usage, _estimate_prompt_tokens(call.fwd))
+        r2c = any(fnmatch.fnmatch(call.real_model or "", g)
+                  for g in (self.backend.get("stream_reasoning_as_content") or []))
+        norm = _StreamNormalizer(want_usage, _estimate_prompt_tokens(call.fwd),
+                                 reasoning_as_content=r2c)
 
         # Open the upstream stream BEFORE building the client response: status +
         # headers arrive first, so a backend that answers with an error (llama-swap
