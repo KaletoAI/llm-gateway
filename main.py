@@ -2781,6 +2781,18 @@ def dashboard_snapshot() -> dict:
     }
 
 
+def _comfy_watch_info(b: dict) -> dict:
+    """Executor-watchdog fields for comfy backends (merged into /health + UI snapshot)."""
+    if b.get("type") != "comfyui":
+        return {}
+    ad = backend_adapters.get(backend_id(b))
+    if ad is None:
+        return {}
+    return {"exec_stuck": bool(getattr(ad, "exec_stuck", False)),
+            "last_restart": int(ad.last_restart) if getattr(ad, "last_restart", 0.0) else None,
+            "last_restart_result": getattr(ad, "last_restart_result", "") or None}
+
+
 def gateway_info() -> dict:
     """Snapshot the UI's Backends/Input/Server tabs read from."""
     config_ids = {backend_id(b) for b in config_backends}
@@ -2796,6 +2808,7 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
+            **_comfy_watch_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
@@ -3028,6 +3041,7 @@ async def health():
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "route_speed": bool(b.get("route_speed")),
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
+                **_comfy_watch_info(b),
             }
             for b in backends
         },
