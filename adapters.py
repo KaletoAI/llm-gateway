@@ -44,6 +44,13 @@ _CHAT_TIMEOUT = 300.0
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
 _UPLOAD_TIMEOUT = 20.0
+_COMFY_STUCK_AFTER_S = 90.0        # default: pending-with-idle-executor this long → stuck
+_COMFY_RESTART_WAIT_S = 120.0      # restart(): max wait for the server to come back
+
+
+class ComfyExecutorStuck(Exception):
+    """ComfyUI answers HTTP but its prompt executor is not draining the queue
+    (queue_pending non-empty, queue_running empty, same head across checks)."""
 
 
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
@@ -1481,6 +1488,13 @@ class ComfyUIAdapter(BackendAdapter):
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
         self._node_types: dict = {}      # {class: {"out":[type],"in":{field:type}}} — bypass slot types
+        # executor watchdog (discover-driven): pending head seen while nothing ran
+        self._stuck_head: Optional[str] = None
+        self._stuck_since: float = 0.0
+        self._stuck_checks: int = 0
+        self.exec_stuck: bool = False
+        self.last_restart: float = 0.0        # ts of the last restart() call (cooldown)
+        self.last_restart_result: str = ""    # "" | running | ok | timeout | no-manager
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         url = self.backend["url"].rstrip("/")
@@ -1488,7 +1502,35 @@ class ComfyUIAdapter(BackendAdapter):
         resp.raise_for_status()
         oi = resp.json()
         self._node_types = _comfy_node_types(oi)      # cache slot types for bypass (free — same fetch)
-        return Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
+        caps = Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
+        qr = await client.get(f"{url}/queue", timeout=_COMFY_DISCOVERY_TIMEOUT)
+        qr.raise_for_status()
+        self._check_executor(qr.json())               # raises ComfyExecutorStuck → DOWN path
+        return caps
+
+    def _check_executor(self, queue: dict) -> None:
+        """Watchdog: prompts waiting while nothing runs, same head prompt across
+        ≥2 consecutive checks AND ≥stuck_after_s → ComfyExecutorStuck. A transient
+        idle moment between dequeues changes the head / empties pending → reset."""
+        pending = queue.get("queue_pending") or []
+        running = queue.get("queue_running") or []
+        head = None
+        if pending and not running:
+            entry = pending[0]
+            head = entry[1] if isinstance(entry, (list, tuple)) and len(entry) > 1 else str(entry)
+        if head is None or head != self._stuck_head:
+            self._stuck_head = head               # None (healthy) or new tracking baseline
+            self._stuck_since = time.time()
+            self._stuck_checks = 0
+            self.exec_stuck = False
+            return
+        self._stuck_checks += 1                   # same head again, still nothing running
+        after = float(self.backend.get("stuck_after_s") or _COMFY_STUCK_AFTER_S)
+        if time.time() - self._stuck_since >= after:
+            self.exec_stuck = True
+            raise ComfyExecutorStuck(
+                f"executor stuck: {len(pending)} prompt(s) pending, none running for "
+                f"{int(time.time() - self._stuck_since)}s (head {head})")
 
     async def _node_types_for(self, wf: dict, bypass_ids: list) -> dict:
         """Slot types for the classes of the nodes about to be bypassed. Uses the
