@@ -94,6 +94,7 @@ _gateway_info: Callable[[], dict] = lambda: {}
 _cancel_generation = None
 _drain_backend = None
 _cancel_drain = None
+_restart_comfy = None
 _set_backend_enabled = None
 _apply_backends: Callable[[], None] = lambda: None
 _llm_backends: Callable[[], list] = lambda: []
@@ -774,6 +775,18 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "directory — used by chain <b>upload</b> hand-offs: the relayed mesh lands here and the "
               "successor gets its full path. Blank = derived from the output dir "
               "(<code>…/output</code> → <code>…/input</code>).</p>"
+            + _field("comfy watchdog",
+                     _checkbox("auto_restart", gb("auto_restart"), "auto_restart",
+                               "restart the ComfyUI service automatically when the executor is stuck"))
+            + _field("restart cooldown s", _inp("restart_cooldown_s", g("restart_cooldown_s"),
+                     placeholder="600", typ="number"))
+            + _field("stuck after s", _inp("stuck_after_s", g("stuck_after_s"),
+                     placeholder="90", typ="number"))
+            + "<p class='hint' style='margin:-4px 0 10px'>Executor watchdog (comfyui only): the "
+              "backend goes <b>down</b> when prompts wait while nothing runs for <b>stuck after s</b> "
+              "seconds. <b>auto_restart</b> then reboots the service via the ComfyUI-Manager "
+              "extension (requires it installed + a systemd unit with <code>Restart=always</code>), "
+              "at most once per <b>restart cooldown s</b>.</p>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
             + _field("discovery filters",
@@ -838,6 +851,10 @@ async def backends_page(request: Request):
             badge = _badge("healthy", "ok")
         else:
             badge = _badge("down", "bad")
+        if b.get("exec_stuck"):
+            badge = _badge("⚠ executor stuck", "bad",
+                           "ComfyUI answers HTTP but its executor is not draining the queue "
+                           "— restart the service (⟳) or check the box/GPU")
         acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
         if draining:
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
@@ -850,6 +867,10 @@ async def backends_page(request: Request):
         else:
             acts_list.append(("⏼", f"/ui/backends/enable?id={quote(bid)}", "secondary",
                               "Bring online (enable)"))
+        if b.get("type") == "comfyui" and b["enabled"]:
+            acts_list.append(("⟳", f"/ui/backends/restart?id={quote(bid)}", "secondary",
+                              "Restart the ComfyUI service (ComfyUI-Manager reboot)",
+                              f"Restart ComfyUI on {b['name']}? Pending prompts there are lost."))
         if b.get("source", "config") == "ui":
             acts_list.append(("✕", f"/ui/backends/delete?id={quote(bid)}", "danger",
                               "Delete", f"Remove backend {b['name']} ({b['type']})?"))
@@ -857,7 +878,8 @@ async def backends_page(request: Request):
         src = "" if b.get("source") == "ui" else " · config"
         flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local", "route_speed") if b.get(fl))
         host = f" · host {b['host']}" if b.get("host") else ""
-        sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{src}"
+        rst = f" · restart: {b['last_restart_result']}" if b.get("last_restart_result") else ""
+        sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Image (comfyui), alphabetical within each
@@ -1023,11 +1045,17 @@ async def backend_save(request: Request):
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
-    for flag in ("chat_only", "serverless_only", "local", "route_speed"):
+    for flag in ("chat_only", "serverless_only", "local", "route_speed", "auto_restart"):
         if f.get(flag):
             b[flag] = True
         else:
             b.pop(flag, None)
+    for nkey in ("restart_cooldown_s", "stuck_after_s"):
+        v = (f.get(nkey, "") or "").strip()
+        if v.isdigit() and int(v) > 0:
+            b[nkey] = int(v)
+        else:
+            b.pop(nkey, None)                  # blank = watchdog defaults (90 / 600)
     renamed = 0
     if orig and (oname != name or otype != new_type):
         store.delete_backend(oname, otype)      # identity changed (rename / type change)
@@ -1048,6 +1076,14 @@ async def backend_del(request: Request):
         name, typ = _parse_bid(bid)
         store.delete_backend(name, typ)
         _apply_backends()
+    return RedirectResponse("/ui/backends", status_code=303)
+
+
+async def backend_restart(request: Request):
+    """Fire-and-forget ComfyUI service restart (ComfyUI-Manager reboot)."""
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _restart_comfy and bid:
+        _restart_comfy(bid)
     return RedirectResponse("/ui/backends", status_code=303)
 
 
@@ -4723,6 +4759,7 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/delete", backend_del, methods=["GET"])
     app.add_api_route("/ui/backends/drain", backend_drain, methods=["GET"])
     app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["GET"])
+    app.add_api_route("/ui/backends/restart", backend_restart, methods=["GET"])
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["GET"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
