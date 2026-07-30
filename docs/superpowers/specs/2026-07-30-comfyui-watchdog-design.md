@@ -60,8 +60,10 @@ die Erkennung/Sichtbarkeit greift trotzdem.
 - Neue Comfy-Backend-Felder (Store-Backend-Editor, wie `comfy_output_dir`):
   `auto_restart` (bool, Default aus), `restart_cooldown_s` (int, Default 600).
 - Trigger: Discovery endet mit `ComfyExecutorStuck` UND `auto_restart` UND
-  Cooldown abgelaufen UND `backend_inflight == 0` → genau EIN
-  `adapter.restart()` als `asyncio.create_task` (fire-and-forget, Log-Event).
+  Cooldown abgelaufen → genau EIN `adapter.restart()` als `asyncio.create_task`
+  (fire-and-forget, Log-Event). Bewusst nicht an `backend_inflight` gekoppelt —
+  stuck heißt: nichts läuft; ein pending Gateway-Prompt ist ohnehin verloren
+  (sein Poll läuft in Failover/Park).
 - Bleibt der Executor danach stuck, bleibt das Backend unhealthy; der Cooldown
   verhindert eine Restart-Schleife.
 

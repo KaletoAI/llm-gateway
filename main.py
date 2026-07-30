@@ -23,9 +23,9 @@ import jobs
 import reasoning
 import stats
 import store
-from adapters import (AdapterContext, NormalizedRequest, image_params, is_image_field,
-                      lora_counterpart, lora_groups, make_adapter, normalize_delivery,
-                      slot_empty_mode, validate_delivery)
+from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
+                      is_image_field, lora_counterpart, lora_groups, make_adapter,
+                      normalize_delivery, slot_empty_mode, validate_delivery)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -377,6 +377,47 @@ def _notify_slot_free() -> None:
             ev.set()
 
 
+_comfy_restarting: set[str] = set()      # backend ids with a restart() in flight
+
+
+def _spawn_comfy_restart(backend: dict, adapter, why: str) -> None:
+    bid = backend_id(backend)
+    _comfy_restarting.add(bid)
+    logger.warning(f"[{backend['name']}] restarting ComfyUI service ({why})")
+
+    async def _run():
+        try:
+            await adapter.restart()
+        except Exception as e:
+            logger.warning(f"[{backend['name']}] ComfyUI restart failed: {e}")
+        finally:
+            _comfy_restarting.discard(bid)
+    asyncio.create_task(_run())
+
+
+def _maybe_auto_restart(backend: dict, adapter) -> None:
+    """Opt-in: one restart attempt per cooldown when the executor is stuck.
+    Deliberately NOT gated on inflight — stuck means nothing is executing, a
+    pending gateway prompt is lost either way (its poll fails over/parks)."""
+    bid = backend_id(backend)
+    if not backend.get("auto_restart") or bid in _comfy_restarting:
+        return
+    cooldown = int(backend.get("restart_cooldown_s") or 600)
+    if adapter.last_restart and time.time() - adapter.last_restart < cooldown:
+        return
+    _spawn_comfy_restart(backend, adapter, "executor stuck — auto-restart")
+
+
+def restart_comfy_backend(bid: str) -> bool:
+    """UI hook (Backends tab): fire-and-forget ComfyUI service restart."""
+    b = next((x for x in backends if backend_id(x) == bid), None)
+    adapter = backend_adapters.get(bid)
+    if b is None or adapter is None or b.get("type") != "comfyui" or bid in _comfy_restarting:
+        return False
+    _spawn_comfy_restart(b, adapter, "manual via UI")
+    return True
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     """Poll a backend's capabilities via its adapter and update discovery state.
 
@@ -412,6 +453,8 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         backend_loras[bid] = set()
         # backend_models is intentionally NOT cleared — keep the last-known (persisted)
         # set so a bare model id still resolves to this offline backend → 503, not 403.
+        if isinstance(e, ComfyExecutorStuck):
+            _maybe_auto_restart(backend, adapter)
 
 
 async def health_loop() -> None:
@@ -2954,6 +2997,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
            drain_backend=begin_drain, cancel_drain=cancel_drain,
            set_backend_enabled=set_backend_enabled,
+           restart_comfy=restart_comfy_backend,
            llm_backend_names=lambda: sorted({b["name"] for b in backends
                                              if b.get("type", "openai") != "comfyui"}),
            resolve_for_backend=resolve_for_backend,
