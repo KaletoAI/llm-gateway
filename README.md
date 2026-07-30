@@ -320,7 +320,23 @@ backends:
     # max_wait: 600          # hard cap for a single generation
     # read_timeout: 60       # per-HTTP-request read timeout (hung read → failover)
     # disconnect_grace: 30   # tolerated unreachability before failing over
+    # stuck_after_s: 90      # executor watchdog: pending prompts + idle executor
+    #                        # this long → backend goes down (see below)
+    # auto_restart: true     # opt-in: restart the ComfyUI service when stuck
+    # restart_cooldown_s: 600  # at most one auto-restart per this window
 ```
+
+**Executor watchdog.** ComfyUI's HTTP server keeps answering even when its
+prompt executor has died (e.g. after a CUDA fault) — prompts then pile up in
+`queue_pending` while nothing runs, and every generation runs into its poll
+timeout. The health loop therefore also checks `/queue`: the same head prompt
+pending with an idle executor across ≥2 checks and ≥`stuck_after_s` (default
+90 s) marks the backend **down** (`exec_stuck: true` in `/health`, "executor
+stuck" badge in the Backends tab). The ⟳ action there — or `auto_restart` —
+restarts the service via the **ComfyUI-Manager** reboot endpoint (requires the
+Manager extension and a systemd unit with `Restart=always`); auto-restart fires
+at most once per `restart_cooldown_s` (default 600 s). A GPU that fell off the
+bus needs a host reboot instead — the backend then simply stays down.
 
 ### Generation aliases + mapping
 

@@ -64,8 +64,19 @@ receive what they need via injected callables, staying hot-reload-safe.
   pre-closed `<|channel>thought` tail, although the model can only emit plain
   answer text then) and
   `ComfyUIAdapter` (`type: comfyui`; `discover()` via `/object_info` →
-  models + **installed LoRAs**; `generate()` submits a parametrised workflow,
-  polls `/history`, fetches `/view`). `AdapterContext` injects app services.
+  models + **installed LoRAs**, plus an **executor watchdog** via `/queue`:
+  same head prompt pending with an idle executor across ≥2 checks and
+  ≥`stuck_after_s` (default 90) → `ComfyExecutorStuck` → the normal DOWN path
+  in `refresh_backend` (ComfyUI answers HTTP even when its prompt worker died —
+  measured 2026-07-30, CUDA fault); `restart()` = ComfyUI-Manager
+  `/manager/reboot` (transport error on the POST is the expected success
+  signal, 404 = Manager missing, then ≤120 s wait for `/object_info` to
+  return); `refresh_backend` triggers opt-in `auto_restart` per backend
+  (`restart_cooldown_s`, default 600, one attempt per cooldown,
+  `_comfy_restarting` guard; deliberately not gated on inflight — stuck means
+  nothing executes). `exec_stuck`/`last_restart*` surface in `/health` + the
+  Backends tab (⟳ restart action). `generate()` submits a parametrised
+  workflow, polls `/history`, fetches `/view`.) `AdapterContext` injects app services.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
   sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
