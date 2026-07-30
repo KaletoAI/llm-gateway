@@ -1532,6 +1532,40 @@ class ComfyUIAdapter(BackendAdapter):
                 f"executor stuck: {len(pending)} prompt(s) pending, none running for "
                 f"{int(time.time() - self._stuck_since)}s (head {head})")
 
+    async def restart(self) -> str:
+        """Restart the ComfyUI service via the ComfyUI-Manager reboot endpoint.
+        The process kills itself mid-response, so a transport error on the POST is
+        the EXPECTED success signal; systemd (Restart=always) brings it back. A 404
+        means the Manager extension is missing → RuntimeError, no wait loop."""
+        url = self.backend["url"].rstrip("/")
+        self.last_restart = time.time()
+        self.last_restart_result = "running"
+        try:
+            async with _pooled_client(self.ctx) as client:
+                r = await client.post(f"{url}/manager/reboot", timeout=5.0)
+            if r.status_code == 404:
+                self.last_restart_result = "no-manager"
+                raise RuntimeError("ComfyUI-Manager not installed (/manager/reboot → 404)")
+        except (httpx.TransportError, httpx.TimeoutException):
+            pass                                   # process died mid-response — expected
+        deadline = time.time() + _COMFY_RESTART_WAIT_S
+        while time.time() < deadline:
+            await asyncio.sleep(3.0)
+            try:
+                async with _pooled_client(self.ctx) as client:
+                    r = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
+                if r.status_code == 200:
+                    self._stuck_head, self._stuck_checks = None, 0
+                    self.exec_stuck = False
+                    self.last_restart_result = "ok"
+                    logger.info(f"[{self.name}] ComfyUI back up after restart")
+                    return "ok"
+            except Exception:
+                pass                               # still rebooting
+        self.last_restart_result = "timeout"
+        logger.warning(f"[{self.name}] ComfyUI not back {_COMFY_RESTART_WAIT_S:.0f}s after restart")
+        return "timeout"
+
     async def _node_types_for(self, wf: dict, bypass_ids: list) -> dict:
         """Slot types for the classes of the nodes about to be bypassed. Uses the
         discovery cache; lazily fetches per-class /object_info/{class} for any class the
