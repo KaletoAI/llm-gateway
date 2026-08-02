@@ -1,0 +1,335 @@
+{
+  "47": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    }
+  },
+  "58": {
+    "inputs": {
+      "image": "source.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image"
+    }
+  },
+  "61": {
+    "inputs": {
+      "value": true
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_remove_background"
+    }
+  },
+  "62": {
+    "inputs": {
+      "value": 100000
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_num_gaussians"
+    }
+  },
+  "102": {
+    "inputs": {
+      "value": 512
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_texture_resolution"
+    }
+  },
+  "106": {
+    "inputs": {
+      "resolution": [
+        "102",
+        0
+      ],
+      "kernel": 5,
+      "smooth": 0,
+      "level": 0.6,
+      "min_component": 500,
+      "min_opacity": 0.02,
+      "color_sharpen": 2,
+      "splat": [
+        "104:55",
+        0
+      ]
+    },
+    "class_type": "SplatToMesh",
+    "_meta": {
+      "title": "Extract Mesh from Splat"
+    }
+  },
+  "107": {
+    "inputs": {
+      "filename_prefix": [
+        "47",
+        0
+      ],
+      "image": "",
+      "mesh": [
+        "106",
+        0
+      ]
+    },
+    "class_type": "SaveGLB",
+    "_meta": {
+      "title": "Save 3D Model"
+    }
+  },
+  "104:24": {
+    "inputs": {
+      "clip_vision": [
+        "104:7",
+        0
+      ],
+      "vae": [
+        "104:8",
+        0
+      ],
+      "image": [
+        "104:2",
+        0
+      ]
+    },
+    "class_type": "TripoSplatConditioning",
+    "_meta": {
+      "title": "TripoSplat Conditioning"
+    }
+  },
+  "104:6": {
+    "inputs": {
+      "seed": 46,
+      "steps": 20,
+      "cfg": 3,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "104:96",
+        0
+      ],
+      "positive": [
+        "104:24",
+        0
+      ],
+      "negative": [
+        "104:24",
+        1
+      ],
+      "latent_image": [
+        "104:24",
+        2
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "104:35": {
+    "inputs": {
+      "switch": [
+        "61",
+        0
+      ],
+      "on_false": [
+        "104:95",
+        0
+      ],
+      "on_true": [
+        "104:85:81",
+        0
+      ]
+    },
+    "class_type": "ComfySwitchNode",
+    "_meta": {
+      "title": "Switch: Mask Source"
+    }
+  },
+  "104:2": {
+    "inputs": {
+      "erode_radius": 1,
+      "size": 1024,
+      "image": [
+        "58",
+        0
+      ],
+      "mask": [
+        "104:35",
+        0
+      ]
+    },
+    "class_type": "TripoSplatPreprocessImage",
+    "_meta": {
+      "title": "TripoSplat Preprocess Image"
+    }
+  },
+  "104:7": {
+    "inputs": {
+      "clip_name": "dino_v3_vit_h.safetensors"
+    },
+    "class_type": "CLIPVisionLoader",
+    "_meta": {
+      "title": "Load CLIP Vision"
+    }
+  },
+  "104:11": {
+    "inputs": {
+      "vae_name": "triposplat_vae_decoder_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "104:8": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "104:55": {
+    "inputs": {
+      "num_gaussians": [
+        "62",
+        0
+      ],
+      "seed": 790219963981395,
+      "samples": [
+        "104:6",
+        0
+      ],
+      "vae": [
+        "104:11",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeTripoSplat",
+    "_meta": {
+      "title": "TripoSplat Decode"
+    }
+  },
+  "104:85:81": {
+    "inputs": {
+      "bg_removal_model": [
+        "104:85:82",
+        0
+      ],
+      "image": [
+        "58",
+        0
+      ]
+    },
+    "class_type": "RemoveBackground",
+    "_meta": {
+      "title": "Remove Background"
+    }
+  },
+  "104:85:82": {
+    "inputs": {
+      "bg_removal_name": "birefnet.safetensors"
+    },
+    "class_type": "LoadBackgroundRemovalModel",
+    "_meta": {
+      "title": "Load Background Removal Model"
+    }
+  },
+  "104:85:103": {
+    "inputs": {
+      "mask": [
+        "104:85:81",
+        0
+      ]
+    },
+    "class_type": "InvertMask",
+    "_meta": {
+      "title": "Invert Mask"
+    }
+  },
+  "104:85:84": {
+    "inputs": {
+      "image": [
+        "58",
+        0
+      ],
+      "alpha": [
+        "104:85:103",
+        0
+      ]
+    },
+    "class_type": "JoinImageWithAlpha",
+    "_meta": {
+      "title": "Join Image with Alpha"
+    }
+  },
+  "104:95": {
+    "inputs": {
+      "mask": [
+        "58",
+        1
+      ]
+    },
+    "class_type": "InvertMask",
+    "_meta": {
+      "title": "Invert Mask"
+    }
+  },
+  "104:16": {
+    "inputs": {
+      "unet_name": "triposplat_fp16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "104:96": {
+    "inputs": {
+      "switch": false,
+      "on_false": [
+        "104:16",
+        0
+      ],
+      "on_true": [
+        "104:97",
+        0
+      ]
+    },
+    "class_type": "ComfySwitchNode",
+    "_meta": {
+      "title": "Switch"
+    }
+  },
+  "104:97": {
+    "inputs": {
+      "octree_level": 5,
+      "num_gaussians": 16384,
+      "yaw": 90,
+      "pitch": 15,
+      "point_size": 2,
+      "model": [
+        "104:16",
+        0
+      ],
+      "vae": [
+        "104:11",
+        0
+      ]
+    },
+    "class_type": "TripoSplatSamplingPreview",
+    "_meta": {
+      "title": "TripoSplat Sampling Preview"
+    }
+  }
+}
