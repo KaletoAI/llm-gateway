@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import socket
+import struct
 import time
 from typing import Callable, Optional
 from urllib.parse import parse_qs, quote, urlencode
@@ -461,6 +462,69 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
     if k == "file":                                   # non-previewable artifact (fbx/obj/…) → download
         return _dl_card(src, cls=cls)
     return f'<img{c}{s} src="{src}">'
+
+
+def _glb_stats(path: str) -> Optional[dict]:
+    """Cheap mesh stats from a GLB's JSON chunk (header-only read, never the whole
+    file): vertex/triangle counts, vertex-color/texture presence, bounding-box dims.
+    Any parse problem returns None — stats are decoration, never an error."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            magic, _ver, _total = struct.unpack("<4sII", fh.read(12))
+            if magic != b"glTF":
+                return None
+            clen, ctype = struct.unpack("<I4s", fh.read(8))
+            if ctype != b"JSON" or clen > 64 * 1024 * 1024:
+                return None
+            doc = json.loads(fh.read(clen))
+        acc = doc.get("accessors", [])
+
+        def _count(i):
+            return acc[i].get("count", 0) if isinstance(i, int) and 0 <= i < len(acc) else 0
+
+        verts = tris = 0
+        colors = False
+        lo: list = [None] * 3
+        hi: list = [None] * 3
+        for m in doc.get("meshes", []):
+            for p in m.get("primitives", []):
+                attrs = p.get("attributes", {})
+                pa = attrs.get("POSITION")
+                n = _count(pa)
+                verts += n
+                colors = colors or any(k.startswith("COLOR_") for k in attrs)
+                if p.get("mode", 4) == 4:                       # triangles only
+                    tris += (_count(p["indices"]) if isinstance(p.get("indices"), int) else n) // 3
+                a = acc[pa] if isinstance(pa, int) and 0 <= pa < len(acc) else {}
+                amin, amax = a.get("min"), a.get("max")
+                if isinstance(amin, list) and isinstance(amax, list) and len(amin) == 3 == len(amax):
+                    for i in range(3):
+                        lo[i] = amin[i] if lo[i] is None else min(lo[i], amin[i])
+                        hi[i] = amax[i] if hi[i] is None else max(hi[i], amax[i])
+        dims = tuple(hi[i] - lo[i] for i in range(3)) if lo[0] is not None else None
+        return {"size": size, "vertices": verts, "triangles": tris,
+                "colors": colors, "textures": len(doc.get("images", [])), "dims": dims}
+    except Exception:
+        return None
+
+
+def _glb_stats_html(path: Optional[str]) -> str:
+    """One muted line under a GLB viewer: vertices · triangles · colors · size."""
+    st = _glb_stats(path) if path else None
+    if not st:
+        return ""
+    parts = [f"{st['vertices']:,} vertices", f"{st['triangles']:,} triangles"]
+    if st["textures"]:
+        parts.append(f"{st['textures']} texture{'s' if st['textures'] != 1 else ''}")
+    if st["colors"]:
+        parts.append("vertex colors")
+    if not st["textures"] and not st["colors"]:
+        parts.append("no color data")
+    if st["dims"]:
+        parts.append("bbox " + " × ".join(f"{d:.2f}" for d in st["dims"]))
+    parts.append(f"{st['size'] / 1048576:.1f} MB")
+    return f"<p class='muted' style='margin:4px 0'>{_esc(' · '.join(parts))}</p>"
 
 
 def _type_badge(t: str) -> str:
@@ -2872,7 +2936,12 @@ _PG_POLL_JS = ("<script>(function(){var rc=document.getElementById('resultcol');
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
                      oi: Optional[dict] = None, kept: Optional[set] = None, poll_job: str = "") -> str:
     pa = f' data-poll-job="{_esc(poll_job)}"' if poll_job else ""
-    return (f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
+    # model-viewer must load with the PAGE: the poller swaps #resultcol via
+    # innerHTML, and innerHTML-inserted <script> tags never execute — a GLB result
+    # arriving through the poll would otherwise sit in an undefined custom element
+    # (an empty dark box). Loaded up front, swapped-in tags upgrade automatically.
+    return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
+            f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
             f'<div class="col"><div id="resultcol"{pa}>{result_html}</div></div></div>{_PG_POLL_JS}')
 
 
@@ -2890,7 +2959,11 @@ def _job_result_html(job_id: str, job: Optional[dict]):
     cells = []
     for r in job.get("results", []):
         src = f"/ui/playground/result/{_esc(job_id)}/{r['n']}"
-        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True)}</div>")
+        extra = ""
+        if (r.get("mime") or "").lower() == "model/gltf-binary":
+            rp = jobs.result_path(job_id, r["n"])
+            extra = _glb_stats_html(rp[0] if rp else None)
+        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True)}{extra}</div>")
     imgs = "".join(cells)
     meta = job.get("meta") or {}
     tags = ""
@@ -3513,7 +3586,11 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
         if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
         elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → <model-viewer> + download
-            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}"
+            stats = ""
+            if kind == "result" and m == "model/gltf-binary":
+                rp = jobs.result_path(jid, r["n"])
+                stats = _glb_stats_html(rp[0] if rp else None)
+            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}{stats}"
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
             has_fbx = True
