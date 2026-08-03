@@ -357,7 +357,8 @@ def _select(name: str, options: list, selected=None) -> str:
     return f'<select name="{_esc(name)}">{opts}</select>'
 
 
-_TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "img2mesh", "mesh2rig", "text2audio")
+_TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "img2mesh", "mesh2mesh",
+                 "mesh2rig", "text2audio")
 # JS that shows the Video section (fps/frames) only for a video task, driven by the
 # task dropdown; matched loosely so img2vid / img2video / text2video all count.
 _TASK_VIDEO_JS = ("var v=document.getElementById('gw-video');"
@@ -1955,6 +1956,13 @@ async def register_post(request: Request):
     oi = await _object_info(backend, wf)
     cand = {"backend": backend, "task": task, "workflow_json": wf,
             "mapping": adapters.suggest_mapping(wf), "fixed": _detect_model_bindings(wf, oi)}
+    # Pre-fill the delivery node when the workflow declares its main export by title
+    # (`Output` / `output_final`) — same node the auto mode would pick, but visible
+    # and editable here, and a run producing nothing then fails clearly. Note the
+    # mesh export classes report nothing themselves; final_output_node redirects to
+    # the Preview3D node that consumes them (chain export_node is NOT this one).
+    if (out_node := adapters.final_output_node(wf)):
+        cand["output_node"] = out_node
     store.upsert(alias, [cand])
     logger.info(f"ui: registered '{alias}' → {backend} ({len(wf)} nodes, {len(cand['fixed'])} model slots)")
     return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
@@ -2166,13 +2174,13 @@ def _tf_opts(cands: list) -> str:
 def _output_section(wf: dict, cands: list) -> str:
     """Which node's artifacts a job returns — rendered under Pinned values.
     Default (auto) keeps the legacy behaviour: every output-producing node, or
-    the node titled `output_final`. Workflows that export intermediate files
-    (Trellis: meshes at several nodes, the rigged model at one) pin the REAL
-    result node here — it producing nothing then fails the job instead of
-    silently returning leftovers."""
+    the one the workflow titles as its main export (`output_final` / `Output`).
+    Workflows that export intermediate files (Trellis: meshes at several nodes,
+    the rigged model at one) pin the REAL result node here — it producing nothing
+    then fails the job instead of silently returning leftovers."""
     cur = next((str(c.get("output_node")) for c in cands if c.get("output_node")), "")
     opts = ('<option value="">auto — every output node '
-            '(or the one titled "output_final")</option>')
+            '(or the one titled "Output" / "output_final")</option>')
     for nid, n in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
         title = ((n.get("_meta") or {}).get("title") or "")
         lbl = f"{nid} — {n.get('class_type', '')}" + (f" “{title}”" if title else "")
@@ -2207,12 +2215,14 @@ def _output_section(wf: dict, cands: list) -> str:
               "exports a 1×1/2×2 constant-colour texture (uniform models).</p>"
             + _field("output files", _textarea("output_globs", globs_text, 4,
                      "plain globs (deliver all), or 'rig: globs' lines for conditional cases:\n"
-                     "mixamo: *_mia.glb\ngeneric: *_articulationxl.fbx, *basecolor*.png"), wide=True)
+                     "mixamo: *.glb\ngeneric: *.fbx, *_basecolor*.png"), wide=True)
             + "<p class='hint'><b>Multi-file delivery</b>. Plain glob lines deliver EVERY match across all "
-              "output nodes, including a same-stem sibling with a glob's extension (so <code>*_mia.glb</code> "
-              "grabs the .glb next to a reported <code>_mia.fbx</code>). Without an <b>output node</b> the "
+              "output nodes, including a same-stem sibling with a glob's extension (so <code>*.glb</code> "
+              "grabs the .glb next to a reported <code>.fbx</code>). ComfyUI appends a counter to save/export "
+              "nodes (<code>&lt;name&gt;_basecolor_00001_.png</code>), so end an artifact glob with "
+              "<code>*</code> before the extension. Without an <b>output node</b> the "
               "globs replace it as the whole delivery; WITH one, the node's result stays authoritative and "
-              "plain globs ship as unconditional extras on top (e.g. a baked <code>*metallic*.png</code> "
+              "plain globs ship as unconditional extras on top (e.g. a baked <code>*_metallic*.png</code> "
               "next to the node's GLB). "
               "<br><b>Cases</b> — <code>rig: glob, glob</code> per line: the FIRST case whose first glob "
               "actually exists wins, and only its files ship, tagged with that <b>rig</b> type "
@@ -2259,11 +2269,12 @@ def _chain_section(wf: dict, cands: list) -> str:
                      placeholder="e.g. mesh-reg-mia"), short=True)
             + _field("mesh export node", f'<select name="chain_export_node">{node_opts}</select>')
             + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
-                     placeholder="mesh_path"), short=True)
+                     placeholder="mesh_path (mesh workflows: input_mesh_path)"), short=True)
             + _field("mesh hand-off", f'<select name="chain_relay">{relay_opts}</select>')
             + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh, and passes "
-              "it to the successor under the <b>mesh param</b> (default <code>mesh_path</code> — must be a "
-              "request field on the successor). <b>Hand-off</b>: <code>path</code> keeps both stages on ONE "
+              "it to the successor under the <b>mesh param</b> (blank = <code>mesh_path</code>; the mesh "
+              "workflows label their mesh input <code>input_mesh_path</code>) — must be a request field "
+              "(param or label) on the successor. <b>Hand-off</b>: <code>path</code> keeps both stages on ONE "
               "backend (shared disk) and passes the mesh's absolute output path. <code>upload</code> lets the "
               "successor run on a DIFFERENT backend — the gateway fetches the mesh, uploads it into that "
               "backend's <b>input</b> dir and passes its absolute path there (the backend's <b>comfy input "
@@ -2273,14 +2284,37 @@ def _chain_section(wf: dict, cands: list) -> str:
               "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
               "threaded to the successor by matching param name.</p>"
             + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
-                     placeholder="e.g. *basecolor*.png"), short=True)
+                     placeholder="e.g. *_basecolor*.png"), short=True)
             + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
                      placeholder="blank · mixamo · generic"), short=True)
             + "<p class='hint'><b>keep from this stage</b>: globs for files THIS (mesh) stage produces that "
-              "must ship with the successor's result — e.g. the <code>*basecolor*.png</code> the texturing "
+              "must ship with the successor's result — e.g. the <code>*_basecolor*.png</code> the texturing "
               "bakes here (the UniRig fbx only references its texture). <b>delivered rig type</b>: set "
               "<code>generic</code>/<code>mixamo</code> to tag + validate the COMBINED delivery at the chain "
-              "level (generic needs fbx + basecolor). Blank = trust the successor's own output config.</p>")
+              "level (generic needs fbx + basecolor). Blank = trust the successor's own output config.</p>"
+            + _chain_rig_warning(wf, s))
+
+
+def _chain_rig_warning(wf: dict, s: dict) -> str:
+    """Static pre-flight for a `generic` (FBX) chain: the rigger's FBX only references
+    its texture by a temp path, so the basecolor PNG has to come from THIS stage —
+    `validate_delivery` fails the (long) job at the very end if it doesn't. Two
+    misconfigurations are visible from the workflow alone: a stage that bakes no
+    texture at all (triposplat — SplatToMesh emits the core MESH type, the texture
+    tool chain is TRIMESH-only, so its texture stays embedded in the GLB), and an
+    empty `keep from this stage`."""
+    if (s.get("rig") or "").strip().lower() != "generic":
+        return ""
+    if not any((n or {}).get("class_type") == "SaveImage" for n in wf.values()):
+        why = ("this stage exports no texture PNG (no <code>SaveImage</code> node), so a "
+               "<code>generic</code> delivery can never be complete — put a texturing stage "
+               "(e.g. <code>mesh-shrink</code>) in between, or deliver via <code>mixamo</code>")
+    elif not [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]:
+        why = ("<b>keep from this stage</b> is empty — add <code>*_basecolor*.png</code>, else the "
+               "chain fails validation after stage 2 has already run")
+    else:
+        return ""
+    return f"<p class='hint'><span class='bad'>⚠ generic rig: {why}.</span></p>"
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:

@@ -969,6 +969,49 @@ def _node_by_title(wf: dict, title: str) -> Optional[str]:
     return None
 
 
+_FINAL_TITLES = ("output_final", "Output")           # image workflows / mesh convention
+
+
+def _preview_consumer(wf: dict, nid: str) -> Optional[str]:
+    """The `Preview*` node (Preview3D, …) that consumes node `nid`'s output, if any.
+    Links are `[<source-node-id>, <slot>]` in an input value."""
+    for cid in sorted(wf, key=lambda n: (len(n), n)):
+        if not str((wf[cid] or {}).get("class_type") or "").startswith("Preview"):
+            continue
+        for v in ((wf[cid] or {}).get("inputs") or {}).values():
+            if isinstance(v, list) and v and str(v[0]) == str(nid):
+                return cid
+    return None
+
+
+def final_output_node(wf: dict) -> Optional[str]:
+    """The node whose `/history` outputs ARE the workflow's main result — the
+    delivery node. Found by title: `output_final` (image workflows) or `Output`
+    (the mesh convention, see sample_comfyui_workflows/README.md — the export that
+    writes `<name>.<ext>` next to intermediates like `<name>_whitemesh.glb`).
+
+    One redirect on top: the mesh export classes (`Trellis2ExportMesh`,
+    `Hy3D21ExportMesh`) return a bare tuple and NO `ui` dict, so despite
+    OUTPUT_NODE=True they never appear in `/history.outputs` — measured on
+    k12-gpu. Their file reaches the client through the `Preview3D` node that
+    consumes them, so a Preview consumer of the titled node becomes the delivery
+    node (trellis2_high 82→83, low 100→101, Pixal3D 312→317, hunyuan3d 50→51,
+    mesh-shrink 30→31). Core save nodes carry their own `ui` dict and have no
+    such consumer, so they stay themselves (triposplat's SaveGLB 107).
+
+    NOTE this is the DELIVERY node only. A chain's `successor.export_node` stays
+    the EXPORT node (82/100/312/50) — that is where the gateway pins
+    `filename_prefix`, which a preview node has no field for.
+
+    Backs the auto delivery mode and the registration pre-fill; None when the
+    workflow declares neither title."""
+    for t in _FINAL_TITLES:
+        nid = _node_by_title(wf, t)
+        if nid is not None:
+            return _preview_consumer(wf, nid) or nid
+    return None
+
+
 def _node_by_class(wf: dict, class_type: str) -> Optional[str]:
     for nid, node in wf.items():
         if node.get("class_type") == class_type:
@@ -1405,6 +1448,24 @@ def suggest_mapping(wf: dict) -> dict:
         for param, field in (("steps", "steps"), ("cfg", "cfg"),
                              ("sampler", "sampler_name"), ("scheduler", "scheduler")):
             m[param] = {"node": ks, "field": field}
+
+    # Every REMAINING node titled `input_<name>` is a declared bind point (the mesh
+    # workflows follow this strictly — see sample_comfyui_workflows/README.md): the
+    # title IS the param's public name, so bind it under the title AND set it as the
+    # label — labels are the stable cross-stage names a chain threads params by
+    # (raw `value` collides between stages). Nodes already bound above (prompt /
+    # width / seed / …) keep their conventional param name; multi-field nodes (a
+    # LoRA stack) are skipped — those are placed by _apply_lora_*.
+    bound = {(b or {}).get("node") for b in m.values()}
+    for nid, node in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
+        title = ((node.get("_meta") or {}).get("title") or "").strip()
+        if not title.lower().startswith("input_") or nid in bound or title in m:
+            continue
+        scalars = [f for f, v in (node.get("inputs") or {}).items() if not isinstance(v, list)]
+        field = ("value" if "value" in scalars else "image" if "image" in scalars else
+                 scalars[0] if len(scalars) == 1 else None)
+        if field and not field.endswith("_name"):   # *_name = model/file picker → pinned, see below
+            m[title] = {"node": nid, "field": field, "label": title}
 
     # Note: the model loader is NOT mapped as a request param here — it's an
     # admin-fixed binding (detected separately) / Pinned values dropdown, since the
@@ -1853,6 +1914,7 @@ class ComfyUIAdapter(BackendAdapter):
                                            f"no fetchable artifact{extra} (no matching file in its outputs)")
                     if req.dummy_check:          # 2x2-dummy safety net (case mode does it in validate);
                         _check_glb_not_dummy(blobs)  # opt-out for legit 1x1/2x2 constant-colour exports
+                    warnings = validate_delivery(blobs, None)   # rig-less: the >30 MB size guideline
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
@@ -1959,14 +2021,15 @@ class ComfyUIAdapter(BackendAdapter):
         # "Output" section) is authoritative — a workflow may export intermediate
         # files from several nodes, and only the configured one is the result. It
         # producing nothing is an ERROR, not a fallback. Without the setting: the
-        # node titled `output_final`, else everything (legacy behaviour).
+        # node the workflow titles as its main export (`output_final` / `Output`),
+        # else everything (legacy behaviour).
         if output_node:
             if output_node not in outputs:
                 raise RuntimeError(f"configured output node {output_node} produced no output "
                                    f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
             targets = {output_node: outputs[output_node]}
         else:
-            final = _node_by_title(wf, "output_final")
+            final = final_output_node(wf)
             targets = {final: outputs[final]} if (final and final in outputs) else outputs
         blobs: list[GenBlob] = []
         seen: set = set()
