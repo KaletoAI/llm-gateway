@@ -101,6 +101,17 @@ Weitere Zusicherungen des Gateways:
 * Dateien über ~30 MB erzeugen einen Eintrag in `warnings` (Hinweis auf
   Web-Tauglichkeit, kein Fehler).
 * `sha256` je Result für Integritätsprüfung.
+* **Eingangs-Isolation (Zusicherung):** Gleichzeitig laufende Jobs teilen sich
+  keinen Eingangs-Zustand — auch nicht bei verschiedenen Aliasen auf derselben
+  Backend-Instanz. Jede hochgeladene Datei (Bild wie Mesh) liegt unter einem
+  job-eindeutigen Namen; schlägt ein Upload fehl, scheitert der Job, statt mit
+  fremden Bytes weiterzurechnen. Muss serialisiert werden, wird der zweite Job
+  wie gehabt **geparkt** (`queued`), nie abgelehnt.
+* **`input_images[]` in der Job-View** führt `sha256` und `bytes` je
+  Referenzbild — analog zu `results[]`. Damit lässt sich nachweisen, welche
+  Bytes tatsächlich in den Job gingen: den lokal berechneten Hash des
+  hochgeladenen Bildes dagegen prüfen. (Jobs von vor dem 03.08.2026 haben den
+  Wert nicht und liefern `null`.)
 
 ---
 
