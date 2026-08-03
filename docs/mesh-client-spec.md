@@ -147,14 +147,21 @@ Gaussian-Splat-Pipeline, andere Parameter: **kein** `input_face_num` und kein
 Preprocess-Größe). Sonst wie oben (`input_image`, `input_name`,
 `input_remove_background`).
 
-Auslieferung: **nur** `<name>_00001_.glb` — es gibt keine getrennten Basecolor-/
-Metallic-Karten, die Textur steckt ausschließlich eingebettet im GLB. Folgen für
-den Client:
+Auslieferung: **nur** `<name>_00001_.glb`, und dieses GLB ist technisch anders
+gebaut als das aller anderen Aliase: die Farbe steckt **in den Vertices**
+(`COLOR_0`), es hat **keine UVs und keine Texturbilder**. Für den Client heißt
+das:
 
-* Wer separate Karten braucht: das GLB durch **`mesh-shrink`** schicken (erzeugt
-  die PNGs aus dem GLB, siehe 3.4).
+* Es gibt **keine** getrennten Basecolor-/Metallic-Karten und keinen Weg, sie
+  nachträglich zu erzeugen — `mesh-shrink` kann Triposplat-Meshes **nicht**
+  verarbeiten (es braucht UVs, siehe 3.4).
 * Es gibt bewusst **keine** `Triposplat-Generic`-Variante — FBX-Rigging ohne
   separate Basecolor ist unmöglich.
+* Beim Rendern beachten: Vertex-Farben brauchen einen Shader, der `COLOR_0`
+  auswertet (das Material ist `KHR_materials_unlit`); Engines, die nur
+  Texturmaterialien erwarten, zeigen das Modell sonst einfarbig.
+* Wer texturierte Meshes mit separaten Karten braucht, nimmt eine der anderen
+  Familien (`Trellis2-*`, `Pixal3D-*`, `Hunyuan3D-*`).
 
 ### 3.4 `mesh-shrink` und `mesh-shrink-quad` — Nachverdichtung
 
@@ -165,6 +172,14 @@ Texturen. Gleiche Parameter:
 |---|---|---|---|
 | `mesh-shrink` | Dezimierung (Quadric Edge Collapse) | Tris, formtreu | **verfügbar** |
 | `mesh-shrink-quad` | Remesh (QuadriFlow) | Quad-Topologie (z. B. für Sculpting/Subdivision) | ⚠ derzeit **nicht verfügbar** — der QuadriFlow-Remesher stürzt backendseitig ab; bis zur Behebung `mesh-shrink` verwenden |
+
+**Voraussetzung an das Eingangs-Mesh:** es muss **UVs und eine eingebettete
+Textur** mitbringen — die Verkleinerung backt die Textur auf die neue Topologie
+um und braucht dafür das texturierte Original. Ergebnisse von `Trellis2-*`,
+`Pixal3D-*` und `Hunyuan3D-*` erfüllen das. **Triposplat-GLBs nicht** (nur
+Vertex-Farben, siehe 3.3): der Job scheitert dann mit
+`node 21 Trellis2RenderMultiViewNvdiffrast: expected np.ndarray (got NoneType)`
+— das ist genau dieser Fall, kein vorübergehender Fehler, ein Retry hilft nicht.
 
 Parameter: `input_mesh_path` (Pflicht — das Mesh selbst, siehe unten),
 `input_name`, `input_face_num` (Default **5000**), `input_texture_resolution`
