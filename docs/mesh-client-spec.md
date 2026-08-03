@@ -144,21 +144,45 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Trellis2-Generic-High`, `Trellis2-Humanoid-High` | 20000 | 1024 | höchste Qualität, längste Laufzeit |
 | `Trellis2-Generic-Low`, `Trellis2-Humanoid-Low`, `Trellis2-Object-Low` | 20000 | 1024 | schnellere Pipeline |
 | `Pixal3D-Generic`, `Pixal3D-Humanoid`, `Pixal3D-Object` | 50000 | 2048 | höchste Auflösung |
-| `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. `-Object` liefert zusätzlich eine LOD-Stufe, siehe unten. |
+| `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. `-Object` liefert zusätzlich frei wählbare LOD-Stufen, siehe unten. |
 
-**LOD-Stufe bei `Hunyuan3D-Object`.** Dieser Alias liefert neben dem Hauptergebnis
-eine zweite, reduzierte Fassung desselben Modells: `<name>_<faces>.glb`, gesteuert
-über den Parameter **`input_lod_faces`** (Default `"5000"`, **als String senden** —
-`"4000"`, nicht `4000`). Die Stufe wird nicht nachträglich verkleinert, sondern aus
-denselben generierten Ansichten neu aufgebacken, ist also qualitativ eigenständig
-und **selbsttragend** (Texturen eingebettet, keine Begleitdateien nötig). Sie
-trifft die Zielzahl exakt (gemessen: 4.000 angefordert → 4.000 Dreiecke) und kostet
-nur wenige Sekunden Mehrlaufzeit. Zwei Hinweise: die Datei ist wegen der
-Textur-Einbettung als Data-URI oft **größer** als das Hauptergebnis, und
-`input_face_num` ist beim Hauptergebnis nur eine **Obergrenze** — liefert das Modell
-von sich aus weniger, ist ein knapp darunter gewählter LOD-Wert wirkungslos.
+#### LOD-Stufen bei `Hunyuan3D-Object`
 
-Erkennung in der Antwort: das Hauptergebnis endet auf `_00001_.glb`, die LOD-Datei
+Dieser Alias liefert neben dem Hauptergebnis **beliebig viele reduzierte Fassungen**
+desselben Modells. Gesteuert wird das über den Parameter **`input_lod_faces`** —
+eine kommaseparierte Liste von Ziel-Dreieckszahlen, **als String gesendet**:
+
+```json
+"params": {"input_name": "Held", "input_face_num": 20000, "input_lod_faces": "8000,4000,2000"}
+```
+
+Ein einzelner Wert (`"5000"`, der Default) ist ebenso gültig. Die Stufen werden
+**nicht nachträglich verkleinert**, sondern aus denselben generierten Ansichten neu
+aufgebacken — jede ist qualitativ eigenständig und **selbsttragend** (Texturen
+eingebettet, keine Begleitdateien nötig). Der Job liefert **alle** angeforderten
+Stufen aus; was davon behalten wird, entscheidet der Client. Jede zusätzliche Stufe
+kostet nur wenige Sekunden.
+
+Regeln für die Auswertung:
+
+* **Dateiname = angeforderter Wert**, nicht der tatsächliche: `<name>_<zahl>.glb`.
+  Wer die echte Dreieckszahl braucht, liest sie aus dem GLB.
+* **Stufen oberhalb der Ausgangsgröße liefern eine Kopie in Originalgröße.**
+  `input_face_num` ist beim Hauptergebnis nur eine **Obergrenze**; liefert das
+  Modell von sich aus weniger, laufen darüberliegende Stufen ins Leere (gemessen:
+  Hauptergebnis 4.972 Dreiecke → `_8000.glb` enthält ebenfalls 4.972, `_4000.glb`
+  und `_2000.glb` treffen exakt).
+* **Die Reihenfolge in der Antwort ist alphabetisch nach Dateiname**, nicht die der
+  Eingabe: `"8000,4000,2000"` kommt als `_2000`, `_4000`, `_8000` zurück. Ordne über
+  den Dateinamen zu, nie über die Position.
+* **`input_name` pro Job eindeutig wählen.** Die Stufen liegen backendseitig unter
+  dem Namen; ein zweiter Lauf mit demselben Namen und weniger Stufen liefert die
+  älteren Stufen mit aus.
+* Die LOD-Dateien sind wegen der Textur-Einbettung als Data-URI oft **größer** als
+  das Hauptergebnis — sie sind nicht als „kleine Datei" gedacht, sondern als
+  geometrisch leichteres Modell.
+
+Erkennung in der Antwort: das Hauptergebnis endet auf `_00001_.glb`, die LOD-Dateien
 auf `_<zahl>.glb` (also Ziffer direkt vor der Endung).
 
 V-Flip und JPEG-Umkodierung (Abschnitt 2) greifen nur bei den
