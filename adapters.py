@@ -967,11 +967,16 @@ def _comfy_prompt_error(status: int, text: str, wf: dict, mapping: dict) -> str:
             recv = extra.get("received_value")
             recv_s = f" (received {recv!r})" if recv is not None else ""
             lines.append(f"{where} ({cls}).{fldn}{via}: {e.get('message', 'error')}{recv_s}")
+    # status 200 = ComfyUI ACCEPTED the prompt and only flagged individual nodes, so it
+    # is not a rejection: saying "HTTP 200" or "rejected" would both mislead.
+    accepted = status == 200
+    where = "queued with unrunnable nodes" if accepted else f"HTTP {status}"
     if not lines:
         msg = (err.get("error") or {}).get("message") or text
-        return f"ComfyUI /prompt HTTP {status}: {msg}"
-    head = (err.get("error") or {}).get("message") or "prompt rejected"
-    return f"ComfyUI {head} (HTTP {status}): " + " · ".join(lines)
+        return f"ComfyUI /prompt {where}: {msg}"
+    head = (err.get("error") or {}).get("message") or ("workflow incomplete" if accepted
+                                                       else "prompt rejected")
+    return f"ComfyUI {head} ({where}): " + " · ".join(lines)
 
 
 def _node_by_title(wf: dict, title: str) -> Optional[str]:
@@ -2032,7 +2037,15 @@ class ComfyUIAdapter(BackendAdapter):
                 pr = await client.post(f"{url}/prompt", json={"prompt": wf})
                 if pr.status_code != 200:
                     raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
-                prompt_id = (pr.json() or {}).get("prompt_id")
+                submitted = pr.json() or {}
+                # A PARTLY invalid workflow still returns 200 AND a prompt_id: ComfyUI
+                # queues the branches it can run and reports the rest in `node_errors`
+                # (measured — one wrong link type). Letting that run would deliver
+                # silently less than the alias configures, so a non-empty node_errors
+                # fails the job here, before anything occupies the GPU.
+                if submitted.get("node_errors"):
+                    raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
+                prompt_id = submitted.get("prompt_id")
                 if not prompt_id:
                     raise RuntimeError("ComfyUI returned no prompt_id")
                 if log_on:
