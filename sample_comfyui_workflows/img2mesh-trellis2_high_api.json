@@ -63,8 +63,8 @@
         "47",
         0
       ],
-      "string_b": "Refined",
-      "delimiter": "_"
+      "string_b": "_refined",
+      "delimiter": ""
     },
     "class_type": "StringConcatenate",
     "_meta": {
@@ -135,7 +135,7 @@
         "47",
         0
       ],
-      "string_b": "WhiteMesh",
+      "string_b": "_whitemesh",
       "delimiter": ""
     },
     "class_type": "StringConcatenate",

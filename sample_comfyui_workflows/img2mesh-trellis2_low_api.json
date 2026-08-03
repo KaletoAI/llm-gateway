@@ -100,7 +100,7 @@
         "74",
         0
       ],
-      "file_format": "obj",
+      "file_format": "glb",
       "trimesh": [
         "71",
         0
@@ -219,7 +219,7 @@
         "47",
         0
       ],
-      "string_b": "_WhiteMesh",
+      "string_b": "_whitemesh",
       "delimiter": ""
     },
     "class_type": "StringConcatenate",

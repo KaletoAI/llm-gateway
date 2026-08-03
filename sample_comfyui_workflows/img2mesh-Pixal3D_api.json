@@ -498,5 +498,49 @@
     "_meta": {
       "title": "Any Switch (rgthree)"
     }
+  },
+  "323": {
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    },
+    "inputs": {
+      "string_a": [
+        "306",
+        0
+      ],
+      "string_b": "_whitemesh",
+      "delimiter": ""
+    }
+  },
+  "321": {
+    "class_type": "Trellis2MeshWithVoxelToTrimesh",
+    "_meta": {
+      "title": "Trellis2 - MeshWithVoxel to Trimesh"
+    },
+    "inputs": {
+      "mesh": [
+        "299",
+        0
+      ],
+      "reorient_vertices": "90 degrees"
+    }
+  },
+  "322": {
+    "class_type": "Trellis2ExportMesh",
+    "_meta": {
+      "title": "Trellis2 - Export Mesh"
+    },
+    "inputs": {
+      "trimesh": [
+        "321",
+        0
+      ],
+      "filename_prefix": [
+        "323",
+        0
+      ],
+      "file_format": "glb"
+    }
   }
 }
