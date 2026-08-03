@@ -152,29 +152,19 @@ Metallic-Karten, die Textur steckt ausschließlich eingebettet im GLB. Folgen f�
 den Client:
 
 * Wer separate Karten braucht: das GLB durch **`mesh-shrink`** schicken (erzeugt
-  die PNGs aus dem GLB) — **derzeit nicht möglich**, siehe die Warnung in 3.4.
+  die PNGs aus dem GLB, siehe 3.4).
 * Es gibt bewusst **keine** `Triposplat-Generic`-Variante — FBX-Rigging ohne
   separate Basecolor ist unmöglich.
 
 ### 3.4 `mesh-shrink` und `mesh-shrink-quad` — Nachverdichtung
 
-> ⚠ **Derzeit außer Betrieb** (Stand 2026-08-03): beide Workflows scheitern bei
-> **jedem** Eingangs-Mesh mit `node 20 Trellis2ProjectHighPolyToLowPoly: No
-> input images provided` — im Workflow fehlt die Render-Stufe, die die
-> Texturprojektion speist (Workflow-Defekt, kein API-/Client-Fehler; der
-> `files`-Upload selbst funktioniert und bleibt der richtige Aufrufweg).
-> **Bis zum Fix:** die Ziel-Polygonzahl direkt beim Erzeugen über
-> `input_face_num` des `img2mesh`-Alias setzen statt nachträglich zu
-> verkleinern. Rigging vorhandener Meshes über `mesh-rig-unirig`/`mesh-mia`
-> (3.5) ist **nicht** betroffen.
-
 Nehmen ein vorhandenes GLB und reduzieren die Polygonzahl inkl. Neu-Bake der
-Texturen. Gleiche Parameter, austauschbar:
+Texturen. Gleiche Parameter:
 
-| Alias | Verfahren | Ergebnis-Topologie |
-|---|---|---|
-| `mesh-shrink` | Dezimierung (Quadric Edge Collapse) | Tris, formtreu |
-| `mesh-shrink-quad` | Remesh (QuadriFlow) | Quad-Topologie (z. B. für Sculpting/Subdivision) |
+| Alias | Verfahren | Ergebnis-Topologie | Status |
+|---|---|---|---|
+| `mesh-shrink` | Dezimierung (Quadric Edge Collapse) | Tris, formtreu | **verfügbar** |
+| `mesh-shrink-quad` | Remesh (QuadriFlow) | Quad-Topologie (z. B. für Sculpting/Subdivision) | ⚠ derzeit **nicht verfügbar** — der QuadriFlow-Remesher stürzt backendseitig ab; bis zur Behebung `mesh-shrink` verwenden |
 
 Parameter: `input_mesh_path` (Pflicht — das Mesh selbst, siehe unten),
 `input_name`, `input_face_num` (Default **5000**), `input_texture_resolution`

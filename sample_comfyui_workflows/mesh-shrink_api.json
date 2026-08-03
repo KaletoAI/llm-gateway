@@ -68,7 +68,7 @@
   "20": {
     "class_type": "Trellis2ProjectHighPolyToLowPoly",
     "_meta": {
-      "title": "Textur High-Poly \u2192 Low-Poly projizieren"
+      "title": "Textur High-Poly → Low-Poly projizieren"
     },
     "inputs": {
       "high_poly_trimesh": [
@@ -85,14 +85,30 @@
       ],
       "blend_texture": true,
       "blend_exponent": 1.0,
-      "ortho_scale": 1.1,
+      "ortho_scale": [
+        "21",
+        1
+      ],
       "norm_size": 1.15,
       "fill_holes": true,
       "max_hole_size": 20,
       "use_metallic": true,
       "depth_eps": 0.01,
       "mesh_cluster_threshold_cone_half_angle_rad": 60,
-      "add_alpha_channel": false
+      "add_alpha_channel": false,
+      "custom_images": [
+        "21",
+        0
+      ],
+      "custom_azimuths": [
+        "21",
+        2
+      ],
+      "custom_elevations": [
+        "21",
+        3
+      ],
+      "custom_weights": "1,1,1,1,1,1"
     }
   },
   "30": {
@@ -182,6 +198,26 @@
         "34",
         0
       ]
+    }
+  },
+  "21": {
+    "class_type": "Trellis2RenderMultiViewNvdiffrast",
+    "_meta": {
+      "title": "High-Poly Ansichten rendern"
+    },
+    "inputs": {
+      "trimesh": [
+        "10",
+        0
+      ],
+      "render_size": [
+        "3",
+        0
+      ],
+      "ortho_scale": 1.1,
+      "azimuths": "0,90,180,270,0,0",
+      "elevations": "0,0,0,0,90,-90",
+      "add_shading": false
     }
   }
 }
