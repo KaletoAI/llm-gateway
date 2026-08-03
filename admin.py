@@ -252,6 +252,8 @@ table.reqf th:nth-child(4),table.reqf td:nth-child(4){width:120px}  /* field */
 textarea{height:auto;min-height:60px;padding:8px 10px;line-height:1.5}
 .chatout{white-space:pre-wrap;word-break:break-word;background:#0c0e12;border:1px solid #242a33;border-radius:8px;padding:12px 14px;user-select:text;font-size:13px}
 .ok-banner{background:#16361f;color:#5cb87f;border:1px solid #1f5232;border-radius:8px;padding:8px 12px;margin:8px 0}
+.ok-banner.fade{animation:okfade 2.2s ease forwards}
+@keyframes okfade{0%,65%{opacity:1}100%{opacity:0;visibility:hidden}}
 .acctbl{max-height:360px;overflow-y:auto;border:1px solid #242a33;border-radius:8px}
 .acctbl table{margin:0}
 .acctbl td:first-child,.acctbl th:first-child{width:1%;text-align:center}
@@ -1914,6 +1916,8 @@ async def mapping_page(request: Request):
         body = cols(list_html, _chat_new_form())
     elif iedit and store.get(iedit):
         editor, available = await _alias_editor(iedit)        # image editor (3 cols)
+        if qp.get("saved"):                                   # transient confirmation after Save
+            editor = "<p class='ok-banner fade'>✓ Saved</p>" + editor
         # wider editor (col 2), narrower Available fields (col 3) — see .cols.map3 CSS
         body = ('<div class="cols map3">'
                 f'<div class="col">{list_html}</div>'
@@ -2014,7 +2018,7 @@ async def update_workflow(request: Request):
     stale_byp = sorted({str(n) for c in cands for n in (c.get("bypass") or []) if str(n) not in wf})
     logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}"
                 + (f"; {len(stale_byp)} stale bypass node(s): {stale_byp}" if stale_byp else ""))
-    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
 def _reorder_js(alias: str) -> str:
@@ -2839,7 +2843,9 @@ async def update(request: Request):
         alias = new_alias
     store.upsert(alias, cands)         # cand is cands[0] — keeps the other allowed backends
     logger.info(f"ui: updated '{alias}' ({len(mapping)} params, {len(fixed)} pinned, retries={retries or 'all'})")
-    return RedirectResponse("/ui/mapping", status_code=303)
+    # Save keeps the editor open (mapping work is iterative); a transient banner
+    # confirms the write instead of the editor closing.
+    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
 async def delete(request: Request):
