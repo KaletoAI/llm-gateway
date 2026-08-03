@@ -1,0 +1,187 @@
+{
+  "6": {
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_no_fingers"
+    },
+    "inputs": {
+      "value": false
+    }
+  },
+  "2": {
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_face_num"
+    },
+    "inputs": {
+      "value": 5000
+    }
+  },
+  "3": {
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_texture_resolution"
+    },
+    "inputs": {
+      "value": 1024
+    }
+  },
+  "4": {
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    },
+    "inputs": {
+      "value": ""
+    }
+  },
+  "10": {
+    "class_type": "Trellis2LoadMesh",
+    "_meta": {
+      "title": "input_mesh_path"
+    },
+    "inputs": {
+      "glb_path": "output/3D/Trellis2_00001_.glb"
+    }
+  },
+  "11": {
+    "class_type": "GeomPackDecimate_QuadricEdgeCollapse",
+    "_meta": {
+      "title": "Dezimieren (Quadric Edge Collapse)"
+    },
+    "inputs": {
+      "trimesh": [
+        "10",
+        0
+      ],
+      "target_face_count": [
+        "2",
+        0
+      ],
+      "quality_threshold": 0.3,
+      "preserve_boundary": "true",
+      "preserve_normal": "true",
+      "preserve_topology": "true",
+      "planar_quadric": "false"
+    }
+  },
+  "20": {
+    "class_type": "Trellis2ProjectHighPolyToLowPoly",
+    "_meta": {
+      "title": "Textur High-Poly \u2192 Low-Poly projizieren"
+    },
+    "inputs": {
+      "high_poly_trimesh": [
+        "10",
+        0
+      ],
+      "low_poly_trimesh": [
+        "11",
+        0
+      ],
+      "texture_size": [
+        "3",
+        0
+      ],
+      "blend_texture": true,
+      "blend_exponent": 1.0,
+      "ortho_scale": 1.1,
+      "norm_size": 1.15,
+      "fill_holes": true,
+      "max_hole_size": 20,
+      "use_metallic": true,
+      "depth_eps": 0.01,
+      "mesh_cluster_threshold_cone_half_angle_rad": 60,
+      "add_alpha_channel": false
+    }
+  },
+  "30": {
+    "class_type": "Trellis2ExportMesh",
+    "_meta": {
+      "title": "Output"
+    },
+    "inputs": {
+      "trimesh": [
+        "20",
+        0
+      ],
+      "filename_prefix": [
+        "4",
+        0
+      ],
+      "file_format": "glb"
+    }
+  },
+  "31": {
+    "class_type": "Preview3D",
+    "_meta": {
+      "title": "Preview 3D & Animation"
+    },
+    "inputs": {
+      "model_file": [
+        "30",
+        0
+      ]
+    }
+  },
+  "32": {
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    },
+    "inputs": {
+      "string_a": [
+        "4",
+        0
+      ],
+      "string_b": "_basecolor",
+      "delimiter": ""
+    }
+  },
+  "33": {
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    },
+    "inputs": {
+      "images": [
+        "20",
+        1
+      ],
+      "filename_prefix": [
+        "32",
+        0
+      ]
+    }
+  },
+  "34": {
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    },
+    "inputs": {
+      "string_a": [
+        "4",
+        0
+      ],
+      "string_b": "_metallic",
+      "delimiter": ""
+    }
+  },
+  "35": {
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    },
+    "inputs": {
+      "images": [
+        "20",
+        2
+      ],
+      "filename_prefix": [
+        "34",
+        0
+      ]
+    }
+  }
+}
