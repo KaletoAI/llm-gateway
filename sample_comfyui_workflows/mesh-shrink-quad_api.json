@@ -45,21 +45,21 @@
     }
   },
   "11": {
-    "class_type": "GeomPackRemesh_QuadriFlow",
+    "class_type": "GeomPackDecimate_QuadricEdgeCollapse",
     "_meta": {
-      "title": "Remesh (QuadriFlow — saubere Quad-Topologie)"
+      "title": "Vor-Dezimierung"
     },
     "inputs": {
       "trimesh": [
         "10",
         0
       ],
-      "target_face_count": [
-        "2",
-        0
-      ],
-      "preserve_sharp": "true",
-      "preserve_boundary": "true"
+      "target_face_count": 20000,
+      "quality_threshold": 0.3,
+      "preserve_boundary": "true",
+      "preserve_normal": "true",
+      "preserve_topology": "false",
+      "planar_quadric": "false"
     }
   },
   "20": {
@@ -73,7 +73,7 @@
         0
       ],
       "low_poly_trimesh": [
-        "11",
+        "12",
         0
       ],
       "texture_size": [
@@ -215,6 +215,27 @@
       "azimuths": "0,90,180,270,0,0",
       "elevations": "0,0,0,0,90,-90",
       "add_shading": false
+    }
+  },
+  "12": {
+    "class_type": "Hy3D21IMRemesh",
+    "_meta": {
+      "title": "Quad-Remesh (Instant Meshes)"
+    },
+    "inputs": {
+      "trimesh": [
+        "11",
+        0
+      ],
+      "merge_vertices": true,
+      "vertex_count": [
+        "2",
+        0
+      ],
+      "smooth_iter": 8,
+      "align_to_boundaries": true,
+      "triangulate_result": false,
+      "max_facenum": 40000
     }
   }
 }
