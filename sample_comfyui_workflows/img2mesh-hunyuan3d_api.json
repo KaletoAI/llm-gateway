@@ -437,66 +437,28 @@
   "63": {
     "class_type": "StringConcatenate",
     "_meta": {
-      "title": "LOD: Ordner <LowPoly>/<faces>"
+      "title": "LOD: Glob <LowPoly>/*/*.glb"
     },
     "inputs": {
       "string_a": [
         "62",
         0
       ],
-      "string_b": [
-        "7",
-        0
-      ],
+      "string_b": "*/*.glb",
       "delimiter": "/"
     }
   },
   "64": {
-    "class_type": "StringConcatenate",
+    "class_type": "GeomPackLoadMeshGlob",
     "_meta": {
-      "title": "LOD: + /<name>"
+      "title": "LOD: alle Stufen einsammeln"
     },
     "inputs": {
-      "string_a": [
+      "glob_pattern": [
         "63",
         0
       ],
-      "string_b": [
-        "5",
-        0
-      ],
-      "delimiter": "/"
-    }
-  },
-  "65": {
-    "class_type": "StringConcatenate",
-    "_meta": {
-      "title": "LOD: + _<faces>"
-    },
-    "inputs": {
-      "string_a": [
-        "64",
-        0
-      ],
-      "string_b": [
-        "7",
-        0
-      ],
-      "delimiter": "_"
-    }
-  },
-  "66": {
-    "class_type": "StringConcatenate",
-    "_meta": {
-      "title": "LOD: + .glb"
-    },
-    "inputs": {
-      "string_a": [
-        "65",
-        0
-      ],
-      "string_b": "glb",
-      "delimiter": "."
+      "sort_by": "name"
     }
   },
   "67": {
@@ -506,8 +468,8 @@
     },
     "inputs": {
       "model_file": [
-        "66",
-        0
+        "64",
+        2
       ]
     }
   }
