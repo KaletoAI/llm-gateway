@@ -40,37 +40,53 @@ stilles Schwarz-Mesh).
   "rig": "generic|mixamo",              // nur bei Rigging-Ketten
   "warnings": ["x.glb is 41 MB (> 30 MB guideline)"],
   "results": [
-    {"n": 0, "name": "Held.glb",                 "mime": "model/gltf-binary", "kind": "model", "sha256": "…", "url": "…/result/0"},
-    {"n": 1, "name": "Held_basecolor_00001_.png", "mime": "image/png",         "kind": "image", "sha256": "…", "url": "…/result/1"},
-    {"n": 2, "name": "Held_metallic_00001_.jpg",  "mime": "image/jpeg",        "kind": "image", "sha256": "…", "url": "…/result/2"}
+    {"n": 0, "name": "Held_articulationxl.fbx",   "mime": "application/octet-stream", "kind": "file",  "sha256": "…", "url": "…/result/0"},
+    {"n": 1, "name": "Held_basecolor_00001_.png", "mime": "image/png",                "kind": "image", "sha256": "…", "url": "…/result/1"},
+    {"n": 2, "name": "Held_metallic_00001_.jpg",  "mime": "image/jpeg",               "kind": "image", "sha256": "…", "url": "…/result/2"}
   ]
 }
 ```
+
+(Beispiel: eine `-Generic`-Kette. `kind` ist bei Meshes — GLB wie FBX — immer
+`"file"`, bei Karten `"image"`; ein Filter auf `kind == "model"` findet nichts.)
 
 ---
 
 ## 2. Artefakte identifizieren und speichern — die zwei Grundregeln
 
 **Regel 1 — Zuordnung über das Artefakt-Token im Namen**, nie über Position oder
-Endung. Dateinamen folgen `<name>` = Wert von `input_name`, Zusatzartefakte
-`<name>_<token>_<zähler>.<ext>` (ComfyUI hängt einen laufenden Zähler wie
-`_00001_` an). Tokens: `_basecolor`, `_metallic`, `_articulationxl` (UniRig-FBX).
-Match als Substring, z. B. `*_basecolor*`.
+Endung. Basis ist `<name>` = Wert von `input_name`; das Token steht als Suffix
+davor der Endung. Match als Substring, z. B. `*_basecolor*`:
+
+| Quelle | Namensmuster | Zähler? |
+|---|---|---|
+| ComfyUI-Export (Meshes, Texturkarten) | `<name>_00001_.glb`, `<name>_basecolor_00001_.png`, `<name>_metallic_00001_.jpg` | ja — ComfyUI hängt `_00001_` an, **auch ans Haupt-GLB** |
+| UniRig (`-Generic`) | `<name>_articulationxl.fbx` | nein |
+| Make-It-Animatable (`-Humanoid`) | `…_rigged.glb` — in Ketten mit **technischem** Präfix `gwchain_<jobid>…`, nicht `<name>` | nein |
+
+Tokens: `_basecolor`, `_metallic`, `_articulationxl` (FBX), `_rigged` (Humanoid-GLB).
+Verlasse dich für das Haupt-Asset nicht auf `<name>` — bei Humanoid-Ketten trägt
+das GLB den internen Ketten-Namen; das Mesh ist zuverlässig das Result mit
+`kind: "file"`.
 
 **Regel 2 — Format, Endung und MIME kommen ausschließlich aus der Antwort**
 (`name` + `mime` je Result), nie aus einer Annahme. Grund: die Umkodierung nach
-JPEG ist **pro Datei**, nicht pro Job. Bei Aliasen mit JPEG-Auslieferung (siehe
-Katalog) kodiert das Gateway nur die Texturen um, die **keinen echten Alphakanal**
-nutzen; eine Basecolor mit Transparenz bleibt PNG, während die Metallic-Map im
-selben Job als JPEG (`.jpg`, `image/jpeg`, Qualität 90) rausgeht. Ein Satz wie
-„bei diesem Alias sind Texturen JPEG" ist deshalb grundsätzlich falsch. Name und
-MIME wechseln dabei immer gemeinsam (gleiche Quelle) — sie können nicht
-auseinanderlaufen.
+JPEG (nur bei `-Generic`-Auslieferungen, siehe unten) ist **pro Datei**, nicht
+pro Job: das Gateway kodiert nur die Texturen um, die **keinen echten
+Alphakanal** nutzen; eine Basecolor mit Transparenz bleibt PNG, während die
+Metallic-Map im selben Job als JPEG (`.jpg`, `image/jpeg`, Qualität 90)
+rausgeht. Ein Satz wie „bei diesem Alias sind Texturen JPEG" ist deshalb
+grundsätzlich falsch. Name und MIME wechseln dabei immer gemeinsam (gleiche
+Quelle) — sie können nicht auseinanderlaufen.
 
 Weitere Zusicherungen des Gateways:
 
-* Texturen sind bereits **V-korrigiert** ausgeliefert — der Client speichert sie
-  unverändert und kompensiert nichts.
+* **Nur bei `rig: "generic"`-Auslieferungen** (die `-Generic`-Ketten) normalisiert
+  das Gateway die Texturkarten: V-Flip passend zu den FBX-UVs plus die
+  JPEG-Umkodierung von oben — der Client speichert sie unverändert und
+  kompensiert nichts. Bei `-Object`-, `-Humanoid`- und Shrink-Auslieferungen
+  werden die Karten **unverändert wie vom Backend erzeugt** durchgereicht
+  (immer PNG); dort gilt die Orientierung des jeweiligen Bakes.
 * Dateien über ~30 MB erzeugen einen Eintrag in `warnings` (Hinweis auf
   Web-Tauglichkeit, kein Fehler).
 * `sha256` je Result für Integritätsprüfung.
@@ -86,9 +102,9 @@ Jede `img2mesh`-Familie gibt es in bis zu drei Varianten, die über das
 
 | Variante | Pipeline | Auslieferung | Pflicht zu speichern |
 |---|---|---|---|
-| `-Object` | nur Mesh | `<name>.glb` (Textur eingebettet) + `*_basecolor*` + `*_metallic*` | **das GLB**; Karten optional (nur wenn die Engine eigene Maps will) |
-| `-Generic` | Mesh → UniRig (Auto-Rig, FBX) | `<name>_articulationxl*.fbx` + `*_basecolor*` + `*_metallic*`; Job-Feld `rig: "generic"` | **FBX + Basecolor-Bild, untrennbar**: die FBX referenziert ihre Textur nur über einen Temp-Pfad, der beim Client ins Leere zeigt — über den gelieferten Dateinamen neu binden. Ohne das Bild ist das Asset unbrauchbar und nicht wiederherstellbar. Das Gateway garantiert das Paar in der Auslieferung (sonst schlägt der Job fehl) — das Speichern liegt beim Client. |
-| `-Humanoid` | Mesh → Make-It-Animatable (mixamo-Rig, GLB) | ein GLB mit mixamorig-Skin und **eingebetteter** Textur (+ `*_metallic*.png` optional); Job-Feld `rig: "mixamo"` | **das GLB — genügt allein.** Das Gateway validiert Skin und Textur hart (bekannter Node-Bug „2×2-Dummy-Textur" → Job `failed` statt kaputtem Asset). |
+| `-Object` | nur Mesh | `<name>_00001_.glb` (Textur eingebettet) + `*_basecolor*.png` + `*_metallic*.png` (unverändert, siehe Abschnitt 2) | **das GLB**; Karten optional (nur wenn die Engine eigene Maps will) |
+| `-Generic` | Mesh → UniRig (Auto-Rig, FBX) | `<name>_articulationxl.fbx` + `*_basecolor*` + `*_metallic*` (V-korrigiert, ggf. JPEG); Job-Feld `rig: "generic"` | **FBX + Basecolor-Bild, untrennbar**: die FBX referenziert ihre Textur nur über einen Temp-Pfad, der beim Client ins Leere zeigt — über den gelieferten Dateinamen neu binden. Ohne das Bild ist das Asset unbrauchbar und nicht wiederherstellbar. Das Gateway garantiert das Paar in der Auslieferung (sonst schlägt der Job fehl) — das Speichern liegt beim Client. |
+| `-Humanoid` | Mesh → Make-It-Animatable (mixamo-Rig, GLB) | ein GLB `*_rigged.glb` (technischer Name!) mit mixamorig-Skin und **eingebetteter** Textur (+ `*_metallic*.png` optional); Job-Feld `rig: "mixamo"` | **das GLB — genügt allein.** Das Gateway validiert Skin und Textur hart (bekannter Node-Bug „2×2-Dummy-Textur" → Job `failed` statt kaputtem Asset). |
 
 `input_no_fingers` wird bei allen Familien angenommen, wirkt aber **nur** in der
 `-Humanoid`-Rig-Stufe (Hände ohne Einzelfinger riggen).
@@ -108,8 +124,9 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Pixal3D-Generic`, `Pixal3D-Humanoid`, `Pixal3D-Object` | 50000 | 2048 | höchste Auflösung |
 | `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. |
 
-JPEG-Auslieferung (Regel 2 aus Abschnitt 2) ist bei allen `-Object`- und
-`-Generic`-Aliasen aktiv; bei `-Humanoid` bleiben Karten PNG.
+V-Flip und JPEG-Umkodierung (Abschnitt 2) greifen nur bei den
+`-Generic`-Aliasen; bei `-Object` und `-Humanoid` kommen die Karten unverändert
+als PNG.
 
 ### 3.3 `Triposplat-Object` — der Sonderfall
 
@@ -119,7 +136,7 @@ Gaussian-Splat-Pipeline, andere Parameter: **kein** `input_face_num` und kein
 Preprocess-Größe). Sonst wie oben (`input_image`, `input_name`,
 `input_remove_background`).
 
-Auslieferung: **nur** `<name>.glb` — es gibt keine getrennten Basecolor-/
+Auslieferung: **nur** `<name>_00001_.glb` — es gibt keine getrennten Basecolor-/
 Metallic-Karten, die Textur steckt ausschließlich eingebettet im GLB. Folgen für
 den Client:
 
@@ -145,12 +162,13 @@ Parameter: `input_mesh_path` (string, Pflicht — siehe unten), `input_name`,
 `input_mesh_path` ist ein **Dateipfad auf dem ComfyUI-Backend** (absolut oder
 relativ zu dessen Arbeitsverzeichnis), kein Upload. Der praktische Weg: das GLB
 eines **vorherigen Jobs auf demselben Gateway** referenzieren — bei den hiesigen
-`img2mesh`-Workflows liegt es unter `output/<gelieferter Dateiname>` (z. B.
-`output/Held.glb`). Es gibt keine API, um fremde Meshes hochzuladen; wer ein
-externes Mesh verdichten will, braucht einen Weg auf das Backend-Dateisystem
-außerhalb dieser API.
+`img2mesh`-Workflows liegt es unter `output/<name aus dessen results>`, den
+Namen **wörtlich** aus der Job-Antwort übernehmen, inklusive Zähler (z. B.
+`output/Held_00001_.glb` — `output/Held.glb` existiert nicht). Es gibt keine
+API, um fremde Meshes hochzuladen; wer ein externes Mesh verdichten will,
+braucht einen Weg auf das Backend-Dateisystem außerhalb dieser API.
 
-Auslieferung: `<name>.glb` + `*_basecolor*.png` + `*_metallic*.png` — hier
+Auslieferung: `<name>_00001_.glb` + `*_basecolor*.png` + `*_metallic*.png` — hier
 **ohne** JPEG-Umkodierung, die Karten bleiben PNG.
 
 ### 3.5 Rigger direkt (`mesh-rig-unirig`, `mesh-mia`)
@@ -159,9 +177,12 @@ Beide sind API-sichtbar, primär aber die Stage-2 der `-Generic`/`-Humanoid`-
 Ketten. Direktaufruf ist möglich (`input_mesh_path` wie in 3.4), liefert aber
 **nur** das Rig-Ergebnis: `mesh-rig-unirig` die nackte FBX (ohne Basecolor —
 das Pflichtpaar aus 3.1 muss der Client dann selbst sicherstellen), `mesh-mia`
-das geriggte GLB (Parameter nur `input_mesh_path`, `input_no_fingers`; kein
-`input_name`). Im Zweifel die Ketten-Aliase verwenden — dort garantiert das
-Gateway die vollständige Auslieferung.
+das geriggte GLB `*_rigged.glb` (Parameter nur `input_mesh_path`,
+`input_no_fingers`; kein `input_name`). Achtung Namensfalle: der Alias
+`mesh-mia` führt das **Make-It-Animatable**-Workflow aus (mixamo-Rig → GLB) —
+der gleichnamige FBX-Rigger „MIA" (`MIAAutoRig`, Workflow `mesh-reg-mia`) ist
+auf dem Gateway **nicht registriert**. Im Zweifel die Ketten-Aliase verwenden —
+dort garantiert das Gateway die vollständige Auslieferung.
 
 ---
 
@@ -172,7 +193,7 @@ Gateway die vollständige Auslieferung.
 | `status: "failed"` + `error` | Workflow-/Validierungsfehler (z. B. „no basecolor PNG", „embedded texture is a 2x2 dummy", per-Node-Fehler des Backends). Nicht blind retrien — Fehlertext auswerten. |
 | `503` + `Retry-After` beim Start | Park-Zeit abgelaufen, alle Backends belegt — nach `Retry-After` neu einreichen. |
 | Job hängt lange in `running` | Mesh-Jobs dauern Minuten; `progress` beachten. Hunyuan3D mit `face_num` > 40000: siehe 3.2 — vermeiden. |
-| `404` auf `result/{n}` | Job-TTL abgelaufen (Artefakte werden serverseitig aufgeräumt) — Ergebnisse zeitnah abholen und selbst speichern. |
+| `404` auf `result/{n}` | Job-TTL abgelaufen (Default **24 h**, `ttl_s` 86400) — Artefakte werden serverseitig aufgeräumt; Ergebnisse zeitnah abholen und selbst speichern. |
 
 ---
 
