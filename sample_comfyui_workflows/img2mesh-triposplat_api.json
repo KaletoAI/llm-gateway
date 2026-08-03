@@ -28,7 +28,7 @@
   },
   "62": {
     "inputs": {
-      "value": 10000
+      "value": 262144
     },
     "class_type": "PrimitiveInt",
     "_meta": {
@@ -52,7 +52,7 @@
       ],
       "kernel": 5,
       "smooth": 0,
-      "level": 0.6,
+      "level": 0.4,
       "min_component": 500,
       "min_opacity": 0.02,
       "color_sharpen": 2,
