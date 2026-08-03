@@ -14,7 +14,7 @@ Alle Aufrufe mit `Authorization: Bearer <key>`.
 |---|---|
 | Aliase entdecken | `GET /v1/models?type=image` |
 | Parameter eines Alias | `GET /v1/generations/{alias}/schema` (Namen, Typen, Defaults, Bild-Slots) |
-| Job starten | `POST /v1/generations` mit `{"model": "<alias>", "mode": "sync"\|"async", "params": {…}, "images": {"input_image": "<base64\|data-URI\|URL>"}}` |
+| Job starten | `POST /v1/generations` mit `{"model": "<alias>", "mode": "sync"\|"async", "params": {…}, "images": {…}, "files": {…}}` |
 | Status/Ergebnis | `GET /v1/jobs/{job_id}` — `sync` blockt und liefert dieselbe Job-View direkt (Status `done`), `async` antwortet `202 {job_id, status: "queued", …}` |
 | Artefakt laden | `GET /v1/jobs/{job_id}/result/{n}` (owner-gated, gleicher Bearer-Key) |
 | Abbrechen | `POST /v1/jobs/{job_id}/cancel` |
@@ -30,6 +30,17 @@ gesendet — bei den Mesh-Aliasen durchgehend `input_*`. Unbekannte Namen werden
 Abgleich gegen das Schema. `input_image` ist bei allen `img2mesh`-Aliasen Pflicht
 (`on_empty: required` — fehlt es, wird der Request abgelehnt, es entsteht kein
 stilles Schwarz-Mesh).
+
+**Dateien** reisen nie in `params`, sondern in eigenen Objekten: Bilder unter
+`images`, alle übrigen Dateien (Meshes) unter `files` — Schlüssel ist der
+öffentliche Parametername, Wert Base64, ein data-URI oder eine http(s)-URL, die
+das Gateway selbst abholt. Das Gateway lädt die Datei auf genau das Backend, auf
+dem der Job dann läuft; Parken und Failover ändern daran nichts, der Client sieht
+nie einen Backend-Pfad. `files` ist bewusst **streng** (anders als `params`):
+unbekannter Schlüssel oder unlesbarer Wert → `400`, Datei über **64 MB** → `413`
+— eine still verschluckte Datei würde einen technisch erfolgreichen Job mit
+falschem Eingang liefern. Die Bytes werden nicht als Job-Input gespeichert; in
+der Job-Ansicht steht nur ein Vermerk `<upload:… (N MB)>`.
 
 ### Antwortform (Job-View)
 
@@ -155,18 +166,29 @@ Texturen. Gleiche Parameter, austauschbar:
 | `mesh-shrink` | Dezimierung (Quadric Edge Collapse) | Tris, formtreu |
 | `mesh-shrink-quad` | Remesh (QuadriFlow) | Quad-Topologie (z. B. für Sculpting/Subdivision) |
 
-Parameter: `input_mesh_path` (string, Pflicht — siehe unten), `input_name`,
-`input_face_num` (Default **5000**), `input_texture_resolution` (Default 1024),
-`input_no_fingers` (nur Durchreichung, hier ohne Wirkung).
+Parameter: `input_mesh_path` (Pflicht — das Mesh selbst, siehe unten),
+`input_name`, `input_face_num` (Default **5000**), `input_texture_resolution`
+(Default 1024), `input_no_fingers` (nur Durchreichung, hier ohne Wirkung).
 
-`input_mesh_path` ist ein **Dateipfad auf dem ComfyUI-Backend** (absolut oder
-relativ zu dessen Arbeitsverzeichnis), kein Upload. Der praktische Weg: das GLB
-eines **vorherigen Jobs auf demselben Gateway** referenzieren — bei den hiesigen
-`img2mesh`-Workflows liegt es unter `output/<name aus dessen results>`, den
-Namen **wörtlich** aus der Job-Antwort übernehmen, inklusive Zähler (z. B.
-`output/Held_00001_.glb` — `output/Held.glb` existiert nicht). Es gibt keine
-API, um fremde Meshes hochzuladen; wer ein externes Mesh verdichten will,
-braucht einen Weg auf das Backend-Dateisystem außerhalb dieser API.
+Das Eingangs-Mesh kommt als **Datei im Request** — unter `files`, nicht in
+`params`:
+
+```json
+{"model":"mesh-shrink","mode":"async",
+ "params":{"input_name":"Held","input_face_num":5000},
+ "files":{"input_mesh_path":"data:model/gltf-binary;base64,…"}}
+```
+
+Erlaubt sind Base64, ein data-URI (die Endung leitet das Gateway aus dem MIME
+ab, sonst `.glb`) und eine http(s)-URL, die das Gateway abholt; Grenze 64 MB
+(Abschnitt 1). Damit ist jedes GLB verdichtbar — auch eines, das nie über dieses
+Gateway lief: Upload-Ziel, Backend-Wahl und Pfad regelt das Gateway pro Job
+selbst. Ein vorheriges Job-Ergebnis wird also normal abgeholt
+(`GET /v1/jobs/{id}/result/{n}`) und beim Shrink-Aufruf wieder mitgeschickt.
+
+(Ein direkt in `params` gesetzter `input_mesh_path` bleibt weiterhin ein
+Dateipfad auf dem Backend — nützlich für Server-Admins mit Zugriff auf dessen
+Dateisystem, für Clients ist `files` der Weg.)
 
 Auslieferung: `<name>_00001_.glb` + `*_basecolor*.png` + `*_metallic*.png` — hier
 **ohne** JPEG-Umkodierung, die Karten bleiben PNG.
@@ -174,10 +196,10 @@ Auslieferung: `<name>_00001_.glb` + `*_basecolor*.png` + `*_metallic*.png` — h
 ### 3.5 Rigger direkt (`mesh-rig-unirig`, `mesh-mia`)
 
 Beide sind API-sichtbar, primär aber die Stage-2 der `-Generic`/`-Humanoid`-
-Ketten. Direktaufruf ist möglich (`input_mesh_path` wie in 3.4), liefert aber
-**nur** das Rig-Ergebnis: `mesh-rig-unirig` die nackte FBX (ohne Basecolor —
-das Pflichtpaar aus 3.1 muss der Client dann selbst sicherstellen), `mesh-mia`
-das geriggte GLB `*_rigged.glb` (Parameter nur `input_mesh_path`,
+Ketten. Direktaufruf ist möglich (Mesh über `files.input_mesh_path` wie in 3.4),
+liefert aber **nur** das Rig-Ergebnis: `mesh-rig-unirig` die nackte FBX (ohne
+Basecolor — das Pflichtpaar aus 3.1 muss der Client dann selbst sicherstellen),
+`mesh-mia` das geriggte GLB `*_rigged.glb` (Parameter nur `input_mesh_path`,
 `input_no_fingers`; kein `input_name`). Achtung Namensfalle: der Alias
 `mesh-mia` führt das **Make-It-Animatable**-Workflow aus (mixamo-Rig → GLB) —
 der gleichnamige FBX-Rigger „MIA" (`MIAAutoRig`, Workflow `mesh-reg-mia`) ist
@@ -215,4 +237,21 @@ curl -s $B/v1/jobs/$JOB -H "Authorization: Bearer $K" | jq '{status, progress, r
 curl -s $B/v1/jobs/$JOB -H "Authorization: Bearer $K" \
   | jq -r '.results[] | [.n, .name, .mime] | @tsv'
 curl -s -o Held.glb $B/v1/jobs/$JOB/result/0 -H "Authorization: Bearer $K"
+```
+
+Dasselbe GLB nachträglich verdichten — das Mesh geht als Datei mit, ein
+Backend-Pfad ist nicht nötig:
+
+```bash
+# GLB als data-URI einbetten (Base64 ohne Zeilenumbrüche)
+MESH="data:model/gltf-binary;base64,$(base64 -w0 Held.glb)"
+
+SHRINK=$(jq -n --arg m "$MESH" \
+  '{model:"mesh-shrink",mode:"async",
+    params:{input_name:"Held_lo",input_face_num:5000,input_texture_resolution:1024},
+    files:{input_mesh_path:$m}}' \
+  | curl -s $B/v1/generations -H "Authorization: Bearer $K" \
+         -H "Content-Type: application/json" -d @- | jq -r .job_id)
+
+curl -s $B/v1/jobs/$SHRINK -H "Authorization: Bearer $K" | jq '{status, error}'
 ```

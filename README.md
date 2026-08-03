@@ -420,6 +420,15 @@ which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
 - **Native job API** — `POST /v1/generations` with `{model, prompt, mode, params}`.
   `mode: "async"` returns `202 {job_id}`; poll `GET /v1/jobs/{id}` and fetch
   `GET /v1/jobs/{id}/result/{n}`. `mode: "sync"` blocks and returns inline.
+  Files ride along in their own fields, keyed by param or label: `images:
+  {param: base64|data-URI|URL}` for image slots, `files: {param: …}` for any
+  other file input (a mesh to shrink/rig). A `files` entry is uploaded into the
+  input dir of whichever backend runs the job — after parking and across
+  failover — and the param gets that file's absolute path, so a client never
+  needs a path on a backend. One fixed slot per param (`overwrite=true`) keeps
+  the backend free of upload garbage; the bytes are not kept as a job input.
+  Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
+  over 64 MB → `413`.
 
 See [docs/anima-versa-integration.md](docs/anima-versa-integration.md) for a full
 client-integration walkthrough.
@@ -524,7 +533,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`); per-field reference images via `images: {param: base64\|URL}` |
+| `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`); per-field reference images via `images: {param: base64\|URL}`, other file inputs (meshes) via `files: {param: base64\|URL}` |
 | `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias |
 | `GET` | `/v1/jobs/{id}` | job status + results |
 | `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |

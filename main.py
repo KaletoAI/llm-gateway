@@ -4,6 +4,7 @@ import calendar
 import fnmatch
 import json
 import logging
+import mimetypes
 import re
 import time
 from contextlib import asynccontextmanager
@@ -24,8 +25,8 @@ import reasoning
 import stats
 import store
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
-                      is_image_field, lora_counterpart, lora_groups, make_adapter,
-                      normalize_delivery, slot_empty_mode, validate_delivery)
+                      input_path_ref, is_image_field, lora_counterpart, lora_groups,
+                      make_adapter, normalize_delivery, slot_empty_mode, validate_delivery)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -1956,32 +1957,8 @@ async def _wait_and_hold(backend: dict, job_id: str, label: str) -> bool:
     return True
 
 
-def _comfy_input_dir(backend: dict) -> str:
-    """The absolute path of a ComfyUI backend's input directory (as the ComfyUI
-    process sees it): explicit `comfy_input_dir`, else derived as the sibling of
-    `comfy_output_dir` (…/output → …/input — ComfyUI's standard layout).
-    '' when neither is known."""
-    d = (backend.get("comfy_input_dir") or "").rstrip("/")
-    if d:
-        return d
-    out = (backend.get("comfy_output_dir") or "").rstrip("/")
-    if out.endswith("/output"):
-        return out[:-len("output")] + "input"
-    return ""
-
-
-def _input_path_ref(backend: dict, stored: str) -> str:
-    """What the successor's mesh param receives after an upload hand-off: the
-    uploaded file's ABSOLUTE path in the stage-2 backend's input dir, so the
-    successor loads it exactly like a path hand-off (no special loader needed).
-    Falls back to the bare stored name when no input dir is known — only a
-    load-from-input node can resolve that."""
-    indir = _comfy_input_dir(backend)
-    return f"{indir}/{stored}" if indir else stored
-
-
 async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
-                     upload_images, inputs: dict, params: dict,
+                     upload_images, upload_files, inputs: dict, params: dict,
                      force: str = "", eligible: Optional[set] = None) -> None:
     """Run a two-stage workflow chain: stage 1 (the client-facing mesh alias) exports
     a mesh under a filename WE pin, and stage 2 (the `successor`, e.g. a rigger) is fed
@@ -2179,6 +2156,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                      + [adapter.export_pin(export_node, prefix)],
                 bypass=(stage1_cand.get("bypass") or []),
                 upload_images=dict(upload_images or {}), raw=request,
+                upload_files=_upload_slots(backend, job_id, upload_files),
                 loras=body.get("loras"), slot_held=True)
             out1 = await adapter.generate(req1)
             # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
@@ -2212,12 +2190,12 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 held = bid2
                 active = backend2
                 await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
-                mesh_ref = _input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
+                mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
                 if log_per_call:
                     logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
                                 f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
             elif relay == "upload":                         # same backend, still via input dir
-                mesh_ref = _input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
+                mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
             else:
                 mesh_ref = f"{outdir}/{mesh_name}"          # shared-disk absolute path
 
@@ -2415,12 +2393,34 @@ async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Opt
     return allc, True, eligible                          # all busy → park (async: queue, sync: block)
 
 
+def _upload_slots(backend: dict, job_id: str, files: Optional[dict]) -> dict:
+    """Per-backend upload slot names for client-supplied files. The name is FIXED per
+    param (`gwup_<param>.<ext>`) and uploaded with `overwrite=true`, so a backend keeps
+    exactly one file per param instead of accumulating meshes — ComfyUI has no delete
+    API, overwriting is the only garbage-free option. Safe because the upload happens
+    after the slot claim and comfy backends run `max_concurrent: 1`: no second job can
+    overwrite the file underneath a running one. A backend that DOES run jobs in
+    parallel gets job-unique names instead (its uploads accumulate, as chain hand-offs
+    already do)."""
+    if not files:
+        return {}
+    if int(backend.get("max_concurrent") or 1) <= 1:
+        return dict(files)
+    return {p: (f"gwup_{job_id}_{name.removeprefix('gwup_')}", data)
+            for p, (name, data) in files.items()}
+
+
 async def run_generation(body: dict, request: Request,
-                         upload_images: Optional[dict] = None) -> dict:
+                         upload_images: Optional[dict] = None,
+                         upload_files: Optional[dict] = None) -> dict:
     """Resolve a generation alias, create a job, and run it (sync) or schedule it
     (async). Returns a job view (sync) or `{job_id, status:"queued"}` (async).
     Fails over across candidate backends on connection errors (e.g. a crashed
-    ComfyUI). Shared by the HTTP endpoint and the UI playground."""
+    ComfyUI). Shared by the HTTP endpoint and the UI playground.
+
+    `upload_files` ({param: (slot name, bytes)}, decoded once by the endpoint) is
+    handed to whichever backend ends up dispatching — the adapter uploads it there,
+    so parking and failover need no special casing."""
     alias = body.get("model", "")
     output = dict(body.get("output") or {})
     mode = output.get("mode") or body.get("mode") or "sync"
@@ -2432,6 +2432,8 @@ async def run_generation(body: dict, request: Request,
     _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
 
     def build_req(backend: dict, cand: dict) -> NormalizedRequest:
+        # `job_id` below is bound by the time this runs (dispatch happens after the job
+        # row exists) — the upload slot name may carry it on parallel backends.
         return NormalizedRequest(
             alias=alias, real_model=cand.get("model"),
             task=cand.get("task", body.get("task", "text2img")),
@@ -2439,6 +2441,7 @@ async def run_generation(body: dict, request: Request,
             workflow=cand.get("workflow"), workflow_json=cand.get("workflow_json"),
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
+            upload_files=_upload_slots(backend, job_id, upload_files),
             loras=body.get("loras"), output_node=(cand.get("output_node") or None),
             output_ext=(cand.get("output_ext") or None),
             output_globs=(cand.get("output_globs") or None),
@@ -2452,12 +2455,16 @@ async def run_generation(body: dict, request: Request,
     task = cand0.get("task", body.get("task", "text2img"))
     owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
-    # persist the request inputs so the job stays inspectable in the UI within its TTL
+    # persist the request inputs so the job stays inspectable in the UI within its TTL.
+    # Uploaded FILES are only noted, never stored: a 40 MB mesh per job would flood the
+    # disk, and the job's value is knowing which file went in, not keeping it.
     ref_blobs = [(slot, data) for slot, data in (upload_images or {}).items() if data]
+    shown = {**params, **{p: f"<upload:{nm} ({len(d) / (1024 * 1024):.1f} MB)>"
+                          for p, (nm, d) in (upload_files or {}).items()}}
     await asyncio.to_thread(jobs.set_inputs, job_id,
                             {"prompt": inputs.get("prompt", ""),
                              "negative_prompt": inputs.get("negative_prompt", ""),
-                             "params": params}, ref_blobs)
+                             "params": shown}, ref_blobs)
     if log_per_call:
         cands = ", ".join(b["name"] for b, _ in routes)
         logger.info(f"→ generation '{alias}' ({task}) job {job_id} mode={mode}"
@@ -2468,7 +2475,7 @@ async def run_generation(body: dict, request: Request,
     # itself (keeping the force pin + LoRA eligibility), so parked/ready both route here.
     succ = cand0.get("successor")
     if succ and (succ.get("alias") or "").strip():
-        runner = _run_chain(job_id, alias, succ, body, request, upload_images,
+        runner = _run_chain(job_id, alias, succ, body, request, upload_images, upload_files,
                             inputs, params, force, eligible)
         if mode == "async":
             _spawn_gen(job_id, runner)
@@ -2490,6 +2497,62 @@ async def run_generation(body: dict, request: Request,
     return await _job_view(job_id, request)
 
 
+_UPLOAD_MAX_BYTES = 64 * 1024 * 1024        # per-file cap for `files` (413) — a mesh is big,
+                                            # but a request body is not a stream
+
+
+def _gen_alias_mapping(alias: str) -> tuple[dict, dict]:
+    """A generation alias's (workflow, mapping) — from its first candidate, since both
+    are backend-independent. Includes busy backends: resolving a request field must not
+    depend on which backend happens to be free."""
+    routes = get_gen_routes(alias, include_busy=True)
+    if not routes:
+        return {}, {}
+    _, cand = routes[0]
+    return (cand.get("workflow_json") or {}), (cand.get("mapping") or {})
+
+
+def _file_param(wf: dict, mapping: dict, key: str) -> str:
+    """Which mapping param a `files` key addresses — param name or public label, the
+    same two names every request field accepts. Image slots are rejected on purpose:
+    they carry their own upload path (`images`) with placeholders and empty-modes."""
+    hit = next((p for p in mapping if p == key), None) \
+        or next((p for p, m in mapping.items()
+                 if ((m or {}).get("label") or "").strip() == key), None)
+    if not hit:
+        raise HTTPException(400, f"unknown `files` key '{key}' — not a parameter of this "
+                                 f"generation alias (see GET /v1/generations/<alias>/schema)")
+    if is_image_field(wf, (mapping.get(hit) or {}).get("node")):
+        raise HTTPException(400, f"`files` key '{key}' addresses an image slot — "
+                                 f"send images via `images`")
+    return hit
+
+
+async def _decode_upload_files(alias: str, files: dict) -> dict:
+    """`files: {param|label: base64|data-URI|URL}` → {param: (slot name, bytes)}.
+
+    Deliberately STRICT where `params` are lenient (unknown names are ignored there):
+    a dropped file would not degrade the job, it would run the workflow against its
+    baked-in default and hand back a confidently wrong result."""
+    wf, mapping = await asyncio.to_thread(_gen_alias_mapping, alias)
+    if not mapping:
+        return {}                       # no candidate at all → run_generation 503s in a moment
+    out = {}
+    for key, val in files.items():
+        param = _file_param(wf, mapping, key)
+        got = await _decode_ref_blob(val)
+        if not got or not got[0]:
+            raise HTTPException(400, f"`files.{key}` could not be read — expected base64, "
+                                     f"a data-URI or an http(s) URL")
+        data, ext = got
+        if len(data) > _UPLOAD_MAX_BYTES:
+            raise HTTPException(413, f"`files.{key}` is {len(data) / (1024 * 1024):.1f} MB — "
+                                     f"the limit is {_UPLOAD_MAX_BYTES // (1024 * 1024)} MB")
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", param)[:40] or "file"
+        out[param] = (f"gwup_{slug}.{ext}", data)
+    return out
+
+
 @app.post("/v1/generations")
 async def generations(request: Request, authorization: Optional[str] = Header(None)):
     body = await request.json()
@@ -2505,7 +2568,14 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
             data = await _decode_ref_image(val)
             if data:
                 uploads[param] = data
-    view = await run_generation(body, request, upload_images=uploads)
+    # Optional client files for NON-image params: {"files": {<param>: <base64|data-URI|URL>}}
+    # — e.g. the mesh a shrink/rig alias works on. The gateway uploads it onto whichever
+    # backend runs the job, so a client never needs a path on a backend.
+    files = body.pop("files", None)
+    if files is not None and not isinstance(files, dict):
+        raise HTTPException(400, "`files` must be an object of {param: base64|data-URI|URL}")
+    upload_files = await _decode_upload_files(body.get("model", ""), files) if files else None
+    view = await run_generation(body, request, upload_images=uploads, upload_files=upload_files)
     code = {"queued": 202, "done": 200}.get(view.get("status"), 502)
     return JSONResponse(view, status_code=code)
 
@@ -2657,22 +2727,52 @@ def _gen_image_slots(alias: str) -> list:
     return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
 
 
-async def _decode_ref_image(ref) -> Optional[bytes]:
-    """Reference image as base64 data-URI / raw base64 / http(s) URL -> bytes."""
+_EXT_BY_MIME = {                            # what a data-URI MIME means as a file extension —
+    "model/gltf-binary": "glb",             # the model types mimetypes doesn't know
+    "model/gltf+json": "gltf",
+    "model/obj": "obj", "model/stl": "stl", "model/ply": "ply",
+    "model/fbx": "fbx", "application/x-fbx": "fbx",
+}
+
+
+async def _decode_ref_blob(ref) -> Optional[tuple[bytes, str]]:
+    """A client-supplied blob as base64 / data-URI / http(s) URL → (bytes, extension).
+
+    The extension comes from the data-URI MIME or the URL path, never from sniffing the
+    bytes: this carries meshes as well as images, and a wrong guess would hand ComfyUI a
+    file its loader refuses. `.glb` is the fallback — the mesh params are the only
+    consumers of a payload that names no type."""
     if not isinstance(ref, str) or not ref:
         return None
+    ext = ""
     if ref.startswith("data:"):
-        ref = ref.split(",", 1)[-1]
+        head, _, rest = ref.partition(",")
+        mime = head[len("data:"):].split(";")[0].strip().lower()
+        ext = _EXT_BY_MIME.get(mime) or (mimetypes.guess_extension(mime) or "").lstrip(".")
+        ref = rest
     if ref.startswith(("http://", "https://")):
+        ext = ext or Path(urlparse(ref).path).suffix.lstrip(".")
         try:
             r = await http_client.get(ref, timeout=20.0)
-            return r.content if r.status_code == 200 else None
         except Exception:
             return None
+        return (r.content, _clean_ext(ext)) if r.status_code == 200 else None
     try:
-        return base64.b64decode(ref)
+        return base64.b64decode(ref), _clean_ext(ext)
     except Exception:
         return None
+
+
+def _clean_ext(ext: str) -> str:
+    """A safe filename extension (the value ends up in an upload filename)."""
+    ext = re.sub(r"[^A-Za-z0-9]", "", ext or "")[:8].lower()
+    return ext or "glb"
+
+
+async def _decode_ref_image(ref) -> Optional[bytes]:
+    """Reference image as base64 data-URI / raw base64 / http(s) URL -> bytes."""
+    got = await _decode_ref_blob(ref)
+    return got[0] if got else None
 
 
 @app.post("/v1/images/generations")

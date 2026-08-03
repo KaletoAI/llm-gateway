@@ -178,6 +178,9 @@ class NormalizedRequest:
     fixed: list = field(default_factory=list)       # [{node, field, value}] admin-pinned (models, …)
     upload_image: Optional[bytes] = None            # legacy single reference image (back-compat)
     upload_images: dict = field(default_factory=dict)  # {param: bytes} per request-field image uploads
+    upload_files: dict = field(default_factory=dict)  # {param: (input filename, bytes)} client-supplied
+                                                    # non-image files (meshes) — uploaded PER dispatch, so
+                                                    # parking/failover re-uploads onto the running backend
     loras: Optional[list] = None                    # [{name, strength}] — pairs resolved server-side
     output_node: Optional[str] = None               # alias setting: ONLY this node's artifacts count
     output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
@@ -1540,6 +1543,30 @@ def _gen_values(req: NormalizedRequest) -> dict:
     return values
 
 
+def comfy_input_dir(backend: dict) -> str:
+    """The absolute path of a ComfyUI backend's input directory (as the ComfyUI
+    process sees it): explicit `comfy_input_dir`, else derived as the sibling of
+    `comfy_output_dir` (…/output → …/input — ComfyUI's standard layout).
+    '' when neither is known."""
+    d = (backend.get("comfy_input_dir") or "").rstrip("/")
+    if d:
+        return d
+    out = (backend.get("comfy_output_dir") or "").rstrip("/")
+    if out.endswith("/output"):
+        return out[:-len("output")] + "input"
+    return ""
+
+
+def input_path_ref(backend: dict, stored: str) -> str:
+    """What a mesh param receives after an upload hand-off: the uploaded file's
+    ABSOLUTE path in that backend's input dir, so the workflow loads it exactly like
+    a shared-disk path (no load-from-input node needed). Falls back to the bare
+    stored name when no input dir is known — only a load-from-input node can
+    resolve that."""
+    indir = comfy_input_dir(backend)
+    return f"{indir}/{stored}" if indir else stored
+
+
 class ComfyUIAdapter(BackendAdapter):
     """ComfyUI image/video/audio backend. discover() via /object_info; generate()
     submits a parametrized workflow and polls /history, then fetches /view."""
@@ -1785,6 +1812,39 @@ class ComfyUIAdapter(BackendAdapter):
                 applied.append(p)
         return applied
 
+    async def _apply_file_params(self, wf: dict, mapping: dict, files: dict,
+                                 protected: set) -> list:
+        """Client-supplied non-image files (`files:{param: …}`, e.g. the mesh a shrink
+        alias works on): upload each into THIS backend's input dir and inject the file's
+        ABSOLUTE path into the mapped param. Runs per dispatch, so parking and failover
+        simply re-upload onto the backend that actually runs the job — the client never
+        deals with backend paths.
+
+        Absolute, because the consumers are plain path loaders (`PrimitiveString`/
+        `GeomPackLoadMeshPath`): a bare input name would not resolve, so a backend whose
+        input dir is unknown fails the job instead of running it against a phantom path."""
+        if not files:
+            return []
+        indir = comfy_input_dir(self.backend)
+        if not indir:
+            raise RuntimeError(f"backend '{self.name}' has no comfy_input_dir/comfy_output_dir "
+                               "— cannot resolve uploaded file to an absolute path")
+        applied = []
+        for p, (name, data) in files.items():
+            m = mapping.get(p) or {}                    # keyed by param — the endpoint already
+            nid, fld = m.get("node"), m.get("field")    # resolved label→param against the mapping
+            if not (nid and fld):
+                raise RuntimeError(f"uploaded file for '{p}' has no mapping on this backend's "
+                                   "workflow — cannot place it")
+            if (nid, fld) in protected:                 # admin pin stays authoritative (repo-wide rule)
+                logger.warning(f"[{self.name}] uploaded file for '{p}' ignored — "
+                               f"node {nid}.{fld} is pinned by the alias")
+                continue
+            stored = await self.upload_input(bytes(data), name)   # raises → job fails with the reply
+            wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = input_path_ref(self.backend, stored)
+            applied.append(p)
+        return applied
+
     async def _autofill_empty_images(self, wf: dict, mapping: dict) -> list:
         """Any image-loader node still left with an empty `image` (not a mapped
         request field) → fill it with the 8×8 placeholder, so ComfyUI never tries to
@@ -1847,12 +1907,15 @@ class ComfyUIAdapter(BackendAdapter):
             uploads[img_params[0]] = req.upload_image          # back-compat single upload
         for p in img_params:
             values.pop(p, None)
+        for p in (req.upload_files or {}):
+            values.pop(p, None)              # the uploaded file feeds this param, not a stale scalar
         # `loras:[{name,strength}]` first (pairs resolved per group), then the flat
         # legacy lora_N params → remaining free slots.
         lora_placed = _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
         lora_placed += _apply_lora_cascade(wf, values)    # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
+        files_applied = await self._apply_file_params(wf, mapping, req.upload_files or {}, protected)
         autofilled = await self._autofill_empty_images(wf, mapping)
         # Bypass LAST — after every injection, so it rewires the FINAL link graph
         # (remove each bypassed node, reconnect consumers to its same-typed input).
@@ -1863,6 +1926,7 @@ class ComfyUIAdapter(BackendAdapter):
                    "fixed": sorted(fixed_applied.keys()),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
                    "images": sorted(img_applied), "autofilled_images": autofilled,
+                   **({"files": sorted(files_applied)} if files_applied else {}),
                    **({"bypassed": bypassed} if bypassed else {})}
 
         poll_interval = float(b.get("poll_interval", 1.0))
