@@ -3721,7 +3721,14 @@ async def job_detail_page(job_id: str, request: Request):
         inbox += ("<h3>Bypassed nodes <span class='muted' style='font-weight:normal'>· skipped, no param/pin</span></h3>"
                   f"<ul class='muted' style='margin:4px 0 0 18px'>{''.join(_byp_li(n) for n in extra_byp)}</ul>")
     if in_imgs:
-        inbox += f"<h3>Reference images</h3>{_job_thumbs(job_id, 'input', in_imgs)}"
+        # the content hash identifies WHICH bytes this run actually processed — the
+        # same guarantee `results[]` gives for the output side.
+        ids = "".join(f"<li><code>{_esc(r.get('slot') or r['n'])}</code> · "
+                      f"sha256 <code>{_esc((r.get('sha256') or '?')[:16])}</code>"
+                      + (f" · {r['bytes'] / 1024:.0f} kB" if r.get("bytes") else "") + "</li>"
+                      for r in in_imgs)
+        inbox += (f"<h3>Reference images</h3>{_job_thumbs(job_id, 'input', in_imgs)}"
+                  f"<ul class='muted' style='margin:4px 0 0 18px;font-size:12px'>{ids}</ul>")
     if not inbox:
         inbox = "<p class='muted'>No stored inputs (job predates this feature).</p>"
     if st in ("queued", "running"):

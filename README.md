@@ -425,10 +425,26 @@ which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
   other file input (a mesh to shrink/rig). A `files` entry is uploaded into the
   input dir of whichever backend runs the job — after parking and across
   failover — and the param gets that file's absolute path, so a client never
-  needs a path on a backend. One fixed slot per param (`overwrite=true`) keeps
-  the backend free of upload garbage; the bytes are not kept as a job input.
+  needs a path on a backend. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`.
+
+**Input isolation (guarantee).** Every file the gateway uploads into a backend
+(`images`, `files`, chain hand-off meshes) is named per job —
+`gw_<job id>_<param>.<ext>` — so **no two jobs ever share input state**, not
+across aliases, not across clients, not on the same backend. This is a
+correctness requirement, not tidiness: ComfyUI opens an input file when the
+prompt *executes*, not when it is submitted, so a name two jobs can both write
+is a window in which one job's reference image is silently swapped for
+another's. An upload that fails now **fails the job** instead of running on
+whatever bytes were already there. After a clean success the job's input files
+are overwritten with a 72-byte placeholder (ComfyUI has no delete-input API), so
+they do not accumulate; after a timeout or cancel they are left alone, because
+the prompt may still be running. The one deliberately shared input file is
+`gw_placeholder.png`, the 8×8 filler for empty slots — its content is constant,
+so overwriting it can mix nothing up. Job inputs are recorded with their
+**sha256** (`input_images[].sha256`, same as `results[]`), so a client can prove
+which bytes a delivered artifact was made from.
 
 See [docs/anima-versa-integration.md](docs/anima-versa-integration.md) for a full
 client-integration walkthrough.

@@ -102,10 +102,24 @@ receive what they need via injected callables, staying hot-reload-safe.
   `normalize_delivery` (case mode + chain level, normalize-once flagged) V-flips
   generic texture PNGs and — alias Output option `texture_format: jpeg` —
   transcodes them to JPEG q90 (real alpha keeps PNG; ComfyUI has no JPEG export).
+  **Input isolation** (`upload_prefix` on `NormalizedRequest`, `upload_prefix_for`
+  + `upload_slot_name`): EVERY uploaded input is named `gw_<job id>[_s1|_s2]_<param>
+  .<ext>` — no two jobs share input state, ever. ComfyUI reads an input file at
+  EXECUTION time, so a shared name is a corruption window the gateway's one-slot
+  cap does NOT close (a poll timeout frees the slot while the prompt runs on) —
+  measured 2026-08: a client job was delivered another subject's mesh. A blank
+  prefix mints a random one; never add a shared fallback. `_upload_image` RAISES
+  on failure (silently keeping the intended name meant running on foreign bytes);
+  only `_upload_placeholder` is best-effort, because `gw_placeholder.png` is a
+  shared CONSTANT. `_cleanup_uploads` overwrites the job's inputs with that 72-byte
+  placeholder after a CLEAN success only (a timed-out prompt may still read them);
+  it never raises.
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
-  (`set_inputs`: prompt/params/reference images) and `reconcile_orphans()` (startup:
+  (`set_inputs`: prompt/params/reference images, each with `sha256`+`bytes` like a
+  result entry — the job view proves WHICH bytes ran; JSON in meta, no migration)
+  and `reconcile_orphans()` (startup:
   mark interrupted `running`/`queued` as failed). Carries `owner`. Reused for
   **background Responses** jobs (task type `response`, result via `complete_json`).
 - **`store.py`** — writable SQLite store, the console's source of truth: backends,

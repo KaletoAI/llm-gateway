@@ -178,9 +178,19 @@ class NormalizedRequest:
     fixed: list = field(default_factory=list)       # [{node, field, value}] admin-pinned (models, …)
     upload_image: Optional[bytes] = None            # legacy single reference image (back-compat)
     upload_images: dict = field(default_factory=dict)  # {param: bytes} per request-field image uploads
-    upload_files: dict = field(default_factory=dict)  # {param: (input filename, bytes)} client-supplied
+    upload_files: dict = field(default_factory=dict)  # {param: (suggested filename, bytes)} client-supplied
                                                     # non-image files (meshes) — uploaded PER dispatch, so
-                                                    # parking/failover re-uploads onto the running backend
+                                                    # parking/failover re-uploads onto the running backend.
+                                                    # The filename is only a hint: the extension is kept, the
+                                                    # NAME is rebuilt from `upload_prefix` (see below).
+    upload_prefix: str = ""                         # job-unique namespace for EVERY input file this request
+                                                    # uploads (`<prefix>_<param>.<ext>`). Filled from the job
+                                                    # id by run_generation/_run_chain; blank → the adapter
+                                                    # mints a random one. NEVER a name shared between jobs:
+                                                    # ComfyUI opens an input file at EXECUTION time, so a
+                                                    # queued prompt reads whatever bytes sit under that name
+                                                    # by then — a shared slot silently swaps one job's
+                                                    # reference image for another's.
     loras: Optional[list] = None                    # [{name, strength}] — pairs resolved server-side
     output_node: Optional[str] = None               # alias setting: ONLY this node's artifacts count
     output_ext: Optional[str] = None                # alias setting: fetch the sibling with THIS extension
@@ -1157,10 +1167,25 @@ def _apply_bypass(wf: dict, bypass_ids: list, node_types: dict) -> list:
     return byp
 
 
-def _img_slug(s: str) -> str:
-    """A safe, stable per-param input filename so each image field reuses one slot."""
-    keep = "".join(ch if ch.isalnum() else "_" for ch in (s or "img"))
-    return f"gw_{keep[:40]}.png"
+def upload_prefix_for(prefix: Optional[str]) -> str:
+    """The per-JOB namespace every input upload of one request is named under.
+
+    A blank prefix (playground/mapping probes, any caller without a job) gets a
+    random time-based one — there is deliberately NO shared fallback name: input
+    files are read by ComfyUI when the prompt EXECUTES, not when it is submitted,
+    so any name two jobs can both write is a data-corruption window (measured: a
+    client job delivered another subject's mesh)."""
+    p = "".join(ch if ch.isalnum() else "_" for ch in (prefix or "").strip())[:60]
+    return p or f"gw_{int(time.time() * 1000):x}_{random.randint(0, 0xFFFFFF):06x}"
+
+
+def upload_slot_name(prefix: str, param: str, ext: str = "png") -> str:
+    """`<job prefix>_<param>.<ext>` — the input filename ONE upload slot of ONE job
+    uses. Job-unique by construction, so concurrent jobs (same alias or not, same
+    backend or not) never share input state."""
+    keep = "".join(ch if ch.isalnum() else "_" for ch in (param or "img"))[:40] or "img"
+    e = "".join(ch for ch in (ext or "").lstrip(".").lower() if ch.isalnum()) or "bin"
+    return f"{prefix}_{keep}.{e}"
 
 
 def _placeholder_png(size: int = 8) -> bytes:
@@ -1177,6 +1202,11 @@ def _placeholder_png(size: int = 8) -> bytes:
 
 
 _PLACEHOLDER_PNG = _placeholder_png(8)
+# The ONE input filename that is deliberately shared across jobs, aliases and clients:
+# its content is a CONSTANT 8×8 grey PNG, so two jobs overwriting each other's copy
+# cannot mix any client data up — the file is byte-identical either way. Every other
+# upload name carries the job prefix (see upload_slot_name).
+_PLACEHOLDER_NAME = "gw_placeholder.png"
 
 
 def _coerce(value, current):
@@ -1694,22 +1724,58 @@ class ComfyUIAdapter(BackendAdapter):
 
     async def _post_upload(self, client: httpx.AsyncClient, data: bytes, name: str,
                            content_type: str):
-        """The one ComfyUI `/upload/image` POST (overwrite=true → one reused slot, no
-        garbage; ComfyUI has no delete-input API). Returns the raw response; callers
-        apply their own success/subfolder + error policy."""
+        """The one ComfyUI `/upload/image` POST (overwrite=true; ComfyUI has no
+        delete-input API, so overwriting is also how we release the space again —
+        see _cleanup_uploads). Returns the raw response; callers apply their own
+        success/subfolder + error policy."""
         url = self.backend["url"].rstrip("/")
         return await client.post(f"{url}/upload/image",
                                  files={"image": (name, data, content_type)},
                                  data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
 
     async def _upload_image(self, client: httpx.AsyncClient, data: bytes, name: str) -> str:
-        """Upload a playground reference image; best-effort (returns the intended name
-        on any failure so a generation still proceeds with the placeholder)."""
+        """Upload one input image into this backend's ComfyUI input dir; returns the
+        stored name. RAISES on failure, like upload_input(): a swallowed error used to
+        leave the workflow pointing at a name whose file was never written — ComfyUI
+        would then run against whatever bytes already sat there (another job's image).
+        Failing the job is the only honest outcome."""
+        r = await self._post_upload(client, data, name, "image/png")
+        if r.status_code != 200:
+            raise RuntimeError(f"image upload '{name}' to '{self.backend.get('name')}' failed "
+                               f"(HTTP {r.status_code}: {r.text[:200]})")
         try:
-            r = await self._post_upload(client, data, name, "image/png")
-            return (r.json() or {}).get("name", name) if r.status_code == 200 else name
+            return (r.json() or {}).get("name", name)
         except Exception:
-            return name
+            return name                                  # 200 without JSON: the name we asked for
+
+    async def _upload_placeholder(self, client: httpx.AsyncClient) -> str:
+        """The 8×8 grey filler for empty image slots. Best-effort ON PURPOSE (the one
+        exception to the rule above): the file is a shared CONSTANT, so a failed upload
+        can only mean the already-present placeholder stays — never someone else's data."""
+        try:
+            return await self._upload_image(client, _PLACEHOLDER_PNG, _PLACEHOLDER_NAME)
+        except Exception as e:
+            logger.debug(f"[{self.name}] placeholder upload failed ({e}) — "
+                         f"using '{_PLACEHOLDER_NAME}' as-is")
+            return _PLACEHOLDER_NAME
+
+    async def _cleanup_uploads(self, names: list) -> None:
+        """Best-effort garbage control for job-unique input files: overwrite each with
+        the 72-byte placeholder, so a finished job leaves a stub instead of a 40 MB mesh
+        (ComfyUI has no delete-input API). Call ONLY after a clean success — after a
+        timeout/interrupt the ComfyUI prompt may still be running and about to read the
+        file. Never raises: cleanup failure is cosmetic, the job is already done."""
+        if not names:
+            return
+        try:
+            async with _pooled_client(self.ctx) as c:
+                for n in dict.fromkeys(names):           # dedupe, keep order
+                    try:
+                        await self._post_upload(c, _PLACEHOLDER_PNG, n, "image/png")
+                    except Exception as e:
+                        logger.debug(f"[{self.name}] input cleanup '{n}' failed: {e}")
+        except Exception as e:                           # client/pool trouble — still not the job's problem
+            logger.debug(f"[{self.name}] input cleanup skipped: {e}")
 
     async def upload_input(self, data: bytes, name: str,
                            content_type: str = "application/octet-stream") -> str:
@@ -1757,7 +1823,8 @@ class ComfyUIAdapter(BackendAdapter):
             return None
         raise RuntimeError(f"/view '{name}' → HTTP {r.status_code}")
 
-    async def _resolve_image_sentinels(self, fixed: list, upload: Optional[bytes]) -> list:
+    async def _resolve_image_sentinels(self, fixed: list, upload: Optional[bytes],
+                                       prefix: str, used: list) -> list:
         """Replace image sentinels in fixed bindings with real uploaded names.
         A node pinned to the playground upload uses the uploaded image, or falls
         back to the 8×8 placeholder when nothing was uploaded — so the placeholder
@@ -1767,9 +1834,12 @@ class ComfyUIAdapter(BackendAdapter):
         if not (has_ph or has_up):
             return fixed
         need_ph = has_ph or (has_up and not upload)        # placeholder also backs an empty upload
+        up_name = upload_slot_name(prefix, "upload")       # job-unique, never a shared 'gw_upload.png'
         async with _pooled_client(self.ctx) as c:
-            ph = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png") if need_ph else None
-            up = await self._upload_image(c, bytes(upload), "gw_upload.png") if (has_up and upload) else None
+            ph = await self._upload_placeholder(c) if need_ph else None
+            up = await self._upload_image(c, bytes(upload), up_name) if (has_up and upload) else None
+        if up:
+            used.append(up_name)
         def sub(b):
             v = b.get("value")
             if v == PLACEHOLDER_SENTINEL:
@@ -1781,11 +1851,13 @@ class ComfyUIAdapter(BackendAdapter):
         return [sub(b) for b in fixed]
 
     async def _apply_image_params(self, wf: dict, mapping: dict, params: list,
-                                  uploads: dict) -> list:
+                                  uploads: dict, prefix: str, used: list) -> list:
         """Per request-field image params: upload that field's image (or the 8×8
         placeholder when none was provided) and set the loader node's field to the
-        stored name. Each param reuses its own input slot, so several images coexist
-        without overwriting each other and without accumulating garbage."""
+        stored name. Each param gets its own JOB-UNIQUE input file (`<prefix>_<param>`),
+        so several images coexist within a job and no concurrent job can overwrite one
+        of them between /prompt and execution. `used` collects the names for the
+        post-success cleanup."""
         if not params:
             return []
         applied = []
@@ -1797,7 +1869,9 @@ class ComfyUIAdapter(BackendAdapter):
                     continue
                 data = uploads.get(p)
                 if data:
-                    name = await self._upload_image(c, bytes(data), _img_slug(p))
+                    slot = upload_slot_name(prefix, p)
+                    name = await self._upload_image(c, bytes(data), slot)   # raises → job fails
+                    used.append(slot)
                 else:
                     mode = slot_empty_mode(m)
                     if mode == "required":
@@ -1807,18 +1881,19 @@ class ComfyUIAdapter(BackendAdapter):
                         _prune_node(wf, nid)  # runs without this image
                         applied.append(p)
                         continue
-                    name = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png")
+                    name = await self._upload_placeholder(c)
                 wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = name
                 applied.append(p)
         return applied
 
     async def _apply_file_params(self, wf: dict, mapping: dict, files: dict,
-                                 protected: set) -> list:
+                                 protected: set, prefix: str, used: list) -> list:
         """Client-supplied non-image files (`files:{param: …}`, e.g. the mesh a shrink
-        alias works on): upload each into THIS backend's input dir and inject the file's
-        ABSOLUTE path into the mapped param. Runs per dispatch, so parking and failover
-        simply re-upload onto the backend that actually runs the job — the client never
-        deals with backend paths.
+        alias works on): upload each into THIS backend's input dir under a JOB-UNIQUE
+        name (`<prefix>_<param>.<ext>`; the client's filename only contributes the
+        extension) and inject the file's ABSOLUTE path into the mapped param. Runs per
+        dispatch, so parking and failover simply re-upload onto the backend that
+        actually runs the job — the client never deals with backend paths.
 
         Absolute, because the consumers are plain path loaders (`PrimitiveString`/
         `GeomPackLoadMeshPath`): a bare input name would not resolve, so a backend whose
@@ -1840,7 +1915,9 @@ class ComfyUIAdapter(BackendAdapter):
                 logger.warning(f"[{self.name}] uploaded file for '{p}' ignored — "
                                f"node {nid}.{fld} is pinned by the alias")
                 continue
-            stored = await self.upload_input(bytes(data), name)   # raises → job fails with the reply
+            slot = upload_slot_name(prefix, p, os.path.splitext(name or "")[1] or "bin")
+            stored = await self.upload_input(bytes(data), slot)   # raises → job fails with the reply
+            used.append(slot)
             wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = input_path_ref(self.backend, stored)
             applied.append(p)
         return applied
@@ -1861,7 +1938,7 @@ class ComfyUIAdapter(BackendAdapter):
         if not empty:
             return []
         async with _pooled_client(self.ctx) as c:
-            name = await self._upload_image(c, _PLACEHOLDER_PNG, "gw_placeholder.png")
+            name = await self._upload_placeholder(c)
         for nid in empty:
             wf[nid].setdefault("inputs", {})["image"] = name
         return empty
@@ -1871,7 +1948,13 @@ class ComfyUIAdapter(BackendAdapter):
         url = b["url"].rstrip("/")
         bname = self.name
         wf = self._workflow_for(req)
-        fixed = await self._resolve_image_sentinels(list(req.fixed or []), req.upload_image)
+        # Every input file this job uploads lives under ONE job-unique prefix, and the
+        # names it actually wrote are collected in `uploaded` for the post-success
+        # cleanup. No two jobs ever address the same input file (see upload_slot_name).
+        prefix = upload_prefix_for(req.upload_prefix)
+        uploaded: list = []
+        fixed = await self._resolve_image_sentinels(list(req.fixed or []), req.upload_image,
+                                                    prefix, uploaded)
         fixed_applied = _apply_fixed(wf, fixed)                # pin models / switches / ref-images
         protected = {(b.get("node"), b.get("field")) for b in fixed   # pins the API cannot override
                      if b.get("node") and b.get("field")}
@@ -1914,8 +1997,10 @@ class ComfyUIAdapter(BackendAdapter):
         lora_placed = _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
         lora_placed += _apply_lora_cascade(wf, values)    # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
-        img_applied = await self._apply_image_params(wf, mapping, img_params, uploads)
-        files_applied = await self._apply_file_params(wf, mapping, req.upload_files or {}, protected)
+        img_applied = await self._apply_image_params(wf, mapping, img_params, uploads,
+                                                     prefix, uploaded)
+        files_applied = await self._apply_file_params(wf, mapping, req.upload_files or {},
+                                                      protected, prefix, uploaded)
         autofilled = await self._autofill_empty_images(wf, mapping)
         # Bypass LAST — after every injection, so it rewires the FINAL link graph
         # (remove each bypassed node, reconnect consumers to its same-typed input).
@@ -1983,6 +2068,11 @@ class ComfyUIAdapter(BackendAdapter):
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
 
+        # Clean success only (any raise above skipped this): the prompt has finished, so
+        # nothing will read these inputs again — shrink them to the 72-byte placeholder.
+        # After a timeout/interrupt the ComfyUI prompt may STILL run and open the file,
+        # so the failure paths deliberately leave the inputs alone.
+        await self._cleanup_uploads(uploaded)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if log_on:
             logger.info(f"← [{bname}] {len(blobs)} artifact(s) in {elapsed_ms} ms")

@@ -1829,8 +1829,11 @@ async def _job_view(job_id: str, request: Request) -> dict:
     if meta.get("warnings"):
         view["warnings"] = meta["warnings"]
     view["inputs"] = meta.get("inputs")
+    # sha256 mirrors `results[]`: it identifies the exact bytes that went INTO the run,
+    # so a client can prove which reference image a delivered artifact was made from.
     view["input_images"] = [{
         "n": r["n"], "slot": r.get("slot"), "mime": r["mime"],
+        "sha256": r.get("sha256"), "bytes": r.get("bytes"),
         "url": f"{base}/v1/jobs/{job_id}/input/{r['n']}",
     } for r in meta.get("input_images", [])]
     # Live jobs get an honest progress estimate: elapsed vs the median runtime of
@@ -2156,7 +2159,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                      + [adapter.export_pin(export_node, prefix)],
                 bypass=(stage1_cand.get("bypass") or []),
                 upload_images=dict(upload_images or {}), raw=request,
-                upload_files=_upload_slots(backend, job_id, upload_files),
+                upload_files=dict(upload_files or {}),
+                upload_prefix=_upload_prefix(job_id, "s1"),
                 loras=body.get("loras"), slot_held=True)
             out1 = await adapter.generate(req1)
             # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
@@ -2215,6 +2219,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
                 workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
                 node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
+                upload_prefix=_upload_prefix(job_id, "s2"),
                 raw=request, output_node=(s2.get("output_node") or None),
                 output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
                 output_cases=(s2.get("output_cases") or None),
@@ -2393,21 +2398,16 @@ async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Opt
     return allc, True, eligible                          # all busy → park (async: queue, sync: block)
 
 
-def _upload_slots(backend: dict, job_id: str, files: Optional[dict]) -> dict:
-    """Per-backend upload slot names for client-supplied files. The name is FIXED per
-    param (`gwup_<param>.<ext>`) and uploaded with `overwrite=true`, so a backend keeps
-    exactly one file per param instead of accumulating meshes — ComfyUI has no delete
-    API, overwriting is the only garbage-free option. Safe because the upload happens
-    after the slot claim and comfy backends run `max_concurrent: 1`: no second job can
-    overwrite the file underneath a running one. A backend that DOES run jobs in
-    parallel gets job-unique names instead (its uploads accumulate, as chain hand-offs
-    already do)."""
-    if not files:
-        return {}
-    if int(backend.get("max_concurrent") or 1) <= 1:
-        return dict(files)
-    return {p: (f"gwup_{job_id}_{name.removeprefix('gwup_')}", data)
-            for p, (name, data) in files.items()}
+def _upload_prefix(job_id: str, stage: str = "") -> str:
+    """The job-unique namespace every input file of this job is uploaded under
+    (`gw_<job id>[_<stage>]_<param>.<ext>`, built by adapters.upload_slot_name).
+
+    Job-unique is NOT an optimisation, it is the correctness contract: ComfyUI opens
+    an input file when the prompt EXECUTES, not when it is submitted, so any name two
+    jobs can both write is a corruption window — and the gateway's one-slot cap does
+    not close it (a poll timeout releases the slot while ComfyUI keeps running the
+    prompt). Measured 2026-08: a client job was delivered another subject's mesh."""
+    return f"gw_{job_id}{('_' + stage) if stage else ''}"
 
 
 async def run_generation(body: dict, request: Request,
@@ -2433,7 +2433,7 @@ async def run_generation(body: dict, request: Request,
 
     def build_req(backend: dict, cand: dict) -> NormalizedRequest:
         # `job_id` below is bound by the time this runs (dispatch happens after the job
-        # row exists) — the upload slot name may carry it on parallel backends.
+        # row exists) — every input upload is namespaced by it.
         return NormalizedRequest(
             alias=alias, real_model=cand.get("model"),
             task=cand.get("task", body.get("task", "text2img")),
@@ -2441,7 +2441,7 @@ async def run_generation(body: dict, request: Request,
             workflow=cand.get("workflow"), workflow_json=cand.get("workflow_json"),
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
-            upload_files=_upload_slots(backend, job_id, upload_files),
+            upload_files=dict(upload_files or {}), upload_prefix=_upload_prefix(job_id),
             loras=body.get("loras"), output_node=(cand.get("output_node") or None),
             output_ext=(cand.get("output_ext") or None),
             output_globs=(cand.get("output_globs") or None),
@@ -2549,6 +2549,8 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
             raise HTTPException(413, f"`files.{key}` is {len(data) / (1024 * 1024):.1f} MB — "
                                      f"the limit is {_UPLOAD_MAX_BYTES // (1024 * 1024)} MB")
         slug = re.sub(r"[^A-Za-z0-9]+", "_", param)[:40] or "file"
+        # The name is a HINT (display + extension); the adapter rebuilds it under the
+        # job's upload prefix, so no two jobs ever write the same backend input file.
         out[param] = (f"gwup_{slug}.{ext}", data)
     return out
 

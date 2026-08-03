@@ -314,7 +314,12 @@ def set_inputs(job_id: str, inputs: dict, ref_blobs: Optional[list] = None) -> N
     """Persist a job's request inputs for later inspection (within TTL): the prompt /
     negative_prompt / params inline in `meta.inputs`, reference images as on-disk blobs
     (`in_<n><ext>`) listed in `meta.input_images`. Merges into existing meta so a later
-    complete() keeps them."""
+    complete() keeps them.
+
+    Each manifest entry carries the blob's `sha256` (same as a result entry), so the
+    job view can prove WHICH image went in — the answer to "did this job process my
+    picture?". No migration: the manifest is JSON inside meta_json, older rows simply
+    have no `sha256` key."""
     job_dir = os.path.join(_BLOB_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     manifest = []
@@ -322,11 +327,13 @@ def set_inputs(job_id: str, inputs: dict, ref_blobs: Optional[list] = None) -> N
         slot, data = item
         if not data:
             continue
-        mime = _img_mime(bytes(data))
+        raw = bytes(data)
+        mime = _img_mime(raw)
         fname = f"in_{n}{_EXT_BY_MIME.get(mime, '.bin')}"
         with open(os.path.join(job_dir, fname), "wb") as f:
-            f.write(bytes(data))
-        manifest.append({"n": n, "slot": slot, "mime": mime, "filename": fname})
+            f.write(raw)
+        manifest.append({"n": n, "slot": slot, "mime": mime, "filename": fname,
+                         "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
     with _conn() as c:                              # one connection: read meta + update
         meta = _read_meta(c, job_id)
         meta["inputs"] = inputs
