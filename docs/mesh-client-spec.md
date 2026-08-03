@@ -144,7 +144,22 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Trellis2-Generic-High`, `Trellis2-Humanoid-High` | 20000 | 1024 | höchste Qualität, längste Laufzeit |
 | `Trellis2-Generic-Low`, `Trellis2-Humanoid-Low`, `Trellis2-Object-Low` | 20000 | 1024 | schnellere Pipeline |
 | `Pixal3D-Generic`, `Pixal3D-Humanoid`, `Pixal3D-Object` | 50000 | 2048 | höchste Auflösung |
-| `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. |
+| `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. `-Object` liefert zusätzlich eine LOD-Stufe, siehe unten. |
+
+**LOD-Stufe bei `Hunyuan3D-Object`.** Dieser Alias liefert neben dem Hauptergebnis
+eine zweite, reduzierte Fassung desselben Modells: `<name>_<faces>.glb`, gesteuert
+über den Parameter **`input_lod_faces`** (Default `"5000"`, **als String senden** —
+`"4000"`, nicht `4000`). Die Stufe wird nicht nachträglich verkleinert, sondern aus
+denselben generierten Ansichten neu aufgebacken, ist also qualitativ eigenständig
+und **selbsttragend** (Texturen eingebettet, keine Begleitdateien nötig). Sie
+trifft die Zielzahl exakt (gemessen: 4.000 angefordert → 4.000 Dreiecke) und kostet
+nur wenige Sekunden Mehrlaufzeit. Zwei Hinweise: die Datei ist wegen der
+Textur-Einbettung als Data-URI oft **größer** als das Hauptergebnis, und
+`input_face_num` ist beim Hauptergebnis nur eine **Obergrenze** — liefert das Modell
+von sich aus weniger, ist ein knapp darunter gewählter LOD-Wert wirkungslos.
+
+Erkennung in der Antwort: das Hauptergebnis endet auf `_00001_.glb`, die LOD-Datei
+auf `_<zahl>.glb` (also Ziffer direkt vor der Endung).
 
 V-Flip und JPEG-Umkodierung (Abschnitt 2) greifen nur bei den
 `-Generic`-Aliasen; bei `-Object` und `-Humanoid` kommen die Karten unverändert
