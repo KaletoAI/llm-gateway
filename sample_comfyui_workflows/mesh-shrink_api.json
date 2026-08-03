@@ -59,7 +59,7 @@
         0
       ],
       "quality_threshold": 0.3,
-      "preserve_boundary": "true",
+      "preserve_boundary": "false",
       "preserve_normal": "true",
       "preserve_topology": "false",
       "planar_quadric": "false"
