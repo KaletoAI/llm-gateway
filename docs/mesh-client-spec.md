@@ -181,8 +181,8 @@ Texturen. Gleiche Parameter:
 
 | Alias | Verfahren | Ergebnis-Topologie | Status |
 |---|---|---|---|
-| `mesh-shrink` | Dezimierung (Quadric Edge Collapse) | Tris, formtreu | **verfügbar** |
-| `mesh-shrink-quad` | Remesh (QuadriFlow) | Quad-Topologie (z. B. für Sculpting/Subdivision) | ⚠ derzeit **nicht verfügbar** — der QuadriFlow-Remesher stürzt backendseitig ab; bis zur Behebung `mesh-shrink` verwenden |
+| `mesh-shrink` | Dezimierung (Quadric Edge Collapse) | Tris, formtreu | **verfügbar**, trifft `input_face_num` gut (typisch +30 % durch das Schließen von Löchern beim Texturbacken) |
+| `mesh-shrink-quad` | Remesh (Instant Meshes) | Quad-Topologie (z. B. für Sculpting/Subdivision) | verfügbar, aber `input_face_num` wirkt nur als **grober Richtwert** (gemessen: 5.000 angefordert → ~38.000 Dreiecke). Wer eine verlässliche Zielgröße braucht, nimmt `mesh-shrink`. |
 
 **Voraussetzung an das Eingangs-Mesh:** es muss **UVs und eine eingebettete
 Textur** mitbringen — die Verkleinerung backt die Textur auf die neue Topologie
