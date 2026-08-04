@@ -59,7 +59,10 @@
         0
       ],
       "quality_threshold": 0.3,
-      "preserve_boundary": "false",
+      "preserve_boundary": [
+        "9",
+        0
+      ],
       "preserve_normal": "true",
       "preserve_topology": "false",
       "planar_quadric": "false"
@@ -218,6 +221,29 @@
       "azimuths": "0,90,180,270,0,0",
       "elevations": "0,0,0,0,90,-90",
       "add_shading": false
+    }
+  },
+  "8": {
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_keep_borders"
+    },
+    "inputs": {
+      "value": "true"
+    }
+  },
+  "9": {
+    "class_type": "StringListToCombo",
+    "_meta": {
+      "title": "keep_borders → combo"
+    },
+    "inputs": {
+      "string": [
+        "8",
+        0
+      ],
+      "separator": ",",
+      "index": 0
     }
   }
 }
