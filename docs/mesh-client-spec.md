@@ -233,7 +233,25 @@ Vertex-Farben, siehe 3.3): der Job scheitert dann mit
 
 Parameter: `input_mesh_path` (Pflicht — das Mesh selbst, siehe unten),
 `input_name`, `input_face_num` (Default **5000**), `input_texture_resolution`
-(Default 1024), `input_no_fingers` (nur Durchreichung, hier ohne Wirkung).
+(Default 1024), **`input_keep_borders`** (Default `"true"`, als String — siehe
+unten), `input_no_fingers` (nur Durchreichung, hier ohne Wirkung).
+
+**`input_keep_borders` entscheidet über Reduktion vs. Formtreue** und ist die
+wichtigste Stellschraube dieses Alias:
+
+* `"true"` (Default) — Randkanten bleiben erhalten. Bei kompakten, geschlossenen
+  Objekten wird die Zielzahl trotzdem exakt getroffen. Bei Meshes aus vielen
+  getrennten Flächen (**Vegetation**: Bäume, Büsche, Gras) verhindert es die
+  Reduktion weitgehend — das Ergebnis bleibt groß, aber **unversehrt**.
+* `"false"` — erzwingt die Zielzahl. Nur für Meshes verwenden, die eine
+  zusammenhängende Oberfläche haben. Bei Vegetation zerfallen die Blattflächen
+  zu losen, verdrehten Dreiecks-Splittern; das ist nicht reparierbar, weil die
+  Flächen dabei zerstört und nicht nur vereinfacht werden.
+
+**Für Bäume und ähnliche Geometrie gilt darum:** nicht nachträglich verkleinern,
+sondern die Polygonzahl gleich bei der Erzeugung über `input_face_num` des
+`img2mesh`-Alias begrenzen. Ein Mesh aus tausenden Einzelflächen lässt sich
+nicht auf einen Bruchteil reduzieren, ohne diese Flächen zu verlieren.
 
 Das Eingangs-Mesh kommt als **Datei im Request** — unter `files`, nicht in
 `params`:
