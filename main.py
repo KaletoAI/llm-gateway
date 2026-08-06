@@ -2111,6 +2111,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     deadline = time.monotonic() + async_park_timeout_s
     tried: set = set()                       # stage-1 backends that failed with a connection error
     skip_reason = None
+    gen_attempts = 0                         # generate() calls across candidates + self-retries
     while True:
         cur = await asyncio.to_thread(jobs.get, job_id)
         if not cur or cur.get("status") not in ("queued", "running"):
@@ -2246,7 +2247,24 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 upload_files=dict(upload_files or {}),
                 upload_prefix=_upload_prefix(job_id, "s1"),
                 loras=body.get("loras"), slot_held=True)
-            out1 = await adapter.generate(req1)
+            # runbook B: retry a sporadic fault on the SAME backend first — the held
+            # slot (`held`) spans the repeats; the last attempt re-raises into the
+            # existing stage-1 failover (next candidate via `tried`).
+            s1_tries = 1 + max(0, int(backend.get("self_retries") or 0))
+            for s1_attempt in range(1, s1_tries + 1):
+                gen_attempts += 1
+                try:
+                    out1 = await adapter.generate(req1)
+                    _record_gen_attempt(bid, conn_fail=False)
+                    break
+                except _GEN_FAILOVER_ERRORS as e:
+                    if s1_attempt >= s1_tries:
+                        raise                # outer handler records + fails over
+                    _record_gen_attempt(bid, conn_fail=True)
+                    logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
+                                   f"connection issue ({type(e).__name__}: {e}) — retrying "
+                                   f"same backend (self-retry {s1_attempt}/{s1_tries - 1})")
+                    await _wait_backend_up(backend)
             # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
             # PNG — the mesh/texturing stage bakes it; the UniRig fbx only references its
             # texture) travel from stage 1 into the final delivery.
@@ -2312,9 +2330,13 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 bypass=(s2.get("bypass") or []), slot_held=True)
             await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
             await _unload_host_llms(backend2)
+            gen_attempts += 1
             out2 = await adapter2.generate(req2)
+            _record_gen_attempt(bid2, conn_fail=False)
             blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
             meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
+            if gen_attempts > 2:             # a clean chain is exactly 2 generate() calls
+                meta["attempts"] = gen_attempts
             if cross:
                 meta["chain_backends"] = [backend["name"], backend2["name"]]
             if chain_rig:                                # validate the COMBINED delivery at chain level
@@ -2333,9 +2355,11 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             asyncio.create_task(_free_comfy_vram(active, "chain done"))
             return
         except _GEN_FAILOVER_ERRORS as e:
+            _record_gen_attempt(backend_id(active), conn_fail=True)
             if s1_done:                              # mesh already relayed — a stage-2 loss is final
                 logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}")
+                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
+                                        {"attempts": gen_attempts} if gen_attempts > 2 else None)
                 asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                 return
             logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] connection issue "
@@ -2345,7 +2369,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             continue
         except Exception as e:
             logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-            await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}")
+            await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
+                                    {"attempts": gen_attempts} if gen_attempts > 2 else None)
             asyncio.create_task(_free_comfy_vram(active, "chain failure"))
             return
         finally:
