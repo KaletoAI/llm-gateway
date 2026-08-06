@@ -849,11 +849,16 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
                      placeholder="600", typ="number"))
             + _field("stuck after s", _inp("stuck_after_s", g("stuck_after_s"),
                      placeholder="90", typ="number"))
+            + _field("self retries", _inp("self_retries", g("self_retries"),
+                     placeholder="0", typ="number"))
             + "<p class='hint' style='margin:-4px 0 10px'>Executor watchdog (comfyui only): the "
               "backend goes <b>down</b> when prompts wait while nothing runs for <b>stuck after s</b> "
               "seconds. <b>auto_restart</b> then reboots the service via the ComfyUI-Manager "
               "extension (requires it installed + a systemd unit with <code>Restart=always</code>), "
-              "at most once per <b>restart cooldown s</b>.</p>"
+              "at most once per <b>restart cooldown s</b>. <b>self retries</b>: a connection-type "
+              "fault mid-job retries the <b>same</b> backend this many times (after waiting for "
+              "<code>/system_stats</code>) before failing over — for hosts with sporadic driver "
+              "faults. Blank/0 = fail over immediately; content errors are never retried.</p>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
             + _field("discovery filters",
@@ -1119,12 +1124,12 @@ async def backend_save(request: Request):
             b[flag] = True
         else:
             b.pop(flag, None)
-    for nkey in ("restart_cooldown_s", "stuck_after_s"):
+    for nkey in ("restart_cooldown_s", "stuck_after_s", "self_retries"):
         v = (f.get(nkey, "") or "").strip()
         if v.isdigit() and int(v) > 0:
             b[nkey] = int(v)
         else:
-            b.pop(nkey, None)                  # blank = watchdog defaults (90 / 600)
+            b.pop(nkey, None)                  # blank = defaults (90 / 600 / no self-retry)
     renamed = 0
     if orig and (oname != name or otype != new_type):
         store.delete_backend(oname, otype)      # identity changed (rename / type change)
