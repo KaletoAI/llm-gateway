@@ -232,10 +232,17 @@ def set_backend(job_id: str, backend: str) -> None:
                   (backend, int(time.time()), job_id))
 
 
-def fail(job_id: str, error: str) -> None:
+def fail(job_id: str, error: str, meta: Optional[dict] = None) -> None:
+    """Mark failed. Optional `meta` (e.g. {"attempts": 2} from a self-retried
+    generation) is merged into meta_json — a retried-and-still-failed job must
+    show its attempt count, or retries would mask the fault rate."""
     with _conn() as c:
-        c.execute("UPDATE jobs SET status='failed', error=?, stage=NULL, updated=? WHERE id=?",
-                  (str(error), int(time.time()), job_id))
+        sets = "status='failed', error=?, stage=NULL, updated=?"
+        args: list = [str(error), int(time.time())]
+        if meta:
+            sets += ", meta_json=?"
+            args.append(json.dumps({**_read_meta(c, job_id), **meta}))
+        c.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*args, job_id))
 
 
 def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:

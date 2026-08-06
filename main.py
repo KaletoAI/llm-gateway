@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import re
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -1857,6 +1858,57 @@ async def _job_view(job_id: str, request: Request) -> dict:
 # execution → RuntimeError) does not — it would fail identically elsewhere.
 _GEN_FAILOVER_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError,
                         ConnectionError, TimeoutError)
+
+
+# ── Per-backend rolling generation fail-rate (runbook C) ────────────────────────
+# bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
+# purpose (a gateway restart resets the sample — fine) and module-global so
+# adapter rebinds on config hot-reload don't lose it. Display-only: NEVER used
+# to drop a backend from rotation (routing control stays priority / runbook A1).
+backend_gen_window: dict = {}
+_GEN_WINDOW_N = 50            # last N attempts …
+_GEN_WINDOW_S = 86400         # … no older than 24 h
+
+
+def _record_gen_attempt(bid: str, conn_fail: bool) -> None:
+    """Count one generate() attempt: every attempt lands in the window;
+    `conn_fail` marks connection-type aborts (_GEN_FAILOVER_ERRORS). Content
+    errors count as attempts, not as faults."""
+    dq = backend_gen_window.setdefault(bid, deque(maxlen=_GEN_WINDOW_N))
+    dq.append((time.time(), bool(conn_fail)))
+
+
+def _gen_fail_stats(bid: str) -> Optional[dict]:
+    """{fail_rate, gen_fails, gen_attempts} over the window, or None without data."""
+    dq = backend_gen_window.get(bid)
+    if not dq:
+        return None
+    cutoff = time.time() - _GEN_WINDOW_S
+    total = fails = 0
+    for ts, cf in dq:
+        if ts >= cutoff:
+            total += 1
+            fails += 1 if cf else 0
+    if not total:
+        return None
+    return {"fail_rate": round(fails / total, 2), "gen_fails": fails,
+            "gen_attempts": total}
+
+
+async def _wait_backend_up(backend: dict, timeout_s: float = 30.0) -> None:
+    """Give a crashed-and-systemd-restarting ComfyUI time to come back before a
+    self-retry: poll /system_stats until it answers (or timeout_s passes). Never
+    raises — a still-down backend just makes the retry fail fast into failover."""
+    url = (backend.get("url") or "").rstrip("/")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2.0)
+        try:
+            r = await http_client.get(f"{url}/system_stats", timeout=5.0)
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
 
 
 def _host_flag(host: str, key: str, default: bool) -> bool:
