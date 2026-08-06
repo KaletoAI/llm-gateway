@@ -2993,15 +2993,21 @@ def dashboard_snapshot() -> dict:
 
 
 def _comfy_watch_info(b: dict) -> dict:
-    """Executor-watchdog fields for comfy backends (merged into /health + UI snapshot)."""
+    """Executor-watchdog + rolling fail-rate fields for comfy backends (merged
+    into /health + UI snapshot). fail_rate is display-only (runbook C): the
+    operator decides — routing control stays priority (A1)."""
     if b.get("type") != "comfyui":
         return {}
+    info: dict = {}
+    fs = _gen_fail_stats(backend_id(b))
+    if fs:
+        info.update(fs)
     ad = backend_adapters.get(backend_id(b))
-    if ad is None:
-        return {}
-    return {"exec_stuck": bool(getattr(ad, "exec_stuck", False)),
-            "last_restart": int(ad.last_restart) if getattr(ad, "last_restart", 0.0) else None,
-            "last_restart_result": getattr(ad, "last_restart_result", "") or None}
+    if ad is not None:
+        info.update({"exec_stuck": bool(getattr(ad, "exec_stuck", False)),
+                     "last_restart": int(ad.last_restart) if getattr(ad, "last_restart", 0.0) else None,
+                     "last_restart_result": getattr(ad, "last_restart_result", "") or None})
+    return info
 
 
 def gateway_info() -> dict:
