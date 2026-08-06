@@ -1967,33 +1967,65 @@ async def _unload_host_llms(backend: dict) -> None:
 
 async def _run_job(job_id: str, candidates: list, build_req) -> None:
     """Run a generation job, failing over to the next candidate on connection-type
-    errors. Content errors are final (not retried). Stops at the first success."""
+    errors. A backend with `self_retries: n` gets n extra attempts on ITSELF first
+    (runbook B: for sporadic driver faults the same host is the cheapest second
+    try — no model re-load elsewhere, same success odds as attempt one). Its ONE
+    job slot is held across the repeats, so no parked job slips in between.
+    Content errors are final (not retried). Stops at the first success."""
     await asyncio.to_thread(jobs.set_status, job_id, "running")
     last = None
+    attempts = 0
     for backend, cand in candidates:
-        adapter = backend_adapters.get(backend_id(backend))
+        bid = backend_id(backend)
+        adapter = backend_adapters.get(bid)
         if adapter is None:
             continue
+        tries = 1 + max(0, int(backend.get("self_retries") or 0))
+        _inflight_inc(bid)                     # hold ONE slot across all self-retries
         try:
-            await _unload_host_llms(backend)         # opt-in host policy, no-op by default
-            out = await adapter.generate(build_req(backend, cand))
-            await asyncio.to_thread(jobs.complete, job_id, out.blobs, out.meta)
-            if log_per_call:
-                logger.info(f"✓ job {job_id} done on [{backend['name']}] — {len(out.blobs)} artifact(s)")
-            asyncio.create_task(_free_comfy_vram(backend, "job done"))
-            return
-        except _GEN_FAILOVER_ERRORS as e:
-            logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
-                           f"({type(e).__name__}: {e}) — failing over")
-            last = e
-            continue
-        except Exception as e:
-            logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {e}")
-            await asyncio.to_thread(jobs.fail, job_id, str(e))
-            asyncio.create_task(_free_comfy_vram(backend, "job failure"))
-            return
+            for attempt in range(1, tries + 1):
+                attempts += 1
+                try:
+                    await _unload_host_llms(backend)   # opt-in host policy, no-op by default
+                    req = build_req(backend, cand)
+                    req.slot_held = True               # we hold it — generate() must not double-count
+                    out = await adapter.generate(req)
+                    _record_gen_attempt(bid, conn_fail=False)
+                    meta = dict(out.meta or {})
+                    if attempts > 1:
+                        meta["attempts"] = attempts    # retries must stay visible (runbook B)
+                    await asyncio.to_thread(jobs.complete, job_id, out.blobs, meta)
+                    if log_per_call:
+                        logger.info(f"✓ job {job_id} done on [{backend['name']}] — "
+                                    f"{len(out.blobs)} artifact(s)"
+                                    + (f" after {attempts} attempts" if attempts > 1 else ""))
+                    asyncio.create_task(_free_comfy_vram(backend, "job done"))
+                    return
+                except _GEN_FAILOVER_ERRORS as e:
+                    _record_gen_attempt(bid, conn_fail=True)
+                    last = e
+                    if attempt < tries:
+                        logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
+                                       f"({type(e).__name__}: {e}) — retrying same backend "
+                                       f"(self-retry {attempt}/{tries - 1})")
+                        await _wait_backend_up(backend)
+                        continue
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
+                                   f"({type(e).__name__}: {e}) — failing over")
+                except Exception as e:
+                    # content error (ComfyUI validation/execution) — final, never retried:
+                    # it would fail identically on any attempt and any backend.
+                    _record_gen_attempt(bid, conn_fail=False)
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {e}")
+                    await asyncio.to_thread(jobs.fail, job_id, str(e),
+                                            {"attempts": attempts} if attempts > 1 else None)
+                    asyncio.create_task(_free_comfy_vram(backend, "job failure"))
+                    return
+        finally:
+            _inflight_dec(bid)
     await asyncio.to_thread(jobs.fail, job_id,
-                            f"all candidate backends unreachable (connection): {last}")
+                            f"all candidate backends unreachable (connection): {last}",
+                            {"attempts": attempts} if attempts > 1 else None)
 
 
 async def _wait_and_hold(backend: dict, job_id: str, label: str) -> bool:
