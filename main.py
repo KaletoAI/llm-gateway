@@ -1980,7 +1980,10 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
         adapter = backend_adapters.get(bid)
         if adapter is None:
             continue
-        tries = 1 + max(0, int(backend.get("self_retries") or 0))
+        try:
+            tries = 1 + max(0, int(backend.get("self_retries") or 0))
+        except (TypeError, ValueError):
+            tries = 1                          # malformed config value → no self-retry
         _inflight_inc(bid)                     # hold ONE slot across all self-retries
         try:
             for attempt in range(1, tries + 1):
@@ -2012,6 +2015,7 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
                         continue
                     logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
                                    f"({type(e).__name__}: {e}) — failing over")
+                    asyncio.create_task(_free_comfy_vram(backend, "job failover"))
                 except Exception as e:
                     # content error (ComfyUI validation/execution) — final, never retried:
                     # it would fail identically on any attempt and any backend.

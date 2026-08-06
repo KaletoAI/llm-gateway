@@ -1129,7 +1129,7 @@ async def backend_save(request: Request):
         if v.isdigit() and int(v) > 0:
             b[nkey] = int(v)
         else:
-            b.pop(nkey, None)                  # blank = defaults (90 / 600 / no self-retry)
+            b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry)
     renamed = 0
     if orig and (oname != name or otype != new_type):
         store.delete_backend(oname, otype)      # identity changed (rename / type change)
