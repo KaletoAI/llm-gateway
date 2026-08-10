@@ -967,7 +967,9 @@ async def backends_page(request: Request):
         rst = f" · restart: {b['last_restart_result']}" if b.get("last_restart_result") else ""
         fr = (f" · fail_rate {b['fail_rate']:.2f} ({b['gen_fails']}/{b['gen_attempts']})"
               if b.get("fail_rate") is not None else "")
-        sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{fr}{rst}{src}"
+        smp = (f" · sampling {_sampling_text(b['sampling_defaults'])}"
+               if b.get("sampling_defaults") else "")
+        sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{smp}{fr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Image (comfyui), alphabetical within each

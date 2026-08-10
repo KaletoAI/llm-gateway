@@ -2995,6 +2995,7 @@ def dashboard_snapshot() -> dict:
             "max_concurrent": backend_max_concurrent(b),
             "models": len(backend_models.get(bid, set())),
             "reqs_1h": src_1h.get(b["name"], 0),
+            "sampling_defaults": b.get("sampling_defaults") or None,
         })
     is_comfy = lambda b: b.get("type") == "comfyui"
     return {
@@ -3048,6 +3049,7 @@ def gateway_info() -> dict:
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "route_speed": bool(b.get("route_speed")),
+            "sampling_defaults": b.get("sampling_defaults") or None,
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
