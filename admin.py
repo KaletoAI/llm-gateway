@@ -395,9 +395,12 @@ def _task_select(current: str = "text2img", onchange: str = "") -> str:
     return f'<select name="task"{oc}>{body}</select>'
 
 
-def _inp(name: str, value="", placeholder: str = "", typ: str = "text") -> str:
+def _inp(name: str, value="", placeholder: str = "", typ: str = "text", step: str = "") -> str:
+    # `step` only matters for type=number: without step="any" a browser rejects
+    # decimals like 0.85 (the implicit step is 1).
+    st = f' step="{_esc(step)}"' if step else ""
     return (f'<input type="{typ}" name="{_esc(name)}" value="{_esc(value)}" '
-            f'placeholder="{_esc(placeholder)}">')
+            f'placeholder="{_esc(placeholder)}"{st}>')
 
 
 def _textarea(name: str, value="", rows: int = 3, placeholder: str = "") -> str:
@@ -900,15 +903,17 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "fastest-first by measured throughput (tok/s) instead of priority — one switch for the "
               "whole catalog (hundreds of ids). Chat aliases are unaffected (they keep their own per-alias "
               "routing). A <code>backend/model</code> pin still forces this backend.</p>"
-            + _field("sampling defaults",
-                     _textarea("sampling_defaults", _sampling_text((b or {}).get("sampling_defaults")),
-                               2, '{"temperature": 0.85, "min_p": 0.05}'))
-            + "<p class='hint'><b>sampling defaults</b>: JSON object filled into every chat request to "
+            + f'<details class="optblock"{" open" if (b or {}).get("sampling_defaults") else ""}>'
+            + "<summary>Sampling defaults <span class='muted'>— used when the caller sends none"
+              "</span></summary>"
+            + _sampling_inputs((b or {}).get("sampling_defaults"))
+            + "<p class='hint'><b>sampling defaults</b>: values filled into every chat request to "
               "this backend, for keys the caller did <b>not</b> send (an explicit client value — and an "
               "alias default — always wins). For backends whose server samples with bare defaults: vLLM "
               "without a truncation sampler (<code>top_p=1</code>, <code>min_p=0</code>) degenerates into "
               "token salad at temperature ≈ 1. Re-derived per backend, so a failover uses the new "
               "backend's values. Applies to chat/completions/responses only.</p>"
+            + "</details>"
             + "</div></form>")
 
 
@@ -1137,22 +1142,80 @@ async def host_save(request: Request):
 _SAMPLING_BLOCKED = ("model", "messages", "stream", "stream_options")
 
 
-def _parse_sampling(raw: str) -> tuple:
-    """Parse a sampling-defaults JSON object from a form field.
-    Returns (values, error) — a non-empty error means reject the save."""
-    s = (raw or "").strip()
+# The samplers that get their own named input (label, placeholder). Everything
+# else — logit_bias, stop, typical_p, a backend's private knob — goes into the
+# free-form "more" JSON box, so no backend sampler is out of reach.
+_SAMPLING_FIELDS = (
+    ("temperature", "0.85"),
+    ("top_p", "0.9"),
+    ("top_k", "40"),
+    ("min_p", "0.05"),
+    ("repetition_penalty", "1.05"),
+    ("presence_penalty", "0"),
+    ("frequency_penalty", "0"),
+)
+
+
+def _sampling_num(raw: str):
+    """A single sampler input → number (or None if blank). Accepts a German
+    decimal comma. Returns (value, error)."""
+    s = (raw or "").strip().replace(",", ".")
     if not s:
-        return {}, ""
+        return None, ""
     try:
-        d = json.loads(s)
-    except Exception as e:
-        return {}, f"sampling defaults: invalid JSON ({e})"
-    if not isinstance(d, dict):
-        return {}, 'sampling defaults: must be a JSON object, e.g. {"temperature": 0.85}'
-    bad = [k for k in d if k in _SAMPLING_BLOCKED or k.startswith("_")]
-    if bad:
-        return {}, f"sampling defaults: these keys are not allowed: {', '.join(sorted(bad))}"
-    return d, ""
+        v = json.loads(s)
+    except Exception:
+        return None, f"'{s}' is not a number"
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None, f"'{s}' is not a number"
+    return v, ""
+
+
+def _parse_sampling_form(f: dict, prefix: str = "smp_") -> tuple:
+    """Read the sampling defaults out of a submitted form: one named input per
+    common sampler plus a free-form JSON box for the rest.
+    Returns (values, error) — a non-empty error means reject the save."""
+    out: dict = {}
+    for key, _ph in _SAMPLING_FIELDS:
+        v, err = _sampling_num(f.get(prefix + key, ""))
+        if err:
+            return {}, f"sampling defaults · {key}: {err}"
+        if v is not None:
+            out[key] = v
+    raw = (f.get(prefix + "more", "") or "").strip()
+    if raw:
+        try:
+            d = json.loads(raw)
+        except Exception as e:
+            return {}, f"sampling defaults · more: invalid JSON ({e})"
+        if not isinstance(d, dict):
+            return {}, 'sampling defaults · more: must be a JSON object, e.g. {"typical_p": 0.95}'
+        bad = [k for k in d if k in _SAMPLING_BLOCKED or k.startswith("_")]
+        if bad:
+            return {}, f"sampling defaults · more: these keys are not allowed: {', '.join(sorted(bad))}"
+        dup = [k for k in d if k in dict(_SAMPLING_FIELDS)]
+        if dup:
+            return {}, (f"sampling defaults · more: {', '.join(sorted(dup))} "
+                        "has its own field above — set it there, not in the JSON box")
+        out.update(d)
+    return out, ""
+
+
+def _sampling_inputs(cur, prefix: str = "smp_") -> str:
+    """Render the sampler inputs, pre-filled from a stored dict. Unknown keys
+    (anything without its own field) land in the 'more' JSON box."""
+    d = cur if isinstance(cur, dict) else {}
+    known = dict(_SAMPLING_FIELDS)
+    rows = "".join(
+        _field(key.replace("_", " "),
+               _inp(prefix + key, d.get(key, ""), placeholder=ph, typ="number", step="any"),
+               short=True)
+        for key, ph in _SAMPLING_FIELDS)
+    rest = {k: v for k, v in d.items() if k not in known}
+    return rows + _field("more (JSON)",
+                         _textarea(prefix + "more",
+                                   json.dumps(rest, ensure_ascii=False) if rest else "", 2,
+                                   '{"typical_p": 0.95, "stop": ["###"]}'))
 
 
 async def backend_save(request: Request):
@@ -1204,7 +1267,7 @@ async def backend_save(request: Request):
             b[nkey] = int(v)
         else:
             b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry)
-    sd, sd_err = _parse_sampling(f.get("sampling_defaults", ""))
+    sd, sd_err = _parse_sampling_form(f)
     if sd_err:
         return HTMLResponse(_page("Backends", f'<p class="bad">{_esc(sd_err)}</p>'
             f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
@@ -1651,10 +1714,8 @@ def _chat_editor(alias: str) -> str:
     smp_field = (
         f'<details class="optblock"{" open" if cur_smp else ""}>'
         "<summary>Sampling defaults <span class='muted'>— client &gt; alias &gt; backend</span></summary>"
-        + _field("sampling defaults",
-                 _textarea("sampling", _sampling_text(cur_smp), 2,
-                           '{"temperature": 0.85, "min_p": 0.05}'))
-        + "<p class='hint' style='margin:-4px 0 10px'>JSON object filled into requests on this alias, "
+        + _sampling_inputs(cur_smp)
+        + "<p class='hint' style='margin:-4px 0 10px'>Filled into requests on this alias, "
           "for keys the client did <b>not</b> send. Precedence: client &gt; alias &gt; the serving "
           "backend's own <a href='/ui/backends'>sampling defaults</a> (an alias value overrides the "
           "backend's for that key; the backend's other keys still apply). "
@@ -1709,7 +1770,7 @@ async def chat_save(request: Request):
     park_s = (f.get("park_s", "") or "").strip()
     rsn = (f.get("reasoning", "") or "").strip()
     rmode = (f.get("route_mode", "") or "").strip()
-    smp, smp_err = _parse_sampling(f.get("sampling", ""))
+    smp, smp_err = _parse_sampling_form(f)
     if smp_err:
         return HTMLResponse(_page("Chat aliases", f'<p class="bad">{_esc(smp_err)}</p>'
             f'<div class="actions">{_btn("← Back", "/ui/mapping", "secondary")}</div>', "routing"))

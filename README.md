@@ -229,19 +229,24 @@ OpenWebUI, the `/ui` Chat Playground with its fields left blank — hit exactly
 that.
 
 Both a **backend** (Backends tab) and a **chat alias** (chat-alias editor) can
-carry a JSON object of defaults, filled into a request only for keys the caller
-did **not** send:
+carry defaults, filled into a request only for keys the caller did **not** send.
+The editors show one input per common sampler — `temperature`, `top_p`, `top_k`,
+`min_p`, `repetition_penalty`, `presence_penalty`, `frequency_penalty` — plus a
+**more (JSON)** box for anything else a backend understands (`typical_p`,
+`stop`, `logit_bias`, …). A decimal comma is accepted; a key that has its own
+input is rejected in the JSON box, so a value can never be set twice.
 
-```jsonc
-// Backend "Infermatic"
-{"temperature": 0.85, "min_p": 0.05}
-// Chat alias "rp-kreativ"
-{"temperature": 1.0}
+Stored shape (this is also the `config.yaml` form on a backend):
+
+```yaml
+# Backend "Infermatic"
+sampling_defaults: {temperature: 0.85, min_p: 0.05}
 ```
 
-**Precedence: client > alias > backend.** In the example a request without
-sampling parameters on `rp-kreativ` runs at `temperature` 1.0 (alias) plus
-`min_p` 0.05 (backend); a client sending `temperature: 0.2` keeps 0.2.
+**Precedence: client > alias > backend.** With the backend above and an alias
+carrying `temperature: 1.0`, a request that sends no sampling parameters runs at
+`temperature` 1.0 (alias) plus `min_p` 0.05 (backend); a client sending
+`temperature: 0.2` keeps 0.2.
 
 Any key is allowed except `model`, `messages`, `stream`, `stream_options` and
 anything starting with `_` — those drive routing, streaming and the reasoning
