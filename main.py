@@ -3186,6 +3186,11 @@ def server_info() -> dict:
             "model_prefix": bool(model_prefix),
             "max_concurrent": max_concurrent_default,
             "health_check_interval": health_check_interval,
+            # park knobs must be echoed back — the Server tab renders the form from
+            # `effective`, so a key missing here shows blank and a Save writes "" over
+            # the stored value (apply then drops it → the setting looks unsaveable).
+            "park_timeout_s": int(park_timeout_s) if park_timeout_s == int(park_timeout_s) else park_timeout_s,
+            "max_parked": max_parked,
             "port": (config or {}).get("port", 4000),
             "stats_enabled": bool(stats_cfg.get("enabled")),
             "stats_db_path": stats_cfg.get("db_path", "stats.db"),
