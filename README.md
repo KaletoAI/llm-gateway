@@ -218,6 +218,42 @@ sent. Busy state shows in `/health` and the Routing tab.
 | `chat_only` | keep only `type == "chat"` models (drops image/video/embedding). Understands Together's `type` and OpenRouter's `architecture.output_modalities`. Backends without those fields (llama-swap, vLLM) are unaffected — so **don't** set it on a backend whose embedding models you want routable. |
 | `serverless_only` | keep only models with non-zero pricing (Together's dedicated-only models are `0/0`; on OpenRouter this also drops `:free`). |
 
+### Sampling defaults (`sampling_defaults`)
+
+Some backends sample with bare server defaults when a request carries no sampling
+parameters. vLLM without a truncation sampler (`top_p=1`, `top_k=-1`, `min_p=0`)
+at temperature ≈ 1 will emit token salad — foreign-script and code fragments
+spliced into the text (measured on an FP8 70B: 1.6–3.5 % non-Latin characters,
+0 % with `min_p: 0.05` or `temperature: 0.85`). Clients that send nothing —
+OpenWebUI, the `/ui` Chat Playground with its fields left blank — hit exactly
+that.
+
+Both a **backend** (Backends tab) and a **chat alias** (chat-alias editor) can
+carry a JSON object of defaults, filled into a request only for keys the caller
+did **not** send:
+
+```jsonc
+// Backend "Infermatic"
+{"temperature": 0.85, "min_p": 0.05}
+// Chat alias "rp-kreativ"
+{"temperature": 1.0}
+```
+
+**Precedence: client > alias > backend.** In the example a request without
+sampling parameters on `rp-kreativ` runs at `temperature` 1.0 (alias) plus
+`min_p` 0.05 (backend); a client sending `temperature: 0.2` keeps 0.2.
+
+Any key is allowed except `model`, `messages`, `stream`, `stream_options` and
+anything starting with `_` — those drive routing, streaming and the reasoning
+hand-off, and are rejected when you save. Values may be scalars, lists (`stop`)
+or objects (`logit_bias`).
+
+Applies to `/v1/chat/completions`, `/v1/completions` and `/v1/responses` only —
+not `/v1/embeddings`, not `/v1/audio/*`, not generation. The backend stage is
+derived **per backend**, so a failover uses the values of the backend that
+actually serves the call. The forwarded body is what gets logged, so the
+**LLM Calls** tab shows exactly which values went out.
+
 ### Alias / model-name collisions
 
 Naming an alias the same as a real model id *shadows* that model. `/health`'s

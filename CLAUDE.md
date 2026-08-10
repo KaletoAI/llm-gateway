@@ -184,7 +184,16 @@ receive what they need via injected callables, staying hot-reload-safe.
   other HTTP error statuses return as-is. The adapter opens the upstream stream
   BEFORE answering, so streamed upstream errors carry their real status too. All busy → **park by default** (FIFO queue, per-alias `park_s`)
   until a backend frees, else 503; no client field. Before dispatch,
-  `_normalize_reasoning()` folds the client `reasoning`/`reasoning_effort` control
+  **sampling defaults** are folded in two stages whose ORDER is the precedence
+  (client > alias > backend; each stage only fills keys that are still absent):
+  `_apply_alias_sampling()` in `route()`/`/v1/responses` applies the alias's
+  `alias_sampling` (store settings, cached in `main.alias_sampling`), then
+  `adapters._prepare()` applies the backend's `sampling_defaults` — there, so it
+  is derived PER BACKEND and a failover re-derives it. Text endpoints only (never
+  embeddings/audio). Rationale: a backend whose server samples with bare defaults
+  (vLLM, no truncation sampler, temp ≈ 1) degenerates into token salad when a
+  client sends no sampling params — measured 2026-08-10 on Infermatic/Anubis-70B.
+  Also before dispatch, `_normalize_reasoning()` folds the client `reasoning`/`reasoning_effort` control
   to `off|on|None` and stashes it in `body["_reasoning"]`; the adapter strips all
   `_`-prefixed keys and runs `apply_reasoning` **per backend** on a copy of the
   body (so failover re-derives it). `/v1/responses` translates bodies and shares
