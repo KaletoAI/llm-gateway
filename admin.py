@@ -266,6 +266,10 @@ table.recent{font-size:12px}
 table.sortable th{cursor:pointer;user-select:none}
 table.sortable th:hover{color:#dfe6ee}
 table.sortable th .sind{margin-left:4px;color:#5fb8c8;font-size:10px}
+details.optblock{border:1px solid #242a33;border-radius:8px;padding:6px 10px;margin:0 0 12px}
+details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:#8b97a4;padding:2px 0}
+details.optblock>summary:hover{color:#cdd6e0}
+details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129;padding-bottom:6px}
 """
 
 
@@ -290,19 +294,30 @@ _SCROLL_JS = ("<script>(function(){"
 # number sorts numerically, otherwise lexically). The choice persists per table in
 # sessionStorage and is re-applied on load — so it survives the dashboard's 4s
 # auto-refresh. Tables with `data-sk` get a stable key; others key off path+index.
+# Grouped tables (a `tr.grp` header row followed by its member rows — the routing
+# views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
+# key for column 0 (it is the alias name), later columns key off the first member row.
 _SORT_JS = ("<script>(function(){"
             "function num(td){var t=(td.textContent||'').trim().replace(/[$,\\s]/g,'');"
             "return /^-?\\d+(\\.\\d+)?$/.test(t)?parseFloat(t):null;}"
             "function ind(th,a){var s=th.querySelector('.sind');"
             "if(!s){s=document.createElement('span');s.className='sind';th.appendChild(s);}"
             "s.textContent=a||'';}"
-            "function sortIt(tbl,idx,dir){var hdr=tbl.rows[0];"
-            "var rows=[].slice.call(tbl.rows).filter(function(r){return r!==hdr&&!r.querySelector('th');});"
-            "rows.sort(function(a,b){var x=a.cells[idx],y=b.cells[idx];if(!x||!y)return 0;"
+            "function blocks(tbl,hdr){var out=[],cur=null;"
+            "[].slice.call(tbl.rows).forEach(function(r){if(r===hdr||r.querySelector('th'))return;"
+            "if(/(^|\\s)grp(\\s|$)/.test(r.className)){cur={rows:[r],grp:r};out.push(cur);}"
+            "else if(cur){cur.rows.push(r);}else{out.push({rows:[r],grp:null});}});return out;}"
+            "function cellOf(b,idx){if(b.grp&&idx===0)return b.grp.cells[0];"
+            "for(var i=0;i<b.rows.length;i++){var r=b.rows[i];"
+            "if(r!==b.grp&&r.cells[idx])return r.cells[idx];}"
+            "return b.grp?b.grp.cells[0]:null;}"
+            "function sortIt(tbl,idx,dir){var hdr=tbl.rows[0];var bs=blocks(tbl,hdr);"
+            "bs.sort(function(a,b){var x=cellOf(a,idx),y=cellOf(b,idx);if(!x||!y)return 0;"
             "var nx=num(x),ny=num(y),r;if(nx!==null&&ny!==null)r=nx-ny;"
             "else r=(x.textContent||'').trim().toLowerCase().localeCompare((y.textContent||'').trim().toLowerCase());"
             "return dir<0?-r:r;});"
-            "var tb=tbl.tBodies[0]||tbl;rows.forEach(function(r){tb.appendChild(r);});"
+            "var tb=tbl.tBodies[0]||tbl;"
+            "bs.forEach(function(b){b.rows.forEach(function(r){tb.appendChild(r);});});"
             "var hs=hdr.cells;for(var i=0;i<hs.length;i++)ind(hs[i],i===idx?(dir<0?'\\u25bc':'\\u25b2'):'');}"
             "function key(tbl,i){return tbl.getAttribute('data-sk')||(location.pathname+'#'+i);}"
             "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
@@ -831,6 +846,9 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + _field("priority", _inp("priority", g("priority", "10"), typ="number"))
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
             + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
+            # ComfyUI-only options — hidden for openai (none of these apply to an LLM backend)
+            + f'<div id="comfyopts" style="{"" if g("type", "openai") == "comfyui" else "display:none"}">'
+            + '<div class="grouphdr">ComfyUI</div>'
             + _field("comfy output dir", _inp("comfy_output_dir", g("comfy_output_dir"),
                      placeholder="e.g. /home/kai/ComfyUI/output"))
             + "<p class='hint' style='margin:-4px 0 10px'>Absolute path to this ComfyUI's <b>output</b> "
@@ -859,8 +877,10 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "fault mid-job retries the <b>same</b> backend this many times (after waiting for "
               "<code>/system_stats</code>) before failing over — for hosts with sporadic driver "
               "faults. Blank/0 = fail over immediately; content errors are never retried.</p>"
+            + "</div>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
+            + '<div class="grouphdr">LLM</div>'
             + _field("discovery filters",
                      _checkbox("chat_only", gb("chat_only"), "chat_only",
                                "keep only models with type==chat (skip image/video/embedding)")
@@ -898,11 +918,14 @@ def _sampling_text(d) -> str:
 
 
 def _type_select(current: str) -> str:
-    """Backend type select that shows/hides the LLM-only options on change."""
+    """Backend type select that shows/hides the type-specific option blocks on change
+    (LLM-only vs ComfyUI-only — the form renders both, only one is ever visible)."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
                    for t in ("comfyui", "openai"))
-    return ('<select name="type" onchange="var e=document.getElementById(\'llmopts\');'
-            "if(e)e.style.display=this.value==='openai'?'':'none'\">" + opts + "</select>")
+    return ('<select name="type" onchange="var t=this.value,'
+            "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts');"
+            "if(l)l.style.display=t==='openai'?'':'none';"
+            "if(c)c.style.display=t==='comfyui'?'':'none'\">" + opts + "</select>")
 
 
 def _bid(b: dict) -> str:
@@ -972,12 +995,12 @@ async def backends_page(request: Request):
         sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{smp}{fr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
-    # group by kind: LLM (openai-compatible) vs Image (comfyui), alphabetical within each
+    # group by kind: LLM (openai-compatible) vs Media (comfyui), alphabetical within each
     binfo = sorted(binfo, key=lambda b: b["name"].lower())
     llm = [b for b in binfo if b.get("type", "openai") != "comfyui"]
     img = [b for b in binfo if b.get("type") == "comfyui"]
     items = ""
-    for label, group in (("LLM", llm), ("Image", img)):
+    for label, group in (("LLM", llm), ("Media", img)):
         if group:
             items += f'<div class="grouphdr">{label}</div>' + "".join(render(b) for b in group)
     items = items or "<p class='muted'>No backends.</p>"
@@ -1002,24 +1025,33 @@ async def backends_page(request: Request):
 
 
 def _hosts_panel(binfo: list, sel_host: str) -> str:
-    """Physical-box grouping under the backend list: one row per host with its
-    member backends. Membership is edited on the backend (its `host` field or the
-    URL IP); this panel edits the per-host extras — a label now, the shared-GPU
-    policy flags later (docs/host-coordination-plan.md)."""
+    """Physical-box grouping under the backend list: one row per **shared** host with
+    its member backends. Membership is edited on the backend (its `host` field or the
+    URL IP); this panel edits the per-host extras — a label and the shared-GPU policy
+    flags (docs/host-coordination-plan.md).
+
+    Only shared boxes (an LLM *and* a ComfyUI backend on the same GPU) are listed:
+    every policy here is about the two contending for VRAM, so a dedicated box has
+    nothing to decide. A host that still carries stored meta stays listed regardless,
+    so an old setting never becomes uneditable."""
     by_host: dict = {}
     for b in binfo:
         if b.get("host"):
             by_host.setdefault(b["host"], []).append(b)
-    if not by_host:
-        return ""
     meta = store.get_hosts() if store.is_active() else {}
+
+    def is_shared(members: list) -> bool:
+        types = {b.get("type", "openai") for b in members}
+        return "comfyui" in types and len(types) > 1
+    listed = [h for h, members in by_host.items() if is_shared(members) or meta.get(h)]
+    if not listed:
+        return ""
     rows = ""
-    for h in sorted(by_host):
+    for h in sorted(listed):
         hm = meta.get(h) or {}
         label = hm.get("label", "")
         members = " · ".join(f"{b['name']} ({b['type']})" for b in by_host[h])
-        types = {b.get("type", "openai") for b in by_host[h]}
-        shared = "comfyui" in types and len(types) > 1
+        shared = is_shared(by_host[h])
         tag = _badge("shared", "warn", "an LLM and a ComfyUI backend share this box (and its GPU/VRAM)") if shared else ""
         if hm.get("avoid_llm_during_media", True) is False:
             tag += " " + _badge("llm-avoid off", "warn",
@@ -1033,7 +1065,10 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
         acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
         title = f"{_esc(h)}{(' — ' + _esc(label)) if label else ''} {tag}"
         rows += _item(title, members, acts, sel=(h == sel_host))
-    return f'<div class="grouphdr" style="margin-top:18px">Hosts</div>{rows}'
+    return ('<div class="grouphdr" style="margin-top:18px">Hosts · shared GPU</div>'
+            "<p class='hint' style='margin:2px 0 6px'>Only boxes where an LLM and a ComfyUI backend "
+            "share the GPU — the policies below arbitrate their VRAM. Dedicated boxes need none of "
+            f"it and are not listed.</p>{rows}")
 
 
 def _host_form(host: str, shared: bool) -> str:
@@ -1264,7 +1299,7 @@ def _input_body() -> str:
             hosts = " ".join(f'<span class="badge muted">{_esc(bn)}</span>'
                              for bn in sorted(model_hosts[m]))
             mrows += f'<tr><td><code>{_esc(m)}</code></td><td>{hosts}</td></tr>'
-        models_tbl = (f'<table><tr><th>model id</th>'
+        models_tbl = (f'<table class="sortable" data-sk="input-models"><tr><th>model id</th>'
                       f'<th>on backends — call bare (priority) or <code>backend/id</code></th>'
                       f'</tr>{mrows}</table>')
     else:
@@ -1343,7 +1378,8 @@ def _models_table(models: list, show_mode: bool = False) -> str:
                 extra = f"<td class='acts'>{badge} {_btn(label, href, 'secondary', sm=True)}</td>"
         rows += f'<tr><td><code>{_esc(m["model"])}</code>{sh}</td><td>{chips}</td>{extra}</tr>'
     head = "<th>model</th><th>backends (priority order)</th>" + ("<th>routing</th>" if show_mode else "")
-    return (f'<table><tr>{head}</tr>{rows}</table>'
+    sk = "routing-llm-models" if show_mode else "routing-image-models"
+    return (f'<table class="sortable" data-sk="{sk}"><tr>{head}</tr>{rows}</table>'
             if rows else "<p class='muted'>none discovered yet</p>")
 
 
@@ -1369,7 +1405,8 @@ def _routing_chat_body(snap: dict) -> str:
             arows += (f'<tr><td>{_esc(r["backend"])}</td><td><code>{_esc(r["model"])}</code></td>'
                       f'<td>{prio}</td><td>{_route_status(r)}</td></tr>')
     html = ("<h2>Chat aliases → routes</h2>" + (
-        f'<table><tr><th>backend</th><th>model</th><th>priority</th><th>status</th></tr>{arows}</table>'
+        '<table class="sortable" data-sk="routing-chat"><tr><th>alias / backend</th><th>model</th>'
+        f'<th>priority</th><th>status</th></tr>{arows}</table>'
         if arows else "<p class='muted'>No chat aliases configured.</p>"))
     conf = snap.get("conflicts", [])
     if conf:
@@ -1383,7 +1420,8 @@ def _routing_chat_body(snap: dict) -> str:
                  "<p class='hint'>An alias named like a real model shadows it. <b>shadowed</b> "
                  "backends host that exact model id but the alias doesn't map them → unreachable "
                  "by that name.</p>"
-                 f'<table><tr><th>alias</th><th>covered</th><th>shadowed</th></tr>{crows}</table>')
+                 '<table class="sortable" data-sk="routing-conflicts">'
+                 f'<tr><th>alias</th><th>covered</th><th>shadowed</th></tr>{crows}</table>')
     return html
 
 
@@ -1400,7 +1438,8 @@ def _routing_gen_body(bmeta: dict) -> str:
                       f'<td>{bm.get("priority", "?") if bm else "?"}</td><td>{_img_status(bm)}</td></tr>')
     return ("<h2>Media Generation aliases → backends</h2>"
             "<p class='hint'>Tried in backend-priority order with failover (see Mapping).</p>"
-            + (f'<table><tr><th>backend</th><th>task</th><th>priority</th><th>status</th></tr>{grows}</table>'
+            + ('<table class="sortable" data-sk="routing-gen"><tr><th>alias / backend</th><th>task</th>'
+               f'<th>priority</th><th>status</th></tr>{grows}</table>'
                if grows else "<p class='muted'>No generation aliases configured.</p>"))
 
 
@@ -1429,7 +1468,8 @@ def _routing_loras_body(bmeta: dict) -> str:
             "subfolder prefixes — requests must match these strings exactly). "
             f"<span class='muted'>{counts}</span></p>"
             f"<div style='margin:6px 0 10px'>{search}</div>"
-            f"<table class='filterable'><tr><th>lora</th><th>on backends</th></tr>{rows}</table>"
+            "<table class='filterable sortable' data-sk='routing-loras'>"
+            f"<tr><th>lora</th><th>on backends</th></tr>{rows}</table>"
             + _FILTER_JS)
 
 
@@ -1588,23 +1628,38 @@ def _chat_editor(alias: str) -> str:
                      "measured throughput (tok/s, shown in <a href='/ui/routing?sub=llm'>LLM models</a> "
                      "and <code>/health</code>), priority as the tiebreak; unmeasured backends are probed "
                      "first. Failover order follows the same ranking.</p>")
+    # Voice defaults are TTS-only and irrelevant for the vast majority of chat aliases,
+    # so they collapse out of the way — folded open only when this alias has them set.
+    # (They live here, not with the media aliases: /v1/audio/speech routes through a
+    # CHAT alias on an openai-type backend, not through the generation store.)
     cur_voice = store.get_alias_voice().get(alias) or {}
-    voice_field = (_field("voice default", _inp("voice_ref", cur_voice.get("voice", ""),
-                          placeholder="backend-side reference, e.g. voices/kai-ref.wav"))
-                   + _field("voice ref text", _inp("voice_ref_text", cur_voice.get("ref_text", ""),
-                          placeholder="exact transcript of the reference recording"))
-                   + "<p class='hint' style='margin:-4px 0 10px'>TTS defaults for <code>/v1/audio/speech</code> "
-                     "via this alias: filled in when the client sends no <code>voice</code>/<code>ref_text</code> "
-                     "(explicit client fields always win). Only relevant when the alias maps a TTS model — "
-                     "lets a client say just <code>model:\"kai\"</code> + <code>input</code>.</p>")
-    smp_field = (_field("sampling defaults",
-                        _textarea("sampling", _sampling_text(store.get_alias_sampling().get(alias)),
-                                  2, '{"temperature": 0.85, "min_p": 0.05}'))
-                 + "<p class='hint' style='margin:-4px 0 10px'>JSON object filled into requests on this "
-                   "alias, for keys the client did <b>not</b> send. Precedence: client &gt; alias &gt; the "
-                   "serving backend's own <a href='/ui/backends'>sampling defaults</a> (an alias value "
-                   "overrides the backend's for that key; the backend's other keys still apply). "
-                   "Chat/completions/responses only.</p>")
+    voice_field = (
+        f'<details class="optblock"{" open" if (cur_voice.get("voice") or cur_voice.get("ref_text")) else ""}>'
+        "<summary>Voice defaults <span class='muted'>— TTS aliases only</span></summary>"
+        + _field("voice default", _inp("voice_ref", cur_voice.get("voice", ""),
+                 placeholder="backend-side reference, e.g. voices/kai-ref.wav"))
+        + _field("voice ref text", _inp("voice_ref_text", cur_voice.get("ref_text", ""),
+                 placeholder="exact transcript of the reference recording"))
+        + "<p class='hint' style='margin:-4px 0 10px'>TTS defaults for <code>/v1/audio/speech</code> "
+          "via this alias: filled in when the client sends no <code>voice</code>/<code>ref_text</code> "
+          "(explicit client fields always win). Reference recordings are managed in "
+          "<a href='/ui/playground?sub=voice'>Playground → Voice</a>.</p>"
+        + "</details>")
+    # Sampling defaults are set on few aliases, so they collapse like the voice block —
+    # folded open only when this alias carries them.
+    cur_smp = store.get_alias_sampling().get(alias)
+    smp_field = (
+        f'<details class="optblock"{" open" if cur_smp else ""}>'
+        "<summary>Sampling defaults <span class='muted'>— client &gt; alias &gt; backend</span></summary>"
+        + _field("sampling defaults",
+                 _textarea("sampling", _sampling_text(cur_smp), 2,
+                           '{"temperature": 0.85, "min_p": 0.05}'))
+        + "<p class='hint' style='margin:-4px 0 10px'>JSON object filled into requests on this alias, "
+          "for keys the client did <b>not</b> send. Precedence: client &gt; alias &gt; the serving "
+          "backend's own <a href='/ui/backends'>sampling defaults</a> (an alias value overrides the "
+          "backend's for that key; the backend's other keys still apply). "
+          "Chat/completions/responses only.</p>"
+        + "</details>")
     return ('<form action="/ui/chat/save" method="post">'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
@@ -1926,7 +1981,7 @@ def _register_form() -> str:
 
 def _mapping_list(cedit: str, iedit: str) -> str:
     """The shared left column: chat aliases and generation aliases, grouped, with
-    their own edit targets (?cedit= for chat, ?edit= for image)."""
+    their own edit targets (?cedit= for chat, ?edit= for media)."""
     # Chat group (config + UI-managed, merged)
     cfg, ui = _config_chat_aliases(), store.list_chat_aliases()
     chat_items = ""
@@ -1943,7 +1998,7 @@ def _mapping_list(cedit: str, iedit: str) -> str:
         chat_items += _item(f"{_esc(name)} {src}", _chat_summary(val), _icon_acts(*specs),
                             sel=(name == cedit))
     chat_items = chat_items or "<p class='muted'>No chat aliases — + Chat alias.</p>"
-    # Image group (generation aliases)
+    # Media group (generation aliases — image/video/audio/mesh)
     img_items = ""
     for alias, cands in store.list_aliases().items():
         c = cands[0]
@@ -1965,7 +2020,7 @@ def _mapping_list(cedit: str, iedit: str) -> str:
               + _badge("config") + " from config.yaml · "
               + _badge("ui", "ok") + " created/edited here (overrides config)</p>")
     return (bar + '<div class="grouphdr">Chat</div>' + legend + chat_items
-            + '<div class="grouphdr">Image</div>' + img_items)
+            + '<div class="grouphdr">Media</div>' + img_items)
 
 
 async def mapping_page(request: Request):
