@@ -168,9 +168,10 @@ def _media_busy_hosts() -> set:
 def rebuild_virtual_models() -> None:
     """Effective chat aliases = config `virtual_models`, with UI-managed (store)
     entries merged over them by alias (store overrides config for the same name).
-    Also refreshes the per-alias park times and reasoning defaults. Call after
-    config reload or any store chat-alias change."""
-    global virtual_models, alias_park_s, alias_reasoning, alias_voice, route_mode
+    Also refreshes the per-alias park times, reasoning defaults, voice defaults
+    and sampling defaults. Call after config reload or any store chat-alias
+    change."""
+    global virtual_models, alias_park_s, alias_reasoning, alias_voice, alias_sampling, route_mode
     merged = dict(config_virtual_models)
     if store.is_active():
         merged.update(store.list_chat_aliases())
@@ -181,6 +182,7 @@ def rebuild_virtual_models() -> None:
     alias_park_s = park
     alias_reasoning = store.get_alias_reasoning() if store.is_active() else {}
     alias_voice = store.get_alias_voice() if store.is_active() else {}
+    alias_sampling = store.get_alias_sampling() if store.is_active() else {}
     rm = dict(config.get("route_mode") or {}) if isinstance(config, dict) else {}
     if store.is_active():
         rm.update(store.get_route_mode())
@@ -329,6 +331,7 @@ max_parked: int = 100
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
 alias_voice: dict = {}                  # alias → {voice, ref_text} TTS defaults (store). Client wins.
+alias_sampling: dict = {}               # alias → {param: value} sampling defaults (store). Client wins.
 route_mode: dict = {}                   # routing key (alias OR bare model id) → "speed" (config+store); absent → priority
 voice_library: dict = {}                # name → {ref_text, file, remote, shipped} (store voice_library)
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
@@ -1365,6 +1368,22 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
             pass
 
 
+def _apply_alias_sampling(alias: str, body: dict) -> None:
+    """Fill this alias's sampling defaults into a chat body — only keys the CLIENT
+    did not send (an explicit client value always wins). The serving backend's own
+    `sampling_defaults` apply later, in the adapter, so the effective precedence is
+    client > alias > backend. A malformed store entry is ignored rather than failing
+    the request."""
+    d = alias_sampling.get(alias)
+    if not isinstance(d, dict):
+        if d is not None:
+            logger.warning(f"alias '{alias}': sampling defaults are not a dict — ignored")
+        return
+    for k, v in d.items():
+        if k not in body:
+            body[k] = v
+
+
 async def route(path: str, request: Request, authorization: Optional[str]) -> JSONResponse | StreamingResponse:
     body = await request.json()
     alias = body.get("model", "")
@@ -1389,6 +1408,8 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
             body["voice"] = e["remote"]
             if e.get("ref_text") and not (body.get("params") or {}).get("ref_text"):
                 body.setdefault("params", {})["ref_text"] = e["ref_text"]
+    if not (path.startswith("/v1/audio/") or path.startswith("/v1/embeddings")):
+        _apply_alias_sampling(alias, body)              # per-alias sampling; client fields win
     r = _normalize_reasoning(body)                      # off|on|None; strips `reasoning`, stashes for dispatch
     if r is None:
         r = alias_reasoning.get(alias)                  # per-alias default (tool vs tool-thinking)
@@ -1610,6 +1631,7 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     alias = chat_body.get("model", "")
     await gate_request(authorization, request, alias)        # auth + model allow-list + quota
 
+    _apply_alias_sampling(alias, chat_body)            # same per-alias defaults as the chat path
     r = _normalize_reasoning(raw_body)                 # honors reasoning + reasoning_effort + {effort}
     if r is None:
         r = alias_reasoning.get(alias)                 # per-alias default (tool vs tool-thinking)
