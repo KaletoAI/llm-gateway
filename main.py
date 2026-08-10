@@ -3285,6 +3285,7 @@ async def health():
                 "priority": b["priority"],
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "route_speed": bool(b.get("route_speed")),
+                "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
                 **_comfy_watch_info(b),
             }
