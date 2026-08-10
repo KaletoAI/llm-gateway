@@ -450,6 +450,28 @@ def set_alias_reasoning(alias: str, mode) -> None:
     set_settings({"alias_reasoning": m})
 
 
+# ── Per-alias sampling defaults ──────────────────────────────────────────────────
+# One settings dict {alias: {param: value}} filled into chat bodies when the CLIENT
+# omits the key (client always wins). Backends carry their own `sampling_defaults`,
+# which apply after these — precedence is client > alias > backend.
+
+def get_alias_sampling() -> dict:
+    return get_setting("alias_sampling") or {}
+
+
+def set_alias_sampling(alias: str, params) -> None:
+    """Set/clear an alias's sampling defaults. Empty/None/non-dict clears."""
+    m = get_alias_sampling()
+    d = dict(params) if isinstance(params, dict) else {}
+    if d:
+        m[alias] = d
+    elif alias in m:
+        del m[alias]
+    else:
+        return
+    set_settings({"alias_sampling": m})
+
+
 # ── Per-key routing mode (priority vs speed) ─────────────────────────────────────
 # One settings dict {name: "speed"} where `name` is a chat alias OR a bare model id
 # (both are routing keys). Absent = "priority" (the default). "speed" makes
