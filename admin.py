@@ -880,7 +880,21 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "fastest-first by measured throughput (tok/s) instead of priority — one switch for the "
               "whole catalog (hundreds of ids). Chat aliases are unaffected (they keep their own per-alias "
               "routing). A <code>backend/model</code> pin still forces this backend.</p>"
+            + _field("sampling defaults",
+                     _textarea("sampling_defaults", _sampling_text((b or {}).get("sampling_defaults")),
+                               2, '{"temperature": 0.85, "min_p": 0.05}'))
+            + "<p class='hint'><b>sampling defaults</b>: JSON object filled into every chat request to "
+              "this backend, for keys the caller did <b>not</b> send (an explicit client value — and an "
+              "alias default — always wins). For backends whose server samples with bare defaults: vLLM "
+              "without a truncation sampler (<code>top_p=1</code>, <code>min_p=0</code>) degenerates into "
+              "token salad at temperature ≈ 1. Re-derived per backend, so a failover uses the new "
+              "backend's values. Applies to chat/completions/responses only.</p>"
             + "</div></form>")
+
+
+def _sampling_text(d) -> str:
+    """Stored sampling defaults → the editor's textarea value (JSON, blank if unset)."""
+    return json.dumps(d, ensure_ascii=False) if isinstance(d, dict) and d else ""
 
 
 def _type_select(current: str) -> str:
@@ -1081,6 +1095,29 @@ async def host_save(request: Request):
     return RedirectResponse("/ui/backends", status_code=303)
 
 
+# Keys a sampling default must never set: they drive routing, streaming, the
+# reasoning hand-off and the stats body — a default here would corrupt dispatch.
+_SAMPLING_BLOCKED = ("model", "messages", "stream", "stream_options")
+
+
+def _parse_sampling(raw: str) -> tuple:
+    """Parse a sampling-defaults JSON object from a form field.
+    Returns (values, error) — a non-empty error means reject the save."""
+    s = (raw or "").strip()
+    if not s:
+        return {}, ""
+    try:
+        d = json.loads(s)
+    except Exception as e:
+        return {}, f"sampling defaults: invalid JSON ({e})"
+    if not isinstance(d, dict):
+        return {}, 'sampling defaults: must be a JSON object, e.g. {"temperature": 0.85}'
+    bad = [k for k in d if k in _SAMPLING_BLOCKED or k.startswith("_")]
+    if bad:
+        return {}, f"sampling defaults: these keys are not allowed: {', '.join(sorted(bad))}"
+    return d, ""
+
+
 async def backend_save(request: Request):
     f = await _form(request)
     name = (f.get("name", "") or "").strip()
@@ -1130,6 +1167,14 @@ async def backend_save(request: Request):
             b[nkey] = int(v)
         else:
             b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry)
+    sd, sd_err = _parse_sampling(f.get("sampling_defaults", ""))
+    if sd_err:
+        return HTMLResponse(_page("Backends", f'<p class="bad">{_esc(sd_err)}</p>'
+            f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
+    if sd:
+        b["sampling_defaults"] = sd
+    else:
+        b.pop("sampling_defaults", None)        # blank = forward the client body untouched
     renamed = 0
     if orig and (oname != name or otype != new_type):
         store.delete_backend(oname, otype)      # identity changed (rename / type change)
