@@ -507,6 +507,19 @@ class OpenAIAdapter(BackendAdapter):
         headers.update(ctx.auth_headers(b))
         real_model = req.body.get("model")
         fwd = {k: v for k, v in req.body.items() if not k.startswith("_")}
+        # Backend sampling defaults: fill only keys the request does NOT carry — the
+        # client's value (and any per-alias default main.py already folded in) wins.
+        # Sits here so it is derived PER BACKEND: a failover re-derives it from the
+        # backend actually serving the call. Text endpoints only — embeddings have no
+        # sampling, /v1/audio is a binary passthrough.
+        sd = b.get("sampling_defaults")
+        if sd and not (req.path.startswith("/v1/embeddings") or req.path.startswith("/v1/audio/")):
+            if isinstance(sd, dict):
+                for k, v in sd.items():
+                    if k not in fwd:
+                        fwd[k] = v
+            else:
+                logger.warning(f"backend '{self.name}': sampling_defaults is not a dict — ignored")
         fwd, reasoning_ctl = ctx.apply_reasoning(b, real_model, req.reasoning, fwd)
         ctx.inflight_inc(self.bid)        # released on completion (stream close / return / error)
         act = ctx.active_register({       # dropped on completion (both finally paths)
