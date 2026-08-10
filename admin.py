@@ -1595,12 +1595,20 @@ def _chat_editor(alias: str) -> str:
                      "via this alias: filled in when the client sends no <code>voice</code>/<code>ref_text</code> "
                      "(explicit client fields always win). Only relevant when the alias maps a TTS model — "
                      "lets a client say just <code>model:\"kai\"</code> + <code>input</code>.</p>")
+    smp_field = (_field("sampling defaults",
+                        _textarea("sampling", _sampling_text(store.get_alias_sampling().get(alias)),
+                                  2, '{"temperature": 0.85, "min_p": 0.05}'))
+                 + "<p class='hint' style='margin:-4px 0 10px'>JSON object filled into requests on this "
+                   "alias, for keys the client did <b>not</b> send. Precedence: client &gt; alias &gt; the "
+                   "serving backend's own <a href='/ui/backends'>sampling defaults</a> (an alias value "
+                   "overrides the backend's for that key; the backend's other keys still apply). "
+                   "Chat/completions/responses only.</p>")
     return ('<form action="/ui/chat/save" method="post">'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
-            + park_field + rsn_field + rmode_field + voice_field
+            + park_field + rsn_field + rmode_field + voice_field + smp_field
             + "<h2>Backends</h2>"
             + "<p class='hint'>Assign backends to this alias, pick the model on each, and optionally "
               "override that backend's global priority for this alias only. Tried in priority order "
@@ -1644,6 +1652,10 @@ async def chat_save(request: Request):
     park_s = (f.get("park_s", "") or "").strip()
     rsn = (f.get("reasoning", "") or "").strip()
     rmode = (f.get("route_mode", "") or "").strip()
+    smp, smp_err = _parse_sampling(f.get("sampling", ""))
+    if smp_err:
+        return HTMLResponse(_page("Chat aliases", f'<p class="bad">{_esc(smp_err)}</p>'
+            f'<div class="actions">{_btn("← Back", "/ui/mapping", "secondary")}</div>', "routing"))
     if not alias or not value:
         return RedirectResponse(f"/ui/mapping?cedit={orig}" if orig else "/ui/mapping", status_code=303)
     if orig and orig != alias and store.get_chat_alias(orig) is not None:
@@ -1651,16 +1663,19 @@ async def chat_save(request: Request):
         store.set_alias_park(orig, None)      # drop the old name's overrides
         store.set_alias_reasoning(orig, None)
         store.set_alias_voice(orig, None)
+        store.set_alias_sampling(orig, None)
         store.set_route_mode(orig, None)
     store.upsert_chat_alias(alias, value)
     store.set_alias_park(alias, park_s if park_s != "" else None)   # blank → global default
     store.set_alias_reasoning(alias, rsn)                           # 'auto'/blank clears
     store.set_alias_voice(alias, {"voice": f.get("voice_ref", ""),  # blank fields clear
                                   "ref_text": f.get("voice_ref_text", "")})
+    store.set_alias_sampling(alias, smp)                            # blank clears
     store.set_route_mode(alias, rmode)                              # only 'speed' persists, else clears
     _apply_chat_aliases()
     logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'}, "
-                f"reasoning={rsn or 'auto'}, routing={rmode or 'priority'})")
+                f"reasoning={rsn or 'auto'}, routing={rmode or 'priority'}"
+                + (f", sampling={smp}" if smp else "") + ")")
     return RedirectResponse("/ui/mapping", status_code=303)
 
 
@@ -1694,6 +1709,7 @@ async def chat_del(request: Request):
         store.set_alias_park(alias, None)     # drop the alias's overrides with it
         store.set_alias_reasoning(alias, None)
         store.set_alias_voice(alias, None)
+        store.set_alias_sampling(alias, None)
         store.set_route_mode(alias, None)
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
