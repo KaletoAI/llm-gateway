@@ -254,6 +254,10 @@ textarea{height:auto;min-height:60px;padding:8px 10px;line-height:1.5}
 .ok-banner{background:#16361f;color:#5cb87f;border:1px solid #1f5232;border-radius:8px;padding:8px 12px;margin:8px 0}
 .ok-banner.fade{animation:okfade 2.2s ease forwards}
 @keyframes okfade{0%,65%{opacity:1}100%{opacity:0;visibility:hidden}}
+/* Save confirmation that lives INSIDE the sticky form bar: a banner stacked above the
+   form would push the whole editor down by its height, so the restored scroll position
+   lands on shifted content — the very jump the scroll restore exists to prevent. */
+.ok-chip{color:#5cb87f;font-size:12px;white-space:nowrap}
 .acctbl{max-height:360px;overflow-y:auto;border:1px solid #242a33;border-radius:8px}
 .acctbl table{margin:0}
 .acctbl td:first-child,.acctbl th:first-child{width:1%;text-align:center}
@@ -275,17 +279,27 @@ details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129
 
 # Preserve each scrolling pane's position across the 303-redirect reloads that every
 # inline edit action triggers — otherwise the column jumps back to the top on each
-# change. Keyed per URL (same key after an action redirects back), stored in
-# sessionStorage so it survives the reload but not a fresh visit.
+# change. Stored in sessionStorage (survives the reload, not a fresh visit) under ONE
+# KEY PER PANE, because the panes differ in what makes a position stale:
+#   · the master list (first `.col`) is the SAME list under every `?edit=…` → keyed on
+#     the path alone, so picking another entry leaves the list where it was;
+#   · every other pane is the selection's detail → keyed on the query too, so alias A's
+#     editor position never lands on alias B's editor.
+# `saved=1` is stripped from that query: it is a transient banner flag the Save redirect
+# appends, and keying on it made every Save read as a fresh URL — the whole point of
+# Save being the ONE action that must not move the pane you were working in.
 _SCROLL_JS = ("<script>(function(){"
-              "var k='scr:'+location.pathname+location.search;"
-              "function t(){return [document.querySelector('main')].concat("
-              "[].slice.call(document.querySelectorAll('.col'))).filter(Boolean);}"
-              "try{var s=JSON.parse(sessionStorage.getItem(k)||'[]');"
-              "t().forEach(function(e,i){if(s[i]!=null)e.scrollTop=s[i];});}catch(e){}"
-              "var p=false;function save(){if(p)return;p=true;requestAnimationFrame(function(){p=false;"
-              "try{sessionStorage.setItem(k,JSON.stringify(t().map(function(e){return e.scrollTop;})));}catch(e){}});}"
-              "t().forEach(function(e){e.addEventListener('scroll',save);});"
+              "var q=location.search.replace(/([?&])saved=[^&]*&?/,'$1').replace(/[?&]$/,'');"
+              "var b='scr:'+location.pathname;"
+              "function t(){var o=[],m=document.querySelector('main');"
+              "if(m)o.push([m,b+q+'|main']);"
+              "[].slice.call(document.querySelectorAll('.col')).forEach(function(e,j){"
+              "o.push([e,j===0?b+'|master':b+q+'|c'+j]);});return o;}"
+              "try{t().forEach(function(p){var v=sessionStorage.getItem(p[1]);"
+              "if(v!=null)p[0].scrollTop=+v;});}catch(e){}"
+              "var d=false;function save(){if(d)return;d=true;requestAnimationFrame(function(){d=false;"
+              "try{t().forEach(function(p){sessionStorage.setItem(p[1],p[0].scrollTop);});}catch(e){}});}"
+              "t().forEach(function(p){p[0].addEventListener('scroll',save);});"
               "window.addEventListener('beforeunload',save);"
               "})();</script>")
 
@@ -2101,9 +2115,9 @@ async def mapping_page(request: Request):
     elif qp.get("cnew"):
         body = cols(list_html, _chat_new_form())
     elif iedit and store.get(iedit):
-        editor, available = await _alias_editor(iedit)        # image editor (3 cols)
-        if qp.get("saved"):                                   # transient confirmation after Save
-            editor = "<p class='ok-banner fade'>✓ Saved</p>" + editor
+        # image editor (3 cols); the post-Save confirmation rides in the form bar so
+        # Save leaves the editor's scroll position untouched
+        editor, available = await _alias_editor(iedit, saved=bool(qp.get("saved")))
         # wider editor (col 2), narrower Available fields (col 3) — see .cols.map3 CSS
         body = ('<div class="cols map3">'
                 f'<div class="col">{list_html}</div>'
@@ -2577,9 +2591,11 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             f"{body}{add_sel}")
 
 
-async def _alias_editor(alias: str) -> str:
+async def _alias_editor(alias: str, saved: bool = False) -> str:
     """The alias editor as a single-column fragment for the master-detail right
-    side (request fields + pinned values in one form, available fields below)."""
+    side (request fields + pinned values in one form, available fields below).
+    `saved` renders the post-Save confirmation inside the sticky form bar (see
+    .ok-chip — a stacked banner would shift the restored scroll position)."""
     cands = store.get(alias)
     if not cands:
         return f'<p class="bad">alias \'{_esc(alias)}\' not found</p>'
@@ -2611,7 +2627,9 @@ async def _alias_editor(alias: str) -> str:
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}'
-            f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}</div>'
+            f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}'
+            + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "")
+            + '</div>'
             + _field("alias name", _inp("new_alias", alias), short=True)
             + _field("task", _task_select(cur_task, _TASK_VIDEO_JS), short=True)
             + '<h2 style="margin-top:18px">Update workflow</h2>'
