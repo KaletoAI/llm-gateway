@@ -21,6 +21,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Routing](#routing) — priority, prefixing, `local`, concurrency, parking
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
+- [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
 - [Media generation](#media-generation) — ComfyUI image/video/audio, aliases, mapping, LoRA, jobs
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
@@ -342,6 +343,83 @@ ignore them.
 
 ---
 
+## Claude Code / Anthropic Messages
+
+The gateway speaks Anthropic's Messages protocol as a **frontdoor**, so
+[Claude Code](https://claude.com/claude-code) can run through it — mixing Claude
+models with open-weight models behind gateway aliases, while keeping routing,
+parking, failover, quotas and stats:
+
+```bash
+export ANTHROPIC_BASE_URL=http://gateway:4000
+export ANTHROPIC_AUTH_TOKEN=<your gateway key>   # or ANTHROPIC_API_KEY (sent as x-api-key)
+export ANTHROPIC_MODEL=claude-sub                # any gateway alias
+claude
+```
+
+Two kinds of backend can serve `POST /v1/messages`:
+
+| Backend | What happens | Why |
+|---|---|---|
+| `type: anthropic` | **verbatim passthrough** to `api.anthropic.com` | `cache_control` breakpoints, thinking signatures and fine-grained tool streaming survive untouched — without cache breakpoints, Claude Code re-reads the whole context at full price every turn |
+| `type: openai` (OpenRouter, LocalAI, vLLM …) | **translated** by `anthropic_bridge.py` — Messages → chat and back, streaming included | one alias can list both, so a failing Anthropic backend fails over to an open-weight model |
+
+Nothing on the passthrough path rewrites body or stream: the SSE normalizer,
+the reasoning rewrite and `sampling_defaults` are all skipped there. On the
+translated path they apply as usual, and Claude Code's `thinking: {type:
+enabled}` maps onto the gateway's [reasoning control](#reasoning-control) so an
+open-weight model thinks when asked to.
+
+`POST /v1/messages/count_tokens` is passed through to Anthropic and answered from
+an estimate for chat backends (they have no such endpoint).
+
+**Point Claude Code's background model somewhere cheap** — it runs a small model
+for titles and summaries:
+
+```bash
+export ANTHROPIC_SMALL_FAST_MODEL=cheap          # a gateway alias on a local/OpenRouter model
+```
+
+### Licence boundary (please keep it)
+
+A Claude **subscription** token (`claude setup-token`) is licensed for *your own*
+use of Claude Code — not for re-serving Claude as a general-purpose API to other
+clients or other people. This is enforced in the gateway, not just documented:
+
+- an `anthropic` backend is routable **only** on `/v1/messages` (`serves_path()`);
+  it can never be reached through `/v1/chat/completions`, `/v1/responses`,
+  `/v1/embeddings` or the console's Playground, whatever alias points at it,
+- an alias served exclusively by Anthropic backends is hidden from the Playground
+  and answers other endpoints with `404 … reachable through POST /v1/messages only`,
+- the Backends tab states the same rule at the credential field.
+
+The reverse direction (Claude models behind `/v1/chat/completions`) is
+deliberately **not** built — that is precisely the path that would turn a
+subscription into an API. If you have a paid API key from console.anthropic.com,
+set the backend's auth mode to `api key`; the same endpoint restriction still
+applies.
+
+### Backend setup
+
+```yaml
+backends:
+  - name: anthropic-sub
+    type: anthropic
+    url: https://api.anthropic.com
+    api_key: <output of `claude setup-token`>
+    auth_mode: subscription        # → Authorization: Bearer + OAuth beta header
+    # auth_mode: api_key           # → x-api-key (console.anthropic.com key)
+    models: [claude-sonnet-5]      # fallback list; discovery tries GET /v1/models first
+    priority: 1
+```
+
+Discovery asks Anthropic's `GET /v1/models` and falls back to `models:` when the
+token isn't allowed there — so a 401 on that endpoint doesn't take the backend
+down. Then map an alias to it (console → **Input & Routing → Chat aliases**, or
+`virtual_models`) and hand that alias to Claude Code as `ANTHROPIC_MODEL`.
+
+---
+
 ## Media generation
 
 A ComfyUI backend speaks a different protocol, so it declares `type: comfyui`.
@@ -558,6 +636,13 @@ stats:
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
 | `POST` | `/v1/images/generations` | text→image (sync); may return a video/audio URL for such aliases |
 | `POST` | `/v1/images/edits` | multipart image+mask edit (sync) |
+
+### Anthropic-compatible
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/messages` | [Claude Code frontdoor](#claude-code--anthropic-messages); verbatim on `anthropic` backends, translated on chat backends; streaming; parking; auth via `x-api-key` **or** `Authorization: Bearer` |
+| `POST` | `/v1/messages/count_tokens` | native upstream count, estimated for chat backends |
 
 ### Voice cloning & the reference library
 

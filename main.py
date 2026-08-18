@@ -805,14 +805,37 @@ def rebuild_route_index() -> None:
     _speed_keys = speed_keys
 
 
-def resolve_routes(alias: str) -> tuple[list, list]:
+def serves_path(backend: dict, path: str) -> bool:
+    """May this backend serve a request on `path`?
+
+    Anthropic backends answer `/v1/messages` ONLY. That is a licence boundary, not
+    a technical one: the credential is normally a personal Claude subscription,
+    which covers using Claude Code — not re-serving Claude as a general-purpose
+    API through the gateway's OpenAI endpoints. Enforced here, in routing, so the
+    backend cannot be reached by any other endpoint, alias or playground; the
+    README and the Backends tab state the same rule in words.
+
+    It is also what keeps a mixed alias honest: an Anthropic backend would receive
+    a chat-completions body it cannot parse, so it must not be a candidate there.
+
+    The restriction runs one way only — a chat backend still serves `/v1/messages`,
+    translated by the bridge. That is what lets one alias fail over from Anthropic
+    to an open-weight model.
+    """
+    if backend.get("type") == "anthropic":
+        return path.startswith("/v1/messages")
+    return True
+
+
+def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list, list]:
     """(ready, busy) (backend, real_model) candidate lists, each in priority order.
 
     `ready` is routable now; `busy` maps + serves the alias but sits at its
     in-flight cap (→ parkable). A '<backend>/<model>' alias resolves to a single
     backend in whichever bucket. Drives both normal routing (ready) and call
     parking (busy). Candidates come pre-resolved and pre-sorted from
-    `_route_index`; only healthy/busy/draining are evaluated per request.
+    `_route_index`; only healthy/busy/draining — and the endpoint a backend is
+    allowed to serve (`serves_path`) — are evaluated per request.
     """
     bname, bare = split_backend_prefix(alias)
     if bname is not None:
@@ -820,6 +843,8 @@ def resolve_routes(alias: str) -> tuple[list, list]:
         # backend is unambiguous here.
         b = next((b for b in _llm_backends if b["name"] == bname), None)
         if b is None or not backend_healthy.get(backend_id(b)) or is_draining(b):
+            return [], []
+        if not serves_path(b, path):
             return [], []
         real = resolve_for_backend(bare, bname)
         if real is None or real not in backend_models.get(backend_id(b), set()):
@@ -829,6 +854,8 @@ def resolve_routes(alias: str) -> tuple[list, list]:
     ready, busy = [], []
     for b, real in _route_index.get(alias, ()):
         if not backend_healthy.get(backend_id(b)) or is_draining(b):
+            continue
+        if not serves_path(b, path):
             continue
         (busy if backend_busy(b) else ready).append((b, real))
     if len(ready) > 1:
@@ -1272,10 +1299,17 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
     the park queue until one frees (then dispatch) or 503. Park window = the alias's
     park time, or an explicit `deadline` (background responses use the longer async
     window). Shared by chat routing, the Responses bridge, and background responses."""
-    ready, busy = resolve_routes(alias)
+    ready, busy = resolve_routes(alias, path)
     if ready:
         return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
     if not busy:
+        # Say WHY when the only backends that could serve this alias are Anthropic
+        # ones: they answer /v1/messages alone (see serves_path), and "no healthy
+        # backend" would send the caller hunting a fault that isn't there.
+        cands = _route_index.get(alias) or []
+        if cands and all(b.get("type") == "anthropic" for b, _ in cands):
+            raise HTTPException(404, f"model '{alias}' is served by an Anthropic backend — "
+                                     "reachable through POST /v1/messages only")
         raise HTTPException(503, f"No healthy backend for model '{alias}'")
     if deadline is None:
         ptime = _park_time_for(alias)
@@ -1347,7 +1381,7 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
     try:
         while True:
             entry["event"].clear()                     # arm before checking → no lost wakeup
-            ready, busy = resolve_routes(alias)
+            ready, busy = resolve_routes(alias, path)
             if ready:
                 return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
             if not busy:
@@ -1689,6 +1723,76 @@ async def cancel_response(response_id: str, request: Request, authorization: Opt
             await asyncio.to_thread(jobs.fail, _bg_job_id(response_id), "cancelled")
         job = await _bg_job_for(response_id)           # re-read post-cancel
     return JSONResponse(_bg_view(response_id, job))
+
+
+# ── Anthropic Messages frontdoor (Claude Code) ────────────────────────────────
+# Claude Code speaks this protocol, so the gateway speaks it too: point it at the
+# gateway with ANTHROPIC_BASE_URL and it can use Anthropic models through a
+# subscription backend (verbatim passthrough, see AnthropicAdapter) AND open-weight
+# models through any chat backend (translated by anthropic_bridge) — with the same
+# routing, parking, failover, quotas and stats as every other endpoint.
+#
+# Claude Code authenticates with `x-api-key`; ANTHROPIC_AUTH_TOKEN sends
+# `Authorization: Bearer` instead. Both carry a GATEWAY key here (never an
+# Anthropic credential — that one lives on the backend).
+
+def _client_credential(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
+    """The caller's gateway credential from either header, in Bearer form."""
+    if authorization:
+        return authorization
+    return f"Bearer {x_api_key}" if x_api_key else None
+
+
+def _messages_error(status: int, message: str) -> JSONResponse:
+    """Gateway-side failure in the shape Claude Code renders (it reads
+    error.message; an OpenAI-shaped or FastAPI `detail` body shows as blank)."""
+    etype = {400: "invalid_request_error", 401: "authentication_error",
+             403: "permission_error", 404: "not_found_error", 429: "rate_limit_error",
+             402: "billing_error"}.get(status, "api_error")
+    return JSONResponse({"type": "error", "error": {"type": etype, "message": str(message)}},
+                        status_code=status)
+
+
+async def _messages_route(path: str, request: Request, credential: Optional[str]):
+    """Shared body of both Messages endpoints: authenticate, fold the thinking
+    control into the gateway's normalized toggle (so a translated backend thinks
+    when Claude Code asks it to), then hand over to the normal dispatch/park path.
+
+    Deliberately NOT applied here: per-alias sampling defaults. Claude Code sends a
+    complete, deliberate request, and a chat-shaped `min_p`/`repetition_penalty`
+    would 400 against Anthropic and change behaviour everywhere else."""
+    body = await request.json()
+    alias = body.get("model", "")
+    await gate_request(credential, request, alias)          # auth + allow-list + quota
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        body["_reasoning"] = "on"                           # honoured by translated backends only
+    elif alias_reasoning.get(alias) is not None:
+        body["_reasoning"] = alias_reasoning[alias]
+    return await _dispatch_or_park(alias, path, body, request)
+
+
+@app.post("/v1/messages")
+async def messages(request: Request, authorization: Optional[str] = Header(None),
+                   x_api_key: Optional[str] = Header(None)):
+    """Anthropic Messages API — Claude Code's endpoint."""
+    try:
+        return await _messages_route("/v1/messages", request,
+                                     _client_credential(authorization, x_api_key))
+    except HTTPException as e:
+        return _messages_error(e.status_code, e.detail)
+
+
+@app.post("/v1/messages/count_tokens")
+async def messages_count_tokens(request: Request, authorization: Optional[str] = Header(None),
+                                x_api_key: Optional[str] = Header(None)):
+    """Token count for a Messages body: passed through to an Anthropic backend,
+    estimated by the bridge for a chat backend (which has no such endpoint)."""
+    try:
+        return await _messages_route("/v1/messages/count_tokens", request,
+                                     _client_credential(authorization, x_api_key))
+    except HTTPException as e:
+        return _messages_error(e.status_code, e.detail)
 
 
 @app.post("/v1/completions")

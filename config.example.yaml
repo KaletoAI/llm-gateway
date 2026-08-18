@@ -107,6 +107,18 @@ backends:
   #   serverless_only: false            # keep :free models; true = paid-only
   #                                     # (paid models need account credits, else HTTP 402)
 
+  # - name: anthropic-sub               # Claude Code frontdoor — see README
+  #   type: anthropic                   # reachable through /v1/messages ONLY
+  #   url: https://api.anthropic.com
+  #   api_key: "sk-ant-oat…"            # output of `claude setup-token`
+  #   auth_mode: subscription           # subscription (OAuth setup-token) | api_key
+  #   models: [claude-sonnet-5]         # fallback list if GET /v1/models is denied
+  #   priority: 1
+  #   # LICENCE: a Claude subscription covers YOUR use of Claude Code — not
+  #   # re-serving Claude as an API to other clients or people. The gateway
+  #   # enforces that: this backend never appears on /v1/chat/completions,
+  #   # /v1/responses or in the Playground. Please keep it that way.
+
 # Virtual models — pseudo model names that map to real model IDs on backends.
 #   string  → same model on every backend
 #   dict    → per-backend mapping; backend keys without an entry are skipped.

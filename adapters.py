@@ -29,12 +29,14 @@ import time
 import zlib
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+import anthropic_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -469,9 +471,50 @@ class _Call:
     act: Any                            # live-call registry token
 
 
+def _anthropic_error(status: int, etype: str, message: str, headers=None) -> JSONResponse:
+    """An error in the shape Claude Code expects — it parses `error.message` and
+    shows it; an OpenAI-shaped error body would surface as an unhelpful blank."""
+    keep = {k: v for k, v in (headers or {}).items() if k.lower().startswith("x-gateway")}
+    return JSONResponse({"type": "error", "error": {"type": etype, "message": message[:2000]}},
+                        status_code=status, headers=keep)
+
+
+def _error_text(resp) -> str:
+    """Readable message out of a failed upstream response (OpenAI error shape,
+    Anthropic error shape, or raw body)."""
+    parsed = getattr(resp, "parsed_json", None)
+    if not isinstance(parsed, dict):
+        try:
+            parsed = json.loads(bytes(getattr(resp, "body", b"") or b"{}"))
+        except Exception:
+            parsed = {}
+    err = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(err, dict) and err.get("message"):
+        return str(err["message"])
+    if isinstance(err, str):
+        return err
+    try:
+        return bytes(getattr(resp, "body", b"") or b"").decode("utf-8", "ignore") or "upstream error"
+    except Exception:
+        return "upstream error"
+
+
+# Client headers that must NEVER be forwarded to a backend. `authorization` AND
+# `x-api-key` are both gateway credentials (Claude Code authenticates with the
+# latter) — forwarding either would hand the caller's gateway key to OpenRouter,
+# Anthropic or whoever else serves the call. The adapter adds the backend's own
+# credential afterwards.
+_HOP_BY_HOP = ("host", "content-length", "authorization", "x-api-key", "x-park-mode")
+
+
 class OpenAIAdapter(BackendAdapter):
     """llama.cpp / llama-swap / vLLM / Ollama / Together / OpenRouter / OpenAI —
-    anything that speaks `/v1/models` + `/v1/chat|completions|embeddings`."""
+    anything that speaks `/v1/models` + `/v1/chat|completions|embeddings`.
+
+    Also serves `/v1/messages` (Anthropic) for these backends by translating both
+    directions through `anthropic_bridge` — so one alias can list an Anthropic
+    backend AND an OpenRouter model, and the router's failover works across them
+    without knowing anything about protocols."""
 
     type = "openai"
 
@@ -486,10 +529,57 @@ class OpenAIAdapter(BackendAdapter):
                             pricing=extract_pricing(payload))
 
     async def dispatch(self, req: NormalizedRequest):
+        if req.path.startswith("/v1/messages"):
+            return await self._dispatch_messages(req)
         call = self._prepare(req)                 # claims the in-flight slot
         if req.body.get("stream"):
             return await self._dispatch_stream(req, call)
         return await self._dispatch_once(req, call)
+
+    async def _dispatch_messages(self, req: NormalizedRequest):
+        """Serve an Anthropic Messages request off a chat-completions backend.
+
+        The request is translated, dispatched down the NORMAL chat path (so
+        in-flight accounting, sampling defaults, reasoning and stats behave exactly
+        as they do for any other call), and the answer is translated back. The
+        recorded endpoint stays `/v1/messages` so the console shows what the client
+        actually called."""
+        estimate = anthropic_bridge.estimate_input_tokens(req.body)
+        if req.path.startswith("/v1/messages/count_tokens"):
+            # No chat backend has this endpoint; answering from the estimate is the
+            # whole point (Claude Code uses it to size the context, not to bill).
+            return JSONResponse({"input_tokens": estimate})
+        try:
+            chat_body = anthropic_bridge.messages_to_chat(req.body)
+        except anthropic_bridge.UnsupportedContent as e:
+            return _anthropic_error(400, "invalid_request_error", str(e))
+        chat_body["model"] = req.real_model
+        chat_req = replace(req, path="/v1/chat/completions", body=chat_body,
+                           stats_endpoint=req.stats_endpoint or "/v1/messages",
+                           stream=bool(chat_body.get("stream")))
+        if chat_body.get("stream"):
+            # The bridge reads the chat usage chunk for message_delta; ask for it
+            # explicitly — the client never sees the raw chunk.
+            chat_body["stream_options"] = {"include_usage": True}
+        resp = await self.dispatch(chat_req)
+        if getattr(resp, "status_code", 200) >= 400:
+            return _anthropic_error(resp.status_code, "api_error",
+                                    _error_text(resp), headers=getattr(resp, "headers", None))
+        if chat_body.get("stream") and isinstance(resp, StreamingResponse):
+            return StreamingResponse(
+                anthropic_bridge.messages_stream(resp, req.alias, input_tokens=estimate),
+                media_type="text/event-stream",
+                headers={k: v for k, v in (resp.headers or {}).items()
+                         if k.lower().startswith("x-gateway")})
+        chat_json = getattr(resp, "parsed_json", None)
+        if not isinstance(chat_json, dict):
+            try:
+                chat_json = json.loads(bytes(resp.body))
+            except Exception:
+                chat_json = {}
+        return JSONResponse(anthropic_bridge.chat_to_messages(chat_json, req.alias),
+                            headers={k: v for k, v in (resp.headers or {}).items()
+                                     if k.lower().startswith("x-gateway")})
 
     def _prepare(self, req: NormalizedRequest) -> _Call:
         """Shared per-dispatch setup: outgoing headers + payload (gateway-private
@@ -502,25 +592,11 @@ class OpenAIAdapter(BackendAdapter):
         ctx = self.ctx
         headers = {
             k: v for k, v in req.raw.headers.items()
-            if k.lower() not in ("host", "content-length", "authorization", "x-park-mode")
+            if k.lower() not in _HOP_BY_HOP
         }
-        headers.update(ctx.auth_headers(b))
+        headers.update(self._backend_auth())
         real_model = req.body.get("model")
-        fwd = {k: v for k, v in req.body.items() if not k.startswith("_")}
-        # Backend sampling defaults: fill only keys the request does NOT carry — the
-        # client's value (and any per-alias default main.py already folded in) wins.
-        # Sits here so it is derived PER BACKEND: a failover re-derives it from the
-        # backend actually serving the call. Text endpoints only — embeddings have no
-        # sampling, /v1/audio is a binary passthrough.
-        sd = b.get("sampling_defaults")
-        if sd and not (req.path.startswith("/v1/embeddings") or req.path.startswith("/v1/audio/")):
-            if isinstance(sd, dict):
-                for k, v in sd.items():
-                    if k not in fwd:
-                        fwd[k] = v
-            else:
-                logger.warning(f"backend '{self.name}': sampling_defaults is not a dict — ignored")
-        fwd, reasoning_ctl = ctx.apply_reasoning(b, real_model, req.reasoning, fwd)
+        fwd, reasoning_ctl = self._payload(req)
         ctx.inflight_inc(self.bid)        # released on completion (stream close / return / error)
         act = ctx.active_register({       # dropped on completion (both finally paths)
             "alias": req.alias, "model": real_model, "backend": self.name,
@@ -539,6 +615,38 @@ class OpenAIAdapter(BackendAdapter):
             source=ctx.source_of(req.raw), req_text=json.dumps(fwd, ensure_ascii=False),
             started=time.monotonic(), log_on=ctx.log_enabled(), act=act,
         )
+
+    def _backend_auth(self) -> dict:
+        """Credential headers for THIS backend. Overridden where the protocol wants
+        a different scheme (Anthropic: x-api-key / OAuth bearer)."""
+        return self.ctx.auth_headers(self.backend)
+
+    def _payload(self, req: NormalizedRequest) -> tuple[dict, Optional[str]]:
+        """(outgoing body, reasoning-control label). Gateway-private `_` keys are
+        stripped, the backend's sampling defaults fill only keys the request does
+        NOT carry (client > alias > backend), and the normalized reasoning toggle is
+        applied to a COPY — all of it derived per backend, so a failover re-derives
+        it from the backend actually serving the call. Text endpoints only:
+        embeddings have no sampling and /v1/audio is a binary passthrough.
+
+        Overridden by adapters that must forward the client's body verbatim."""
+        b = self.backend
+        fwd = {k: v for k, v in req.body.items() if not k.startswith("_")}
+        sd = b.get("sampling_defaults")
+        if sd and not (req.path.startswith("/v1/embeddings") or req.path.startswith("/v1/audio/")):
+            if isinstance(sd, dict):
+                for k, v in sd.items():
+                    if k not in fwd:
+                        fwd[k] = v
+            else:
+                logger.warning(f"backend '{self.name}': sampling_defaults is not a dict — ignored")
+        return self.ctx.apply_reasoning(b, req.body.get("model"), req.reasoning, fwd)
+
+    def _usage_of(self, resp_json: dict) -> tuple[int, int]:
+        """(input, output) tokens out of a non-streamed response body. Overridden
+        where the protocol names them differently (Anthropic)."""
+        usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
+        return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
 
     def _finish(self, call: _Call) -> None:
         """Release the in-flight slot + live-registry entry (every path's finally)."""
@@ -651,9 +759,7 @@ class OpenAIAdapter(BackendAdapter):
                 resp_json = resp.json()
             except Exception:
                 pass
-        usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
-        in_tok = int(usage.get("prompt_tokens") or 0)
-        out_tok = int(usage.get("completion_tokens") or 0)
+        in_tok, out_tok = self._usage_of(resp_json if isinstance(resp_json, dict) else {})
         # Successful binary audio (TTS) → stored as its own stats blob so the call
         # view can play it back; other binary bodies stay unstored.
         resp_audio = ((resp.content, ct) if ct.startswith("audio/") and resp.status_code == 200
@@ -668,6 +774,177 @@ class OpenAIAdapter(BackendAdapter):
                        headers=call.rheaders)
         out.parsed_json = resp_json    # internal callers (Responses bridge) reuse this — no re-parse
         return out
+
+
+# ── Anthropic adapter ─────────────────────────────────────────────────────────
+# Claude Code's own protocol, forwarded VERBATIM. Nothing on this path may rewrite
+# the body or the stream: `cache_control` breakpoints, thinking signatures and
+# fine-grained tool streaming only survive untouched, and without cache
+# breakpoints Claude Code re-reads the whole context at full price every turn.
+# Concretely, three things that run for every other backend must NOT run here:
+# `_StreamNormalizer` (OpenAI-SSE-specific), `apply_reasoning()` (Claude Code sets
+# `thinking` itself) and `sampling_defaults`.
+
+_ANTHROPIC_VERSION = "2023-06-01"           # sent only when the client didn't
+_OAUTH_BETA = "oauth-2025-04-20"            # required for subscription (setup-token) auth
+
+
+class AnthropicAdapter(OpenAIAdapter):
+    """`type: anthropic` — api.anthropic.com (or a compatible endpoint).
+
+    Reachable ONLY through `/v1/messages`: the credential is normally a personal
+    Claude subscription token, and a subscription is licensed for Claude Code, not
+    for serving a general-purpose API. Keeping the other endpoints shut is the
+    enforcement; the README and the console say the same thing in words.
+    Inherits the OpenAI adapter's in-flight/stats/failover bookkeeping and replaces
+    exactly what is protocol-specific: auth headers, payload (verbatim), usage
+    field names, and the streamed passthrough."""
+
+    type = "anthropic"
+
+    def _subscription(self) -> bool:
+        """A subscription (OAuth setup-token) credential rather than an API key."""
+        return (self.backend.get("auth_mode") or "subscription") == "subscription"
+
+    def _backend_auth(self) -> dict:
+        key = self.backend.get("api_key") or ""
+        if not key:
+            return {}
+        if self._subscription():
+            # setup-token → OAuth bearer + the beta that unlocks it. The client's own
+            # anthropic-beta list is preserved by _prepare and merged in dispatch().
+            return {"authorization": f"Bearer {key}"}
+        return {"x-api-key": key}
+
+    def _payload(self, req: NormalizedRequest) -> tuple[dict, Optional[str]]:
+        """Verbatim, minus the gateway's private `_` keys. No sampling defaults, no
+        reasoning rewrite — see the module note above."""
+        return {k: v for k, v in req.body.items() if not k.startswith("_")}, None
+
+    def _usage_of(self, resp_json: dict) -> tuple[int, int]:
+        """Anthropic names them input_tokens/output_tokens; cache reads and writes
+        are input the model processed, so they count toward the input figure the
+        console shows."""
+        u = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
+        in_tok = (int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+                  + int(u.get("cache_creation_input_tokens") or 0))
+        return in_tok, int(u.get("output_tokens") or 0)
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        """Anthropic's GET /v1/models, falling back to the backend's configured
+        `models` list — a subscription token is not guaranteed to be allowed on the
+        models endpoint, and a 401 there must not take the backend down when the
+        admin has said which models to offer."""
+        b = self.backend
+        configured = b.get("models") or []
+        if isinstance(configured, str):
+            configured = [m.strip() for m in configured.split(",") if m.strip()]
+        headers = {"anthropic-version": _ANTHROPIC_VERSION, **self._backend_auth()}
+        if self._subscription():
+            headers["anthropic-beta"] = _OAUTH_BETA
+        try:
+            resp = await client.get(f"{b['url']}/v1/models", headers=headers,
+                                    timeout=_DISCOVERY_TIMEOUT)
+            resp.raise_for_status()
+            models = extract_models(resp.json(), b) | set(configured)
+            return Capabilities(models=models, pricing={})
+        except Exception as e:
+            if configured:
+                logger.info(f"[{self.name}] /v1/models unavailable ({type(e).__name__}) — "
+                            f"using the {len(configured)} configured model(s)")
+                return Capabilities(models=set(configured), pricing={})
+            raise
+
+    async def dispatch(self, req: NormalizedRequest):
+        if not req.path.startswith("/v1/messages"):
+            # Unreachable through the router (resolve_routes filters this backend out
+            # for every other path); explicit so a future caller can't slip past it.
+            return _anthropic_error(404, "not_found_error",
+                                    f"backend '{self.name}' serves /v1/messages only")
+        call = self._prepare(req)                  # claims the in-flight slot
+        # The client's anthropic-beta list must survive, and subscription auth needs
+        # its own beta appended to it.
+        if self._subscription():
+            betas = [b for b in (call.headers.get("anthropic-beta") or "").split(",") if b.strip()]
+            if _OAUTH_BETA not in betas:
+                betas.append(_OAUTH_BETA)
+            call.headers["anthropic-beta"] = ",".join(betas)
+        call.headers.setdefault("anthropic-version", _ANTHROPIC_VERSION)
+        call.headers.pop("accept-encoding", None)  # httpx re-negotiates its own
+        if req.body.get("stream"):
+            return await self._dispatch_stream_raw(req, call)
+        return await self._dispatch_once(req, call)
+
+    async def _dispatch_stream_raw(self, req: NormalizedRequest, call: _Call) -> Response:
+        """Byte-for-byte SSE passthrough. The gateway only READS along (usage for
+        stats); it never rewrites an event, so thinking signatures and partial tool
+        JSON reach Claude Code exactly as Anthropic sent them."""
+        ctx = self.ctx
+        client_cm = _pooled_client(ctx)
+        client = None
+        try:
+            client = await client_cm.__aenter__()
+            stream_cm = client.stream("POST", call.url, json=call.fwd,
+                                      headers=call.headers, timeout=_CHAT_TIMEOUT)
+            resp = await stream_cm.__aenter__()
+        except BaseException:
+            if client is not None:
+                await client_cm.__aexit__(None, None, None)
+            self._finish(call)
+            raise
+        if call.log_on:
+            logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} "
+                        f"(stream open, {(time.monotonic() - call.started):.2f}s)")
+        if resp.status_code >= 400:
+            try:
+                err = await resp.aread()
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
+                self._finish(call)
+            self._record(req, call, resp.status_code, 0, 0,
+                         response_text=err.decode("utf-8", "ignore"))
+            return Response(content=err, status_code=resp.status_code,
+                            media_type=resp.headers.get("content-type"), headers=call.rheaders)
+
+        counted = {"in": 0, "out": 0, "text": []}
+
+        def sniff(raw: str) -> None:
+            """Read usage + text off the passing events (stats only)."""
+            for line in raw.split("\n"):
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    obj = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                u = obj.get("usage") or (obj.get("message") or {}).get("usage") or {}
+                if u:
+                    counted["in"] = max(counted["in"], self._usage_of({"usage": u})[0])
+                    counted["out"] = max(counted["out"], int(u.get("output_tokens") or 0))
+                d = obj.get("delta") or {}
+                if d.get("type") == "text_delta" and d.get("text"):
+                    counted["text"].append(d["text"])
+
+        async def generate():
+            buf = ""
+            try:
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk.decode("utf-8", "ignore")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        sniff(line)
+                    yield chunk                       # verbatim, always
+            finally:
+                await stream_cm.__aexit__(None, None, None)
+                await client_cm.__aexit__(None, None, None)
+                self._finish(call)
+            self._record(req, call, resp.status_code, counted["in"], counted["out"],
+                         response_text="".join(counted["text"]) or None)
+
+        return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 
 
 # ── ComfyUI adapter ───────────────────────────────────────────────────────────
@@ -2351,6 +2628,7 @@ class ComfyUIAdapter(BackendAdapter):
 
 ADAPTERS: dict[str, type[BackendAdapter]] = {
     "openai": OpenAIAdapter,
+    "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
 }
 
