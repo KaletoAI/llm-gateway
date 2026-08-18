@@ -149,6 +149,32 @@ class MessagesToChat(unittest.TestCase):
                                           "cache_control": {"type": "ephemeral"}}]}]}
         self.assertNotIn("cache_control", json.dumps(ab.messages_to_chat(body)))
 
+    def test_cache_control_survives_when_the_backend_understands_it(self):
+        """OpenRouter forwards cache_control to Anthropic/Gemini models. Dropping it
+        for those backends means paying full price for the whole context every turn,
+        so a backend can opt in (`prompt_cache: true`) and keep the breakpoints."""
+        chat = ab.messages_to_chat({"model": "m", "max_tokens": 100,
+                                    "system": [{"type": "text", "text": "preamble",
+                                                "cache_control": {"type": "ephemeral"}}],
+                                    "messages": [{"role": "user", "content": [
+                                        {"type": "text", "text": "hi",
+                                         "cache_control": {"type": "ephemeral"}}]}]},
+                                   keep_cache_control=True)
+        self.assertEqual(chat["messages"][0]["content"],
+                         [{"type": "text", "text": "preamble",
+                           "cache_control": {"type": "ephemeral"}}])
+        self.assertEqual(chat["messages"][1]["content"],
+                         [{"type": "text", "text": "hi",
+                           "cache_control": {"type": "ephemeral"}}])
+
+    def test_kept_cache_control_does_not_reshape_uncached_turns(self):
+        """Only the turns that actually carry a breakpoint become part lists; the
+        rest stay plain strings, so nothing changes for backends by accident."""
+        chat = ab.messages_to_chat({"model": "m", "max_tokens": 100, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "plain"}]}]},
+            keep_cache_control=True)
+        self.assertEqual(chat["messages"][0]["content"], "plain")
+
     def test_document_block_raises_instead_of_silently_dropping_it(self):
         """Dropping a PDF the user asked about would answer about nothing at all —
         the one case where silence produces a wrong result."""

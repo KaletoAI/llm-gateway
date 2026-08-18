@@ -550,7 +550,12 @@ class OpenAIAdapter(BackendAdapter):
             # whole point (Claude Code uses it to size the context, not to bill).
             return JSONResponse({"input_tokens": estimate})
         try:
-            chat_body = anthropic_bridge.messages_to_chat(req.body)
+            # `prompt_cache` (per backend): keep Claude Code's cache breakpoints in the
+            # translated body. OpenRouter forwards them to Anthropic/Gemini models, where
+            # dropping them means paying full price for the entire context every turn.
+            # Opt-in, because a strict server may reject the part-list shape it produces.
+            chat_body = anthropic_bridge.messages_to_chat(
+                req.body, keep_cache_control=bool(self.backend.get("prompt_cache")))
         except anthropic_bridge.UnsupportedContent as e:
             return _anthropic_error(400, "invalid_request_error", str(e))
         chat_body["model"] = req.real_model

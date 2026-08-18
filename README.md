@@ -370,6 +370,22 @@ translated path they apply as usual, and Claude Code's `thinking: {type:
 enabled}` maps onto the gateway's [reasoning control](#reasoning-control) so an
 open-weight model thinks when asked to.
 
+### Prompt caching and cost
+
+Claude Code marks cache breakpoints with `cache_control`, and they are what keeps
+a long session cheap — without them the whole context is billed again every turn.
+
+- **Passthrough** (`type: anthropic`): the request body reaches Anthropic
+  byte-for-byte, with the alias resolved to the real model id as the only change.
+  Breakpoints, thinking signatures and tool streaming all survive.
+- **Translated** (`type: openai`): breakpoints are dropped by default, because a
+  chat backend has no field for them. That costs nothing for local models (no
+  token billing) or OpenAI models (they cache automatically) — but it *does* cost
+  money on **OpenRouter**, which forwards `cache_control` to Anthropic and Gemini
+  models. Set `prompt_cache: true` on such a backend and the breakpoints are
+  carried into the translated body. It stays opt-in because they turn a message
+  into a content-part list, which a strict server may reject.
+
 `POST /v1/messages/count_tokens` is passed through to Anthropic and answered from
 an estimate for chat backends (they have no such endpoint).
 

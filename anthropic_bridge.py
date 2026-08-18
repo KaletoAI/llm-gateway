@@ -248,11 +248,33 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
     yield ev("message_stop", {})
 
 
-def messages_to_chat(body: dict) -> dict:
+def _text_parts(blocks: list, keep_cache_control: bool):
+    """Text blocks → a chat `content` value. Normally that is one flattened string;
+    with `keep_cache_control` and at least one breakpoint present it stays a part
+    LIST so the breakpoints ride along (OpenRouter passes them to Anthropic/Gemini
+    models — dropping them means paying full price for the whole context every
+    turn). Turns without a breakpoint keep the plain-string shape, so opting in
+    never reshapes more of the request than it has to."""
+    texts = [b.get("text", "") for b in blocks]
+    if not keep_cache_control or not any(b.get("cache_control") for b in blocks):
+        return "\n\n".join(texts)
+    out = []
+    for b in blocks:
+        part = {"type": "text", "text": b.get("text", "")}
+        if b.get("cache_control"):
+            part["cache_control"] = b["cache_control"]
+        out.append(part)
+    return out
+
+
+def messages_to_chat(body: dict, keep_cache_control: bool = False) -> dict:
     """Translate an Anthropic Messages request body to Chat Completions.
 
     Raises UnsupportedContent for blocks that cannot be dropped without changing
-    the answer. Gateway-private `_`-prefixed keys are never forwarded."""
+    the answer. Gateway-private `_`-prefixed keys are never forwarded.
+
+    `keep_cache_control` (backend opt-in) carries prompt-cache breakpoints into the
+    chat body instead of dropping them — see `_text_parts`."""
     chat: dict = {}
     for src, dst in (("model", "model"), ("max_tokens", "max_tokens"), ("temperature", "temperature"),
                      ("top_p", "top_p"), ("top_k", "top_k"), ("stream", "stream")):
@@ -291,9 +313,13 @@ def messages_to_chat(body: dict) -> dict:
 
     messages: list[dict] = []
     if system := body.get("system"):
-        text = system if isinstance(system, str) else _blocks_text(system)
-        if text:
-            messages.append({"role": "system", "content": text})
+        if isinstance(system, str):
+            content = system
+        else:
+            content = _text_parts([b for b in system if isinstance(b, dict)
+                                   and b.get("type") == "text"], keep_cache_control)
+        if content:
+            messages.append({"role": "system", "content": content})
 
     for m in body.get("messages") or []:
         role = m.get("role", "user")
@@ -301,7 +327,7 @@ def messages_to_chat(body: dict) -> dict:
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
             continue
-        texts: list[str] = []
+        text_blocks: list[dict] = []
         images: list[dict] = []
         tool_calls: list[dict] = []
         for block in content or []:
@@ -309,7 +335,7 @@ def messages_to_chat(body: dict) -> dict:
                 continue
             btype = block.get("type")
             if btype == "text":
-                texts.append(block.get("text", ""))
+                text_blocks.append(block)
             elif btype == "image":
                 images.append(_image_part(block))
             elif btype == "tool_use":
@@ -332,14 +358,17 @@ def messages_to_chat(body: dict) -> dict:
                     "route this model to an Anthropic backend")
             else:
                 logger.warning(f"anthropic bridge: dropping unknown content block '{btype}'")
+        text_content = _text_parts(text_blocks, keep_cache_control)
         if images:
             parts: list[dict] = []
-            if any(t for t in texts):
-                parts.append({"type": "text", "text": "\n\n".join(texts)})
+            if isinstance(text_content, list):
+                parts.extend(text_content)
+            elif text_content:
+                parts.append({"type": "text", "text": text_content})
             parts.extend(images)
             messages.append({"role": role, "content": parts})
-        elif texts or tool_calls:
-            msg: dict = {"role": role, "content": "\n\n".join(texts)}
+        elif text_blocks or tool_calls:
+            msg: dict = {"role": role, "content": text_content}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
             messages.append(msg)

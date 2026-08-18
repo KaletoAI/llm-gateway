@@ -900,6 +900,14 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "id (without the <code>backend/</code> prefix). Several local backends sharing a model id "
               "then collapse into one entry that routes by priority and fails over — an implicit "
               "cross-backend alias.</p>"
+            + _field("prompt cache passthrough",
+                     _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
+            + "<p class='hint'><b>prompt_cache</b>: keep Claude Code's cache breakpoints when this "
+              "backend serves <code>/v1/messages</code> (translated). Turn it on for <b>OpenRouter</b>, "
+              "which forwards them to Anthropic/Gemini models — without them the full context is billed "
+              "again every turn. Off by default: the breakpoints turn a message into a content-part list, "
+              "which a strict server may reject. Irrelevant for local models (no token billing) and for "
+              "OpenAI models (they cache automatically).</p>"
             + _field("route by speed",
                      _checkbox("route_speed", gb("route_speed"), "route_speed"))
             + "<p class='hint'><b>route_speed</b>: every bare model id this backend serves routes "
@@ -1290,7 +1298,8 @@ async def backend_save(request: Request):
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
-    for flag in ("chat_only", "serverless_only", "local", "route_speed", "auto_restart"):
+    for flag in ("chat_only", "serverless_only", "local", "route_speed", "auto_restart",
+                 "prompt_cache"):
         if f.get(flag):
             b[flag] = True
         else:
