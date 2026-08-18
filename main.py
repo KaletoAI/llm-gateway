@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from watchfiles import awatch
 
 import admin
+import anthropic_bridge
 import jobs
 import reasoning
 import stats
@@ -1028,6 +1029,13 @@ async def probe_reasoning(backend_name: str, model: str, adapter: str, param: di
               and x.get("type", "openai") != "comfyui"), None)
     if b is None:
         return {"error": f"backend '{backend_name}' not found or not an LLM backend"}
+    if b.get("type") == "anthropic":
+        # The one path that could otherwise reach an Anthropic backend off
+        # /v1/messages: this probe talks to the backend DIRECTLY, and
+        # api.anthropic.com does answer /v1/chat/completions. Same licence rule as
+        # serves_path — a subscription is not a chat-completions API.
+        return {"error": f"backend '{backend_name}' is an Anthropic backend — "
+                         "reachable through /v1/messages only, so there is nothing to probe here"}
     url = f"{b['url']}/v1/chat/completions"
     headers = {"content-type": "application/json", **backend_auth_headers(b)}
     base_body = {"model": model, "stream": False, "temperature": 0.1, "max_tokens": 300,
@@ -1305,9 +1313,13 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
     if not busy:
         # Say WHY when the only backends that could serve this alias are Anthropic
         # ones: they answer /v1/messages alone (see serves_path), and "no healthy
-        # backend" would send the caller hunting a fault that isn't there.
+        # backend" would send the caller hunting a fault that isn't there. Only off
+        # the messages path — ON it the very same candidate set means the backend is
+        # simply down, and a 404 there would tell the caller to use the endpoint they
+        # are already on (and Claude Code does not retry a 404, a 503 it does).
         cands = _route_index.get(alias) or []
-        if cands and all(b.get("type") == "anthropic" for b, _ in cands):
+        if (not path.startswith("/v1/messages")
+                and cands and all(b.get("type") == "anthropic" for b, _ in cands)):
             raise HTTPException(404, f"model '{alias}' is served by an Anthropic backend — "
                                      "reachable through POST /v1/messages only")
         raise HTTPException(503, f"No healthy backend for model '{alias}'")
@@ -1743,14 +1755,16 @@ def _client_credential(authorization: Optional[str], x_api_key: Optional[str]) -
     return f"Bearer {x_api_key}" if x_api_key else None
 
 
-def _messages_error(status: int, message: str) -> JSONResponse:
+def _messages_error(status: int, message: str, headers: Optional[dict] = None) -> JSONResponse:
     """Gateway-side failure in the shape Claude Code renders (it reads
-    error.message; an OpenAI-shaped or FastAPI `detail` body shows as blank)."""
+    error.message; an OpenAI-shaped or FastAPI `detail` body shows as blank).
+    `headers` carries the ones that steer a client's retry — a park-timeout 503
+    without its `Retry-After` tells the caller nothing about when to come back."""
     etype = {400: "invalid_request_error", 401: "authentication_error",
              403: "permission_error", 404: "not_found_error", 429: "rate_limit_error",
              402: "billing_error"}.get(status, "api_error")
     return JSONResponse({"type": "error", "error": {"type": etype, "message": str(message)}},
-                        status_code=status)
+                        status_code=status, headers=headers or None)
 
 
 async def _messages_route(path: str, request: Request, credential: Optional[str]):
@@ -1761,14 +1775,30 @@ async def _messages_route(path: str, request: Request, credential: Optional[str]
     Deliberately NOT applied here: per-alias sampling defaults. Claude Code sends a
     complete, deliberate request, and a chat-shaped `min_p`/`repetition_penalty`
     would 400 against Anthropic and change behaviour everywhere else."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "request body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
     alias = body.get("model", "")
     await gate_request(credential, request, alias)          # auth + allow-list + quota
     thinking = body.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
-        body["_reasoning"] = "on"                           # honoured by translated backends only
+    if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "disabled"):
+        # An explicit client control always wins over the per-alias default — same
+        # rule as the chat path. Honoured by translated backends; the Anthropic
+        # passthrough sets `thinking` itself and never sees this.
+        body["_reasoning"] = "on" if thinking["type"] == "enabled" else "off"
     elif alias_reasoning.get(alias) is not None:
         body["_reasoning"] = alias_reasoning[alias]
+    if path.startswith("/v1/messages/count_tokens"):
+        # No chat backend has this endpoint — it is answered from an estimate. Doing
+        # that BEFORE dispatch keeps it out of the in-flight/park machinery: sizing a
+        # context must not queue behind real calls (or hold a slot on a
+        # max_concurrent:1 backend) when no backend is needed at all.
+        ready, busy = resolve_routes(alias, path)
+        if not any(b.get("type") == "anthropic" for b, _ in ready + busy):
+            return JSONResponse({"input_tokens": anthropic_bridge.estimate_input_tokens(body)})
     return await _dispatch_or_park(alias, path, body, request)
 
 
@@ -1780,7 +1810,7 @@ async def messages(request: Request, authorization: Optional[str] = Header(None)
         return await _messages_route("/v1/messages", request,
                                      _client_credential(authorization, x_api_key))
     except HTTPException as e:
-        return _messages_error(e.status_code, e.detail)
+        return _messages_error(e.status_code, e.detail, getattr(e, "headers", None))
 
 
 @app.post("/v1/messages/count_tokens")
@@ -1792,7 +1822,7 @@ async def messages_count_tokens(request: Request, authorization: Optional[str] =
         return await _messages_route("/v1/messages/count_tokens", request,
                                      _client_credential(authorization, x_api_key))
     except HTTPException as e:
-        return _messages_error(e.status_code, e.detail)
+        return _messages_error(e.status_code, e.detail, getattr(e, "headers", None))
 
 
 @app.post("/v1/completions")

@@ -389,6 +389,13 @@ a long session cheap — without them the whole context is billed again every tu
 `POST /v1/messages/count_tokens` is passed through to Anthropic and answered from
 an estimate for chat backends (they have no such endpoint).
 
+**One caveat for mixed aliases with thinking on:** a translated backend produces
+thinking blocks without Anthropic's cryptographic `signature`. Claude Code sends
+those blocks back in the next turn, and if that turn lands on the Anthropic
+backend, Anthropic rejects unsigned thinking blocks with a `400`. Failover
+between the two is fine as long as thinking is off; with thinking on, give
+Claude and the open-weight model **separate aliases** and switch with `/model`.
+
 **Point Claude Code's background model somewhere cheap** — it runs a small model
 for titles and summaries:
 

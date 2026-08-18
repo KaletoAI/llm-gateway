@@ -1921,16 +1921,24 @@ def _anthropic_backends() -> set:
 
 
 def _anthropic_only(alias: str, anthro: set) -> bool:
-    """True when every backend this alias names is an Anthropic one. Such an alias
-    is unreachable outside /v1/messages (see main.serves_path) — the playground
-    must not offer it, because a subscription credential is licensed for Claude
-    Code, not for a chat console."""
+    """True when only Anthropic backends can serve this alias. Such an alias is
+    unreachable outside /v1/messages (see main.serves_path) — the playground must
+    not offer it, because a subscription credential is licensed for Claude Code,
+    not for a chat console.
+
+    Both alias shapes count: a dict alias names its backends outright, a string
+    alias applies to every backend but is only served where the model exists."""
     if not anthro:
         return False
     v = _config_chat_aliases().get(alias)
     if v is None and store.is_active():
         v = store.get_chat_alias(alias)
-    return bool(isinstance(v, dict) and v and set(v.keys()) <= anthro)
+    if isinstance(v, dict):
+        return bool(v) and set(v.keys()) <= anthro
+    if isinstance(v, str) and v:
+        serving = {b["name"] for b in _llm_backends() if v in (b.get("models") or [])}
+        return bool(serving) and serving <= anthro
+    return False
 
 
 def _chat_models() -> list:

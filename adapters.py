@@ -471,10 +471,19 @@ class _Call:
     act: Any                            # live-call registry token
 
 
+# Anthropic error `type` per HTTP status — a client steers its retry off the status,
+# but shows the type, so a 429 must not read as a generic api_error.
+_ANTHROPIC_ERROR_TYPE = {400: "invalid_request_error", 401: "authentication_error",
+                         403: "permission_error", 404: "not_found_error",
+                         413: "request_too_large", 429: "rate_limit_error",
+                         529: "overloaded_error"}
+
+
 def _anthropic_error(status: int, etype: str, message: str, headers=None) -> JSONResponse:
     """An error in the shape Claude Code expects — it parses `error.message` and
     shows it; an OpenAI-shaped error body would surface as an unhelpful blank."""
-    keep = {k: v for k, v in (headers or {}).items() if k.lower().startswith("x-gateway")}
+    keep = {k: v for k, v in (headers or {}).items()
+            if k.lower().startswith(("x-gateway", "x-reasoning"))}
     return JSONResponse({"type": "error", "error": {"type": etype, "message": message[:2000]}},
                         status_code=status, headers=keep)
 
@@ -567,15 +576,22 @@ class OpenAIAdapter(BackendAdapter):
             # explicitly — the client never sees the raw chunk.
             chat_body["stream_options"] = {"include_usage": True}
         resp = await self.dispatch(chat_req)
-        if getattr(resp, "status_code", 200) >= 400:
-            return _anthropic_error(resp.status_code, "api_error",
+        status = getattr(resp, "status_code", 200)
+        if status >= 400:
+            # A backend-local load failure (llama-swap's "unable to start process"
+            # 502) must reach the router UNTOUCHED: it recognises that body and fails
+            # over to the next candidate. Re-shaping it here would leave that
+            # detection depending on where the marker happens to land in the new body.
+            if status == 502 and b"unable to start process" in (getattr(resp, "body", b"") or b""):
+                return resp
+            return _anthropic_error(status, _ANTHROPIC_ERROR_TYPE.get(status, "api_error"),
                                     _error_text(resp), headers=getattr(resp, "headers", None))
         if chat_body.get("stream") and isinstance(resp, StreamingResponse):
             return StreamingResponse(
                 anthropic_bridge.messages_stream(resp, req.alias, input_tokens=estimate),
                 media_type="text/event-stream",
                 headers={k: v for k, v in (resp.headers or {}).items()
-                         if k.lower().startswith("x-gateway")})
+                         if k.lower().startswith(("x-gateway", "x-reasoning"))})
         chat_json = getattr(resp, "parsed_json", None)
         if not isinstance(chat_json, dict):
             try:
@@ -584,7 +600,7 @@ class OpenAIAdapter(BackendAdapter):
                 chat_json = {}
         return JSONResponse(anthropic_bridge.chat_to_messages(chat_json, req.alias),
                             headers={k: v for k, v in (resp.headers or {}).items()
-                                     if k.lower().startswith("x-gateway")})
+                                     if k.lower().startswith(("x-gateway", "x-reasoning"))})
 
     def _prepare(self, req: NormalizedRequest) -> _Call:
         """Shared per-dispatch setup: outgoing headers + payload (gateway-private

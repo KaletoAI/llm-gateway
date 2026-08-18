@@ -158,13 +158,24 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
     event sequence Claude Code drives off: message_start → per content block
     start/delta/stop → message_delta (stop_reason + real usage) → message_stop.
 
-    Blocks are opened lazily and strictly sequentially — a text, thinking or
-    tool_use block is closed before the next one opens, and whatever is open when
-    the stream ends is closed — so a client's block bookkeeping never desyncs."""
+    Blocks are opened lazily and strictly sequentially — a text or thinking block
+    is closed before the next one opens, and whatever is open when the stream ends
+    is closed — so a client's block bookkeeping never desyncs.
+
+    Tool calls are the exception: their fragments are COLLECTED and emitted as
+    complete blocks at the end of the stream. A chat backend may interleave text
+    between two fragments of the same call, number its calls inconsistently, or
+    omit the index entirely — while Anthropic blocks are strictly sequential, so a
+    late fragment would have to land on an already-closed block. Nothing is lost:
+    a client can only run a tool once its arguments parse, which is after the last
+    fragment either way. (The verbatim Anthropic path keeps true fine-grained tool
+    streaming — this only concerns translated backends.)"""
     mid = _mid()
     state = {"index": -1, "kind": None}       # currently OPEN block
     stop_reason, usage = None, None
-    tool_slots: dict = {}                     # chat tool_call index → anthropic block index
+    tools: list[dict] = []                    # collected tool calls, in arrival order
+    slots: dict = {}                          # chat slot key → index into `tools`
+    last_slot = {"key": None}
 
     def ev(etype: str, payload: dict) -> str:
         return f"event: {etype}\ndata: {json.dumps({'type': etype, **payload}, ensure_ascii=False)}\n\n"
@@ -184,9 +195,15 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
     yield ev("message_start", {"message": message_shell(
         mid, model, usage={"input_tokens": input_tokens, "output_tokens": 0})})
 
+    # Hold the iterator in a local so it can be closed explicitly: when the CLIENT
+    # disconnects, GeneratorExit lands in THIS generator, and the inner adapter
+    # generator — which holds the in-flight slot and the upstream connection — would
+    # otherwise only be finalized whenever the event loop gets around to collecting
+    # it. The project's rule is explicit release on every path.
+    source = chat_resp.body_iterator
     try:
         buf = ""
-        async for chunk in chat_resp.body_iterator:
+        async for chunk in source:
             buf += chunk.decode("utf-8", "ignore") if isinstance(chunk, (bytes, bytearray)) else chunk
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
@@ -226,21 +243,53 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
                              "delta": {"type": "text_delta", "text": text}})
 
                 for tc in d.get("tool_calls") or []:
-                    slot = tc.get("index", 0)
                     fn = tc.get("function") or {}
-                    if slot not in tool_slots:                  # first fragment → open the block
-                        yield close_open()
-                        yield open_block("tool", {"type": "tool_use", "id": tc.get("id", ""),
-                                                  "name": fn.get("name", ""), "input": {}})
-                        tool_slots[slot] = state["index"]
-                    args = fn.get("arguments")
-                    if args:
-                        yield ev("content_block_delta", {"index": tool_slots[slot],
-                                 "delta": {"type": "input_json_delta", "partial_json": args}})
-    except Exception as e:                    # a broken upstream must still close the message
+                    # Slot identity: the index when the backend numbers its calls, else
+                    # a new id starts a new call and an id-less fragment continues the
+                    # last one. Keying everything on a missing index would merge two
+                    # calls' arguments into one.
+                    if tc.get("index") is not None:
+                        key = ("i", tc["index"])
+                    elif tc.get("id"):
+                        key = ("id", tc["id"])
+                    else:
+                        key = last_slot["key"] or ("i", 0)
+                    last_slot["key"] = key
+                    if key not in slots:
+                        slots[key] = len(tools)
+                        tools.append({"id": tc.get("id", ""), "name": fn.get("name", ""),
+                                      "args": ""})
+                    t = tools[slots[key]]
+                    if tc.get("id") and not t["id"]:
+                        t["id"] = tc["id"]
+                    if fn.get("name") and not t["name"]:
+                        t["name"] = fn["name"]
+                    t["args"] += fn.get("arguments") or ""
+    except Exception as e:
+        # A stream that died mid-answer must NOT be dressed up as a finished one:
+        # closing with stop_reason=end_turn would present a truncated answer as
+        # complete. Anthropic has an `error` event for exactly this.
         logger.warning(f"anthropic SSE translate aborted: {e}")
+        yield close_open()
+        yield ev("error", {"error": {"type": "api_error",
+                                     "message": f"upstream stream failed: {e}"}})
+        return
+    finally:
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:                  # already closed / never started
+                pass
 
     yield close_open()
+    for t in tools:                            # complete tool blocks, in arrival order
+        yield open_block("tool", {"type": "tool_use", "id": t["id"], "name": t["name"],
+                                  "input": {}})
+        if t["args"]:
+            yield ev("content_block_delta", {"index": state["index"],
+                     "delta": {"type": "input_json_delta", "partial_json": t["args"]}})
+        yield close_open()
     final_usage = {"input_tokens": int((usage or {}).get("prompt_tokens") or input_tokens),
                    "output_tokens": int((usage or {}).get("completion_tokens") or 0)}
     yield ev("message_delta", {"delta": {"stop_reason": stop_reason or "end_turn",
@@ -254,7 +303,12 @@ def _text_parts(blocks: list, keep_cache_control: bool):
     LIST so the breakpoints ride along (OpenRouter passes them to Anthropic/Gemini
     models — dropping them means paying full price for the whole context every
     turn). Turns without a breakpoint keep the plain-string shape, so opting in
-    never reshapes more of the request than it has to."""
+    never reshapes more of the request than it has to.
+
+    Note the one visible difference: in part-list form the blocks stay separate
+    instead of being joined with a blank line, so a turn's rendered prompt can
+    differ marginally between `prompt_cache` on and off. It is consistent per
+    backend, which is what caching needs."""
     texts = [b.get("text", "") for b in blocks]
     if not keep_cache_control or not any(b.get("cache_control") for b in blocks):
         return "\n\n".join(texts)

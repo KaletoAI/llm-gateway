@@ -384,6 +384,68 @@ class MessagesStream(unittest.TestCase):
         tdelta = [e for e in events if e["type"] == "content_block_delta"][0]
         self.assertEqual(tdelta["delta"], {"type": "thinking_delta", "thinking": "think"})
 
+    def test_tool_args_never_land_on_a_closed_block(self):
+        """A backend may interleave text between tool-call fragments. Anthropic
+        blocks are strictly sequential, so a delta after content_block_stop would
+        desync the client's block bookkeeping."""
+        stream = FakeStream([
+            delta_chunk(tool_calls=[{"index": 0, "id": "c1", "type": "function",
+                                     "function": {"name": "Read", "arguments": '{"a"'}}]),
+            delta_chunk(content="thinking out loud"),
+            delta_chunk(tool_calls=[{"index": 0, "function": {"arguments": ':1}'}}]),
+            sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ])
+        events = collect(ab.messages_stream(stream, "m"))
+        closed = set()
+        for e in events:
+            if e["type"] == "content_block_stop":
+                closed.add(e["index"])
+            if e["type"] == "content_block_delta":
+                self.assertNotIn(e["index"], closed,
+                                 f"delta on closed block {e['index']}: {e}")
+        json_deltas = [e["delta"]["partial_json"] for e in events
+                       if e["type"] == "content_block_delta"
+                       and e["delta"]["type"] == "input_json_delta"]
+        self.assertEqual("".join(json_deltas), '{"a":1}')
+
+    def test_tool_calls_without_an_index_field_stay_separate(self):
+        """Not every OpenAI-compatible server numbers streamed tool calls; keying
+        on a missing index would merge two calls' arguments into one."""
+        stream = FakeStream([
+            delta_chunk(tool_calls=[{"id": "c1", "type": "function",
+                                     "function": {"name": "Read", "arguments": '{"a":1}'}}]),
+            delta_chunk(tool_calls=[{"id": "c2", "type": "function",
+                                     "function": {"name": "Write", "arguments": '{"b":2}'}}]),
+            sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+        ])
+        events = collect(ab.messages_stream(stream, "m"))
+        tools = [e["content_block"] for e in events if e["type"] == "content_block_start"
+                 and e["content_block"]["type"] == "tool_use"]
+        self.assertEqual([t["id"] for t in tools], ["c1", "c2"])
+        per_block = {}
+        for e in events:
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "input_json_delta":
+                per_block.setdefault(e["index"], "")
+                per_block[e["index"]] += e["delta"]["partial_json"]
+        self.assertEqual(sorted(per_block.values()), ['{"a":1}', '{"b":2}'])
+
+    def test_a_broken_upstream_stream_reports_an_error_event(self):
+        """Silently finishing with stop_reason=end_turn would present a truncated
+        answer as a complete one."""
+        class Exploding(FakeStream):
+            @property
+            def body_iterator(self):
+                async def gen():
+                    yield delta_chunk(content="partial").encode()
+                    raise ConnectionError("upstream died")
+                return gen()
+
+        with self.assertLogs("anthropic_bridge", level="WARNING"):
+            events = collect(ab.messages_stream(Exploding([]), "m"))
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1]["error"]["type"], "api_error")
+        self.assertNotIn("message_stop", [e["type"] for e in events])
+
     def test_a_stream_that_never_produced_content_still_closes_cleanly(self):
         events = collect(ab.messages_stream(FakeStream(["data: [DONE]\n\n"]), "m"))
         self.assertEqual([e["type"] for e in events],
