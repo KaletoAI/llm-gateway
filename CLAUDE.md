@@ -33,9 +33,9 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   before deploy.
 - `requirements.txt` omits `watchfiles`; it ships with `uvicorn[standard]`. Keep it.
 - Deploy with `DEPLOY_HOST=root@host ./deploy.sh` (rsync/tar over SSH, remote venv
-  install, systemd sync, restart). The prod box has no rsync from dev — see project
-  memory for the scp+restart path. Always compile-gate before scp (a broken file
-  silently fails the restart).
+  install, systemd sync, restart). rsync IS present on both dev and the prod box
+  (re-checked 2026-08-18; an older note claiming otherwise was stale). Always
+  compile-gate first — a broken file fails the restart silently.
 
 ## Architecture
 
@@ -232,8 +232,11 @@ hot-reload-safe.
 - **Messages** (`POST /v1/messages`, `POST /v1/messages/count_tokens` — the Claude
   Code frontdoor): `_messages_route()` authenticates (`x-api-key` OR `Authorization:
   Bearer` — Claude Code uses the former; both carry a GATEWAY key), folds
-  `thinking:{type:enabled}` into `body["_reasoning"]` (honoured by translated
-  backends only) and hands over to the SAME `_dispatch_or_park()`. Deliberately no
+  `thinking:{type:enabled|disabled}` into `body["_reasoning"]` (an explicit client
+  control beats the per-alias default, as on the chat path; honoured by translated
+  backends only) and hands over to the SAME `_dispatch_or_park()`.
+  `count_tokens` for a chat backend is answered from the bridge's estimate BEFORE
+  dispatch, so sizing a context never queues for an in-flight slot. Deliberately no
   `_apply_alias_sampling()` here: Claude Code sends a complete request, and a
   chat-shaped `min_p` would 400 against Anthropic. Errors are re-shaped to
   `{"type":"error","error":{…}}` — Claude Code reads `error.message` and renders a
