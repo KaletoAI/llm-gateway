@@ -568,6 +568,8 @@ def _type_badge(t: str) -> str:
     t = (t or "openai").lower()
     if t == "comfyui":
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
+    if t == "anthropic":
+        return _badge("🅐 anthropic", "warn", "Anthropic backend — reachable via /v1/messages only")
     return _badge(f"💬 {t}", "llm", "LLM backend (OpenAI-compatible)")
 
 
@@ -854,7 +856,8 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + "<p class='hint' style='margin:-4px 0 10px'><b>openai</b> = every OpenAI-compatible server "
               "(llama.cpp / llama-swap / vLLM / LocalAI / cloud) — including <b>TTS/voice</b> and whisper "
               "models, which are discovered and routed like any other model. <b>comfyui</b> = workflow-based "
-              "media generation.</p>"
+              "media generation. <b>anthropic</b> = api.anthropic.com for Claude Code, reachable through "
+              "<code>/v1/messages</code> only.</p>"
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
             + _field("host", host_inp)
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
@@ -911,6 +914,14 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "id (without the <code>backend/</code> prefix). Several local backends sharing a model id "
               "then collapse into one entry that routes by priority and fails over — an implicit "
               "cross-backend alias.</p>"
+            + _field("prompt cache passthrough",
+                     _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
+            + "<p class='hint'><b>prompt_cache</b>: keep Claude Code's cache breakpoints when this "
+              "backend serves <code>/v1/messages</code> (translated). Turn it on for <b>OpenRouter</b>, "
+              "which forwards them to Anthropic/Gemini models — without them the full context is billed "
+              "again every turn. Off by default: the breakpoints turn a message into a content-part list, "
+              "which a strict server may reject. Irrelevant for local models (no token billing) and for "
+              "OpenAI models (they cache automatically).</p>"
             + _field("route by speed",
                      _checkbox("route_speed", gb("route_speed"), "route_speed"))
             + "<p class='hint'><b>route_speed</b>: every bare model id this backend serves routes "
@@ -928,6 +939,35 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "token salad at temperature ≈ 1. Re-derived per backend, so a failover uses the new "
               "backend's values. Applies to chat/completions/responses only.</p>"
             + "</details>"
+            + "</div>"
+            # Anthropic-only options — the licence warning sits AT the credential field,
+            # not in a footnote, because that is where the decision is made.
+            + f'<div id="anthopts" style="{"" if g("type", "openai") == "anthropic" else "display:none"}">'
+            + '<div class="grouphdr">Anthropic</div>'
+            + "<p class='bad' style='margin:0 0 10px'><b>Licence boundary.</b> A Claude "
+              "<b>subscription</b> token (<code>claude setup-token</code>) is licensed for your own use of "
+              "Claude Code — <b>not</b> for re-serving Claude as an API to other clients or people. This "
+              "backend is therefore reachable through <code>/v1/messages</code> only: it never appears in "
+              "<code>/v1/chat/completions</code>, <code>/v1/responses</code> or the Playground. Keep it that "
+              "way, and don't hand its gateway key to third parties. With a paid <b>API key</b> "
+              "(console.anthropic.com) the same restriction applies here — the gateway does not translate "
+              "Claude into the OpenAI endpoints.</p>"
+            + _field("auth mode", _select("auth_mode", [
+                ("subscription", "subscription — claude setup-token (OAuth)"),
+                ("api_key", "api key — console.anthropic.com")],
+                g("auth_mode", "subscription")))
+            + "<p class='hint' style='margin:-4px 0 10px'>Determines how the credential in <b>api key</b> "
+              "above is sent: <b>subscription</b> → <code>Authorization: Bearer</code> plus the OAuth beta "
+              "header; <b>api key</b> → <code>x-api-key</code>.</p>"
+            + _field("models", _inp("models", ", ".join((b or {}).get("models") or [])
+                                    if isinstance((b or {}).get("models"), list)
+                                    else g("models"),
+                                    placeholder="claude-sonnet-5, claude-opus-5"))
+            + "<p class='hint' style='margin:-4px 0 10px'>Comma-separated fallback model list. Discovery "
+              "asks <code>GET /v1/models</code> first; a subscription token is not guaranteed to be allowed "
+              "there, and this list keeps the backend usable when it isn't. Point a chat alias at one of "
+              "these ids, then run Claude Code with "
+              "<code>ANTHROPIC_BASE_URL=&lt;gateway&gt;</code>.</p>"
             + "</div></form>")
 
 
@@ -938,13 +978,15 @@ def _sampling_text(d) -> str:
 
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
-    (LLM-only vs ComfyUI-only — the form renders both, only one is ever visible)."""
+    (LLM / ComfyUI / Anthropic — the form renders all, only one is ever visible)."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
-                   for t in ("comfyui", "openai"))
+                   for t in ("comfyui", "openai", "anthropic"))
     return ('<select name="type" onchange="var t=this.value,'
-            "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts');"
+            "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
+            "a=document.getElementById('anthopts');"
             "if(l)l.style.display=t==='openai'?'':'none';"
-            "if(c)c.style.display=t==='comfyui'?'':'none'\">" + opts + "</select>")
+            "if(c)c.style.display=t==='comfyui'?'':'none';"
+            "if(a)a.style.display=t==='anthropic'?'':'none'\">" + opts + "</select>")
 
 
 def _bid(b: dict) -> str:
@@ -1270,7 +1312,8 @@ async def backend_save(request: Request):
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
-    for flag in ("chat_only", "serverless_only", "local", "route_speed", "auto_restart"):
+    for flag in ("chat_only", "serverless_only", "local", "route_speed", "auto_restart",
+                 "prompt_cache"):
         if f.get(flag):
             b[flag] = True
         else:
@@ -1281,6 +1324,18 @@ async def backend_save(request: Request):
             b[nkey] = int(v)
         else:
             b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry)
+    # Anthropic: how the credential is sent, plus the fallback model list used when
+    # a subscription token isn't allowed on GET /v1/models.
+    if new_type == "anthropic":
+        b["auth_mode"] = "api_key" if (f.get("auth_mode") or "") == "api_key" else "subscription"
+        models = [m.strip() for m in (f.get("models", "") or "").split(",") if m.strip()]
+        if models:
+            b["models"] = models
+        else:
+            b.pop("models", None)
+    else:
+        b.pop("auth_mode", None)
+        b.pop("models", None)
     sd, sd_err = _parse_sampling_form(f)
     if sd_err:
         return HTMLResponse(_page("Backends", f'<p class="bad">{_esc(sd_err)}</p>'
@@ -1875,11 +1930,41 @@ def _is_image_model(mid: str) -> bool:
     return any(h in m for h in _IMG_MODEL_HINTS)
 
 
+def _anthropic_backends() -> set:
+    return {b["name"] for b in _llm_backends() if b.get("type") == "anthropic"}
+
+
+def _anthropic_only(alias: str, anthro: set) -> bool:
+    """True when only Anthropic backends can serve this alias. Such an alias is
+    unreachable outside /v1/messages (see main.serves_path) — the playground must
+    not offer it, because a subscription credential is licensed for Claude Code,
+    not for a chat console.
+
+    Both alias shapes count: a dict alias names its backends outright, a string
+    alias applies to every backend but is only served where the model exists."""
+    if not anthro:
+        return False
+    v = _config_chat_aliases().get(alias)
+    if v is None and store.is_active():
+        v = store.get_chat_alias(alias)
+    if isinstance(v, dict):
+        return bool(v) and set(v.keys()) <= anthro
+    if isinstance(v, str) and v:
+        serving = {b["name"] for b in _llm_backends() if v in (b.get("models") or [])}
+        return bool(serving) and serving <= anthro
+    return False
+
+
 def _chat_models() -> list:
     """Everything callable as a chat `model`: aliases first, then bare model ids
-    (priority-routed) and backend/model forms — feeds the model datalist."""
-    aliases = list(_gateway_info().get("virtual_models", []))
-    llm = _llm_backends()
+    (priority-routed) and backend/model forms — feeds the model datalist. Anthropic
+    backends and their alias-only entries are left out: they answer /v1/messages
+    only, so offering them here would just produce a 503 (and inviting a
+    subscription backend into a chat console is exactly what it is not for)."""
+    anthro = _anthropic_backends()
+    aliases = [a for a in _gateway_info().get("virtual_models", [])
+               if not _anthropic_only(a, anthro)]
+    llm = [b for b in _llm_backends() if b.get("type") != "anthropic"]
     bare = sorted({m for b in llm for m in b.get("models", [])})
     prefixed = sorted(f"{b['name']}/{m}" for b in llm for m in b.get("models", []))
     out, seen = [], set()

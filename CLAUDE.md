@@ -39,10 +39,11 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Ten self-contained Python files hold everything. `main.py` owns app state; the
+Eleven self-contained Python files hold everything. `main.py` owns app state; the
 others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
-`responses_bridge`, `openai_image_bridge`, `previewanim`) never import `main` — they
-receive what they need via injected callables, staying hot-reload-safe.
+`responses_bridge`, `anthropic_bridge`, `openai_image_bridge`, `previewanim`) never
+import `main` — they receive what they need via injected callables, staying
+hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
   endpoints, auth/quotas, call parking, generation orchestration, the Responses
@@ -77,6 +78,24 @@ receive what they need via injected callables, staying hot-reload-safe.
   nothing executes). `exec_stuck`/`last_restart*` surface in `/health` + the
   Backends tab (⟳ restart action). `generate()` submits a parametrised
   workflow, polls `/history`, fetches `/view`.) `AdapterContext` injects app services.
+  `AnthropicAdapter` (`type: anthropic`, subclasses `OpenAIAdapter`) serves
+  **`/v1/messages` only** — a licence boundary enforced in routing
+  (`main.serves_path`), not just documented: a Claude subscription token covers
+  Claude Code, not re-serving Claude as an API. It is a VERBATIM passthrough, so
+  three things that run for every other backend must not run there —
+  `_StreamNormalizer`, `apply_reasoning()` and `sampling_defaults` — else
+  `cache_control` breakpoints (full-price context re-reads without them), thinking
+  signatures and fine-grained tool streaming are lost. The three seams that make
+  this a subclass instead of a fork: `_payload()` (verbatim vs. sampling+reasoning),
+  `_backend_auth()` (`x-api-key` vs. OAuth bearer + `oauth-2025-04-20` beta appended
+  to the CLIENT's beta list) and `_usage_of()` (`input_tokens`/`output_tokens`
+  incl. cache reads, else every subscription call books 0 tokens). The same
+  `OpenAIAdapter` also serves `/v1/messages` for chat backends by calling
+  `anthropic_bridge` in both directions, which is what lets ONE alias hold an
+  Anthropic backend AND an OpenRouter model with normal failover between them.
+  `_HOP_BY_HOP` drops `x-api-key` alongside `authorization` — both are GATEWAY
+  credentials (Claude Code sends the former), and forwarding either would hand the
+  caller's key to the backend.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
   sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
@@ -147,6 +166,16 @@ receive what they need via injected callables, staying hot-reload-safe.
   builds on. `main.py` keeps the endpoints, dispatch/parking, and background
   mode; the adapter attaches `resp.parsed_json` so the bridge never re-parses
   the raw body.
+- **`anthropic_bridge.py`** — pure Messages↔Chat translation (no gateway state,
+  no `main`/`adapters` imports): `messages_to_chat` / `chat_to_messages` /
+  `messages_stream` (chat SSE → Anthropic SSE) / `estimate_input_tokens` and
+  `message_shell()`. Used ONLY when a non-Anthropic backend serves `/v1/messages`;
+  an `anthropic` backend forwards verbatim (see `AnthropicAdapter`). Translation
+  policy: drop what is inert (`cache_control`, history `thinking` blocks,
+  server-side tools), raise `UnsupportedContent` → 400 where dropping would
+  silently answer about content the model never saw (documents/PDFs). Covered by
+  `test_anthropic_bridge.py` (stdlib `unittest`, the repo's only test file —
+  a streaming tool-call bridge fails silently rather than crashing).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
   slot mapping, `images_response`); imports only the leaf `jobs`. `main.py`
@@ -200,6 +229,18 @@ receive what they need via injected callables, staying hot-reload-safe.
   `_dispatch_or_park()` too (also parks, and normalizes reasoning incl. the
   Responses `{effort}` shape); `background:true` runs it async via the official
   Responses background mode (see below).
+- **Messages** (`POST /v1/messages`, `POST /v1/messages/count_tokens` — the Claude
+  Code frontdoor): `_messages_route()` authenticates (`x-api-key` OR `Authorization:
+  Bearer` — Claude Code uses the former; both carry a GATEWAY key), folds
+  `thinking:{type:enabled}` into `body["_reasoning"]` (honoured by translated
+  backends only) and hands over to the SAME `_dispatch_or_park()`. Deliberately no
+  `_apply_alias_sampling()` here: Claude Code sends a complete request, and a
+  chat-shaped `min_p` would 400 against Anthropic. Errors are re-shaped to
+  `{"type":"error","error":{…}}` — Claude Code reads `error.message` and renders a
+  FastAPI `detail` body as blank. Routing filters candidates by `serves_path()`, so
+  an Anthropic backend is invisible everywhere else and an alias served only by
+  such backends answers `404 … reachable through POST /v1/messages only` instead of
+  a misleading 503.
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   the alias via the **separate** generation store (`image_models`/store), filtered
