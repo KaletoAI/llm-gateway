@@ -232,10 +232,30 @@ Gegen `api.anthropic.com` mit einem echten Subscription-Token (Abo „max") geme
    oauth-2025-04-20` identisch. Der Adapter hängt den Beta-Wert weiterhin an die
    Client-Liste an (statt sie zu ersetzen) — schadet nicht, schützt vor künftigem
    Pflichtwerden.
-3. **Kein Claude-Code-Systemprompt und keine CLI-Kennung verlangt.** Requests ohne
-   `user-agent: claude-cli/…` und ohne Claude-Code-Systemprompt werden normal
-   bedient. Die Lizenzgrenze wird also NICHT upstream erzwungen — genau deshalb
-   steht sie im Gateway (Abschnitt 3) und muss dort bleiben.
+3. **Der Claude-Code-Systemprompt WIRD verlangt — für die starken Modelle.**
+   (Korrigiert: die erste Messung dazu lief versehentlich gegen einen ungültigen
+   Modellnamen und war deshalb wertlos.) Sauber nachgemessen mit
+   `claude-sonnet-5`:
+
+   | Request | Ergebnis |
+   |---|---|
+   | nur Bearer | 429 `rate_limit_error` |
+   | + `anthropic-beta: claude-code-20250219` | 429 |
+   | + `user-agent: claude-cli/2.1.235` | 429 |
+   | + `x-app: cli` | 429 |
+   | + `system: "You are Claude Code, Anthropic's official CLI for Claude."` | **200** |
+
+   Es hängt also am **Systemprompt**, nicht an Headern. `claude-haiku-4-5` ist
+   ausgenommen (geht auch ohne). Der 429 ist irreführend: die Rate-Limit-Header
+   melden bei Haiku zeitgleich 5h-Auslastung 0.1 — es ist kein Verbrauchslimit,
+   sondern eine Zugriffsentscheidung.
+
+   **Konsequenz fürs Gateway: nichts tun.** Der Systemprompt kommt vom echten
+   Client und geht durch den Passthrough unverändert mit; ihn selbst einzusetzen
+   hieße, beliebige Clients als Claude Code zu tarnen — genau die Grenze, die
+   dieser Backend-Typ respektieren soll. Anthropic setzt sie damit teilweise auch
+   upstream durch; die Sperre aus Abschnitt 3 bleibt trotzdem nötig (Haiku wäre
+   sonst offen, und die Grenze darf nicht von Anthropics Verhalten abhängen).
 
 Weitere Messungen derselben Sitzung:
 

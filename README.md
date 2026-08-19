@@ -403,6 +403,22 @@ for titles and summaries:
 export ANTHROPIC_SMALL_FAST_MODEL=cheap          # a gateway alias on a local/OpenRouter model
 ```
 
+Recent Claude Code versions carry one slot per model class, each taking any
+gateway alias or bare model id — so you can mix providers inside a single
+session and switch with `/model`:
+
+```bash
+export ANTHROPIC_DEFAULT_OPUS_MODEL=opus         # alias → your Anthropic backend
+export ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet
+export ANTHROPIC_DEFAULT_FABLE_MODEL=fable
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=glm         # background model → OpenRouter/local
+```
+
+`ANTHROPIC_CUSTOM_MODEL_OPTION` (plus `…_NAME` / `…_DESCRIPTION`) adds an entry of
+your own to the `/model` menu instead of overwriting one of the built-in slots.
+Note that a *reasoning* model in the Haiku slot spends its budget thinking about
+titles and summaries — a small local model is usually the better fit there.
+
 ### Licence boundary (please keep it)
 
 A Claude **subscription** token (`claude setup-token`) is licensed for *your own*
@@ -490,8 +506,23 @@ Smoke-test it from the gateway box before pointing Claude Code at it:
 curl -s localhost:4000/v1/messages -H "x-api-key: $GATEWAY_KEY" \
   -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' \
   -d '{"model":"claude-sonnet-5","max_tokens":16,
+       "system":"You are Claude Code, Anthropic'\''s official CLI for Claude.",
        "messages":[{"role":"user","content":"Reply with: gateway works"}]}'
 ```
+
+**That `system` line is not decoration.** With a subscription token, Anthropic
+serves the stronger models only when the request identifies itself as Claude Code:
+without it, `claude-sonnet-5` and `claude-opus-5` answer `429 rate_limit_error`
+while the rate-limit headers report the account barely used (measured 2026-08-19:
+5h utilization 0.1 with Haiku going through fine). Haiku is exempt; Sonnet and
+Opus are not. So a bare curl failing with 429 is expected and says nothing about
+your quota.
+
+This matters not at all for normal use — Claude Code sends that system prompt
+itself and the passthrough forwards it untouched. And the gateway deliberately
+does **not** inject it on your behalf: doing so would disguise arbitrary clients
+as Claude Code, which is exactly the licence boundary this backend type exists to
+respect.
 
 ---
 
