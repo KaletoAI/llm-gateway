@@ -198,6 +198,7 @@ _DEFAULT_PRIORITY = 100                 # backends without an explicit priority 
 
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
 backend_healthy: dict[str, bool] = {}                          # name → bool
+backend_error: dict[str, dict] = {}                            # bid → why discovery failed (see _classify_error)
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
@@ -424,6 +425,37 @@ def restart_comfy_backend(bid: str) -> bool:
     return True
 
 
+def _classify_error(e: Exception) -> dict:
+    """Why a discovery poll failed, in a form the console can act on.
+
+    "down" alone sends you hunting a network fault that may not exist: a rejected
+    credential and an unplugged host look identical in the Backends tab, yet one is
+    fixed in the api-key field and the other on the host. `kind` carries that
+    distinction; `detail` keeps the raw message for the tooltip."""
+    detail = str(e) or e.__class__.__name__
+    status = None
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        status = getattr(resp, "status_code", None)
+    if isinstance(e, ComfyExecutorStuck):
+        kind = "stuck"
+    elif status in (401, 403):
+        kind = "auth"                       # credential rejected — not a network problem
+    elif status == 404:
+        kind = "not_found"                  # wrong base url / path (e.g. url ends in /v1)
+    elif status == 429:
+        kind = "rate_limit"
+    elif status is not None and status >= 500:
+        kind = "upstream"
+    elif isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+        kind = "unreachable"
+    elif isinstance(e, httpx.TimeoutException):
+        kind = "timeout"
+    else:
+        kind = "error"
+    return {"kind": kind, "status": status, "detail": detail[:300], "since": int(time.time())}
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     """Poll a backend's capabilities via its adapter and update discovery state.
 
@@ -449,11 +481,20 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         if not was_healthy:
             logger.info(f"[{label}] UP  — {len(caps.models)} models, {len(caps.pricing)} priced")
         backend_healthy[bid] = True
+        backend_error.pop(bid, None)
         if not was_healthy or changed:     # a backend came online / gained models →
             _notify_slot_free()            # let parked calls re-evaluate and grab it
     except Exception as e:
+        info = _classify_error(e)
+        # Keep the ORIGINAL failure time across repeated polls of the same fault, so
+        # the console can say how long it has been broken.
+        prev = backend_error.get(bid)
+        if prev and prev.get("kind") == info["kind"] and prev.get("status") == info["status"]:
+            info["since"] = prev["since"]
+        backend_error[bid] = info
         if backend_healthy.get(bid, True):
-            logger.warning(f"[{label}] DOWN — {e}")
+            hint = " (credential rejected — check the api key)" if info["kind"] == "auth" else ""
+            logger.warning(f"[{label}] DOWN — {e}{hint}")
         backend_healthy[bid] = False
         backend_pricing[bid] = {}
         backend_loras[bid] = set()
@@ -486,6 +527,7 @@ def reload_config() -> None:
     new_ids = {backend_id(b) for b in backends}
     for stale in old_ids - new_ids:
         backend_healthy.pop(stale, None)
+        backend_error.pop(stale, None)
         backend_models.pop(stale, None)
         backend_pricing.pop(stale, None)
         backend_loras.pop(stale, None)
@@ -946,6 +988,7 @@ def routing_snapshot() -> dict:
                 "overridden": prio is not None,
                 "enabled": enbl,
                 "healthy": healthy,
+                "error": backend_error.get(bid) if enbl and not healthy else None,
                 "present": present,
                 "busy": busy,
                 "routable": enbl and healthy and present,
@@ -3178,6 +3221,7 @@ def gateway_info() -> dict:
         "backends": [{
             "name": b["name"], "type": b.get("type", "openai"), "priority": b["priority"],
             "enabled": is_enabled(b), "healthy": backend_healthy.get(backend_id(b), False),
+            "error": backend_error.get(backend_id(b)),      # why it is down (kind/status/detail)
             "inflight": backend_inflight.get(backend_id(b), 0), "draining": is_draining(b),
             "models": len(backend_models.get(backend_id(b), set())), "url": b["url"],
             "max_concurrent": b.get("max_concurrent"),
@@ -3418,6 +3462,7 @@ async def health():
                 "name": b["name"], "type": b.get("type", "openai"),
                 "enabled": is_enabled(b),
                 "healthy": is_enabled(b) and backend_healthy.get(backend_id(b), False),
+                "error": backend_error.get(backend_id(b)) if is_enabled(b) else None,
                 "busy": is_enabled(b) and backend_busy(b),
                 "inflight": backend_inflight.get(backend_id(b), 0),
                 "max_concurrent": backend_max_concurrent(b),

@@ -443,6 +443,41 @@ def _badge(text: str, kind: str = "muted", title: str = "") -> str:
     return f'<span class="badge {kind}"{t}>{_esc(text)}</span>'
 
 
+# What a failed discovery poll looked like → the badge that says what to DO about it.
+# A rejected credential and an unplugged host both used to read "down", which sends
+# you debugging the network when the fix is one field in this very form.
+_DOWN_BADGE = {
+    "auth": ("🔑 token invalid", "Backend rejected the credential — check the api key "
+                                 "field (Anthropic tokens start with sk-ant-oat01- or sk-ant-api03-)"),
+    "not_found": ("✖ endpoint not found", "The URL answered 404 — check it: it must be the base "
+                                          "URL without /v1, which the gateway appends itself"),
+    "rate_limit": ("⏱ rate limited", "The backend is rate-limiting discovery (429) — usually "
+                                     "temporary; the next poll retries"),
+    "upstream": ("⚠ upstream error", "The backend answered with a server error (5xx)"),
+    "unreachable": ("⇥ unreachable", "No TCP connection — host down, wrong port, or firewalled"),
+    "timeout": ("⏱ timeout", "The backend accepted the connection but did not answer in time"),
+    "stuck": ("⚠ executor stuck", "Answers HTTP but is not draining its queue"),
+}
+
+
+def _down_badge(err: Optional[dict]) -> str:
+    """Status chip for an unhealthy backend, naming the actual cause."""
+    if not err:
+        return _badge("down", "bad")
+    label, hint = _DOWN_BADGE.get(err.get("kind") or "", ("down", ""))
+    status = err.get("status")
+    detail = err.get("detail") or ""
+    since = err.get("since")
+    parts = [hint] if hint else []
+    if status:
+        parts.append(f"HTTP {status}")
+    if since:
+        parts.append(f"for {_age(int(since))}")
+    if detail:
+        parts.append(detail)
+    return _badge(label, "bad", " · ".join(p for p in parts if p))
+
+
 _MODELVIEWER_SRC = "/ui/static/model-viewer.min.js"   # bundled locally (no CDN); served by static_asset
 
 
@@ -569,7 +604,9 @@ def _type_badge(t: str) -> str:
     if t == "comfyui":
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
     if t == "anthropic":
-        return _badge("🅐 anthropic", "warn", "Anthropic backend — reachable via /v1/messages only")
+        # plain glyph on purpose: the enclosed-A (🅐) renders as a blank box in the
+        # console's system font stack
+        return _badge("✳ anthropic", "warn", "Anthropic backend — reachable via /v1/messages only")
     return _badge(f"💬 {t}", "llm", "LLM backend (OpenAI-compatible)")
 
 
@@ -1020,7 +1057,7 @@ async def backends_page(request: Request):
         elif b["healthy"]:
             badge = _badge("healthy", "ok")
         else:
-            badge = _badge("down", "bad")
+            badge = _down_badge(b.get("error"))
         if b.get("exec_stuck"):
             badge = _badge("⚠ executor stuck", "bad",
                            "ComfyUI answers HTTP but its executor is not draining the queue "
@@ -1457,7 +1494,7 @@ def _route_status(r: dict) -> str:
     elif not r.get("enabled"):
         out = _badge("disabled")
     elif not r.get("healthy"):
-        out = _badge("down", "bad")
+        out = _down_badge(r.get("error"))
     elif not r.get("present"):
         out = _badge("model absent", "warn")
     else:
@@ -1521,7 +1558,7 @@ def _img_status(bm: Optional[dict]) -> str:
     if not bm.get("enabled"):
         return _badge("disabled")
     if not bm.get("healthy"):
-        return _badge("down", "bad")
+        return _down_badge(bm.get("error"))
     return _badge("healthy", "ok")
 
 
