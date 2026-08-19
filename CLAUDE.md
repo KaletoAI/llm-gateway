@@ -158,7 +158,18 @@ hot-reload-safe.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console). Zero new dependencies — keep it.
-  The `calls` row carries the applied `reasoning` control (shown in LLM Calls).
+  The `calls` row carries the applied `reasoning` control (shown in LLM Calls) and
+  the prompt-cache split `cache_read`/`cache_write` — both SUBSETS of
+  `input_tokens` (which stays the total the model processed), so
+  `input - read - write` is what was billed fresh. Fed by the adapters'
+  `_cache_of()` hook (Anthropic: `cache_read_input_tokens` /
+  `cache_creation_input_tokens`; OpenAI-shaped: `prompt_tokens_details.
+  cached_tokens`) on all four paths — streamed and not, both protocols.
+  `cache_trend()` buckets that per backend over 24h and drives the Statistic tab's
+  sparkline; a hit rate collapsing while input keeps rising is the signal that a
+  long Claude Code session started paying full price again. New columns are added
+  by the same `ALTER TABLE` migration list as the earlier ones (an existing prod
+  stats.db migrates in place; pre-existing rows read 0, never NULL).
 - **`responses_bridge.py`** — pure Responses↔Chat translation functions (no
   gateway state): `responses_to_chat` / `chat_to_responses` / `responses_stream`
   (chat SSE → Responses SSE) and `response_shell()`, the ONE Responses-object

@@ -362,6 +362,7 @@ class _StreamNormalizer:
         self.reasoning_as_content = reasoning_as_content
         self.buf = b""
         self.in_tok = self.out_tok = 0      # best backend-reported usage so far
+        self.cache_read = self.cache_write = 0   # prompt-cache share of in_tok (stats only)
         self.pieces = 0                     # content-bearing deltas ≈ completion tokens
         self.meta: dict = {}                # id/model/created of the last chunk seen
         self.usage_sent = False
@@ -414,6 +415,13 @@ class _StreamNormalizer:
         if isinstance(u, dict):
             self.in_tok = max(self.in_tok, int(u.get("prompt_tokens") or 0))
             self.out_tok = max(self.out_tok, int(u.get("completion_tokens") or 0))
+            # Prompt-cache share, for stats only — never forwarded, the client's
+            # usage chunk keeps the strict OpenAI shape.
+            det = u.get("prompt_tokens_details") or {}
+            self.cache_read = max(self.cache_read,
+                                  int(det.get("cached_tokens") or u.get("cached_tokens") or 0))
+            self.cache_write = max(self.cache_write,
+                                   int(u.get("cache_creation_input_tokens") or 0))
         if not obj.get("choices"):                            # terminal usage chunk
             if u is None:
                 return line + "\n"                            # odd keepalive — leave it
@@ -669,6 +677,20 @@ class OpenAIAdapter(BackendAdapter):
         usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
         return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
 
+    def _cache_of(self, resp_json: dict) -> tuple[int, int]:
+        """(cache_read, cache_write) — how much of the input came out of the
+        backend's prompt cache, and how much was written into it. Both are SUBSETS
+        of the input figure, so the console can show what was actually paid fresh.
+
+        OpenAI-shaped backends report reads under `prompt_tokens_details.cached_
+        tokens` (OpenAI, vLLM, OpenRouter) and have no write counter — except
+        OpenRouter serving an Anthropic model, which passes Anthropic's through."""
+        usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
+        details = usage.get("prompt_tokens_details") or {}
+        read = int(details.get("cached_tokens") or usage.get("cached_tokens") or 0)
+        write = int(usage.get("cache_creation_input_tokens") or 0)
+        return read, write
+
     def _finish(self, call: _Call) -> None:
         """Release the in-flight slot + live-registry entry (every path's finally)."""
         self.ctx.inflight_dec(self.bid)
@@ -676,8 +698,10 @@ class OpenAIAdapter(BackendAdapter):
 
     def _record(self, req: NormalizedRequest, call: _Call, status: int,
                 in_tok: int, out_tok: int, response_text: Optional[str] = None,
-                response_audio: Optional[tuple] = None) -> int:
-        """Fire-and-forget stats row for this dispatch; returns the elapsed ms."""
+                response_audio: Optional[tuple] = None,
+                cache: tuple[int, int] = (0, 0)) -> int:
+        """Fire-and-forget stats row for this dispatch; returns the elapsed ms.
+        `cache` is (read, write) — the prompt-cache share of `in_tok`."""
         ctx = self.ctx
         elapsed_ms = int((time.monotonic() - call.started) * 1000)
         ctx.note_speed(self.bid, out_tok, elapsed_ms, status)   # speed-routing EWMA (guarded in main)
@@ -689,6 +713,7 @@ class OpenAIAdapter(BackendAdapter):
             request_text=call.req_text, response_text=response_text,
             response_audio=response_audio,
             reasoning=call.reasoning_ctl,
+            cache_read=cache[0], cache_write=cache[1],
         ))
         return elapsed_ms
 
@@ -755,7 +780,8 @@ class OpenAIAdapter(BackendAdapter):
                 await client_cm.__aexit__(None, None, None)
                 self._finish(call)
             in_tok, out_tok = norm.tokens()
-            self._record(req, call, resp.status_code, in_tok, out_tok)
+            self._record(req, call, resp.status_code, in_tok, out_tok,
+                         cache=(norm.cache_read, norm.cache_write))
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 
@@ -787,7 +813,8 @@ class OpenAIAdapter(BackendAdapter):
                       else None)
         elapsed_ms = self._record(req, call, resp.status_code, in_tok, out_tok,
                                   response_text=(resp.text if is_texty else None),
-                                  response_audio=resp_audio)
+                                  response_audio=resp_audio,
+                                  cache=self._cache_of(resp_json if isinstance(resp_json, dict) else {}))
         if call.log_on:
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
         out = Response(resp.content, status_code=resp.status_code,
@@ -845,11 +872,19 @@ class AnthropicAdapter(OpenAIAdapter):
     def _usage_of(self, resp_json: dict) -> tuple[int, int]:
         """Anthropic names them input_tokens/output_tokens; cache reads and writes
         are input the model processed, so they count toward the input figure the
-        console shows."""
+        console shows (with `_cache_of` breaking that total back down)."""
         u = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
         in_tok = (int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
                   + int(u.get("cache_creation_input_tokens") or 0))
         return in_tok, int(u.get("output_tokens") or 0)
+
+    def _cache_of(self, resp_json: dict) -> tuple[int, int]:
+        """Anthropic reports the cache explicitly — a read costs a tenth of a fresh
+        token, a write a quarter more, so the split is what makes a session's cost
+        readable."""
+        u = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
+        return (int(u.get("cache_read_input_tokens") or 0),
+                int(u.get("cache_creation_input_tokens") or 0))
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         """Anthropic's GET /v1/models, falling back to the backend's configured
@@ -928,10 +963,12 @@ class AnthropicAdapter(OpenAIAdapter):
             return Response(content=err, status_code=resp.status_code,
                             media_type=resp.headers.get("content-type"), headers=call.rheaders)
 
-        counted = {"in": 0, "out": 0, "text": []}
+        counted = {"in": 0, "out": 0, "read": 0, "write": 0, "text": []}
 
         def sniff(raw: str) -> None:
-            """Read usage + text off the passing events (stats only)."""
+            """Read usage + text off the passing events (stats only). The cache
+            figures ride in `message_start`'s usage — the very numbers that say
+            whether a long Claude Code session is still being served cheaply."""
             for line in raw.split("\n"):
                 if not line.startswith("data:"):
                     continue
@@ -945,6 +982,9 @@ class AnthropicAdapter(OpenAIAdapter):
                 if u:
                     counted["in"] = max(counted["in"], self._usage_of({"usage": u})[0])
                     counted["out"] = max(counted["out"], int(u.get("output_tokens") or 0))
+                    read, write = self._cache_of({"usage": u})
+                    counted["read"] = max(counted["read"], read)
+                    counted["write"] = max(counted["write"], write)
                 d = obj.get("delta") or {}
                 if d.get("type") == "text_delta" and d.get("text"):
                     counted["text"].append(d["text"])
@@ -963,7 +1003,8 @@ class AnthropicAdapter(OpenAIAdapter):
                 await client_cm.__aexit__(None, None, None)
                 self._finish(call)
             self._record(req, call, resp.status_code, counted["in"], counted["out"],
-                         response_text="".join(counted["text"]) or None)
+                         response_text="".join(counted["text"]) or None,
+                         cache=(counted["read"], counted["write"]))
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 

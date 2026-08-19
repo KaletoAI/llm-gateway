@@ -637,6 +637,17 @@ stats:
 - **Streaming** calls record real tokens when the backend honors
   `stream_options.include_usage` (requested automatically), else `0`.
 - The applied **reasoning control** is logged per call (LLM Calls tab column).
+- **Prompt cache** — the *By backend* table breaks the input tokens down into
+  `cached` (served out of the backend's prompt cache, at a fraction of the fresh
+  price), `written` (stored into it, a one-off surcharge) and `fresh` (billed in
+  full), plus a **24h trend** sparkline of the hit rate. This is what tells you a
+  long [Claude Code](#claude-code--anthropic-messages) session is still cheap — a
+  cache that stops being hit (changed prefix, expired window) shows up as the
+  trend falling to zero while input keeps climbing. Anthropic reports the split
+  natively (`cache_read_input_tokens` / `cache_creation_input_tokens`);
+  OpenAI-shaped backends report reads via `prompt_tokens_details.cached_tokens`.
+  A backend that reports nothing shows `—` rather than zeros — "no cache
+  reporting" is not the same statement as "the cache missed everything".
 - Recent calls store the full request/response body (large/binary bodies on disk),
   viewable per-call, pruned with the same retention.
 
