@@ -4385,6 +4385,52 @@ async def llmcalls_page(request: Request):
     return RedirectResponse(f"/ui/jobs?{urlencode(q)}", status_code=307)
 
 
+def _cache_cells(in_tok: int, read: int, write: int, series: Optional[list]) -> str:
+    """The prompt-cache columns of a By-backend row: cached / written / fresh, plus
+    a 24h hit-rate sparkline. A backend that reported no cache numbers at all shows
+    dashes rather than a row of zeros — zeros would read as "cache missed
+    everything", which is a different statement from "does not do caching"."""
+    in_tok, read, write = int(in_tok or 0), int(read or 0), int(write or 0)
+    if not read and not write:
+        return "<td class='muted'>—</td><td class='muted'>—</td>" \
+               f"<td>{in_tok or '—'}</td><td class='muted'>—</td>"
+    fresh = max(0, in_tok - read - write)
+    pct = f" <span class='muted'>{read * 100 // in_tok}%</span>" if in_tok else ""
+    return (f"<td>{read}{pct}</td><td>{write}</td><td>{fresh}</td>"
+            f"<td>{_cache_spark(series)}</td>")
+
+
+def _cache_spark(series: Optional[list]) -> str:
+    """Inline-SVG sparkline of the hit rate (cache_read / input) per bucket. Bars
+    only where the bucket saw traffic, so a gap means "no calls", not "no hits".
+    Inline SVG keeps the console dependency-free (no chart library, no JS)."""
+    if not series:
+        return "<span class='muted'>—</span>"
+    n = len(series)
+    w, h, gap = 4, 18, 1
+    bars = []
+    for i, (in_tok, read, _write) in enumerate(series):
+        if not in_tok:
+            continue
+        rate = min(1.0, read / in_tok)
+        bh = max(1, round(rate * h))
+        bars.append(f"<rect x='{i * (w + gap)}' y='{h - bh}' width='{w}' height='{bh}' "
+                    f"fill='#5cb87f' opacity='{0.35 + 0.65 * rate:.2f}'></rect>")
+    if not bars:
+        return "<span class='muted'>—</span>"
+    total_in = sum(i for i, _r, _w in series)
+    total_read = sum(r for _i, r, _w in series)
+    title = f"{(total_read * 100 // total_in) if total_in else 0}% of input served from cache (24h)"
+    width = n * (w + gap)
+    # A baseline + a full-height frame: without them a single bar reads as a stray
+    # mark instead of "one hour out of twenty-four".
+    axis = (f"<rect x='0' y='0' width='{width}' height='{h}' fill='#1b2028'></rect>"
+            f"<rect x='0' y='{h - 1}' width='{width}' height='1' fill='#2a313c'></rect>")
+    return (f"<svg width='{width}' height='{h}' viewBox='0 0 {width} {h}' "
+            f"role='img' aria-label='{_esc(title)}'><title>{_esc(title)}</title>"
+            f"{axis}{''.join(bars)}</svg>")
+
+
 async def statistic_page(request: Request):
     if not stats.is_active():
         return HTMLResponse(_page("Statistic", "<h2>Statistic</h2><p class='hint'>Call recording is off. "
@@ -4400,10 +4446,24 @@ async def statistic_page(request: Request):
              f"<div class='card'><div class='cnum'>{s['h24_count']}</div><div class='clbl'>calls · 24h</div></div>"
              f"<div class='card'><div class='cnum'>{_cost(s['h24_cost'])}</div><div class='clbl'>cost · 24h</div></div>"
              f"</div>")
-    be = "".join(f"<tr><td>{_esc(r[0])}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td>"
-                 f"<td>{_cost(r[4])}</td><td>{_dur(r[5])}</td></tr>" for r in s["by_backend"])
-    by_backend = (f"<h2>By backend</h2><table class='filterable sortable' data-sk='stat-backend'>"
+    trend = await asyncio.to_thread(stats.cache_trend, user=user)
+    be = "".join(f"<tr><td>{_esc(r[0])}</td><td>{r[1]}</td><td>{r[2]}</td>"
+                 + _cache_cells(r[2], r[6] if len(r) > 6 else 0, r[7] if len(r) > 7 else 0,
+                                trend.get(r[0]))
+                 + f"<td>{r[3]}</td><td>{_cost(r[4])}</td><td>{_dur(r[5])}</td></tr>"
+                 for r in s["by_backend"])
+    by_backend = (f"<h2>By backend</h2>"
+                  f"<p class='hint'>Prompt cache: <b>cached</b> = input served from the backend's "
+                  f"cache (a fraction of the fresh price), <b>written</b> = input stored into it "
+                  f"(a surcharge, paid once), <b>fresh</b> = the rest, billed in full. The trend is "
+                  f"the hit rate over the last 24h — a session whose cache stops being hit starts "
+                  f"paying full price for its whole context again.</p>"
+                  f"<table class='filterable sortable' data-sk='stat-backend'>"
                   f"<tr><th>backend</th><th>calls</th><th>in tok</th>"
+                  f"<th title='input served out of the prompt cache'>cached</th>"
+                  f"<th title='input written into the prompt cache'>written</th>"
+                  f"<th title='input processed fresh — neither read nor written'>fresh</th>"
+                  f"<th title='cache hit rate per hour, last 24h'>24h trend</th>"
                   f"<th>out tok</th><th>cost</th><th>avg</th></tr>{be}</table>" if be
                   else "<h2>By backend</h2><p class='muted'>no calls yet</p>")
     mo = "".join(f"<tr><td>{_esc(r[0]) or '—'}</td><td><code>{_esc(r[1])}</code></td><td>{r[2]}</td>"

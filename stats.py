@@ -41,7 +41,12 @@ CREATE TABLE IF NOT EXISTS calls (
     output_tokens INTEGER DEFAULT 0,
     cost_usd      REAL    DEFAULT 0,
     req_preview   TEXT,
-    reasoning     TEXT
+    reasoning     TEXT,
+    -- Prompt-cache breakdown of input_tokens (which stays the TOTAL the model
+    -- processed): cache_read = served from cache, cache_write = written into it.
+    -- input_tokens - cache_read - cache_write = paid at the full fresh rate.
+    cache_read    INTEGER DEFAULT 0,
+    cache_write   INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_calls_ts      ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
@@ -104,9 +109,12 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
         "active": True, "user": user,
         "total_count": total[0], "total_cost": total[1],
         "h24_count": h24[0], "h24_cost": h24[1],
+        # by_backend carries the prompt-cache breakdown too: cache_read/cache_write
+        # are subsets of input_tokens, so "fresh" is the remainder.
         "by_backend": _q(
             f"SELECT backend, COUNT(*), COALESCE(SUM(input_tokens),0), "
-            f"COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0), COALESCE(AVG(duration_ms),0) "
+            f"COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0), COALESCE(AVG(duration_ms),0), "
+            f"COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0) "
             f"FROM calls{flt} GROUP BY backend ORDER BY COUNT(*) DESC", *ua),
         "by_model": _q(
             f"SELECT COALESCE(alias,''), COALESCE(model,''), COUNT(*), "
@@ -120,6 +128,36 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
             f"input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
             f"FROM calls{flt} ORDER BY id DESC LIMIT ?", *ua, recent_limit),
     }
+
+
+def cache_trend(hours: int = 24, buckets: int = 24, user: Optional[str] = None) -> dict:
+    """Prompt-cache history per backend: `buckets` equal slices over the last
+    `hours`, each carrying (input, cache_read, cache_write).
+
+    A single total says whether caching works at all; the trend says whether it
+    still works — a cache that stopped being hit (a changed prefix, an expired
+    window) shows up here as a hit rate falling to zero while input keeps rising,
+    which is exactly the moment a long session starts costing full price again.
+    Only backends that reported cache numbers at all are included."""
+    if _DB_PATH is None or hours <= 0 or buckets <= 0:
+        return {}
+    now = int(time.time())
+    start = now - hours * 3600
+    span = max(1, (hours * 3600) // buckets)
+    flt = " AND source = ?" if user else ""
+    ua = [user] if user else []
+    rows = _q(
+        f"SELECT backend, (ts - ?) / ? AS bucket, COALESCE(SUM(input_tokens),0), "
+        f"COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0) "
+        f"FROM calls WHERE ts > ?{flt} GROUP BY backend, bucket ORDER BY bucket",
+        start, span, start, *ua)
+    out: dict = {}
+    for backend, bucket, in_tok, read, write in rows:
+        series = out.setdefault(backend, [(0, 0, 0)] * buckets)
+        idx = min(buckets - 1, max(0, int(bucket)))
+        i, r, w = series[idx]
+        series[idx] = (i + int(in_tok), r + int(read), w + int(write))
+    return {b: s for b, s in out.items() if any(r or w for _, r, w in s)}
 
 
 def month_cost(user: str, month_start_ts: int) -> float:
@@ -147,7 +185,9 @@ def init(db_path: str, blob_dir: str = "calls") -> None:
         cols = {r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()}
         for col, ddl in (("req_preview", "TEXT"),
                          ("has_body", "INTEGER DEFAULT 0"),
-                         ("reasoning", "TEXT")):
+                         ("reasoning", "TEXT"),
+                         ("cache_read", "INTEGER DEFAULT 0"),
+                         ("cache_write", "INTEGER DEFAULT 0")):
             if col not in cols:
                 c.execute(f"ALTER TABLE calls ADD COLUMN {col} {ddl}")
     logger.info(f"stats: SQLite at {_DB_PATH} (WAL), call bodies in {_BLOB_DIR}/")
@@ -218,8 +258,9 @@ def _record_sync(row: tuple, request_text=None, response_text=None, response_aud
     with _conn() as c:
         cur = c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
-            "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview, reasoning) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview, reasoning, "
+            "cache_read, cache_write) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             row,
         )
         if request_text is not None or response_text is not None or response_audio is not None:
@@ -263,10 +304,17 @@ async def record_call(
     response_text: Optional[str] = None,
     response_audio: Optional[tuple] = None,
     reasoning: Optional[str] = None,
+    cache_read: int = 0,
+    cache_write: int = 0,
 ) -> None:
     """Async-safe insert. Never raises into the request path. Full request/response
     bodies (when given) are written to an on-disk blob, not the DB row;
-    `response_audio` = (bytes, mime) for binary TTS replies (own blob + player)."""
+    `response_audio` = (bytes, mime) for binary TTS replies (own blob + player).
+
+    `cache_read`/`cache_write` break `input_tokens` down: how much of it the
+    backend served from its prompt cache and how much it wrote into the cache.
+    Both are SUBSETS of input_tokens, never additions — the rest was processed
+    fresh at full price."""
     if _DB_PATH is None:
         return
     row = (
@@ -283,6 +331,8 @@ async def record_call(
         cost_usd,
         _preview(request_text),
         reasoning,
+        max(0, int(cache_read or 0)),
+        max(0, int(cache_write or 0)),
     )
     try:
         await asyncio.to_thread(_record_sync, row, request_text, response_text, response_audio)
