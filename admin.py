@@ -2213,24 +2213,42 @@ def _mapping_list_chat(cedit: str) -> str:
 
 
 def _mapping_list_media(iedit: str) -> str:
-    # Media group (generation aliases — image/video/audio/mesh)
-    img_items = ""
-    for alias, cands in store.list_aliases().items():
-        c = cands[0]
-        mapped = ", ".join((c.get("mapping") or {}).keys()) or "auto"
-        backends = ", ".join(x.get("backend", "") for x in cands)
-        acts = _icon_acts(
-            ("✎", f"/ui/mapping?edit={_esc(alias)}", "secondary", "Edit"),
-            ("⧉", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
-            ("✕", f"/ui/mapping/delete?alias={_esc(alias)}", "danger", "Delete", f"Delete {alias}?"))
-        img_items += _item(_esc(alias), f"{backends} · {c.get('task')} · {mapped}", acts,
-                           sel=(alias == iedit))
-    img_items = img_items or "<p class='muted'>No workflows — + Workflow.</p>"
+    """Generation aliases (image/video/audio/mesh), grouped by task.
+
+    Flat, the list runs to dozens of entries in which a text2img workflow sits
+    between two rigging ones. Grouping by `task` is what you actually navigate by —
+    you come here to edit "one of the mesh flows", not "the 14th alias". Groups
+    follow _TASK_OPTIONS order (the pipeline's own order: image → video → mesh),
+    anything unrecognised trails alphabetically so a typo'd task stays visible
+    instead of silently vanishing."""
+    by_task: dict[str, list] = {}
+    for alias, cands in sorted(store.list_aliases().items()):
+        by_task.setdefault((cands[0].get("task") or "").strip() or "—", []).append((alias, cands))
+
+    order = [t for t in _TASK_OPTIONS if t in by_task]
+    order += sorted(t for t in by_task if t not in _TASK_OPTIONS)
+
+    body = ""
+    for task in order:
+        entries = by_task[task]
+        body += (f'<div class="grouphdr">{_esc(task)} '
+                 f'<span class="muted" style="font-weight:normal">{len(entries)}</span></div>')
+        for alias, cands in entries:
+            c = cands[0]
+            mapped = ", ".join((c.get("mapping") or {}).keys()) or "auto"
+            backends = ", ".join(x.get("backend", "") for x in cands)
+            acts = _icon_acts(
+                ("✎", f"/ui/mapping?edit={_esc(alias)}", "secondary", "Edit"),
+                ("⧉", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
+                ("✕", f"/ui/mapping/delete?alias={_esc(alias)}", "danger", "Delete", f"Delete {alias}?"))
+            # the task is the group header now — the row shows what differs within it
+            body += _item(_esc(alias), f"{backends} · {mapped}", acts, sel=(alias == iedit))
+    body = body or "<p class='muted'>No workflows — + Workflow.</p>"
     bar = ('<div class="bar"><h2>Media workflows</h2>'
            f'<div style="display:flex;gap:8px">'
            f'{_btn("⬇ Export all", "/ui/mapping/export-all", "secondary", title="Download all cleaned workflows as a zip")}'
            f'{_btn("+ Workflow", "/ui/mapping?new=1")}</div></div>')
-    return bar + img_items
+    return bar + body
 
 
 async def mapping_page(request: Request):

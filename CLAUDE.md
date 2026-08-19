@@ -155,7 +155,10 @@ hot-reload-safe.
   Media aliases | Image models | LoRAs); the workflow Mapping editor owns a pasted
   ComfyUI API JSON and offers discovery-fed dropdowns. Mapping's sub-tab is derived
   when `?sub=` is absent (`?edit=`/`?new=` → media, else chat), so the dozens of
-  existing action links keep working unchanged and still land in the right tab. POST bodies parsed by
+  existing action links keep working unchanged and still land in the right tab.
+  The Media list groups by `task` in `_TASK_OPTIONS` order (unknown tasks trail
+  alphabetically, so a typo stays visible) with a per-group count; the task is the
+  header, so the row shows what differs WITHIN a group (backends · mapped params). POST bodies parsed by
   hand (`parse_qs`) to stay `python-multipart`-free.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
