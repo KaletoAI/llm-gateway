@@ -151,9 +151,11 @@ hot-reload-safe.
   locked. Tabs in `TABS`; a top tab can group child views via `SUBTABS` +
   `_with_subnav()` (`?sub=` on the parent route, first child = default —
   Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
-  Input & Routing: Input | Chat aliases | LLM models | Media aliases |
-  Image models | LoRAs); the workflow Mapping editor owns a pasted
-  ComfyUI API JSON and offers discovery-fed dropdowns. POST bodies parsed by
+  Mapping: Chat | Media, Input & Routing: Input | Chat aliases | LLM models |
+  Media aliases | Image models | LoRAs); the workflow Mapping editor owns a pasted
+  ComfyUI API JSON and offers discovery-fed dropdowns. Mapping's sub-tab is derived
+  when `?sub=` is absent (`?edit=`/`?new=` → media, else chat), so the dozens of
+  existing action links keep working unchanged and still land in the right tab. POST bodies parsed by
   hand (`parse_qs`) to stay `python-multipart`-free.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone

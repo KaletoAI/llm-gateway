@@ -54,6 +54,7 @@ DEFAULT_TAB = "dashboard"
 # register here; the parent page dispatches on `sub` and passes
 # _page(..., subnav=_subnav(parent, sub)) so the bar renders under the header.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
+           "mapping": [("chat", "Chat"), ("media", "Media")],
            "jobs": [("llm", "LLM Calls"), ("media", "Media Jobs"), ("voice", "Voice Calls")],
            "routing": [("input", "Input"), ("chat", "Chat aliases"), ("llm", "LLM models"),
                        ("gen", "Media aliases"), ("image", "Image models"), ("loras", "LoRAs")]}
@@ -2165,7 +2166,7 @@ def _register_form() -> str:
     backend_opts = [b["name"] for b in _comfy_backends()] or [("", "(no comfyui backends)")]
     return ('<form action="/ui/mapping/register" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Register Workflow</h2>{_btn("Register", submit=True)}'
-            f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
+            f'{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}</div>'
             "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
             "later ComfyUI-GUI edits. You'll map fields after registering.</p>"
             + _field("alias", _inp("alias", placeholder="flux"))
@@ -2176,9 +2177,17 @@ def _register_form() -> str:
             + "</form>")
 
 
-def _mapping_list(cedit: str, iedit: str) -> str:
-    """The shared left column: chat aliases and generation aliases, grouped, with
-    their own edit targets (?cedit= for chat, ?edit= for media)."""
+def _mapping_list(cedit: str, iedit: str, sub: str = "chat") -> str:
+    """The left column for ONE sub-tab: chat aliases (?cedit=) or media workflows
+    (?edit=). They used to share a single scrolling list, which grew past the point
+    where either was findable — the two are edited in completely different ways, so
+    they get their own tab each."""
+    if sub == "media":
+        return _mapping_list_media(iedit)
+    return _mapping_list_chat(cedit)
+
+
+def _mapping_list_chat(cedit: str) -> str:
     # Chat group (config + UI-managed, merged)
     cfg, ui = _config_chat_aliases(), store.list_chat_aliases()
     chat_items = ""
@@ -2195,6 +2204,15 @@ def _mapping_list(cedit: str, iedit: str) -> str:
         chat_items += _item(f"{_esc(name)} {src}", _chat_summary(val), _icon_acts(*specs),
                             sel=(name == cedit))
     chat_items = chat_items or "<p class='muted'>No chat aliases — + Chat alias.</p>"
+    bar = ('<div class="bar"><h2>Chat aliases</h2>'
+           f'<div style="display:flex;gap:8px">{_btn("+ Chat alias", "/ui/mapping?cnew=1")}</div></div>')
+    legend = ("<p class='hint' style='margin:2px 0 6px'>"
+              + _badge("config") + " from config.yaml · "
+              + _badge("ui", "ok") + " created/edited here (overrides config)</p>")
+    return bar + legend + chat_items
+
+
+def _mapping_list_media(iedit: str) -> str:
     # Media group (generation aliases — image/video/audio/mesh)
     img_items = ""
     for alias, cands in store.list_aliases().items():
@@ -2208,16 +2226,11 @@ def _mapping_list(cedit: str, iedit: str) -> str:
         img_items += _item(_esc(alias), f"{backends} · {c.get('task')} · {mapped}", acts,
                            sel=(alias == iedit))
     img_items = img_items or "<p class='muted'>No workflows — + Workflow.</p>"
-    bar = ('<div class="bar"><h2>Mapping</h2>'
+    bar = ('<div class="bar"><h2>Media workflows</h2>'
            f'<div style="display:flex;gap:8px">'
            f'{_btn("⬇ Export all", "/ui/mapping/export-all", "secondary", title="Download all cleaned workflows as a zip")}'
-           f'{_btn("+ Chat alias", "/ui/mapping?cnew=1", "secondary")}'
            f'{_btn("+ Workflow", "/ui/mapping?new=1")}</div></div>')
-    legend = ("<p class='hint' style='margin:2px 0 6px'>"
-              + _badge("config") + " from config.yaml · "
-              + _badge("ui", "ok") + " created/edited here (overrides config)</p>")
-    return (bar + '<div class="grouphdr">Chat</div>' + legend + chat_items
-            + '<div class="grouphdr">Media</div>' + img_items)
+    return bar + img_items
 
 
 async def mapping_page(request: Request):
@@ -2225,7 +2238,13 @@ async def mapping_page(request: Request):
         return _inactive()
     qp = request.query_params
     cedit, iedit = qp.get("cedit", ""), qp.get("edit", "")
-    list_html = _mapping_list(cedit, iedit)
+    # Which sub-tab: an explicit ?sub= wins, otherwise the edit target decides. That
+    # keeps every existing action link working — they redirect to ?edit=/?cedit= and
+    # land in the matching tab without carrying a sub of their own.
+    sub = qp.get("sub", "")
+    if sub not in ("chat", "media"):
+        sub = "media" if (iedit or qp.get("new")) else "chat"
+    list_html = _mapping_list(cedit, iedit, sub)
 
     def cols(*panels):
         return ('<div class="cols">'
@@ -2248,10 +2267,10 @@ async def mapping_page(request: Request):
     elif qp.get("new"):
         body = cols(list_html, _register_form())
     else:
-        detail = ("<h2>Details</h2><p class='hint'>Pick an alias to <b>Edit</b>, or add a "
-                  "<b>+ Chat alias</b> / <b>+ Workflow</b>.</p>")
+        what = ("a <b>+ Chat alias</b>" if sub == "chat" else "a <b>+ Workflow</b>")
+        detail = (f"<h2>Details</h2><p class='hint'>Pick an entry to <b>Edit</b>, or add {what}.</p>")
         body = cols(list_html, detail)
-    return HTMLResponse(_page("Mapping", body, "mapping"))
+    return HTMLResponse(_page("Mapping", body, "mapping", subnav=_subnav("mapping", sub)))
 
 
 async def register_post(request: Request):
@@ -2264,7 +2283,7 @@ async def register_post(request: Request):
 
     def err(msg):
         return HTMLResponse(_page("Register", f'<p class="bad">{_esc(msg)}</p>'
-                            f'<div class="actions" style="padding-left:0">{_btn("← Back", "/ui/mapping", "secondary")}</div>', "mapping"))
+                            f'<div class="actions" style="padding-left:0">{_btn("← Back", "/ui/mapping?sub=media", "secondary")}</div>', "mapping"))
     if not alias or not backend:
         return err("alias and backend are required")
     try:
@@ -2748,7 +2767,7 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     is_video = "vid" in cur_task.lower() or any(c.get("fps") for c in cands)
     form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
-            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping", "secondary")}'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
             f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}'
             + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "")
             + '</div>'
@@ -3178,14 +3197,14 @@ async def delete(request: Request):
     alias = request.query_params.get("alias", "").strip()
     if alias:
         store.delete(alias)
-    return RedirectResponse("/ui/mapping", status_code=303)
+    return RedirectResponse("/ui/mapping?sub=media", status_code=303)
 
 
 async def copy(request: Request):
     alias = _qp(request, "alias")
     cands = store.get(alias)
     if not cands:
-        return RedirectResponse("/ui/mapping", status_code=303)
+        return RedirectResponse("/ui/mapping?sub=media", status_code=303)
     new = f"{alias}-copy"
     i = 2
     while store.get(new):
