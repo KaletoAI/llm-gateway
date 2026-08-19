@@ -220,28 +220,45 @@ schließt trotzdem jeden offenen Content-Block und sendet `message_delta` +
 - Streaming-Reconnect (`GET /v1/messages/{id}`) gibt es bei Anthropic nicht; nichts
   zu tun.
 
-## Zu verifizierende Annahmen (Stand: weiterhin offen, brauchen ein echtes Token)
+## Annahmen — am 2026-08-19 empirisch geklärt
 
-Diese habe ich aus Erfahrung angenommen, aber in dieser Sitzung **nicht**
-empirisch geprüft:
+Gegen `api.anthropic.com` mit einem echten Subscription-Token (Abo „max") gemessen:
 
-1. Ob `GET /v1/models` mit einem Subscription-`setup-token` überhaupt bedient
-   wird (sonst greift der konfigurierte Fallback).
-2. Der genaue Beta-Header für OAuth-Tokens. Wird vermutlich dadurch gelöst, dass
-   Claude Codes eigene `anthropic-beta`/`anthropic-version`-Header durchgereicht
-   werden.
-3. Ob Anthropic bei Subscription-Tokens den Claude-Code-Systemprompt im Request
-   verlangt. Falls ja, würde die Lizenz-Grenze zusätzlich upstream durchgesetzt —
-   das wäre ein Bonus, kein Fundament: die Durchsetzung aus Abschnitt 3 muss
-   unabhängig davon stehen.
+1. **`GET /v1/models` WIRD bedient** — 200, 10 Modelle. Die ursprüngliche Sorge war
+   unbegründet; die konfigurierte `models`-Liste bleibt reiner Fallback (und ist
+   nicht nötig, damit ein Backend hochkommt).
+2. **Es braucht gar keinen Zusatz-Header.** Der Bearer-Token allein genügt:
+   `/v1/models` und `/v1/messages` antworten mit und ohne `anthropic-beta:
+   oauth-2025-04-20` identisch. Der Adapter hängt den Beta-Wert weiterhin an die
+   Client-Liste an (statt sie zu ersetzen) — schadet nicht, schützt vor künftigem
+   Pflichtwerden.
+3. **Kein Claude-Code-Systemprompt und keine CLI-Kennung verlangt.** Requests ohne
+   `user-agent: claude-cli/…` und ohne Claude-Code-Systemprompt werden normal
+   bedient. Die Lizenzgrenze wird also NICHT upstream erzwungen — genau deshalb
+   steht sie im Gateway (Abschnitt 3) und muss dort bleiben.
 
-Punkt 2 ist inzwischen gelöst: der Adapter hängt `oauth-2025-04-20` an die vom
-Client geschickte `anthropic-beta`-Liste an (statt sie zu ersetzen) und setzt
-`anthropic-version` nur, wenn der Client keine mitschickt.
+Weitere Messungen derselben Sitzung:
+
+- **Prompt-Caching greift erst ab einer Mindestgröße.** Bei
+  `claude-haiku-4-5-20251001` blieb ein ~2 210-Token-Prompt mit `cache_control`
+  vollständig ungecacht (write=0, read=0), ein ~6 000-Token-Prompt wurde gecacht
+  (write=6002, danach read=6002). Wer die Cache-Spalten testet, muss groß genug
+  bauen — 0 bedeutet dort nicht „kaputt".
+- **Der Passthrough ist auch praktisch byte-identisch:** ein über das Gateway
+  gesendeter Request TRAF den Cache-Eintrag, den ein direkter Request an Anthropic
+  zuvor angelegt hatte. Ein abweichendes Präfix hätte den Cache verfehlt.
+- **Der Token-Flow braucht keinen Browser auf der Maschine.** `claude setup-token`
+  nutzt `redirect_uri=https://platform.claude.com/oauth/code/callback` mit
+  `code=true` — die CLI zeigt eine URL, man meldet sich irgendwo an und fügt den
+  angezeigten Code zurück in die CLI. Also headless-tauglich (Gateway-Container),
+  kein SSH-Tunnel nötig. Gültigkeit: 1 Jahr.
+- **Nicht verwenden:** `claudeAiOauth.accessToken` aus
+  `~/.claude/.credentials.json` — läuft nach Stunden ab, und das Gateway kann ihn
+  nicht per Refresh-Token erneuern.
 
 ## Nächster Schritt
 
-Mit einem echten `claude setup-token` ein Backend anlegen (Backends-Tab →
-type `anthropic`), einen Alias darauf zeigen lassen und Claude Code mit
-`ANTHROPIC_BASE_URL` gegen das Gateway laufen lassen. Bleibt `GET /v1/models`
-verwehrt, trägt die konfigurierte `models`-Liste.
+Erledigt: Backend `claude` läuft auf .10 (UP, 10 Modelle), `/v1/messages` liefert
+echte Antworten, `/v1/chat/completions` bleibt 404, und die Cache-Spalten füllen
+sich mit echten Anthropic-Zahlen. Offen ist nur noch, den kurzlebigen
+Access-Token dort durch einen `setup-token` (1 Jahr) zu ersetzen.

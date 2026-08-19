@@ -422,24 +422,76 @@ subscription into an API. If you have a paid API key from console.anthropic.com,
 set the backend's auth mode to `api key`; the same endpoint restriction still
 applies.
 
+### Getting the subscription token
+
+`claude setup-token` mints a **long-lived (1-year)** token from your Claude
+subscription. It works fine on a headless server — including the gateway box
+itself — because the flow does **not** use a localhost callback: it prints a URL,
+you sign in wherever you have a browser, and paste the code it shows back into the
+CLI. No X server, no SSH tunnel.
+
+On the gateway machine (Debian/Ubuntu container, root, no Node required):
+
+```bash
+# 1. install the CLI once — native binary, lands in ~/.local/bin
+curl -fsSL https://claude.ai/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+
+# 2. mint the token
+claude setup-token
+#    "Opening browser to sign in…"
+#    "Browser didn't open? Use the url below to sign in (c to copy)"
+#    → copy that URL into any browser, sign in with the subscription account,
+#      then paste the code it displays back into the waiting CLI
+#    → prints a token starting with sk-ant-oat01-…
+```
+
+The token belongs to the *account*, not the machine — minting it on your laptop
+and pasting it into the console works exactly as well. Either way it goes into the
+backend's **api key** field (stored encrypted in `store.db`).
+
+Do **not** use the `accessToken` out of `~/.claude/.credentials.json`: that one is
+the short-lived session token Claude Code refreshes for itself (hours), and the
+gateway has no refresh mechanism — the backend would go DOWN when it expires.
+
 ### Backend setup
+
+In the console: **Backends → + Add backend**, type `anthropic`, url
+`https://api.anthropic.com` (no `/v1` — the gateway appends the path), the token in
+**api key**, auth mode `subscription`. Or in `config.yaml`:
 
 ```yaml
 backends:
   - name: anthropic-sub
     type: anthropic
     url: https://api.anthropic.com
-    api_key: <output of `claude setup-token`>
+    api_key: <output of `claude setup-token`>   # sk-ant-oat01-…
     auth_mode: subscription        # → Authorization: Bearer + OAuth beta header
     # auth_mode: api_key           # → x-api-key (console.anthropic.com key)
     models: [claude-sonnet-5]      # fallback list; discovery tries GET /v1/models first
     priority: 1
 ```
 
+Then check the Backends tab: the row should read **UP** with the model count
+(a subscription token is served on `GET /v1/models`, so discovery finds them all).
+`401 Unauthorized` in the log means the credential is wrong — a real one always
+starts with `sk-ant-oat01-` (subscription) or `sk-ant-api03-` (API key).
+
 Discovery asks Anthropic's `GET /v1/models` and falls back to `models:` when the
 token isn't allowed there — so a 401 on that endpoint doesn't take the backend
 down. Then map an alias to it (console → **Input & Routing → Chat aliases**, or
-`virtual_models`) and hand that alias to Claude Code as `ANTHROPIC_MODEL`.
+`virtual_models`) and hand that alias to Claude Code as `ANTHROPIC_MODEL`. A bare
+model id works too: `ANTHROPIC_MODEL=claude-sonnet-5` routes straight to whichever
+backend serves it.
+
+Smoke-test it from the gateway box before pointing Claude Code at it:
+
+```bash
+curl -s localhost:4000/v1/messages -H "x-api-key: $GATEWAY_KEY" \
+  -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-5","max_tokens":16,
+       "messages":[{"role":"user","content":"Reply with: gateway works"}]}'
+```
 
 ---
 
