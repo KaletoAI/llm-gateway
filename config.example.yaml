@@ -110,7 +110,11 @@ backends:
   # - name: anthropic-sub               # Claude Code frontdoor — see README
   #   type: anthropic                   # reachable through /v1/messages ONLY
   #   url: https://api.anthropic.com
-  #   api_key: "sk-ant-oat…"            # output of `claude setup-token`
+  #   api_key: "sk-ant-oat01-…"         # `claude setup-token` (valid 1 year; the
+  #                                     # flow is headless-friendly — see README.
+  #                                     # NOT the accessToken from
+  #                                     # ~/.claude/.credentials.json, that expires
+  #                                     # within hours)
   #   auth_mode: subscription           # subscription (OAuth setup-token) | api_key
   #   models: [claude-sonnet-5]         # fallback list if GET /v1/models is denied
   #   priority: 1
