@@ -353,7 +353,17 @@ session is gated by `_ui_guard` once locked.
 ### Stats recording
 
 Every forward calls `stats.record_call(...)` fire-and-forget via
-`asyncio.create_task` — never raises into the request path. Cost from pricing
+`asyncio.create_task` — never raises into the request path. **Refused** calls are
+recorded too, by the app-wide `HTTPException` handler (`_rejected_call` →
+`_record_rejected`): anything turned away before a backend saw it (no healthy
+backend, park timeout, quota, unknown alias, bad key) used to leave NO trace at
+all, which is precisely the call you go looking for in LLM Calls. Such rows carry
+backend `(refused)`, an empty `model` (none was ever resolved), the status, and
+the reason as the stored response body. `request.state.gw_dispatched` (set in
+`_dispatch_over` once an adapter answered) prevents a second row when an endpoint
+re-raises an upstream error — and `gw_alias`/`gw_body`/`gw_endpoint` carry the
+context the handler cannot see. The same handler renders `/v1/messages` errors in
+Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always
 requests `include_usage` upstream); a backend that reports zeros/nothing

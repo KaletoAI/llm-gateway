@@ -17,6 +17,7 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from watchfiles import awatch
 
@@ -611,6 +612,56 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 admin.register(app)                     # generation management UI at /ui
 
+
+@app.exception_handler(HTTPException)
+async def _rejected_call(request: Request, exc: HTTPException):
+    """Log every API call the gateway REFUSES, then render it.
+
+    Stats rows were written by the adapter only — so a request that never reached a
+    backend ("No healthy backend", park timeout, quota, unknown alias) left no trace
+    at all, which is exactly the request you go looking for in LLM Calls. Recorded
+    here, centrally, because a refusal can be raised from a dozen places.
+
+    `gw_dispatched` guards the double entry: once a backend answered, the adapter
+    owns the row (e.g. /v1/responses re-raises an upstream error as HTTPException).
+    """
+    if request.url.path.startswith("/v1/") and not getattr(request.state, "gw_dispatched", False):
+        _record_rejected(request, exc)
+    if request.url.path.startswith("/v1/messages"):
+        return _messages_error(exc.status_code, exc.detail, getattr(exc, "headers", None))
+    return await http_exception_handler(request, exc)
+
+
+def _record_rejected(request: Request, exc: HTTPException) -> None:
+    """Fire-and-forget stats row for a refused call. Never raises into the response
+    path: a logging failure must not turn a clean 503 into a 500."""
+    if not stats.is_active():
+        return
+    try:
+        body = getattr(request.state, "gw_body", None)
+        alias = getattr(request.state, "gw_alias", None)
+        if alias is None and isinstance(body, dict):
+            alias = body.get("model")
+        asyncio.create_task(stats.record_call(
+            duration_ms=0, backend=_REJECTED_BACKEND, source=_source_of(request),
+            # `model` stays empty: it holds the REAL model a backend served, and no
+            # backend ever resolved one here — filling it with the alias would render
+            # as "x→x" in the call list and claim a resolution that never happened.
+            alias=alias, model=None,
+            endpoint=getattr(request.state, "gw_endpoint", None) or request.url.path,
+            status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
+            request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
+            response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
+        ))
+    except Exception as e:                       # never let logging break the answer
+        logger.warning(f"stats: could not record a rejected call: {e}")
+
+
+# Shown in the backend column for calls no backend ever saw. A name rather than a
+# blank so it reads as a statement ("nothing served this") and so the Statistic tab
+# can show how many requests were turned away at the door.
+_REJECTED_BACKEND = "(refused)"
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 # ── Multi-user auth ──────────────────────────────────────────────────────────────
@@ -687,6 +738,11 @@ async def gate_request(authorization: Optional[str], request: Request, model: Op
     to the user (stats source / job owner read it off request.state). Returns the user
     (None = anonymous bootstrap mode). Async only for the monthly-cost DB scan (run
     off-loop); the daily-quota check+increment stays await-free → atomic."""
+    # Every caller passes the requested model here, and a rejection below (403/402/429)
+    # happens before dispatch — so this is the earliest point where a refused call can
+    # be logged with the model it asked for.
+    if model and getattr(request.state, "gw_alias", None) is None:
+        request.state.gw_alias = model
     user = authenticate(authorization)
     if user is None:
         return None
@@ -1350,6 +1406,11 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
     the park queue until one frees (then dispatch) or 503. Park window = the alias's
     park time, or an explicit `deadline` (background responses use the longer async
     window). Shared by chat routing, the Responses bridge, and background responses."""
+    # Stash what a refusal needs to be logged with (see _record_rejected): the alias
+    # and body only exist here, but the rejection is rendered by the error handler.
+    request.state.gw_alias = alias
+    request.state.gw_body = body
+    request.state.gw_endpoint = stats_endpoint or path
     ready, busy = resolve_routes(alias, path)
     if ready:
         return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
@@ -1413,6 +1474,9 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
                 stats_endpoint=stats_endpoint, reasoning=body.get("_reasoning"),
             )
             resp = await adapter.dispatch(req)
+            # A backend answered — the adapter has written (or will write) the stats
+            # row, so the error handler must not add a second one for this request.
+            request.state.gw_dispatched = True
             if _retryable_upstream_error(resp):
                 logger.warning(f"✗ [{backend['name']}] upstream can't start the model (502) — trying next")
                 last_resp = resp
@@ -1848,12 +1912,10 @@ async def _messages_route(path: str, request: Request, credential: Optional[str]
 @app.post("/v1/messages")
 async def messages(request: Request, authorization: Optional[str] = Header(None),
                    x_api_key: Optional[str] = Header(None)):
-    """Anthropic Messages API — Claude Code's endpoint."""
-    try:
-        return await _messages_route("/v1/messages", request,
-                                     _client_credential(authorization, x_api_key))
-    except HTTPException as e:
-        return _messages_error(e.status_code, e.detail, getattr(e, "headers", None))
+    """Anthropic Messages API — Claude Code's endpoint. Errors are shaped by the
+    app-wide HTTPException handler (which also logs the refusal)."""
+    return await _messages_route("/v1/messages", request,
+                                 _client_credential(authorization, x_api_key))
 
 
 @app.post("/v1/messages/count_tokens")
@@ -1861,11 +1923,8 @@ async def messages_count_tokens(request: Request, authorization: Optional[str] =
                                 x_api_key: Optional[str] = Header(None)):
     """Token count for a Messages body: passed through to an Anthropic backend,
     estimated by the bridge for a chat backend (which has no such endpoint)."""
-    try:
-        return await _messages_route("/v1/messages/count_tokens", request,
-                                     _client_credential(authorization, x_api_key))
-    except HTTPException as e:
-        return _messages_error(e.status_code, e.detail, getattr(e, "headers", None))
+    return await _messages_route("/v1/messages/count_tokens", request,
+                                 _client_credential(authorization, x_api_key))
 
 
 @app.post("/v1/completions")
