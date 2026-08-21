@@ -720,6 +720,11 @@ stats:
 - **Streaming** calls record real tokens when the backend honors
   `stream_options.include_usage` (requested automatically), else `0`.
 - The applied **reasoning control** is logged per call (LLM Calls tab column).
+- **Refused calls are logged too** — a request turned away before any backend saw
+  it (no healthy backend, park timeout, quota exceeded, unknown alias, bad key)
+  appears in LLM Calls with backend `(refused)`, its status, and the reason in the
+  stored body. Without that, the calls you most want to investigate were the only
+  ones missing from the log.
 - **Prompt cache** — the *By backend* table breaks the input tokens down into
   `cached` (served out of the backend's prompt cache, at a fraction of the fresh
   price), `written` (stored into it, a one-off surcharge) and `fresh` (billed in
