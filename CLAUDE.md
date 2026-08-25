@@ -77,7 +77,16 @@ hot-reload-safe.
   `_comfy_restarting` guard; deliberately not gated on inflight — stuck means
   nothing executes). `exec_stuck`/`last_restart*` surface in `/health` + the
   Backends tab (⟳ restart action). `generate()` submits a parametrised
-  workflow, polls `/history`, fetches `/view`.) `AdapterContext` injects app services.
+  workflow, polls `/history` every `poll_interval` (default 1) until the backend's
+  `max_wait` (default 600) — the gateway's cap on ONE generation; ComfyUI itself has
+  none — then `/interrupt`s and raises `TimeoutError`, and fetches `/view`. Both
+  fields are edited in the Backends tab: a store backend replaces a same-named config
+  entry WHOLESALE (`rebuild_backends`), so config.yaml cannot supply them for a
+  UI-managed backend. `TimeoutError` sits in `_GEN_FAILOVER_ERRORS` so it fails over,
+  but `_fault_label`/`_gen_exhausted_msg` keep it NAMED apart from a real connection
+  fault and from an httpx transport timeout — reporting a `max_wait` expiry as
+  "unreachable (connection)" sends you diagnosing the network instead of the
+  workflow, and the cap is spent PER CANDIDATE.) `AdapterContext` injects app services.
   `AnthropicAdapter` (`type: anthropic`, subclasses `OpenAIAdapter`) serves
   **`/v1/messages` only** — a licence boundary enforced in routing
   (`main.serves_path`), not just documented: a Claude subscription token covers

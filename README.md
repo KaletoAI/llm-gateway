@@ -554,8 +554,8 @@ backends:
     url: http://192.168.1.20:8188
     priority: 1
     max_concurrent: 1        # one generation at a time on this GPU
-    # poll_interval: 1.0     # seconds between /history polls
-    # max_wait: 600          # hard cap for a single generation
+    # poll_interval: 1.0     # seconds between /history polls (Backends tab)
+    # max_wait: 600          # hard cap for a single generation (Backends tab)
     # read_timeout: 60       # per-HTTP-request read timeout (hung read → failover)
     # disconnect_grace: 30   # tolerated unreachability before failing over
     # stuck_after_s: 90      # executor watchdog: pending prompts + idle executor
@@ -563,6 +563,16 @@ backends:
     # auto_restart: true     # opt-in: restart the ComfyUI service when stuck
     # restart_cooldown_s: 600  # at most one auto-restart per this window
 ```
+
+**How long a generation may take** is the gateway's call, not ComfyUI's: `max_wait`
+(default **600 s**) caps one generation — the span from submitting the prompt until
+its result shows up in `/history`, polled every `poll_interval` (default 1 s). On
+expiry the gateway sends `/interrupt` (freeing the GPU) and fails the attempt over to
+the next candidate, so the cap is spent **per candidate backend** — with two
+candidates a client can wait twice that long. Raise it for slow workflows (video,
+mesh, rigging). Both fields are editable in the **Backends** tab; note that a backend
+managed there overrides a same-named `config.yaml` entry *wholesale*, so for
+store-managed backends the tab is the only place that takes effect.
 
 **Executor watchdog.** ComfyUI's HTTP server keeps answering even when its
 prompt executor has died (e.g. after a CUDA fault) — prompts then pile up in

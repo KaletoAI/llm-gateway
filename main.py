@@ -2172,6 +2172,34 @@ _GEN_FAILOVER_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.ReadEr
 
 
 # ── Per-backend rolling generation fail-rate (runbook C) ────────────────────────
+def _fault_label(e: BaseException) -> str:
+    """How to name a failover-worthy generation fault in a log line. Three distinct
+    causes hide behind one failover path — say which one it was."""
+    if isinstance(e, TimeoutError):            # the adapter's own max_wait cap
+        return "did not finish in time"
+    if isinstance(e, httpx.TimeoutException):  # a single HTTP round trip timed out
+        return "timed out mid-request"
+    return "connection issue"
+
+
+def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
+    """The message a generation job dies with once every candidate is used up.
+
+    `_GEN_FAILOVER_ERRORS` lumps timeouts in with genuine connection faults — correct
+    for routing (all warrant trying another backend), wrong for the report: a job that
+    hit `max_wait` reached its backend perfectly well and was simply not finished in
+    time. Saying "unreachable (connection)" there sends you diagnosing the network
+    instead of the workflow (measured 2026-08-25). The `max_wait` hint belongs ONLY on
+    the adapter's own TimeoutError — an httpx timeout is a transport fault and naming
+    max_wait there would mislead exactly the same way."""
+    if isinstance(last, TimeoutError):
+        return (f"no candidate backend finished in time — the gateway's per-backend "
+                f"`max_wait` (default 600s; raise it in Backends for slow workflows): {last}")
+    if isinstance(last, httpx.TimeoutException):
+        return f"no candidate backend answered in time (transport timeout): {last}"
+    return f"all candidate backends unreachable (connection): {last}"
+
+
 # bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
 # purpose (a gateway restart resets the sample — fine) and module-global so
 # adapter rebinds on config hot-reload don't lose it. Display-only: NEVER used
@@ -2324,13 +2352,16 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
                 except _GEN_FAILOVER_ERRORS as e:
                     _record_gen_attempt(bid, conn_fail=True)
                     last = e
+                    # both fail over, but they are different faults — name them apart so
+                    # the log points at the workflow, not the network (see _gen_exhausted_msg)
+                    what = _fault_label(e)
                     if attempt < tries:
-                        logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
+                        logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                        f"({type(e).__name__}: {e}) — retrying same backend "
                                        f"(self-retry {attempt}/{tries - 1})")
                         await _wait_backend_up(backend)
                         continue
-                    logger.warning(f"✗ job {job_id} [{backend['name']}] connection issue "
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                    f"({type(e).__name__}: {e}) — failing over")
                     asyncio.create_task(_free_comfy_vram(backend, "job failover"))
                 except Exception as e:
@@ -2344,8 +2375,7 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
                     return
         finally:
             _inflight_dec(bid)
-    await asyncio.to_thread(jobs.fail, job_id,
-                            f"all candidate backends unreachable (connection): {last}",
+    await asyncio.to_thread(jobs.fail, job_id, _gen_exhausted_msg(last),
                             {"attempts": attempts} if attempts > 1 else None)
 
 
@@ -2584,7 +2614,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                         raise                # outer handler records + fails over
                     _record_gen_attempt(bid, conn_fail=True)
                     logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
-                                   f"connection issue ({type(e).__name__}: {e}) — retrying "
+                                   f"{_fault_label(e)} ({type(e).__name__}: {e}) — retrying "
                                    f"same backend (self-retry {s1_attempt}/{s1_tries - 1})")
                     await _wait_backend_up(backend)
             # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
@@ -2684,7 +2714,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                         {"attempts": gen_attempts} if gen_attempts > 2 else None)
                 asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                 return
-            logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] connection issue "
+            logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
                            f"({type(e).__name__}: {e}) — failing over")
             tried.add(backend["name"])
             asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))

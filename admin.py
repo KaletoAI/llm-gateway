@@ -927,6 +927,16 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
                      placeholder="90", typ="number"))
             + _field("self retries", _inp("self_retries", g("self_retries"),
                      placeholder="0", typ="number"))
+            + _field("max wait s", _inp("max_wait", g("max_wait"),
+                     placeholder="600", typ="number"))
+            + _field("poll interval s", _inp("poll_interval", g("poll_interval"),
+                     placeholder="1", typ="number", step="0.1"))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>max wait s</b> caps ONE generation: "
+              "how long the gateway polls <code>/history</code> for a submitted prompt before it "
+              "gives up (it then sends <code>/interrupt</code> to free the GPU). ComfyUI itself has "
+              "no such limit — this is the gateway's. Raise it for slow workflows (video, mesh); the "
+              "cap is spent per candidate backend, so with two candidates a client can wait twice "
+              "this long. <b>poll interval s</b> is the gap between those polls. Blank = 600 / 1.</p>"
             + "<p class='hint' style='margin:-4px 0 10px'>Executor watchdog (comfyui only): the "
               "backend goes <b>down</b> when prompts wait while nothing runs for <b>stuck after s</b> "
               "seconds. <b>auto_restart</b> then reboots the service via the ComfyUI-Manager "
@@ -1356,12 +1366,21 @@ async def backend_save(request: Request):
             b[flag] = True
         else:
             b.pop(flag, None)
-    for nkey in ("restart_cooldown_s", "stuck_after_s", "self_retries"):
+    for nkey in ("restart_cooldown_s", "stuck_after_s", "self_retries", "max_wait"):
         v = (f.get(nkey, "") or "").strip()
         if v.isdigit() and int(v) > 0:
             b[nkey] = int(v)
         else:
-            b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry)
+            b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry / 600)
+    pi = (f.get("poll_interval", "") or "").strip()   # float — sub-second polling is legitimate
+    try:
+        pi_val = float(pi)
+    except ValueError:
+        pi_val = 0.0
+    if pi_val > 0:
+        b["poll_interval"] = pi_val
+    else:
+        b.pop("poll_interval", None)           # blank/0/garbage = the 1.0 s default
     # Anthropic: how the credential is sent, plus the fallback model list used when
     # a subscription token isn't allowed on GET /v1/models.
     if new_type == "anthropic":
