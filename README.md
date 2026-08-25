@@ -139,6 +139,11 @@ Two layers, both optional:
   key (generate one in the form, or paste your own), a role (`user` / `admin`),
   an enabled flag, an optional model **allow-list**, and an optional **monthly
   cost quota**. Calls are attributed to the user (stats source, job owner).
+  An existing user's key can be **copied again** later: the editor pre-fills it
+  (masked; 📋 Copy reveals and copies). Keys are stored encrypted, and the
+  pre-fill is a console convenience you can switch off — clear
+  `show_user_keys` in the Server tab and only a key generated right there in the
+  form is ever shown, as before.
 
 **Bootstrap-open → locked.** With no users *and* no master key, the gateway and
 console are fully open. Add an admin user (or set a master key) to lock it down.
@@ -285,6 +290,14 @@ or a `503` (with `Retry-After`) if the wait runs out.
   backend is dispatched first (no head-of-line blocking across aliases). Live
   queue is visible in the **Parked calls** panel on the Dashboard.
 - **On timeout** the call leaves the queue with a `503` + `Retry-After`.
+- **A backend that comes back is picked up immediately.** Waiting work is never
+  pinned to the backend it was queued for: a parked call re-evaluates its routes
+  whenever a backend goes healthy or gains models, and a parked generation job
+  re-resolves its candidates every 2 s — so a returning or newly added backend is
+  used the moment it is available, priority order included. To keep *noticing* it
+  fast, unhealthy backends are re-polled every `fast_probe_interval_s` (**3 s**,
+  Server tab; `0` = off) for as long as something is waiting, instead of only once
+  per `health_check_interval`. Nothing waiting → no extra polling.
 
 Applies to `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
 `/v1/responses`, and the generation path (a busy ComfyUI backend queues the job
@@ -691,8 +704,8 @@ locked). Tabs:
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
-| **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL) |
-| **LLM Calls** | per-call history with stored request/response bodies |
+| **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL), plus the media requests that were refused before they became a job |
+| **LLM Calls** | per-call history with stored request/response bodies (LLM endpoints only — voice and media have their own sub-tabs) |
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
@@ -722,9 +735,11 @@ stats:
 - The applied **reasoning control** is logged per call (LLM Calls tab column).
 - **Refused calls are logged too** — a request turned away before any backend saw
   it (no healthy backend, park timeout, quota exceeded, unknown alias, bad key)
-  appears in LLM Calls with backend `(refused)`, its status, and the reason in the
-  stored body. Without that, the calls you most want to investigate were the only
-  ones missing from the log.
+  appears with backend `(refused)`, its status, and the reason in the stored body:
+  in **LLM Calls** for the chat endpoints, in **Media Jobs** for the image ones.
+  Without that, the calls you most want to investigate were the only ones missing
+  from the log. A generation that *ran* and failed is **not** in this list — once a
+  job exists the job owns the outcome, with the real backend, duration and error.
 - **Prompt cache** — the *By backend* table breaks the input tokens down into
   `cached` (served out of the backend's prompt cache, at a fraction of the fresh
   price), `written` (stored into it, a one-off surcharge) and `fresh` (billed in

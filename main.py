@@ -339,6 +339,27 @@ route_mode: dict = {}                   # routing key (alias OR bare model id) �
 voice_library: dict = {}                # name → {ref_text, file, remote, shipped} (store voice_library)
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
+_probing: set = set()                  # backend ids with a discovery poll in flight (see refresh_backend)
+
+# How often an UNHEALTHY backend is re-polled while something waits for capacity, so a
+# backend that came back outside the gateway is noticed in seconds instead of a whole
+# health_check_interval. 0 disables the fast probe (Server tab).
+fast_probe_interval_s: float = 3.0
+# Media jobs park in their own poll loops rather than in `_parked`, so they announce
+# themselves here instead. A TIMESTAMP, not a counter: a cancelled or crashed job task
+# can never leave a phantom waiter behind, it just stops refreshing.
+_gen_wait_at: list = [0.0]
+_GEN_WAIT_TTL_S = 5.0                  # how long one ping counts as "still waiting"
+
+
+def _gen_wait_ping() -> None:
+    """A parked generation job just polled for a free backend (see _run_gen_parked)."""
+    _gen_wait_at[0] = time.monotonic()
+
+
+def _capacity_wanted() -> bool:
+    """Is anything waiting for a backend right now? Drives the fast probe."""
+    return bool(_parked) or (time.monotonic() - _gen_wait_at[0]) < _GEN_WAIT_TTL_S
 
 # Normalized reasoning rules (store-backed, UI-editable). Cached here and refreshed on
 # save so the resolver doesn't hit the DB per request. See reasoning.py.
@@ -468,6 +489,9 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     adapter = backend_adapters.get(bid)
     if adapter is None:
         return
+    if bid in _probing:
+        return                             # a poll of this backend is already in flight
+    _probing.add(bid)
     try:
         caps = await adapter.discover(client)
         changed = caps.models != backend_models.get(bid)
@@ -503,13 +527,40 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         # set so a bare model id still resolves to this offline backend → 503, not 403.
         if isinstance(e, ComfyExecutorStuck):
             _maybe_auto_restart(backend, adapter)
+    finally:
+        _probing.discard(bid)
 
 
 async def health_loop() -> None:
+    """Poll every enabled backend, then sleep. Backends are polled CONCURRENTLY: a
+    sequential loop adds each unreachable backend's connect timeout to the cycle, so
+    the wait for a returning backend grew with the number of broken ones."""
     while True:
-        for backend in enabled_backends():
-            await refresh_backend(backend, http_client)
+        await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()],
+                             return_exceptions=True)     # refresh_backend absorbs its own errors
         await asyncio.sleep(health_check_interval)
+
+
+async def fast_probe_loop() -> None:
+    """Re-poll UNHEALTHY backends quickly while calls or jobs are waiting for capacity.
+
+    Re-routing onto a backend that just came back already works — `refresh_backend`
+    wakes the park queue on DOWN→UP and parked generation jobs re-resolve their routes
+    every 2 s. What was slow is NOTICING: on the normal `health_check_interval`
+    (default 30 s) a backend restarted outside the gateway stays invisible for up to a
+    full cycle, and that wait is the whole delay a queued job sees.
+
+    Only unhealthy backends are probed — a healthy-but-busy one needs no poll, its
+    freed slot is announced by `_inflight_dec` → `_notify_slot_free`."""
+    while True:
+        await asyncio.sleep(max(1.0, fast_probe_interval_s or 1.0))
+        if not fast_probe_interval_s or not _capacity_wanted():
+            continue
+        targets = [b for b in enabled_backends()
+                   if not backend_healthy.get(backend_id(b), False)]
+        if targets:
+            await asyncio.gather(*[refresh_backend(b, http_client) for b in targets],
+                                 return_exceptions=True)
 
 
 def reload_config() -> None:
@@ -575,6 +626,7 @@ async def lifespan(app: FastAPI):
     log_config_summary()
     await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
     health_task = asyncio.create_task(health_loop())
+    probe_task = asyncio.create_task(fast_probe_loop())
     watch_task = asyncio.create_task(watch_config_loop())
 
     # Stats: record calls + prune, but NO separate server — the dashboard lives in
@@ -599,6 +651,7 @@ async def lifespan(app: FastAPI):
 
     yield
     health_task.cancel()
+    probe_task.cancel()
     watch_task.cancel()
     if jobs_prune_task is not None:
         jobs_prune_task.cancel()
@@ -2243,6 +2296,12 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
         except (TypeError, ValueError):
             tries = 1                          # malformed config value → no self-retry
         _inflight_inc(bid)                     # hold ONE slot across all self-retries
+        # The job row was stamped with the FIRST candidate at creation; re-point it at
+        # the backend actually claiming it. A parked job routinely lands somewhere else
+        # (a different backend freed first, or one came back while it waited), and a row
+        # naming the wrong backend sends you reading the wrong ComfyUI's log. Same
+        # reason the chain re-points at claim and hand-off.
+        await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])
         try:
             for attempt in range(1, tries + 1):
                 attempts += 1
@@ -2418,6 +2477,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                         f"chain: all usable backends stayed busy past park "
                                         f"time ({async_park_timeout_s:.0f}s)")
                 return
+            _gen_wait_ping()                     # stage 1 is waiting → keep the fast probe awake
             await asyncio.sleep(2.0)
             continue
 
@@ -2687,6 +2747,7 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
     deadline = time.monotonic() + async_park_timeout_s
     unhealthy_since = None                       # when the candidate set first went empty (flap timer)
     while True:
+        _gen_wait_ping()                         # this job is waiting → keep the fast probe awake
         ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per poll
         ready, allc = _force_filter(ready, force), _force_filter(allc, force)
         if eligible is not None:
@@ -2826,6 +2887,13 @@ async def run_generation(body: dict, request: Request,
     task = cand0.get("task", body.get("task", "text2img"))
     owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
+    # From here on the outcome is recorded in the JOB, so the refusal handler must not
+    # write a call-log row for it (see _record_rejected). Without this, a failed media
+    # job surfaced as HTTPException 502 by gen_done_or_502 was logged a second time as
+    # "(refused), 0 ms, no backend" — a request that was in fact served and failed.
+    # Refusals BEFORE this point (no eligible backend, quota, missing prompt) still get
+    # their row: no job exists there, so it would otherwise leave no trace at all.
+    request.state.gw_dispatched = True
     # persist the request inputs so the job stays inspectable in the UI within its TTL.
     # Uploaded FILES are only noted, never stored: a 40 MB mesh per job would flood the
     # disk, and the job's value is knowing which file went in, not keeping it.
@@ -3388,6 +3456,7 @@ def apply_server_settings() -> None:
     port is set by the launch command, so it is informational here."""
     global api_key, log_per_call, model_prefix, max_concurrent_default, health_check_interval
     global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked
+    global fast_probe_interval_s
     s = store.get_settings() if store.is_active() else {}
     if "api_key" in s:
         api_key = s["api_key"] or None
@@ -3422,6 +3491,11 @@ def apply_server_settings() -> None:
             max_parked = int(s["max_parked"])
         except (TypeError, ValueError):
             pass
+    if "fast_probe_interval_s" in s:
+        try:
+            fast_probe_interval_s = max(0.0, float(s["fast_probe_interval_s"]))
+        except (TypeError, ValueError):
+            pass
     # restart-only: overlaid onto stats_cfg / jobs_cfg so the next start picks them up
     # (these init once at startup). Lets config.yaml shed the jobs/stats db knobs.
     for skey, ckey in (("stats_enabled", "enabled"),
@@ -3452,6 +3526,9 @@ def server_info() -> dict:
             # the stored value (apply then drops it → the setting looks unsaveable).
             "park_timeout_s": int(park_timeout_s) if park_timeout_s == int(park_timeout_s) else park_timeout_s,
             "max_parked": max_parked,
+            "fast_probe_interval_s": (int(fast_probe_interval_s)
+                                      if fast_probe_interval_s == int(fast_probe_interval_s)
+                                      else fast_probe_interval_s),
             "port": (config or {}).get("port", 4000),
             "stats_enabled": bool(stats_cfg.get("enabled")),
             "stats_db_path": stats_cfg.get("db_path", "stats.db"),

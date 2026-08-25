@@ -143,7 +143,10 @@ hot-reload-safe.
   **background Responses** jobs (task type `response`, result via `complete_json`).
 - **`store.py`** — writable SQLite store, the console's source of truth: backends,
   chat aliases, generation aliases (+ workflow_json/mapping/fixed), users (api keys
-  **encrypted** via `secret.key`), IP aliases, server settings. Seeded once from
+  **encrypted** via `secret.key`, and therefore re-readable: the user editor
+  pre-fills an existing key so it can be copied again — masked, gated by the
+  `show_user_keys` setting, default ON, `admin._show_user_keys()`), IP aliases,
+  server settings. Seeded once from
   config, then authoritative.
 - **`admin.py`** — the `/ui` console (mounted via `admin.register(app)` +
   `add_api_route`, *not* `include_router` — broken in this starlette build;
@@ -311,6 +314,19 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   bare (cross-backend implicit alias). `model_prefix` toggles prefixed listing.
 - **Concurrency/busy** (`backend_inflight`, `backend_busy`): incremented in
   `dispatch()`/`generate()`, decremented on completion incl. the streamed `finally`.
+- **Re-routing onto a returning backend**: waiting work is never pinned to the
+  backend it queued for. `refresh_backend` calls `_notify_slot_free()` on DOWN→UP
+  and on a model-set change (parked calls re-evaluate); `apply_backend_change` and
+  `cancel_drain` do the same; parked gen jobs re-resolve routes every 2 s. The slow
+  part was NOTICING, so `health_loop` polls backends concurrently (a sequential loop
+  added every dead backend's connect timeout to the cycle) and `fast_probe_loop`
+  re-polls only UNHEALTHY backends every `fast_probe_interval_s` (default 3, Server
+  tab, 0 = off) while `_capacity_wanted()` — `_parked` non-empty, or a gen park loop
+  pinged `_gen_wait_ping()` within 5 s. A TIMESTAMP, not a counter: a cancelled job
+  task cannot leave a phantom waiter. `_probing` guards against two concurrent polls
+  of one backend. `_run_job` re-points the job row (`jobs.set_backend`) at the
+  backend that actually claims it — a parked job routinely lands elsewhere, and a row
+  naming the wrong backend sends you reading the wrong ComfyUI's log.
 - **Parking** vs 503: "all busy" is distinguished from "no backend" — only the
   former parks (the default). The queue is `_parked` (rich entries: alias, source,
   deadline, `asyncio.Event`); `_inflight_dec`→`_notify_slot_free` wakes all in FIFO
@@ -360,9 +376,17 @@ backend, park timeout, quota, unknown alias, bad key) used to leave NO trace at
 all, which is precisely the call you go looking for in LLM Calls. Such rows carry
 backend `(refused)`, an empty `model` (none was ever resolved), the status, and
 the reason as the stored response body. `request.state.gw_dispatched` (set in
-`_dispatch_over` once an adapter answered) prevents a second row when an endpoint
-re-raises an upstream error — and `gw_alias`/`gw_body`/`gw_endpoint` carry the
-context the handler cannot see. The same handler renders `/v1/messages` errors in
+`_dispatch_over` once an adapter answered, and in `run_generation` right after
+`jobs.create`) prevents a second row when an endpoint re-raises an upstream error —
+and `gw_alias`/`gw_body`/`gw_endpoint` carry the context the handler cannot see.
+The generation arm of that flag is not cosmetic: `gen_done_or_502` raises AFTER a
+job ran, so without it a **failed media job** was logged a second time as
+`(refused)`, 0 ms, no backend — a request that was in fact served and failed
+(measured 2026-08-25). The invariant: once a job row exists, the JOB owns the
+outcome; only refusals BEFORE it (no eligible backend, quota, malformed request)
+belong in the call log. `admin._call_kind()` partitions that log into
+`voice`/`media`/`llm` so each row has exactly one home — media refusals show under
+Media Jobs, not LLM Calls. The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always

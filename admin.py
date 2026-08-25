@@ -3869,20 +3869,59 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     return "<tr>" + "".join(cells) + "</tr>"
 
 
-def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
+def _call_kind(endpoint: str) -> str:
+    """Which sub-tab a call-log row belongs to: 'voice' | 'media' | 'llm'.
+
+    The stats table is ONE log, but the console shows it in three places, and every
+    row must land in exactly one of them. Media endpoints used to have no partition
+    of their own, so a refused image request surfaced under LLM Calls."""
+    p = str(endpoint or "")
+    if p.startswith("/v1/audio"):
+        return "voice"
+    if p.startswith("/v1/images") or p.startswith("/v1/generations") or p.startswith("/v1/jobs"):
+        return "media"
+    return "llm"
+
+
+async def _refused_media_table(user, aliases) -> str:
+    """Media requests the gateway turned away, for the Media Jobs sub-tab.
+
+    A refusal on a media endpoint happens BEFORE a job row exists (no eligible
+    backend, quota, a malformed request), so the job list cannot show it — and
+    without a home here it would either vanish or, as before, be filed under LLM
+    Calls. Once a job exists the call log stays out of it: the job owns the outcome
+    (see run_generation), which is why a failed generation is NOT in this table."""
+    if not stats.is_active():
+        return ""
+    s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
+    rows = [r for r in s["recent"] if _call_kind(r[7]) == "media"]
+    if not rows:
+        return ""
+    return (f"<h2 style='margin-top:26px'>Refused media requests "
+            f"<span class='muted' style='font-weight:normal'>· last {len(rows)}</span></h2>"
+            "<p class='hint'>Requests turned away before a job existed — they have no job row "
+            "above. A generation that ran and <b>failed</b> is a job, not a refusal.</p>"
+            + _recent_calls_table(rows, aliases, src="media"))
+
+
+async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     """(body, refresh) — generation jobs (image/video/audio), newest first; excludes
-    parked-chat / background-response rows. Same user picker + row-filter input as
-    the call lists (`?user=` filters by job owner)."""
+    parked-chat / background-response rows, followed by the media requests that were
+    refused before they became a job. Same user picker + row-filter input as the call
+    lists (`?user=` filters by job owner)."""
+    user = (request.query_params.get("user") or "").strip() or None
+    aliases = store.get_ip_aliases()
+    refused = await _refused_media_table(user, aliases)
     if not jobs.is_active():
         return ("<h2>Media Jobs</h2><p class='hint'>Job store is off — set <code>image_models</code> "
-                "or <code>jobs.enabled: true</code> in config.</p>", None)
-    user = (request.query_params.get("user") or "").strip() or None
+                "or <code>jobs.enabled: true</code> in config.</p>" + refused + _FILTER_JS, None)
     rows = jobs.recent(200, media_only=True, owner=user)
     if not rows and not user:
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
-                "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>", None)
+                "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>"
+                + refused + _FILTER_JS, None)
     scope, bar = _user_filter_bar("/ui/jobs?sub=media", user,
-                                  [(o,) for o in jobs.owners()], store.get_ip_aliases())
+                                  [(o,) for o in jobs.owners()], aliases)
     now = int(time.time())
     tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True, time_col=True)
                  for j in rows)
@@ -3893,25 +3932,25 @@ def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
     head = (f"<h2>Media Jobs{scope} <span class='muted' style='font-weight:normal'>"
             f"· last {len(rows)}</span></h2>{bar}")
-    return (f"{head}{tbl}{_JOB_TICK}{_FILTER_JS}", refresh)
+    return (f"{head}{tbl}{refused}{_JOB_TICK}{_FILTER_JS}", refresh)
 
 
-async def _calls_view_body(request: Request, voice: bool) -> str:
-    """Per-call history body — LLM Calls (everything except /v1/audio/*) or Voice
-    Calls (only /v1/audio/*). Same table/filter machinery, split by endpoint."""
-    title = "Voice Calls" if voice else "LLM Calls"
+async def _calls_view_body(request: Request, kind: str) -> str:
+    """Per-call history body for ONE partition (see _call_kind) — LLM Calls or Voice
+    Calls. Same table/filter machinery, split by endpoint. Media rows live in the
+    Media Jobs sub-tab next to the jobs they belong with."""
+    title = "Voice Calls" if kind == "voice" else "LLM Calls"
     if not stats.is_active():
         return (f"<h2>{title}</h2><p class='hint'>Call recording is off. Enable <b>stats</b> in the "
                 "<a href='/ui/server'>Server</a> tab (needs a restart) to log per-call history here.</p>")
     user = (request.query_params.get("user") or "").strip() or None
     s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
-    rows = [r for r in s["recent"] if bool(str(r[7] or "").startswith("/v1/audio")) == voice]
+    rows = [r for r in s["recent"] if _call_kind(r[7]) == kind]
     aliases = store.get_ip_aliases()
-    scope, bar = _user_filter_bar(f"/ui/jobs?sub={'voice' if voice else 'llm'}",
-                                  user, s["by_source"], aliases)
+    scope, bar = _user_filter_bar(f"/ui/jobs?sub={kind}", user, s["by_source"], aliases)
     head = (f"<h2>{title}{scope} <span class='muted' style='font-weight:normal'>· last {len(rows)}</span></h2>"
             f"{bar}")
-    return head + _recent_calls_table(rows, aliases) + _FILTER_JS
+    return head + _recent_calls_table(rows, aliases, src=kind) + _FILTER_JS
 
 
 async def jobs_page(request: Request):
@@ -3920,12 +3959,12 @@ async def jobs_page(request: Request):
     sub = request.query_params.get("sub") or SUBTABS["jobs"][0][0]
     refresh = None
     if sub == "llm":
-        title, body = "LLM Calls", await _calls_view_body(request, voice=False)
+        title, body = "LLM Calls", await _calls_view_body(request, "llm")
     elif sub == "voice":
-        title, body = "Voice Calls", await _calls_view_body(request, voice=True)
+        title, body = "Voice Calls", await _calls_view_body(request, "voice")
     else:
         sub = "media"
-        title, (body, refresh) = "Media Jobs", _jobs_media_body(request)
+        title, (body, refresh) = "Media Jobs", await _jobs_media_body(request)
     return HTMLResponse(_page(title, body, "jobs", refresh=refresh, subnav=_subnav("jobs", sub)))
 
 
@@ -4394,11 +4433,13 @@ def _reasoning_cell(rsn) -> str:
 
 def _call_row(r, aliases) -> str:
     """One finished-call row (15-col stats tuple) — the ONE template behind the
-    LLM Calls list and the dashboard's running+5min panel."""
+    LLM Calls list and the dashboard's running+5min panel. The detail link's `src`
+    is derived from the endpoint so a row carries its own way back regardless of
+    which list rendered it."""
     cid, ts, dur, backend, source, alias, model, endpoint, status, intk, outk, cost, prev, has_body, rsn = r
     scls = "ok" if (status and 200 <= int(status) < 300) else "bad"
     if has_body:
-        src = "voice" if str(endpoint or "").startswith("/v1/audio") else "llm"
+        src = _call_kind(endpoint)
         view = f"<a href='/ui/call/{cid}?src={src}' title='{_esc(prev or '')}'>view</a>"
     elif prev:
         view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
@@ -4419,12 +4460,13 @@ def _calls_table(rows_html: str, sk: str) -> str:
             f"<th>req</th></tr>{rows_html}</table>")
 
 
-def _recent_calls_table(rows, aliases) -> str:
-    """The per-call history table (time/source/backend/alias→model/…/reasoning/req body)."""
+def _recent_calls_table(rows, aliases, src: str = "llm") -> str:
+    """The per-call history table (time/source/backend/alias→model/…/reasoning/req body).
+    `src` only names the sort-key so the three lists keep their own sort state."""
     rec = "".join(_call_row(r, aliases) for r in rows)
     if not rec:
         return "<p class='muted'>no calls yet</p>"
-    return _calls_table(rec, sk="llm-calls")
+    return _calls_table(rec, sk=f"{src}-calls")
 
 
 _BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
@@ -4576,15 +4618,20 @@ async def call_view(call_id: int, request: Request):
             resp_html = f"<pre class='chatout'>{_esc(json.dumps(respobj, indent=2, ensure_ascii=False))}</pre>"
         inner = (f"<h3>Request</h3><pre class='chatout'>{_esc(req)}</pre>"
                  f"<h3>Response</h3>{resp_html}")
-    voice = request.query_params.get("src") == "voice"
-    src = "voice" if voice else "llm"
-    back = _btn("← Back to Voice Calls" if voice else "← Back to LLM Calls",
-                f"/ui/jobs?sub={src}", "secondary")
+    src = request.query_params.get("src") or "llm"
+    if src not in ("voice", "media"):
+        src = "llm"
+    back = _btn({"voice": "← Back to Voice Calls", "media": "← Back to Media Jobs"}
+                .get(src, "← Back to LLM Calls"), f"/ui/jobs?sub={src}", "secondary")
     # prev/next within the same list partition (newest first: prev = newer row
-    # above, next = older row below); hidden at the list ends.
-    newer, older = stats.call_neighbors(call_id, voice)
-    nav = ((_btn("‹ Prev", f"/ui/call/{newer}?src={src}", "secondary", title="Newer call") if newer else "")
-           + (_btn("Next ›", f"/ui/call/{older}?src={src}", "secondary", title="Older call") if older else ""))
+    # above, next = older row below); hidden at the list ends. `call_neighbors`
+    # only partitions voice vs. rest, so media rows — a handful of refusals, listed
+    # under their jobs — get the Back button and no stepping.
+    nav = ""
+    if src != "media":
+        newer, older = stats.call_neighbors(call_id, src == "voice")
+        nav = ((_btn("‹ Prev", f"/ui/call/{newer}?src={src}", "secondary", title="Newer call") if newer else "")
+               + (_btn("Next ›", f"/ui/call/{older}?src={src}", "secondary", title="Older call") if older else ""))
     page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
             f"<div style='display:flex;gap:8px'>{nav}{back}</div></div>{inner}")
     return HTMLResponse(_page("Call", page, "jobs"))
@@ -4940,9 +4987,21 @@ async def reasoning_del(request: Request):
     return RedirectResponse("/ui/reasoning", status_code=303)
 
 
+def _show_user_keys() -> bool:
+    """Whether the user editor pre-fills an existing user's API key so it can be
+    copied again. Default ON; turn it off in Server → flags to keep the key out of
+    the rendered page and show only keys generated right there in the form."""
+    return bool(store.get_setting("show_user_keys", True)) if store.is_active() else True
+
+
 def _user_form(u: Optional[dict]) -> str:
     g = lambda k, d="": str((u or {}).get(k) if (u or {}).get(k) is not None else d)
     has_key = bool((u or {}).get("api_key"))
+    # A stored key is only prefilled for an EXISTING user (a new one has none) and
+    # only with the setting on. Masked as a password field; the Copy button reveals
+    # it, exactly as it does for a freshly generated key.
+    show_key = has_key and _show_user_keys()
+    key_val = (u or {}).get("api_key", "") if show_key else ""
     orig = f'<input type="hidden" name="orig" value="{_esc((u or {}).get("name", ""))}">' if u else ""
     # model allow-list as a table — ALIASES only (chat + image generation aliases),
     # since access is granted at the alias level; raw model ids would be noise.
@@ -4979,14 +5038,20 @@ def _user_form(u: Optional[dict]) -> str:
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/users", "secondary")}</div>'
             + _field("name", _inp("name", g("name"), placeholder="alice"))
             + _field("API key",
-                     _inp("api_key", "", placeholder=("•••• set — blank keeps it" if has_key
-                                                      else "the user's bearer token"))
+                     _inp("api_key", key_val, typ=("password" if show_key else "text"),
+                          placeholder=("" if show_key else
+                                       ("•••• set — blank keeps it" if has_key
+                                        else "the user's bearer token")))
                      + ' <button type="button" class="btn secondary sm" onclick="gwGenKey(this)" '
                        'title="generate a random key">🔑 Generate</button>'
                      + ' <button type="button" class="btn secondary sm" onclick="gwCopyKey(this)" '
                        'title="copy to clipboard">📋 Copy</button>'
-                     + "<p class='hint' style='margin:4px 0 0'>The key is shown once here — copy it now; "
-                       "after Save it is stored encrypted and no longer displayed.</p>"
+                     + ("<p class='hint' style='margin:4px 0 0'>This user's key is filled in and hidden — "
+                        "<b>📋 Copy</b> reveals and copies it. Overwrite the field to change the key. "
+                        "Turn off <code>show_user_keys</code> in <a href='/ui/server'>Server</a> to keep "
+                        "stored keys out of this page.</p>" if show_key else
+                        "<p class='hint' style='margin:4px 0 0'>The key is shown once here — copy it now; "
+                        "after Save it is stored encrypted and no longer displayed.</p>")
                      + "<script>function _gwKeyInp(b){return b.closest('.control').querySelector('input[name=api_key]');}"
                        "function gwGenKey(b){var a=new Uint8Array(24);crypto.getRandomValues(a);"
                        "var k='sk-'+Array.from(a).map(function(x){return ('0'+x.toString(16)).slice(-2);}).join('');"
@@ -5131,6 +5196,10 @@ _SRV_RUNTIME = [
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
     ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Mapping; 0 = off)"),
     ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
+    ("fast_probe_interval_s", "int", "fast probe interval",
+     "seconds — how often an UNHEALTHY backend is re-checked while calls or jobs wait for "
+     "capacity, so one that came back is picked up in seconds instead of a whole health "
+     "check interval (blank = 3; 0 = off)"),
 ]
 _SRV_RESTART = [
     ("__grp", "", "Gateway", ""),
@@ -5188,7 +5257,10 @@ async def server_page(request: Request):
                  _checkbox("log_per_call", bool(eff.get("log_per_call")), "log_per_call",
                            "one log line per forwarded request")
                  + _checkbox("model_prefix", bool(eff.get("model_prefix")), "model_prefix",
-                             "list models as backend/model in /v1/models")))
+                             "list models as backend/model in /v1/models")
+                 + _checkbox("show_user_keys", _show_user_keys(), "show_user_keys",
+                             "let an existing user's API key be copied again in the user "
+                             "editor (off: only a key generated right there is shown)")))
     runtime_form = (
         '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="runtime">'
         f'<div class="formbar"><h2>Runtime settings</h2>{_btn("Save", submit=True)}</div>'
@@ -5224,7 +5296,7 @@ async def server_save(request: Request):
     f = await _form(request)
     which = f.get("_form", "")
     spec = _SRV_RUNTIME if which == "runtime" else _SRV_RESTART
-    bools = {"log_per_call", "model_prefix"} if which == "runtime" else set()
+    bools = {"log_per_call", "model_prefix", "show_user_keys"} if which == "runtime" else set()
     vals = {}
     for k, kind, *_ in spec:
         if not kind:
