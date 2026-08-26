@@ -4489,10 +4489,30 @@ def _recent_calls_table(rows, aliases, src: str = "llm") -> str:
 
 
 _BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
-_FILTER_JS = ("<script>function sfRun(){var q=(document.getElementById('sf').value||'').toLowerCase();"
+# Row filter for `table.filterable`, driven by the ONE `#sf` input a view renders.
+# The typed text is persisted in sessionStorage per view and re-applied on load — like
+# the sort order above, and for the same reason: Media Jobs auto-refreshes every 5 s
+# while a job runs, and a full-page reload otherwise wipes the search you just typed
+# (reported from the Media Jobs list). Focus + caret come back too, but ONLY when the
+# save is seconds old: that means the reload pulled the page out from under someone who
+# was typing, whereas re-opening the tab later must not steal focus.
+_FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.search;"
+              "function el(){return document.getElementById('sf');}"
+              "function save(){var i=el();if(!i)return;try{sessionStorage.setItem(K,"
+              "JSON.stringify({v:i.value,c:i.selectionStart,f:document.activeElement===i,"
+              "t:Date.now()}));}catch(e){}}"
+              "window.sfRun=function(){var i=el();if(!i)return;"
+              "var q=(i.value||'').toLowerCase();"
               "document.querySelectorAll('.filterable tr').forEach(function(r){"
               "if(r.getElementsByTagName('th').length)return;"
-              "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});}</script>")
+              "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});save();};"
+              "var i=el();if(i){var s=null;"
+              "try{s=JSON.parse(sessionStorage.getItem(K)||'null');}catch(e){}"
+              "if(s&&s.v){i.value=s.v;window.sfRun();"
+              "if(s.f&&Date.now()-(s.t||0)<15000){i.focus();"
+              "try{i.setSelectionRange(s.c,s.c);}catch(e){}}}"
+              "i.addEventListener('blur',save);window.addEventListener('beforeunload',save);}"
+              "})();</script>")
 
 
 def _user_filter_bar(path: str, user, by_source, aliases) -> tuple[str, str]:
