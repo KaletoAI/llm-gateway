@@ -383,8 +383,14 @@ recorded too, by the app-wide `HTTPException` handler (`_rejected_call` →
 `_record_rejected`): anything turned away before a backend saw it (no healthy
 backend, park timeout, quota, unknown alias, bad key) used to leave NO trace at
 all, which is precisely the call you go looking for in LLM Calls. Such rows carry
-backend `(refused)`, an empty `model` (none was ever resolved), the status, and
-the reason as the stored response body. `request.state.gw_dispatched` (set in
+backend `stats.REFUSED_BACKEND` = `(refused)` (defined THERE, not in `main`, because
+the aggregates are what must exclude it), an empty `model` (none was ever resolved),
+the status, and the reason as the stored response body. That marker is a call-log
+entry only: `summary()` keeps it out of `by_backend`/`by_model` — a pseudo-backend
+with 0 tokens/0 cost/0 ms says nothing about any backend, and its empty model splits
+the alias into two rows — and reports it as `refused_count`/`refused_24h`, which the
+Statistic tab shows as its own card (totals and `by_source` still count it: a refused
+call is real traffic from that user). `request.state.gw_dispatched` (set in
 `_dispatch_over` once an adapter answered, and in `run_generation` right after
 `jobs.create`) prevents a second row when an endpoint re-raises an upstream error —
 and `gw_alias`/`gw_body`/`gw_endpoint` carry the context the handler cannot see.

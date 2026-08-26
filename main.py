@@ -712,8 +712,10 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
 
 # Shown in the backend column for calls no backend ever saw. A name rather than a
 # blank so it reads as a statement ("nothing served this") and so the Statistic tab
-# can show how many requests were turned away at the door.
-_REJECTED_BACKEND = "(refused)"
+# can show how many requests were turned away at the door. It lives in stats.py
+# because the aggregates there must exclude it from the per-backend/per-model tables —
+# one definition, or the marker silently starts counting as a backend again.
+_REJECTED_BACKEND = stats.REFUSED_BACKEND
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

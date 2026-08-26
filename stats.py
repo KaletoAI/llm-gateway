@@ -53,6 +53,14 @@ CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
 CREATE INDEX IF NOT EXISTS idx_calls_source  ON calls(source, ts);  -- month_cost quota scan
 """
 
+# Backend column of a call NO backend ever saw (park timeout, quota, unknown alias,
+# bad key — written by main._record_rejected). A marker, not a backend: it is excluded
+# from every per-backend / per-model aggregate below, because a pseudo-backend with 0
+# tokens, 0 cost and 0 ms in the "By backend" table is not a fact about any backend,
+# and its empty model splits the alias's row in two. summary() reports it as its own
+# figure instead, so the refusals stay visible where they mean something.
+REFUSED_BACKEND = "(refused)"
+
 
 def is_active() -> bool:
     return _DB_PATH is not None
@@ -96,30 +104,42 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
             user: Optional[str] = None) -> dict:
     """Aggregated call stats for the in-UI dashboard (data only, no HTML). If
     `user` is given, every figure is scoped to that source (per-user drilldown);
-    `by_source` stays unscoped so it can drive the user picker."""
+    `by_source` stays unscoped so it can drive the user picker.
+
+    Refused calls (see REFUSED_BACKEND) are traffic, so they count in the totals
+    and in by_source — but they are kept out of by_backend/by_model, which are
+    about work a backend actually did, and reported separately as `refused_*`."""
     if _DB_PATH is None:
         return {"active": False}
     now = int(time.time())
     flt = " WHERE source = ?" if user else ""
     ua = [user] if user else []
+    served = (flt + " AND" if flt else " WHERE") + " backend <> ?"   # forwarded calls only
+    sa = [*ua, REFUSED_BACKEND]
     total = _q(f"SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls{flt}", *ua)[0]
     h24flt = " WHERE ts > ?" + (" AND source = ?" if user else "")
     h24 = _q(f"SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls{h24flt}", now - 86400, *ua)[0]
+    # Params bind by position across the WHOLE statement, so the SELECT's ts window
+    # comes before the WHERE's backend/source.
+    ref = _q(f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END),0) "
+             f"FROM calls WHERE backend = ?" + (" AND source = ?" if user else ""),
+             now - 86400, REFUSED_BACKEND, *ua)[0]
     return {
         "active": True, "user": user,
         "total_count": total[0], "total_cost": total[1],
         "h24_count": h24[0], "h24_cost": h24[1],
+        "refused_count": ref[0], "refused_24h": ref[1],
         # by_backend carries the prompt-cache breakdown too: cache_read/cache_write
         # are subsets of input_tokens, so "fresh" is the remainder.
         "by_backend": _q(
             f"SELECT backend, COUNT(*), COALESCE(SUM(input_tokens),0), "
             f"COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0), COALESCE(AVG(duration_ms),0), "
             f"COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0) "
-            f"FROM calls{flt} GROUP BY backend ORDER BY COUNT(*) DESC", *ua),
+            f"FROM calls{served} GROUP BY backend ORDER BY COUNT(*) DESC", *sa),
         "by_model": _q(
             f"SELECT COALESCE(alias,''), COALESCE(model,''), COUNT(*), "
             f"COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0) "
-            f"FROM calls{flt} GROUP BY alias, model ORDER BY COUNT(*) DESC LIMIT ?", *ua, model_limit),
+            f"FROM calls{served} GROUP BY alias, model ORDER BY COUNT(*) DESC LIMIT ?", *sa, model_limit),
         "by_source": _q(
             "SELECT COALESCE(source,'unknown'), COUNT(*), COALESCE(SUM(cost_usd),0) "
             "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", source_limit),

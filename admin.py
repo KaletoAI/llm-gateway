@@ -4575,11 +4575,24 @@ async def statistic_page(request: Request):
     s = await asyncio.to_thread(stats.summary, user=user)
     aliases = store.get_ip_aliases()
     scope, bar = _user_filter_bar("/ui/statistic", user, s["by_source"], aliases)
+    # Refused calls are counted in the totals but never in the tables below (they had no
+    # backend and no model) — this card is where they stay visible, and it explains the
+    # gap between "calls total" and the sum of the By-backend column. Deliberately NOT
+    # a link: _call_kind() files each row under LLM Calls, Media Jobs or Voice Calls by
+    # endpoint, so no single list holds them all (measured on prod: a whole day of 401s
+    # on /v1/models next to media 503s). The tooltip names the three places instead.
+    ref_tip = (f"{s['refused_count']} in total. Turned away before any backend saw them "
+               f"(no healthy backend, park timeout, quota, unknown alias, bad key) — "
+               f"counted in the totals above, but not in the tables below. The rows sit "
+               f"under LLM Calls, Media Jobs or Voice Calls, by endpoint.")
     cards = (f"<div class='cards'>"
              f"<div class='card'><div class='cnum'>{s['total_count']}</div><div class='clbl'>calls total</div></div>"
              f"<div class='card'><div class='cnum'>{_cost(s['total_cost'])}</div><div class='clbl'>cost total</div></div>"
              f"<div class='card'><div class='cnum'>{s['h24_count']}</div><div class='clbl'>calls · 24h</div></div>"
              f"<div class='card'><div class='cnum'>{_cost(s['h24_cost'])}</div><div class='clbl'>cost · 24h</div></div>"
+             f"<div class='card' title='{_esc(ref_tip)}'>"
+             f"<div class='cnum'>{s['refused_24h']}</div>"
+             f"<div class='clbl'>refused · 24h</div></div>"
              f"</div>")
     trend = await asyncio.to_thread(stats.cache_trend, user=user)
     be = "".join(f"<tr><td>{_esc(r[0])}</td><td>{r[1]}</td><td>{r[2]}</td>"
@@ -4600,7 +4613,11 @@ async def statistic_page(request: Request):
                   f"<th title='input processed fresh — neither read nor written'>fresh</th>"
                   f"<th title='cache hit rate per hour, last 24h'>24h trend</th>"
                   f"<th>out tok</th><th>cost</th><th>avg</th></tr>{be}</table>" if be
-                  else "<h2>By backend</h2><p class='muted'>no calls yet</p>")
+                  # "no calls yet" would be a lie when every call was refused — that is
+                  # exactly the state this table can no longer show by itself.
+                  else "<h2>By backend</h2><p class='muted'>" + (
+                      f"no forwarded calls — all {s['refused_count']} were refused"
+                      if s["refused_count"] else "no calls yet") + "</p>")
     mo = "".join(f"<tr><td>{_esc(r[0]) or '—'}</td><td><code>{_esc(r[1])}</code></td><td>{r[2]}</td>"
                  f"<td>{r[3]}</td><td>{r[4]}</td><td>{_cost(r[5])}</td></tr>" for r in s["by_model"])
     by_model = (f"<h2>By alias / model</h2><table class='filterable sortable' data-sk='stat-model'>"
