@@ -1415,13 +1415,95 @@ async def backend_save(request: Request):
     return RedirectResponse("/ui/backends", status_code=303)
 
 
+# What a delete clears, and what it deliberately does not — the wording the confirm
+# and result pages share, so both explain the same rule with the same words.
+_REF_CLEARED = (
+    ("gen", "media aliases", "the candidate goes; the alias and its workflow stay"),
+    ("chat", "chat aliases", "the backend's entry goes"),
+    ("chat_empty", "chat aliases left mapping nothing",
+     "the alias stays, but routes nowhere until you give it a backend"),
+    ("rule", "reasoning rules", "the backend drops out of the rule's list"),
+    ("user", "user grants", "the whole-backend grant goes from the allow-list"),
+)
+_REF_KEPT = (
+    ("gen_last", "media aliases whose only backend this is",
+     "kept: the workflow lives in that candidate — removing it would leave the alias "
+     "standing without its workflow"),
+    ("rule_last", "reasoning rules whose only backend this is",
+     "kept: an empty backend list means EVERY backend, so removing it would silently "
+     "widen the rule"),
+    ("user_alias", "allow-list entries that name an alias too",
+     "kept: the entry grants that alias, not this backend"),
+)
+
+
+def _refs_rows(found: dict, spec) -> str:
+    return "".join(
+        f"<tr><td>{len(names)}</td><td>{_esc(label)}</td>"
+        f"<td><code>{_esc(', '.join(names))}</code></td>"
+        f"<td class='muted'>{_esc(why)}</td></tr>"
+        for key, label, why in spec if (names := found.get(key) or []))
+
+
+def _refs_table(found: dict, spec, title: str, hint: str = "") -> str:
+    rows = _refs_rows(found, spec)
+    if not rows:
+        return ""
+    return (f"<h3>{title}</h3>" + (f"<p class='hint'>{hint}</p>" if hint else "")
+            + f"<table><tr><th></th><th>what</th><th>which</th><th></th></tr>{rows}</table>")
+
+
 async def backend_del(request: Request):
+    """Delete a backend — and clear its name out of the store with it.
+
+    A delete used to remove the backend row alone, so every alias that named it kept
+    a candidate pointing at nothing: the backend stayed visible in Media aliases long
+    after it was gone (reported 2026-08-27 for evo-x2-gpu, 25 stale references).
+    `rename_backend_references` had done this for renames since forever; this is the
+    missing counterpart. When something does point at the backend, the click lands on
+    a confirm page first — that is the check that was missing — and REFERENCES are all
+    that ever get cleared: no alias, rule or user is deleted here."""
     bid = (request.query_params.get("id", "") or request.query_params.get("name", "") or "").strip()
-    if bid:
-        name, typ = _parse_bid(bid)
-        store.delete_backend(name, typ)
-        _apply_backends()
-    return RedirectResponse("/ui/backends", status_code=303)
+    if not bid:
+        return RedirectResponse("/ui/backends", status_code=303)
+    name, typ = _parse_bid(bid)
+    found = store.backend_references(name) if store.is_active() else {}
+    hits = sum(len(v) for v in found.values())
+
+    if hits and request.query_params.get("confirm") != "1":
+        body = (f"<h2>Delete backend <code>{_esc(name)}</code>?</h2>"
+                "<p class='hint'>It is still named in the store. Deleting removes those "
+                "references as well — nothing else: every alias, rule and user stays, they "
+                "just stop pointing at this backend.</p>"
+                + _refs_table(found, _REF_CLEARED, "Will be cleared")
+                + _refs_table(found, _REF_KEPT, "Will be left alone",
+                              "Removing these would destroy or widen something, so they stay "
+                              "and keep naming a backend that no longer exists — handle them "
+                              "yourself if that matters.")
+                + '<div class="actions">'
+                + _btn("Delete and clean up", f"/ui/backends/delete?id={quote(bid)}&confirm=1", "danger")
+                + _btn("Cancel", "/ui/backends", "secondary") + "</div>")
+        return HTMLResponse(_page(f"Delete {name}", body, "backends"))
+
+    if hits:
+        store.delete_backend_references(name)
+    store.delete_backend(name, typ)
+    _apply_backends()
+    if found.get("chat") or found.get("chat_empty"):
+        _apply_chat_aliases()
+    if found.get("rule"):
+        _apply_reasoning()
+    if found.get("user"):
+        _apply_users()
+    logger.info(f"ui: deleted backend '{name}' ({typ})"
+                + (f" — cleared {hits} reference(s)" if hits else ""))
+    if not hits:
+        return RedirectResponse("/ui/backends", status_code=303)
+    body = (f"<h2>Backend <code>{_esc(name)}</code> deleted</h2>"
+            + _refs_table(found, _REF_CLEARED, "Cleared")
+            + _refs_table(found, _REF_KEPT, "Left alone — still naming a backend that is gone")
+            + f'<div class="actions">{_btn("← Backends", "/ui/backends", "secondary")}</div>')
+    return HTMLResponse(_page(f"Deleted {name}", body, "backends"))
 
 
 async def backend_restart(request: Request):

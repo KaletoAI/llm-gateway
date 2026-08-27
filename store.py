@@ -314,6 +314,80 @@ def rename_backend_references(old: str, new: str) -> int:
     return changed
 
 
+def backend_references(name: str) -> dict:
+    """Everything in the store that names `name` as a backend, WITHOUT touching it:
+    generation-alias candidates, per-backend chat-alias entries, reasoning rules and
+    whole-backend user grants. Same buckets as delete_backend_references() so the
+    UI can show beforehand exactly what a delete would do.
+
+    Three buckets are "would not be removed", because removing them destroys or
+    widens something rather than just dropping a dangling name:
+      · `gen_last` — the alias's LAST candidate: `workflow_json` lives inside the
+        candidate, so dropping it would leave the alias standing without its
+        workflow (the editor enforces the same rule: "an alias must keep at least one");
+      · `rule_last` — a rule's LAST backend: an empty list means ALL backends in
+        reasoning.resolve(), so removing it would silently widen the rule;
+      · `user_alias` — an allow-list entry that is also an alias name, which then
+        grants that alias rather than the backend.
+    """
+    out = {k: [] for k in ("gen", "gen_last", "chat", "chat_empty",
+                           "rule", "rule_last", "user", "user_alias")}
+    gen = list_aliases()
+    alias_names = set(gen) | set(list_chat_aliases())
+    for alias, cands in sorted(gen.items()):
+        if not any((c.get("backend") or "").strip() == name for c in cands):
+            continue
+        kept = [c for c in cands if (c.get("backend") or "").strip() != name]
+        out["gen" if kept else "gen_last"].append(alias)
+    for alias, value in sorted(list_chat_aliases().items()):
+        if isinstance(value, dict) and name in value:
+            out["chat_empty" if len(value) == 1 else "chat"].append(alias)
+    for r in get_reasoning_rules() or []:
+        bks = r.get("backends") or []
+        if name not in bks:
+            continue
+        label = r.get("match") or "*"
+        out["rule_last" if len(bks) == 1 else "rule"].append(label)
+    for u in list_users():
+        if name in (u.get("models") or []):
+            out["user_alias" if name in alias_names else "user"].append(u.get("name") or "?")
+    return out
+
+
+def delete_backend_references(name: str) -> dict:
+    """Drop every reference to a backend being removed — the counterpart to
+    rename_backend_references(), which is what a delete had been missing: a deleted
+    backend used to stay behind in every alias that named it.
+
+    REFERENCES only. No alias, rule or user is ever deleted here, and the three
+    buckets documented in backend_references() are left untouched. Returns the same
+    dict, now describing what actually happened."""
+    found = backend_references(name)
+    for alias in found["gen"]:
+        cands = get(alias) or []
+        kept = [c for c in cands if (c.get("backend") or "").strip() != name]
+        if kept and len(kept) != len(cands):
+            upsert(alias, kept)
+    for alias in found["chat"] + found["chat_empty"]:
+        value = get_chat_alias(alias)
+        if isinstance(value, dict) and name in value:
+            value.pop(name)
+            upsert_chat_alias(alias, value)          # the alias itself stays, empty or not
+    if found["rule"]:
+        rules = get_reasoning_rules() or []
+        for r in rules:
+            bks = r.get("backends") or []
+            if name in bks and len(bks) > 1:
+                r["backends"] = [b for b in bks if b != name]
+        set_reasoning_rules(rules)
+    for uname in found["user"]:
+        u = get_user(uname)
+        if u and name in (u.get("models") or []):
+            u["models"] = [m for m in u["models"] if m != name]
+            upsert_user(u)
+    return found
+
+
 # ── Server settings (UI-managed overrides of config.yaml) ────────────────────────
 # Secret-valued keys (api_key) are encrypted at rest like backend keys.
 
