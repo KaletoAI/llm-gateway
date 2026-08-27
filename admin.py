@@ -1614,9 +1614,61 @@ def _routing_chat_body(snap: dict) -> str:
     return html
 
 
-def _routing_gen_body(bmeta: dict) -> str:
-    grows = ""
+def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
+    """Media aliases → the backends that serve them, in two views behind one picker.
+
+    Unfiltered it stays alias-first: a group per alias with its candidates in
+    priority order — that answers "where does THIS alias run". Pick a backend and it
+    flips to backend-first: one flat row per alias on that backend, carrying what is
+    per-BACKEND about it (pinned values, bypassed nodes) beside the shared mapping.
+    Keeping the grouped shape while filtered would print a group header above a
+    single row — twice the height for none of the answer.
+
+    The picker is built from the aliases, not from the live backend list, so an alias
+    still pointing at a renamed or deleted backend stays visible instead of silently
+    dropping out of the very overview you would use to find it."""
     gen_aliases = store.list_aliases() if store.is_active() else {}
+    per_backend: dict = {}
+    for alias, cands in gen_aliases.items():
+        for c in cands:
+            per_backend.setdefault((c.get("backend") or "").strip() or "—", []).append((alias, c, cands))
+
+    opts = "<option value=''>all backends</option>" + "".join(
+        f"<option value='{_esc(b)}'{' selected' if b == sel else ''}>{_esc(b)} ({len(v)})</option>"
+        for b, v in sorted(per_backend.items()))
+    picker = (f"<div style='margin:6px 0 10px'><select style=\"width:auto;{_BOX_STYLE}\" "
+              f"onchange=\"location.href='/ui/routing?sub=gen'+"
+              f"(this.value?('&amp;backend='+encodeURIComponent(this.value)):'')\">{opts}</select></div>")
+
+    if sel:
+        bm = bmeta.get(sel)
+        entries = sorted(per_backend.get(sel, []), key=lambda e: e[0].lower())
+        rows = ""
+        for alias, c, cands in entries:
+            mapped = ", ".join((c.get("mapping") or {}).keys()) or "auto"
+            pins = len([b for b in (c.get("fixed") or []) if b.get("node")])
+            byp = len(c.get("bypass") or [])
+            # pins + bypass are the per-backend half of a workflow — the reason this
+            # view exists at all; the mapping beside them is shared across candidates.
+            local = " · ".join(x for x in ((f"{pins} pinned" if pins else ""),
+                                           (f"{byp} bypassed" if byp else "")) if x) or "—"
+            others = ", ".join(sorted(x.get("backend", "") for x in cands
+                                      if (x.get("backend") or "").strip() != sel)) or "—"
+            rows += (f'<tr><td><a href="/ui/mapping?edit={quote(alias)}"><code>{_esc(alias)}</code></a></td>'
+                     f'<td>{_esc(c.get("task", ""))}</td>'
+                     f'<td class="muted">{_esc(mapped)}</td><td>{_esc(local)}</td>'
+                     f'<td class="muted">{_esc(others)}</td></tr>')
+        head = (f"<h2>Media aliases on <b>{_esc(sel)}</b> "
+                f"<span class='muted' style='font-weight:normal'>· {len(entries)}</span></h2>"
+                f"<p class='hint'>{_img_status(bm)} priority "
+                f"{bm.get('priority', '?') if bm else '?'} — <b>mapping</b> is shared by all of an "
+                f"alias's backends, <b>pinned</b> and <b>bypassed</b> are this backend's own.</p>")
+        return (head + picker
+                + ('<table class="sortable" data-sk="routing-gen-on"><tr><th>alias</th><th>task</th>'
+                   f'<th>mapping</th><th>this backend</th><th>also on</th></tr>{rows}</table>'
+                   if rows else "<p class='muted'>No media alias names this backend.</p>"))
+
+    grows = ""
     for alias, cands in sorted(gen_aliases.items()):
         grows += f'<tr class="grp"><td colspan="4">{_esc(alias)}</td></tr>'
         ordered = sorted(cands, key=lambda c: bmeta.get(c.get("backend"), {}).get("priority", 100))
@@ -1626,7 +1678,9 @@ def _routing_gen_body(bmeta: dict) -> str:
             grows += (f'<tr><td>{_esc(bn)}</td><td>{_esc(c.get("task", ""))}</td>'
                       f'<td>{bm.get("priority", "?") if bm else "?"}</td><td>{_img_status(bm)}</td></tr>')
     return ("<h2>Media Generation aliases → backends</h2>"
-            "<p class='hint'>Tried in backend-priority order with failover (see Mapping).</p>"
+            "<p class='hint'>Tried in backend-priority order with failover (see Mapping). "
+            "Pick a backend to see everything mapped onto it instead.</p>"
+            + picker
             + ('<table class="sortable" data-sk="routing-gen"><tr><th>alias / backend</th><th>task</th>'
                f'<th>priority</th><th>status</th></tr>{grows}</table>'
                if grows else "<p class='muted'>No generation aliases configured.</p>"))
@@ -1684,7 +1738,8 @@ async def routing_page(request: Request):
             "switches all its bare ids to speed at once — no per-model toggle then.</p>"
             + _models_table([m for m in on_llm if not _is_image_model(m["model"])], show_mode=True))
     elif sub == "gen":
-        title, body = "Media aliases", _routing_gen_body(bmeta)
+        title, body = "Media aliases", _routing_gen_body(
+            bmeta, (request.query_params.get("backend") or "").strip() or None)
     elif sub == "image":
         snap = _routing_snapshot()
         img_models = [m for m in snap.get("models", []) if any(h.get("type") == "comfyui" for h in m["hosts"])]
