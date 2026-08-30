@@ -11,6 +11,9 @@ cd "$(dirname "$(readlink -f "$0")")"
 # patterns; tar wants the in-archive path (./foo) — hence two lists.
 RSYNC_EXCLUDES=(
     --exclude='.git/'        --exclude='.claude/'
+    # Agent/tool state that lives ON the prod box and is in no checkout — without
+    # these, --delete wipes it on every deploy.
+    --exclude='.remember/'   --exclude='.superpowers/'
     --exclude='__pycache__/' --exclude='*.pyc'
     --exclude='.venv/'       --exclude='venv/'        --exclude='.env'
     --exclude='config.yaml'  --exclude='config.yaml.bak*'  --exclude='config.prod.yaml'
@@ -22,6 +25,7 @@ RSYNC_EXCLUDES=(
 )
 TAR_EXCLUDES=(
     --exclude='./.git'        --exclude='./.claude'
+    --exclude='./.remember'   --exclude='./.superpowers'
     --exclude='__pycache__'   --exclude='*.pyc'
     --exclude='./.venv'       --exclude='./venv'        --exclude='./.env'
     --exclude='./config.yaml' --exclude='./config.yaml.bak*' --exclude='./config.prod.yaml'
