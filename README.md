@@ -621,9 +621,23 @@ Key mapping concepts:
   identical from outside. A request param that targets a pinned node/field is
   **ignored** — a pin is authoritative; the API can't override it.
 - **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
-  request fields. By default an unfilled slot gets an 8×8 placeholder; mark a slot
-  **`required`** (Mapping checkbox) to leave it empty instead so ComfyUI errors
-  clearly when a needed image/mask is missing (inpaint).
+  request fields. The Mapping editor picks one of three behaviours per slot for a
+  request that sends no image:
+  - **`8×8 if empty`** (default) — the loader gets a black 8×8 placeholder.
+  - **`required`** — the slot is left empty so ComfyUI errors clearly when a needed
+    image/mask is missing (inpaint).
+  - **`disable branch if empty`** — the loader node is removed together with the
+    **dead branch behind it**: every node that declares that input **required** in
+    `/object_info` cannot run and is removed too, transitively; a node whose socket
+    is **optional** keeps running without the image. Nothing to configure — it
+    follows the workflow. Example (`img2mesh-trellis2_multiview`): leaving
+    `input_image_back` empty drops the back loader *and* its
+    `Trellis2PreProcessImage` (whose `image` is required), while the multi-view
+    generator's optional `back_image` is simply unwired and the mesh is built from
+    the remaining views. If the branch would take the alias's **output node** with
+    it (e.g. the *front* view, which the generator requires), the job is refused up
+    front naming that slot, instead of submitting a workflow that cannot deliver.
+    Removed nodes are listed as `disabled_nodes` in the job's parameter summary.
 - **Numeric fields** (strength, steps, cfg) render with `min`/`max`/`step` pulled
   live from `/object_info`.
 

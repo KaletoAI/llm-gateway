@@ -2620,13 +2620,15 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
         if is_img:
             mode = adapters.slot_empty_mode(m)
             eopts = [("placeholder", "8×8 if empty"), ("required", "required"),
-                     ("disable", "disable node if empty")]
+                     ("disable", "disable branch if empty")]
             esel = "".join(f'<option value="{v}"{" selected" if v == mode else ""}>{l}</option>'
                            for v, l in eopts)
             cur_cell = ('image upload <select name="empty__' + _esc(p) + '" style="width:auto" '
                         'title="what to do when the request sends no image for this slot: '
                         '8×8 black placeholder · required (error if missing) · disable the loader '
-                        'node (drop it + its links, optional consumer runs without it)">'
+                        'node AND the dead branch behind it — every node that requires that '
+                        'input dies with it, a node whose socket is optional keeps running '
+                        'without the image (no depth to configure, it follows the workflow)">'
                         + esel + '</select>')
         elif isinstance(cur, list):
             cur_cell = "(linked)"                        # wired to another node — not editable
