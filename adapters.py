@@ -1434,7 +1434,8 @@ def image_params(wf: dict, mapping: dict) -> list:
 def slot_empty_mode(m: dict) -> str:
     """What a mapped image slot does when the request sends no image for it:
     'placeholder' (8×8 black, the default) · 'required' (no fallback → ComfyUI errors
-    if it is missing) · 'disable' (drop the loader node and any link to it, so an
+    if it is missing) · 'disable' (drop the loader node, any link to it, and the dead
+    branch behind it — every node that REQUIRED that input, see _prune_branch — so an
     OPTIONAL downstream input runs without this image). Reads the `on_empty` field,
     falling back to the legacy `no_placeholder` boolean."""
     mode = (m or {}).get("on_empty")
@@ -1443,18 +1444,48 @@ def slot_empty_mode(m: dict) -> str:
     return "required" if (m or {}).get("no_placeholder") else "placeholder"
 
 
-def _prune_node(wf: dict, nid: str) -> None:
-    """Deactivate a node: remove it from the prompt and drop any input link that points
-    at its output (`[nid, slot]`). The consuming node must accept the now-missing input
-    (an optional socket), else ComfyUI errors — that contract is on the workflow."""
-    if wf.pop(nid, None) is None:
-        return
-    for n in wf.values():
-        inp = n.get("inputs")
-        if isinstance(inp, dict):
-            for fld in [k for k, v in inp.items()
-                        if isinstance(v, list) and v and str(v[0]) == str(nid)]:
+def _prune_branch(wf: dict, nid: str, node_types: dict) -> list:
+    """Deactivate a node AND the dead branch it leaves behind. Removes `nid`, drops every
+    input link pointing at it (`[nid, slot]`), and CASCADES onto any consumer that thereby
+    lost a REQUIRED input — ComfyUI aborts the whole prompt on a missing required input,
+    so such a consumer cannot run either and is part of the same dead branch. A consumer
+    that only lost an OPTIONAL socket stays: running without that image is the entire
+    point of `on_empty: disable`.
+
+    Measured on img2mesh-trellis2_multiview (2026-08-30): dropping the `back` loader
+    leaves its Trellis2PreProcessImage with no `image` — required, so it dies too — while
+    the generator's `back_image` is optional and the mesh is built from the other views.
+    Pruning only the loader (the pre-cascade behaviour) failed the job at /prompt.
+
+    `node_types` is the /object_info-derived map (`req` per class). A class missing from
+    it stops the cascade there — the old single-node behaviour, never a guess about what
+    a node needs. Returns the ids removed, in removal order."""
+    removed: list = []
+    queue = [str(nid)]
+    while queue:
+        cur = queue.pop(0)
+        if wf.pop(cur, None) is None:            # absent, or already taken by this cascade
+            continue
+        removed.append(cur)
+        for cid, n in list(wf.items()):
+            inp = n.get("inputs")
+            if not isinstance(inp, dict):
+                continue
+            lost = [k for k, v in inp.items()
+                    if isinstance(v, list) and v and str(v[0]) == cur]
+            if not lost:
+                continue
+            for fld in lost:
                 inp.pop(fld, None)
+            req = (node_types.get(n.get("class_type")) or {}).get("req")
+            if req is None:
+                logger.warning(f"node {cid} ({n.get('class_type')}) lost input(s) "
+                               f"{lost} to a disabled node, but /object_info for that "
+                               "class is unavailable — not cascading")
+                continue
+            if any(fld in req for fld in lost):
+                queue.append(cid)
+    return removed
 
 
 def _is_link(v) -> bool:
@@ -1490,7 +1521,8 @@ def _apply_bypass(wf: dict, bypass_ids: list, node_types: dict) -> list:
     """Bypass nodes (ComfyUI mode 4): remove each and rewire its consumers to the input
     that passes through (type-matched), following chains of bypassed nodes. Stale/absent
     ids are skipped. An input that resolves to nothing is dropped (the consuming socket
-    must be optional, else ComfyUI errors — same contract as _prune_node). Returns the
+    must be optional, else ComfyUI errors — bypass does NOT cascade the way _prune_branch
+    does: a bypassed node is deliberately transparent, not dead). Returns the
     ids actually applied. Pure: `node_types` is injected (adapter owns the cache/fetch)."""
     byp = [n for n in (str(x) for x in bypass_ids) if n in wf]
     if not byp:
@@ -1892,20 +1924,27 @@ def _comfy_loras(object_info: dict) -> set[str]:
 
 
 def _node_type_entry(info: dict) -> dict:
-    """Reduce ONE /object_info class entry to `{"out":[type|None,…], "in":{field:type}}`.
-    Only string type tokens (data links: IMAGE/LATENT/MODEL/…) are kept — combo/enum
-    specs (a list, or "COMBO") are never wired links, so they carry no passthrough type.
-    Input order is required-then-optional = the node's socket order (dict order preserved),
-    which the bypass rewiring relies on for the k-th-same-type pairing."""
+    """Reduce ONE /object_info class entry to
+    `{"out":[type|None,…], "in":{field:type}, "req":[field,…]}`.
+    Only string type tokens (data links: IMAGE/LATENT/MODEL/…) are kept in `in` —
+    combo/enum specs (a list, or "COMBO") are never wired links, so they carry no
+    passthrough type. Input order is required-then-optional = the node's socket order
+    (dict order preserved), which the bypass rewiring relies on for the k-th-same-type
+    pairing. `req` names EVERY field of the required section, typed or not: it answers
+    "does losing this input kill the node?" for _prune_branch, and a required combo
+    can be link-fed too."""
     outs = [t if isinstance(t, str) else None for t in (info.get("output") or [])]
     ins: dict = {}
+    req: list = []
     inp = info.get("input") or {}
     for section in ("required", "optional"):
         for field_name, spec in (inp.get(section) or {}).items():
+            if section == "required":
+                req.append(field_name)
             t = spec[0] if isinstance(spec, list) and spec and isinstance(spec[0], str) else None
             if t and t != "COMBO":
                 ins[field_name] = t
-    return {"out": outs, "in": ins}
+    return {"out": outs, "in": ins, "req": req}
 
 
 def _comfy_node_types(object_info: dict) -> dict:
@@ -2208,13 +2247,15 @@ class ComfyUIAdapter(BackendAdapter):
         return [sub(b) for b in fixed]
 
     async def _apply_image_params(self, wf: dict, mapping: dict, params: list,
-                                  uploads: dict, prefix: str, used: list) -> list:
+                                  uploads: dict, prefix: str, used: list,
+                                  node_types: dict, pruned: dict) -> list:
         """Per request-field image params: upload that field's image (or the 8×8
         placeholder when none was provided) and set the loader node's field to the
         stored name. Each param gets its own JOB-UNIQUE input file (`<prefix>_<param>`),
         so several images coexist within a job and no concurrent job can overwrite one
         of them between /prompt and execution. `used` collects the names for the
-        post-success cleanup."""
+        post-success cleanup; `pruned` collects `{param: [node ids]}` for the ones an
+        `on_empty: disable` slot took out (job summary + the output-node check)."""
         if not params:
             return []
         applied = []
@@ -2234,8 +2275,10 @@ class ComfyUIAdapter(BackendAdapter):
                     if mode == "required":
                         continue              # no 8×8 fallback (e.g. inpaint image/mask) →
                                               # keep the workflow's own value / error if empty
-                    if mode == "disable":     # drop the loader node + its links → optional consumer
-                        _prune_node(wf, nid)  # runs without this image
+                    if mode == "disable":     # drop the loader AND whatever cannot run
+                        gone = _prune_branch(wf, nid, node_types)   # without it (dead branch)
+                        if gone:
+                            pruned[p] = gone
                         applied.append(p)
                         continue
                     name = await self._upload_placeholder(c)
@@ -2354,8 +2397,28 @@ class ComfyUIAdapter(BackendAdapter):
         lora_placed = _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
         lora_placed += _apply_lora_cascade(wf, values)    # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
+        # An `on_empty: disable` slot left empty prunes a whole dead branch, which needs
+        # each candidate class's required-input set. Loaded ONLY when such a slot is
+        # actually empty; after discovery the cache already holds every class, so this
+        # normally costs no request at all (and a cold cache stops the cascade safely).
+        pruned: dict = {}
+        prune_types = ({} if not any(not uploads.get(p)
+                                     and slot_empty_mode(mapping.get(p)) == "disable"
+                                     for p in img_params)
+                       else await self._node_types_for(wf, list(wf)))
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads,
-                                                     prefix, uploaded)
+                                                     prefix, uploaded, prune_types, pruned)
+        # A disabled slot that takes the alias's output node with it would submit a
+        # workflow that cannot deliver anything — name the slot instead of letting the
+        # job fail later as "produced no output".
+        if pruned and req.output_node and req.output_node not in wf:
+            culprit = next((p for p, ids in pruned.items() if req.output_node in ids),
+                           next(iter(pruned)))
+            raise RuntimeError(
+                f"no image for '{culprit}' disabled node "
+                f"{(mapping.get(culprit) or {}).get('node')} and everything downstream that "
+                f"requires it, including the alias's output node {req.output_node} — "
+                f"this slot is not optional in this workflow")
         files_applied = await self._apply_file_params(wf, mapping, req.upload_files or {},
                                                       protected, prefix, uploaded)
         autofilled = await self._autofill_empty_images(wf, mapping)
@@ -2368,6 +2431,7 @@ class ComfyUIAdapter(BackendAdapter):
                    "fixed": sorted(fixed_applied.keys()),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
                    "images": sorted(img_applied), "autofilled_images": autofilled,
+                   **({"disabled_nodes": pruned} if pruned else {}),
                    **({"files": sorted(files_applied)} if files_applied else {}),
                    **({"bypassed": bypassed} if bypassed else {})}
 

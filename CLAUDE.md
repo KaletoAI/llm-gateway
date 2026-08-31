@@ -115,6 +115,18 @@ hot-reload-safe.
   remove each node and reconnect its consumers to the same-typed input (k-th
   same-typed output → k-th same-typed link input, via cached `/object_info`
   slot types; single-link fallback when types are unknown);
+  an image slot mapped `on_empty: disable` and left empty prunes a whole DEAD
+  BRANCH (`_prune_branch`, not just the loader): the cascade follows consumers that
+  lose a **required** input — ComfyUI aborts the prompt on one, so they cannot run
+  either — and stops at an **optional** socket, which is the point of the mode
+  (measured 2026-08-30 on trellis2-multiview: the back loader's
+  `Trellis2PreProcessImage.image` is required and must go, the generator's
+  `back_image` is optional and stays). `required` per class comes from the same
+  `/object_info` cache the bypass rewiring uses (`_node_type_entry`'s `req`), loaded
+  only when such a slot is actually empty; an unknown class stops the cascade
+  (pre-cascade behaviour — never guess what a node needs). A branch that would take
+  the alias's `output_node` with it fails the job UP FRONT naming the slot, instead
+  of submitting a workflow that cannot deliver;
   `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
   rejections are translated to readable per-node errors (node title, class,
   field, offending request param) via `_comfy_prompt_error`; raw body stays the
@@ -202,8 +214,10 @@ hot-reload-safe.
   policy: drop what is inert (`cache_control`, history `thinking` blocks,
   server-side tools), raise `UnsupportedContent` → 400 where dropping would
   silently answer about content the model never saw (documents/PDFs). Covered by
-  `test_anthropic_bridge.py` (stdlib `unittest`, the repo's only test file —
-  a streaming tool-call bridge fails silently rather than crashing).
+  `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
+  silently rather than crashing). The repo's only other test file is
+  `test_prune_branch.py`, for the same reason: a dead-branch prune that cascades one
+  node too far or too few surfaces as an aborted generation, not an exception.
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
   slot mapping, `images_response`); imports only the leaf `jobs`. `main.py`

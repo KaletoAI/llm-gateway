@@ -10,7 +10,14 @@ cd "$(dirname "$(readlink -f "$0")")"
 # Same exclude set for both transports. rsync wants trailing-slash dir
 # patterns; tar wants the in-archive path (./foo) — hence two lists.
 RSYNC_EXCLUDES=(
-    --exclude='.git/'        --exclude='.claude/'
+    # No trailing slash on .git: in a WORKTREE it is a file, not a directory, and
+    # 'gitdir: …' pointing at a dev box has no business on prod.
+    --exclude='.git'         --exclude='.claude/'
+    # Lives ON the prod box and in no checkout — without these, --delete wipes it on
+    # every deploy: agent/tool state, and the raw workflow originals .gitignore
+    # deliberately keeps out of git ("keep raw originals out of git").
+    --exclude='.remember/'   --exclude='.superpowers/'
+    --exclude='sample_comfyui_workflows/org/'
     --exclude='__pycache__/' --exclude='*.pyc'
     --exclude='.venv/'       --exclude='venv/'        --exclude='.env'
     --exclude='config.yaml'  --exclude='config.yaml.bak*'  --exclude='config.prod.yaml'
@@ -22,6 +29,8 @@ RSYNC_EXCLUDES=(
 )
 TAR_EXCLUDES=(
     --exclude='./.git'        --exclude='./.claude'
+    --exclude='./.remember'   --exclude='./.superpowers'
+    --exclude='./sample_comfyui_workflows/org'
     --exclude='__pycache__'   --exclude='*.pyc'
     --exclude='./.venv'       --exclude='./venv'        --exclude='./.env'
     --exclude='./config.yaml' --exclude='./config.yaml.bak*' --exclude='./config.prod.yaml'
