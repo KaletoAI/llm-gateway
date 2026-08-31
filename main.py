@@ -2523,9 +2523,28 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         if relay == "upload":
             cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
             if not cands2:
-                await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
-                                        "enabled+healthy candidate backend for the upload relay")
-                return
+                # No candidate configured at all is a config error — fail fast. A
+                # configured successor whose backend is merely in a transient health
+                # dip parks instead (nothing is held yet): re-enter the stage-1 loop,
+                # which re-resolves everything fresh, until the park deadline.
+                raw2 = (await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None
+                if raw2 is None:
+                    raw2 = image_models.get(succ_alias, [])
+                comfy_names = {b["name"] for b in _comfy_backends}
+                if not any(c.get("backend") in comfy_names for c in raw2):
+                    # unconfigured, or every candidate backend is disabled/gone — an
+                    # admin state, not a transient: parking would never recover it.
+                    await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
+                                            "enabled candidate backend for the upload relay")
+                    return
+                if time.monotonic() > deadline:
+                    await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' had no "
+                                            "enabled+healthy candidate backend for the upload relay "
+                                            f"within park time ({async_park_timeout_s:.0f}s)")
+                    return
+                _gen_wait_ping()             # keep the fast probe awake → quick recovery pickup
+                await asyncio.sleep(2.0)
+                continue
             backend2, s2 = next((bc for bc in cands2 if backend_id(bc[0]) == bid), None) or cands2[0]
         else:
             backend2 = backend
@@ -2645,6 +2664,24 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # first, so no A-holds-waits-B cycle).
                 _inflight_dec(held); held = None
                 asyncio.create_task(_free_comfy_vram(backend, "chain stage 1 done"))
+                # Stage 1 ran for minutes — the successor backend picked up front may be
+                # in a transient health dip right now. The mesh bytes are in hand and no
+                # slot is held, so waiting is free: park until it is healthy again (or
+                # the park timeout passes) instead of losing the finished mesh to a
+                # connection error on the upload.
+                h_deadline = time.monotonic() + async_park_timeout_s
+                while not backend_healthy.get(bid2):
+                    cur = await asyncio.to_thread(jobs.get, job_id)
+                    if not cur or cur.get("status") not in ("queued", "running"):
+                        return               # cancelled meanwhile
+                    if time.monotonic() > h_deadline:
+                        await asyncio.to_thread(jobs.fail, job_id,
+                                                f"chain: successor backend '{backend2['name']}' "
+                                                f"stayed unhealthy past park time for the mesh "
+                                                f"hand-off ({async_park_timeout_s:.0f}s)")
+                        return
+                    _gen_wait_ping()         # keep the fast probe awake → quick recovery pickup
+                    await asyncio.sleep(2.0)
                 if not await _wait_and_hold(backend2, job_id, "stage 2"):
                     return
                 held = bid2
