@@ -2629,7 +2629,18 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
                         'node AND the dead branch behind it — every node that requires that '
                         'input dies with it, a node whose socket is optional keeps running '
                         'without the image (no depth to configure, it follows the workflow)">'
-                        + esel + '</select>')
+                        + esel + '</select>'
+                        # extra ids for the disable mode: nodes the dead-branch cascade does NOT
+                        # reach (optional socket, main path) but that are pointless without the
+                        # image — bypassed mode-4, so the path behind them stays connected
+                        + ' <input type="text" style="width:9em" name="bypass__' + _esc(p) + '" '
+                        'value="' + _esc(", ".join(str(x) for x in (m.get("on_empty_bypass") or [])))
+                        + '" placeholder="also bypass: 58,61" '
+                        'title="only for &quot;disable branch if empty&quot;: node ids that are '
+                        'additionally BYPASSED (ComfyUI mode 4 — consumers reconnect to the '
+                        'node\'s same-typed input) when this slot gets no image. For nodes the '
+                        'dead-branch cascade cannot take because their image socket is optional, '
+                        'but which do nothing useful without it. Comma separated.">')
         elif isinstance(cur, list):
             cur_cell = "(linked)"                        # wired to another node — not editable
         elif node and fld and node in wf:
@@ -2991,6 +3002,28 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     return form, _available_fields(alias, wf, mapped, oi)
 
 
+_HEAD_MAX = 60
+
+
+def _node_head(nid: str, n: dict) -> str:
+    """Node header for the Available fields pane (mapping column 3): `<id> <class> · <title>`,
+    SHORTENED once that runs past `_HEAD_MAX` chars — a wide header widens the whole
+    (narrow) column. Custom node packs name a class and then title it with the same words
+    again (`Trellis2MeshWithVoxelMultiViewGenerator · Trellis2 - Mesh With Voxel Multi-View
+    Generator`), so the shortening drops the class — the title is the readable half — and
+    the title's own vendor prefix up to the first ` - `. Whatever is left is hard-capped;
+    the full text always stays in the tooltip, so nothing becomes unrecoverable."""
+    cls = str(n.get("class_type") or "")
+    title = str((n.get("_meta") or {}).get("title") or "")
+    full = f"{nid} {cls}" + (f" · {title}" if title else "")
+    if len(full) <= _HEAD_MAX:
+        return f"<code>{_esc(nid)}</code> {_esc(cls)}" + (f" · {_esc(title)}" if title else "")
+    short = (title.split(" - ", 1)[1] if " - " in title else title) or cls
+    if len(nid) + 1 + len(short) > _HEAD_MAX:
+        short = short[:max(1, _HEAD_MAX - len(nid) - 2)].rstrip() + "…"
+    return f'<code>{_esc(nid)}</code> <span title="{_esc(full)}">{_esc(short)}</span>'
+
+
 def _available_fields(alias: str, wf: dict, mapped: set, oi: dict) -> str:
     """Available scalar fields (not yet mapped) with + (pin) / → (request field)
     actions — stacked below the editor form."""
@@ -3017,9 +3050,7 @@ def _available_fields(alias: str, wf: dict, mapped: set, oi: dict) -> str:
             arows += (f"<tr><td>{_esc(f2)} <span class='muted'>= {_esc(str(v2))[:22]}</span>{fhint}</td>"
                       f"<td class='acts'>{add}{req_btn}</td></tr>")
         if arows:
-            title = n.get("_meta", {}).get("title", "")
-            head = f"<code>{_esc(nid)}</code> {_esc(n.get('class_type'))}" + (f" · {_esc(title)}" if title else "")
-            avail += f"<tr class='node'><td colspan=2>{head}</td></tr>{arows}"
+            avail += f"<tr class='node'><td colspan=2>{_node_head(nid, n)}</td></tr>{arows}"
     return (f"<h2>Available fields</h2>"
             f"<p class='hint'>Add a field to pin it (Switch boolean, reference image, …). "
             f"Unmapped fields keep the workflow's value.</p>"
@@ -3220,6 +3251,14 @@ async def update(request: Request):
                 emode = (f.get(f"empty__{p}", "") or "").strip()   # image slot empty-behaviour
                 if emode in ("placeholder", "required", "disable"):
                     entry["on_empty"] = emode
+                # extra node ids bypassed when THIS slot is empty — only stored for the
+                # disable mode, so switching the slot back to placeholder/required leaves
+                # no invisible rule behind (adapters.slot_empty_bypass ignores it anyway)
+                if emode == "disable":
+                    extra = list(dict.fromkeys(
+                        x for x in re.split(r"[,\s]+", f.get(f"bypass__{p}", "") or "") if x))
+                    if extra:
+                        entry["on_empty_bypass"] = extra
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
     # value a request-without-this-field runs with into the workflow JSON at the

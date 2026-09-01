@@ -638,6 +638,16 @@ Key mapping concepts:
     it (e.g. the *front* view, which the generator requires), the job is refused up
     front naming that slot, instead of submitting a workflow that cannot deliver.
     Removed nodes are listed as `disabled_nodes` in the job's parameter summary.
+
+    Next to the dropdown, **`also bypass`** takes extra node ids (comma separated)
+    for the same empty slot. The cascade only takes what *requires* the image, so a
+    node sitting in the **main path** with an optional image socket survives it and
+    then runs on nothing — an apply/switch node that exists solely for that image.
+    Listed here, such a node is **bypassed** instead (ComfyUI mode 4: its consumers
+    reconnect to its same-typed input), so the path behind it stays connected —
+    pruning it would cut that path, which is why this is bypass and not prune. The
+    ids join the backend's own **Bypass** list for one pass and show up together
+    under `bypassed` in the job summary. Only stored for `disable branch if empty`.
 - **Numeric fields** (strength, steps, cfg) render with `min`/`max`/`step` pulled
   live from `/object_info`.
 

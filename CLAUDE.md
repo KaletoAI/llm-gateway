@@ -126,7 +126,12 @@ hot-reload-safe.
   only when such a slot is actually empty; an unknown class stops the cascade
   (pre-cascade behaviour — never guess what a node needs). A branch that would take
   the alias's `output_node` with it fails the job UP FRONT naming the slot, instead
-  of submitting a workflow that cannot deliver;
+  of submitting a workflow that cannot deliver. The same slot's `on_empty_bypass`
+  (`slot_empty_bypass`, Mapping's *also bypass* field) names extra ids the cascade
+  CANNOT take — a main-path node whose image socket is optional, which would then run
+  on nothing; those are BYPASSED, not pruned (pruning cuts the path behind them), by
+  joining `req.bypass` for the single `_apply_bypass` pass, so both sources dedupe,
+  chain-resolve and report together under `bypassed`;
   `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
   rejections are translated to readable per-node errors (node title, class,
   field, offending request param) via `_comfy_prompt_error`; raw body stays the
