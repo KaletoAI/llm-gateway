@@ -2562,7 +2562,18 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
                         'node AND the dead branch behind it — every node that requires that '
                         'input dies with it, a node whose socket is optional keeps running '
                         'without the image (no depth to configure, it follows the workflow)">'
-                        + esel + '</select>')
+                        + esel + '</select>'
+                        # extra ids for the disable mode: nodes the dead-branch cascade does NOT
+                        # reach (optional socket, main path) but that are pointless without the
+                        # image — bypassed mode-4, so the path behind them stays connected
+                        + ' <input type="text" style="width:9em" name="bypass__' + _esc(p) + '" '
+                        'value="' + _esc(", ".join(str(x) for x in (m.get("on_empty_bypass") or [])))
+                        + '" placeholder="also bypass: 58,61" '
+                        'title="only for &quot;disable branch if empty&quot;: node ids that are '
+                        'additionally BYPASSED (ComfyUI mode 4 — consumers reconnect to the '
+                        'node\'s same-typed input) when this slot gets no image. For nodes the '
+                        'dead-branch cascade cannot take because their image socket is optional, '
+                        'but which do nothing useful without it. Comma separated.">')
         elif isinstance(cur, list):
             cur_cell = "(linked)"                        # wired to another node — not editable
         elif node and fld and node in wf:
@@ -2924,6 +2935,28 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     return form, _available_fields(alias, wf, mapped, oi)
 
 
+_HEAD_MAX = 60
+
+
+def _node_head(nid: str, n: dict) -> str:
+    """Node header for the Available fields pane (mapping column 3): `<id> <class> · <title>`,
+    SHORTENED once that runs past `_HEAD_MAX` chars — a wide header widens the whole
+    (narrow) column. Custom node packs name a class and then title it with the same words
+    again (`Trellis2MeshWithVoxelMultiViewGenerator · Trellis2 - Mesh With Voxel Multi-View
+    Generator`), so the shortening drops the class — the title is the readable half — and
+    the title's own vendor prefix up to the first ` - `. Whatever is left is hard-capped;
+    the full text always stays in the tooltip, so nothing becomes unrecoverable."""
+    cls = str(n.get("class_type") or "")
+    title = str((n.get("_meta") or {}).get("title") or "")
+    full = f"{nid} {cls}" + (f" · {title}" if title else "")
+    if len(full) <= _HEAD_MAX:
+        return f"<code>{_esc(nid)}</code> {_esc(cls)}" + (f" · {_esc(title)}" if title else "")
+    short = (title.split(" - ", 1)[1] if " - " in title else title) or cls
+    if len(nid) + 1 + len(short) > _HEAD_MAX:
+        short = short[:max(1, _HEAD_MAX - len(nid) - 2)].rstrip() + "…"
+    return f'<code>{_esc(nid)}</code> <span title="{_esc(full)}">{_esc(short)}</span>'
+
+
 def _available_fields(alias: str, wf: dict, mapped: set, oi: dict) -> str:
     """Available scalar fields (not yet mapped) with + (pin) / → (request field)
     actions — stacked below the editor form."""
@@ -2950,9 +2983,7 @@ def _available_fields(alias: str, wf: dict, mapped: set, oi: dict) -> str:
             arows += (f"<tr><td>{_esc(f2)} <span class='muted'>= {_esc(str(v2))[:22]}</span>{fhint}</td>"
                       f"<td class='acts'>{add}{req_btn}</td></tr>")
         if arows:
-            title = n.get("_meta", {}).get("title", "")
-            head = f"<code>{_esc(nid)}</code> {_esc(n.get('class_type'))}" + (f" · {_esc(title)}" if title else "")
-            avail += f"<tr class='node'><td colspan=2>{head}</td></tr>{arows}"
+            avail += f"<tr class='node'><td colspan=2>{_node_head(nid, n)}</td></tr>{arows}"
     return (f"<h2>Available fields</h2>"
             f"<p class='hint'>Add a field to pin it (Switch boolean, reference image, …). "
             f"Unmapped fields keep the workflow's value.</p>"
@@ -3153,6 +3184,14 @@ async def update(request: Request):
                 emode = (f.get(f"empty__{p}", "") or "").strip()   # image slot empty-behaviour
                 if emode in ("placeholder", "required", "disable"):
                     entry["on_empty"] = emode
+                # extra node ids bypassed when THIS slot is empty — only stored for the
+                # disable mode, so switching the slot back to placeholder/required leaves
+                # no invisible rule behind (adapters.slot_empty_bypass ignores it anyway)
+                if emode == "disable":
+                    extra = list(dict.fromkeys(
+                        x for x in re.split(r"[,\s]+", f.get(f"bypass__{p}", "") or "") if x))
+                    if extra:
+                        entry["on_empty_bypass"] = extra
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
     # value a request-without-this-field runs with into the workflow JSON at the
@@ -4139,6 +4178,71 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     return out + _FBX_VIEWER_JS if has_fbx else out
 
 
+def _stage2_section(s2: dict) -> str:
+    """The chain hand-off, for the job view: what stage 2 was actually HANDED and which
+    of it the successor mapped. Stage-1 params are threaded to the successor by mapping
+    LABEL, and `_apply_mapping` silently skips a name the successor does not bind — so a
+    param that never arrives (a renamed label on either side) is invisible in the result
+    and used to be answerable only from the backend's own ComfyUI history.
+
+    `s2` is recorded at run time by `_run_chain` (meta.chain_stage2); only the node/field
+    DETAIL is looked up in the alias config live, and marked as such — the mapping may
+    have changed since the run. `applied` is absent when stage 2 never reported back
+    (a failed hand-off); the rows then say what the CURRENT config would bind, and say so."""
+    alias2, b2 = s2.get("alias") or "?", s2.get("backend") or "?"
+    params = s2.get("params") or {}
+    mesh_param = s2.get("mesh_param") or ""
+    applied = s2.get("applied")               # None → stage 2 never got that far
+    mapping2 = {}
+    if store.is_active():
+        cs = store.get(alias2) or []
+        c2 = next((x for x in cs if x.get("backend") == b2), cs[0] if cs else None) or {}
+        mapping2 = c2.get("mapping") or {}
+
+    def target(k):                            # (node, field) the successor binds `k` to, per CURRENT config
+        for p, m in mapping2.items():
+            m = m or {}
+            if p == k or ((m.get("label") or "").strip() == k):
+                return str(m.get("node")), str(m.get("field") or "")
+        return None, None
+
+    rows, n_app, n_drop = [], 0, 0
+    for k, v in params.items():
+        if k == mesh_param:                   # the mesh itself gets its own line below
+            continue
+        node, field = target(k)
+        if applied is None:                   # unverified: describe the binding, don't claim it ran
+            hit = node is not None
+            tag = (f"<span class='muted' title='from the successor alias config as it "
+                   f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if hit else
+                   "<span class='muted'>not mapped by successor</span>")
+        else:
+            hit = k in applied
+            # node None while applied says otherwise = the mapping moved since the run;
+            # still say "applied", never leave the cell blank.
+            tag = ((f"<span class='muted' title='from the successor alias config as it "
+                    f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if node else
+                    "<span class='muted'>applied</span>")
+                   if hit else "<span class='muted'>dropped · not mapped by successor</span>")
+        n_app, n_drop = (n_app + 1, n_drop) if hit else (n_app, n_drop + 1)
+        s = "" if hit else " style='text-decoration:line-through;opacity:.55'"
+        rows.append(f"<tr><td{s}><code>{_esc(k)}</code></td><td{s}>{_esc(str(v))}</td>"
+                    f"<td>{tag}</td></tr>")
+    verb = "applied" if applied is not None else "mapped"
+    tally = (f"{len(rows)} param(s) handed · {n_app} {verb} · {n_drop} dropped"
+             if rows else "no params handed besides the mesh")
+    warn = ("" if applied is not None else
+            " <span class='bad'>· stage 2 did not report back — bindings shown are from "
+            "the current alias config</span>")
+    mesh = (f"<p style='margin:6px 0'><code>{_esc(mesh_param)}</code> "
+            f"<span class='muted'>← the relayed mesh</span><br>"
+            f"<code style='font-size:12px'>{_esc(str(s2.get('mesh_ref') or ''))}</code></p>")
+    tbl = f"<table>{''.join(rows)}</table>" if rows else ""
+    return (f"<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2 · "
+            f"{_esc(alias2)} · {_esc(b2)} · {_esc(s2.get('relay') or 'path')} hand-off</span></h3>"
+            f"<p class='hint' style='margin:2px 0 8px'>{tally}{warn}</p>{mesh}{tbl}")
+
+
 async def job_detail_page(job_id: str, request: Request):
     """Input (prompt/params/reference images) + output artifacts of one job."""
     if not jobs.is_active():
@@ -4224,6 +4328,13 @@ async def job_detail_page(job_id: str, request: Request):
                   f"<ul class='muted' style='margin:4px 0 0 18px;font-size:12px'>{ids}</ul>")
     if not inbox:
         inbox = "<p class='muted'>No stored inputs (job predates this feature).</p>"
+    # Chain hand-off: what stage 2 was handed. Recorded per run; a job from before that
+    # says so rather than being reconstructed from today's config, which may have moved.
+    if meta.get("chain_stage2"):
+        inbox += _stage2_section(meta["chain_stage2"])
+    elif meta.get("chain") or cand.get("successor"):
+        inbox += ("<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2</span></h3>"
+                  "<p class='muted'>Hand-off params not recorded (job predates this feature).</p>")
     if st in ("queued", "running"):
         outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
     elif st == "failed":

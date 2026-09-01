@@ -106,6 +106,17 @@ hot-reload-safe.
   `_HOP_BY_HOP` drops `x-api-key` alongside `authorization` — both are GATEWAY
   credentials (Claude Code sends the former), and forwarding either would hand the
   caller's key to the backend.
+  Going the other way, every response builder keeps only its OWN headers
+  (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
+  `content-length` would describe a body the gateway re-serializes — with ONE
+  exception: `_ratelimit_headers()` carries the upstream's `retry-after` through,
+  because that header is not diagnostics but an instruction to the caller. It is
+  merged in at all four places that rebuild a response from an upstream one
+  (`_dispatch_once`, both stream error paths, `_anthropic_error`), covered by
+  `test_ratelimit_headers.py`. Dropping it fails silently — the client still gets
+  its 429 and just retries blind: measured 2026-09-01 on prod, one Claude Code
+  request became ~10 upstream calls in 20 s against `api.anthropic.com`, which had
+  said exactly how long to wait.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
   sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
@@ -127,7 +138,12 @@ hot-reload-safe.
   only when such a slot is actually empty; an unknown class stops the cascade
   (pre-cascade behaviour — never guess what a node needs). A branch that would take
   the alias's `output_node` with it fails the job UP FRONT naming the slot, instead
-  of submitting a workflow that cannot deliver;
+  of submitting a workflow that cannot deliver. The same slot's `on_empty_bypass`
+  (`slot_empty_bypass`, Mapping's *also bypass* field) names extra ids the cascade
+  CANNOT take — a main-path node whose image socket is optional, which would then run
+  on nothing; those are BYPASSED, not pruned (pruning cuts the path behind them), by
+  joining `req.bypass` for the single `_apply_bypass` pass, so both sources dedupe,
+  chain-resolve and report together under `bypassed`;
   `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
   rejections are translated to readable per-node errors (node title, class,
   field, offending request param) via `_comfy_prompt_error`; raw body stays the
@@ -304,6 +320,15 @@ hot-reload-safe.
   successor's mapping (param or label) and the mesh extension honors pins/mapped
   params on the export node's `file_format`. The job row's `backend` is re-pointed
   at claim and hand-off (`jobs.set_backend`) so cancel interrupts the LIVE backend.
+  Stage-1 params are threaded to the successor by mapping **label** (never the raw
+  node-based name), and `_apply_mapping` SILENTLY skips a name the successor does not
+  bind — so what stage 2 was handed is recorded on the job (`meta.chain_stage2`:
+  alias/backend/relay/mesh_param/mesh_ref/params, plus stage 2's `applied` on success)
+  and rendered by `admin._stage2_section` as handed / applied / dropped. Recorded at
+  run time, never re-derived from config (the mapping may have moved since); written
+  into `jobs.complete`'s meta AND, via `fail_meta()`, onto a failed row — a stage-2
+  failure is when the hand-off matters most. Without it, "did my param reach the
+  rigger?" was only answerable from the backend's own ComfyUI history.
   Chain stages run with `slot_held` (the chain claims the one slot itself — no
   double count). Two hand-offs:
   `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot

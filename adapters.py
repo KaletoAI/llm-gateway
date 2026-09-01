@@ -487,11 +487,30 @@ _ANTHROPIC_ERROR_TYPE = {400: "invalid_request_error", 401: "authentication_erro
                          529: "overloaded_error"}
 
 
+def _ratelimit_headers(headers) -> dict:
+    """The upstream's `retry-after`, lowercased — the ONE response header of a
+    backend error that is not diagnostics but an instruction to the caller.
+
+    Everything else a backend sends is either the gateway's own business or
+    describes a body the gateway is about to re-serialize (`content-length`), so
+    the response builders below keep only `x-gateway*`/`x-reasoning*`. Dropping
+    this one with them is silent: the client still gets its 429 and simply retries
+    on a blind 1-2-4-8 s backoff. Measured 2026-09-01 on prod — one Claude Code
+    request turned into ~10 upstream calls inside 20 s, against a rate limit that
+    had told the gateway exactly how long to wait."""
+    val = None
+    for k, v in (headers or {}).items():
+        if k.lower() == "retry-after":
+            val = v
+    return {"retry-after": val} if val else {}
+
+
 def _anthropic_error(status: int, etype: str, message: str, headers=None) -> JSONResponse:
     """An error in the shape Claude Code expects — it parses `error.message` and
     shows it; an OpenAI-shaped error body would surface as an unhelpful blank."""
     keep = {k: v for k, v in (headers or {}).items()
             if k.lower().startswith(("x-gateway", "x-reasoning"))}
+    keep.update(_ratelimit_headers(headers))
     return JSONResponse({"type": "error", "error": {"type": etype, "message": message[:2000]}},
                         status_code=status, headers=keep)
 
@@ -764,7 +783,7 @@ class OpenAIAdapter(BackendAdapter):
                          response_text=err.decode("utf-8", "ignore"))
             return Response(content=err, status_code=resp.status_code,
                             media_type=resp.headers.get("content-type"),
-                            headers=call.rheaders)
+                            headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
         async def generate():
             try:
@@ -819,7 +838,7 @@ class OpenAIAdapter(BackendAdapter):
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
         out = Response(resp.content, status_code=resp.status_code,
                        media_type=resp.headers.get("content-type", "application/json"),
-                       headers=call.rheaders)
+                       headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
         out.parsed_json = resp_json    # internal callers (Responses bridge) reuse this — no re-parse
         return out
 
@@ -961,7 +980,8 @@ class AnthropicAdapter(OpenAIAdapter):
             self._record(req, call, resp.status_code, 0, 0,
                          response_text=err.decode("utf-8", "ignore"))
             return Response(content=err, status_code=resp.status_code,
-                            media_type=resp.headers.get("content-type"), headers=call.rheaders)
+                            media_type=resp.headers.get("content-type"),
+                            headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
         counted = {"in": 0, "out": 0, "read": 0, "write": 0, "text": []}
 
@@ -1442,6 +1462,27 @@ def slot_empty_mode(m: dict) -> str:
     if mode in ("placeholder", "required", "disable"):
         return mode
     return "required" if (m or {}).get("no_placeholder") else "placeholder"
+
+
+def slot_empty_bypass(m: dict) -> list:
+    """Extra node ids to BYPASS when this slot's image is missing — the `on_empty_bypass`
+    companion to `on_empty: disable`. Pruning the loader only kills what REQUIRES the
+    image; a node in the main path that merely passes something through (an apply/switch
+    node whose image socket is optional) survives the cascade and would still run on
+    nothing. Listing it here removes it ComfyUI mode-4 style instead: its consumers are
+    rewired to its same-typed input, so the main path stays connected.
+
+    Bypass, not prune, on purpose — pruning such a node would cut the path behind it.
+    The ids join the backend's own `bypass` list, so ONE `_apply_bypass` pass handles
+    both and the job summary reports them together under `bypassed`.
+
+    Only meaningful for `on_empty: disable`; any other mode returns []."""
+    if slot_empty_mode(m) != "disable":
+        return []
+    ids = (m or {}).get("on_empty_bypass") or []
+    if isinstance(ids, str):                       # tolerate a comma/space separated string
+        ids = re.split(r"[,\s]+", ids)
+    return list(dict.fromkeys(s for s in (str(x).strip() for x in ids) if s))
 
 
 def _prune_branch(wf: dict, nid: str, node_types: dict) -> list:
@@ -2248,14 +2289,17 @@ class ComfyUIAdapter(BackendAdapter):
 
     async def _apply_image_params(self, wf: dict, mapping: dict, params: list,
                                   uploads: dict, prefix: str, used: list,
-                                  node_types: dict, pruned: dict) -> list:
+                                  node_types: dict, pruned: dict,
+                                  extra_bypass: list) -> list:
         """Per request-field image params: upload that field's image (or the 8×8
         placeholder when none was provided) and set the loader node's field to the
         stored name. Each param gets its own JOB-UNIQUE input file (`<prefix>_<param>`),
         so several images coexist within a job and no concurrent job can overwrite one
         of them between /prompt and execution. `used` collects the names for the
         post-success cleanup; `pruned` collects `{param: [node ids]}` for the ones an
-        `on_empty: disable` slot took out (job summary + the output-node check)."""
+        `on_empty: disable` slot took out (job summary + the output-node check) and
+        `extra_bypass` the same slot's `on_empty_bypass` ids, handed to the one
+        `_apply_bypass` pass at the end of `generate` (see slot_empty_bypass)."""
         if not params:
             return []
         applied = []
@@ -2279,6 +2323,9 @@ class ComfyUIAdapter(BackendAdapter):
                         gone = _prune_branch(wf, nid, node_types)   # without it (dead branch)
                         if gone:
                             pruned[p] = gone
+                        # …plus the slot's opt-in extras, bypassed (not pruned) so a node
+                        # in the main path is skipped without cutting the path behind it
+                        extra_bypass.extend(slot_empty_bypass(m))
                         applied.append(p)
                         continue
                     name = await self._upload_placeholder(c)
@@ -2402,12 +2449,14 @@ class ComfyUIAdapter(BackendAdapter):
         # actually empty; after discovery the cache already holds every class, so this
         # normally costs no request at all (and a cold cache stops the cascade safely).
         pruned: dict = {}
+        extra_bypass: list = []          # the empty slots' `on_empty_bypass` ids (mode-4)
         prune_types = ({} if not any(not uploads.get(p)
                                      and slot_empty_mode(mapping.get(p)) == "disable"
                                      for p in img_params)
                        else await self._node_types_for(wf, list(wf)))
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads,
-                                                     prefix, uploaded, prune_types, pruned)
+                                                     prefix, uploaded, prune_types, pruned,
+                                                     extra_bypass)
         # A disabled slot that takes the alias's output node with it would submit a
         # workflow that cannot deliver anything — name the slot instead of letting the
         # job fail later as "produced no output".
@@ -2424,8 +2473,15 @@ class ComfyUIAdapter(BackendAdapter):
         autofilled = await self._autofill_empty_images(wf, mapping)
         # Bypass LAST — after every injection, so it rewires the FINAL link graph
         # (remove each bypassed node, reconnect consumers to its same-typed input).
-        bypassed = _apply_bypass(wf, req.bypass or [],
-                                 await self._node_types_for(wf, req.bypass or []))
+        # The backend's own `bypass` and the empty image slots' `on_empty_bypass` run in
+        # ONE pass: same mechanics, one `bypassed` entry in the summary, and a chain of
+        # bypassed nodes resolves across both sources instead of only within one.
+        # de-duplicated: a node may sit in the backend's list AND in an empty slot's
+        # extras, and `_apply_bypass` reports what it was given — a doubled id in the
+        # summary reads like the node was skipped twice.
+        byp_ids = list(dict.fromkeys(str(x) for x in (list(req.bypass or []) + extra_bypass)))
+        bypassed = _apply_bypass(wf, byp_ids,
+                                 await self._node_types_for(wf, byp_ids))
         summary = {"applied": sorted(applied.keys()),
                    "seed": values.get(seed_param) if seed_param else None,
                    "fixed": sorted(fixed_applied.keys()),

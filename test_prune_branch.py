@@ -105,6 +105,84 @@ class PruneBranch(unittest.TestCase):
         self.assertEqual(set(wf), {"1"})
 
 
+class SlotEmptyBypass(unittest.TestCase):
+    """The `on_empty_bypass` companion: extra ids the empty slot bypasses (mode 4) on top
+    of the pruned branch. Reading it under the WRONG mode would silently skip nodes on a
+    slot that is merely placeholder-filled, so the mode gate is the point of these."""
+
+    def test_ids_are_read_for_the_disable_mode(self):
+        self.assertEqual(
+            adapters.slot_empty_bypass({"on_empty": "disable", "on_empty_bypass": ["58", "61"]}),
+            ["58", "61"])
+
+    def test_other_modes_yield_nothing(self):
+        for mode in ("placeholder", "required", None):
+            m = {"on_empty_bypass": ["58"]}
+            if mode:
+                m["on_empty"] = mode
+            self.assertEqual(adapters.slot_empty_bypass(m), [], mode)
+
+    def test_values_are_normalized_to_stripped_strings(self):
+        """Ints from a hand-edited store row and a comma string from a form both work."""
+        self.assertEqual(
+            adapters.slot_empty_bypass({"on_empty": "disable", "on_empty_bypass": [58, " 61 ", ""]}),
+            ["58", "61"])
+        self.assertEqual(
+            adapters.slot_empty_bypass({"on_empty": "disable", "on_empty_bypass": "58, 61"}),
+            ["58", "61"])
+
+    def test_duplicates_collapse(self):
+        """`_apply_bypass` returns what it was handed — a doubled id would be reported
+        twice in the job summary as if the node had been skipped twice."""
+        self.assertEqual(
+            adapters.slot_empty_bypass({"on_empty": "disable",
+                                        "on_empty_bypass": ["58", "61", "61", "58"]}),
+            ["58", "61"])
+
+    def test_missing_field_is_empty(self):
+        self.assertEqual(adapters.slot_empty_bypass({"on_empty": "disable"}), [])
+        self.assertEqual(adapters.slot_empty_bypass({}), [])
+        self.assertEqual(adapters.slot_empty_bypass(None), [])
+
+
+class EmptySlotBypassApplied(unittest.TestCase):
+    """What the two mechanisms do TOGETHER for one empty slot: the loader's branch is
+    pruned, the slot's extra ids are bypassed. The extra is for a node the cascade
+    cannot take — its image socket is optional — but which only exists for that image.
+    Bypassing keeps the path behind it; pruning would cut it, which is the whole reason
+    this is a separate field."""
+
+    def _wf_with_apply(self):
+        """loader 58 → Apply 70 (image optional, model passthrough) → Sampler 71."""
+        return {
+            "58": {"class_type": "Loader", "inputs": {"image": "ref.png"}},
+            "60": {"class_type": "LoadModel", "inputs": {"name": "m"}},
+            "70": {"class_type": "Apply", "inputs": {"model": ["60", 0], "image": ["58", 0]}},
+            "71": {"class_type": "Sampler", "inputs": {"model": ["70", 0]}},
+        }
+
+    TYPES = {"Apply": {"out": ["MODEL"], "in": {"model": "MODEL", "image": "IMAGE"},
+                       "req": ["model"]},                      # image OPTIONAL → survives prune
+             "Sampler": {"out": ["LATENT"], "in": {"model": "MODEL"}, "req": ["model"]},
+             "Loader": {"out": ["IMAGE"], "in": {}, "req": ["image"]},
+             "LoadModel": {"out": ["MODEL"], "in": {}, "req": ["name"]}}
+
+    def test_prune_alone_leaves_the_apply_node_running_on_nothing(self):
+        wf = self._wf_with_apply()
+        adapters._prune_branch(wf, "58", self.TYPES)
+        self.assertIn("70", wf)                                # optional socket → cascade stops
+        self.assertNotIn("image", wf["70"]["inputs"])          # …but it has no image any more
+
+    def test_extra_bypass_removes_it_and_keeps_the_path(self):
+        wf = self._wf_with_apply()
+        m = {"node": "58", "field": "image", "on_empty": "disable", "on_empty_bypass": ["70"]}
+        adapters._prune_branch(wf, "58", self.TYPES)
+        applied = adapters._apply_bypass(wf, adapters.slot_empty_bypass(m), self.TYPES)
+        self.assertEqual(applied, ["70"])
+        self.assertNotIn("70", wf)
+        self.assertEqual(wf["71"]["inputs"]["model"], ["60", 0])   # rewired past it, not cut
+
+
 class NodeTypeEntry(unittest.TestCase):
 
     def test_required_field_names_are_captured(self):
