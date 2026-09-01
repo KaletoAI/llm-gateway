@@ -2831,9 +2831,13 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                         f"successor's mesh-load input or fix 'successor mesh param'")
                 return
             s1_wf = stage1_cand.get("workflow_json") or {}
-            if export_node not in s1_wf:
-                await asyncio.to_thread(jobs.fail, job_id, f"chain export node '{export_node}' "
-                                        "is not in the mesh workflow")
+            # The export node must EXIST and accept the filename pin — a node without a
+            # `filename_prefix` input drops it silently (_apply_fixed), so stage 1 would
+            # run to completion under its own name and only the /view fetch below would
+            # notice. Reject here, before the GPU-minutes are spent.
+            export_why = adapter.export_node_error(s1_wf, export_node)
+            if export_why:
+                await asyncio.to_thread(jobs.fail, job_id, export_why)
                 return
             # The mesh filename's extension is what ComfyUI will WRITE: the export node's
             # file_format as the adapter effectively applies it — a mapped request param

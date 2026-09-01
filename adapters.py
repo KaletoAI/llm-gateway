@@ -2239,6 +2239,40 @@ class ComfyUIAdapter(BackendAdapter):
         return {"node": node, "field": "filename_prefix", "value": prefix}
 
     @staticmethod
+    def export_node_error(wf: dict, node: Optional[str]) -> Optional[str]:
+        """Why `node` cannot serve as a chain's stage-1 export node — None if it can.
+
+        The pin from `export_pin` is what makes stage 1 write under OUR filename, and
+        `_apply_fixed` silently drops a binding whose `(node, field)` isn't there. So a
+        node without a `filename_prefix` input keeps its own name, stage 1 runs to
+        completion (tens of GPU-minutes for a mesh) and only the /view fetch afterwards
+        reports 'produced no mesh' — pointing at the export node instead of at the whole
+        wasted run. Node ids drift when a workflow is rebuilt (measured 2026-08-31: a
+        multi-view Trellis2 alias inherited `export_node: 82` from the revision where 82
+        WAS the export node; there it is the model loader), so name the node's real class
+        and list the workflow's actual export candidates."""
+        n = wf.get(node) if node else None
+        if not isinstance(n, dict):
+            return f"chain export node '{node}' is not in the mesh workflow"
+        if "filename_prefix" in (n.get("inputs") or {}):
+            return None
+        cls = n.get("class_type") or "?"
+        title = ((n.get("_meta") or {}).get("title") or "").strip()
+        cands = [f"{nid} ({(nn.get('class_type') or '?')}"
+                 + (f" '{t}'" if (t := ((nn.get("_meta") or {}).get("title") or "").strip()) else "")
+                 + ")"
+                 for nid, nn in sorted(wf.items(), key=lambda kv: (not str(kv[0]).isdigit(),
+                                                                   int(kv[0]) if str(kv[0]).isdigit() else 0,
+                                                                   str(kv[0])))
+                 if isinstance(nn, dict) and "filename_prefix" in (nn.get("inputs") or {})]
+        hint = ("; the workflow's export/save nodes are " + ", ".join(cands[:4])
+                if cands else "; this workflow has no node with a 'filename_prefix' input")
+        return (f"chain export node '{node}' is a {cls}"
+                + (f" '{title}'" if title else "")
+                + " with no 'filename_prefix' input — it cannot be pinned, so stage 1 "
+                  "would keep its own output name" + hint)
+
+    @staticmethod
     def pinned_output_name(prefix: str, ext: str) -> str:
         """The file an export node writes for `filename_prefix=prefix`: ComfyUI's %05d
         counter, and a fresh prefix always yields `_00001_`."""
