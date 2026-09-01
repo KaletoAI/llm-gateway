@@ -127,15 +127,16 @@ def backend_host(b: dict) -> str:
 
 def rebuild_backends() -> None:
     """Effective backend list = config backends, with UI-added (store) backends
-    merged in by name (store overrides config for the same name). Re-sorted by
-    priority. Also rebuilds the host grouping maps. Call after config reload or
-    any store backend change."""
+    merged in by name (store overrides config for the same name). Kept in the
+    configured `priority` order so listings stay stable — priority no longer routes
+    anything (spec 2026-09-01). Also rebuilds the host grouping maps. Call after
+    config reload or any store backend change."""
     global backends, backend_hosts, host_backends
     merged = {backend_id(b): b for b in config_backends}
     if store.is_active():
         for b in store.list_backends():
             merged[backend_id(b)] = b      # store overrides config per (name, type)
-    backends = sorted(merged.values(), key=lambda b: b.get("priority", _DEFAULT_PRIORITY))
+    backends = sorted(merged.values(), key=lambda b: b.get("priority", 100))   # list order only
     for b in backends:
         # Cost tier for the scheduler (spec 2026-09-01): a paid backend is a candidate
         # only when no unpaid one is free. Normalized here — config and store entries
@@ -196,8 +197,6 @@ def rebuild_virtual_models() -> None:
     rebuild_route_index()                  # alias mappings changed
 
 # ── State ─────────────────────────────────────────────────────────────────────
-
-_DEFAULT_PRIORITY = 100                 # backends without an explicit priority sort last-ish
 
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
 backend_healthy: dict[str, bool] = {}                          # name → bool
@@ -379,6 +378,15 @@ fast_probe_interval_s: float = 3.0
 # can never leave a phantom waiter behind, it just stops refreshing.
 _gen_wait_at: list = [0.0]
 _GEN_WAIT_TTL_S = 5.0                  # how long one ping counts as "still waiting"
+# The media queue (spec 2026-09-01, "Designated taker"): every generation job that has
+# to wait registers here for its whole run, so a freed ComfyUI backend goes to the job
+# it belongs to (overdue first, else one needing the alias it just ran) instead of to
+# whoever polls next. Separate pool from `_parked` — an LLM backend never serves media
+# and vice versa. Entries in enqueue order:
+#   {job_id, alias, enqueued_at (monotonic), eligible, force, claimed?}
+# `claimed` marks an entry that holds a backend slot: still registered, no longer
+# waiting (see _gen_waiting_pool).
+_gen_waiting: list = []
 
 
 def _gen_wait_ping() -> None:
@@ -2142,11 +2150,13 @@ async def audio_speech(request: Request, authorization: Optional[str] = Header(N
 
 def _gen_routes(alias: str) -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
-    by **backend priority** and filtered to enabled + healthy backends; `ready`
-    additionally drops busy ones. ONE store read serves both lists.
+    **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
+    unmeasured backend sorts first, probe-once) and filtered to enabled + healthy
+    backends; `ready` additionally drops busy ones. ONE store read serves both lists.
+    Priority sorts nothing any more (spec 2026-09-01).
 
     An alias holds a flat list of *allowed* backends (no primary/fallback). They are
-    tried in backend-priority order; on a connection error the job runner moves to the
+    tried in that order; on a connection error the job runner moves to the
     next. An optional per-alias `retries` caps how many backends are attempted (1 +
     retries); blank = try all eligible. Each list is capped independently — same
     result as the old per-include_busy filtering.
@@ -2166,7 +2176,7 @@ def _gen_routes(alias: str) -> tuple[list, list]:
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
         allc.append((b, cand))
-    allc.sort(key=lambda bc: bc[0].get("priority", _DEFAULT_PRIORITY))   # backend priority decides order
+    allc = scheduler.order_ready(allc, _gen_speed_of(alias), lambda b: bool(b.get("paid")))
     ready = [r for r in allc if not backend_busy(r[0])]     # busy → only parkable, not ready
     raw = next((c.get("retries") for c in candidates if c.get("retries") not in (None, "")), None)
     if raw is not None:
@@ -2188,6 +2198,77 @@ def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, d
 def _force_filter(routes: list, force: str) -> list:
     """Keep only the force-pinned backend's candidates (no-op without a pin)."""
     return [r for r in routes if r[0].get("name") == force] if force else routes
+
+
+def _entry_can_use(entry: dict, backend: dict) -> bool:
+    """May this waiting generation job run on `backend` right now? Mirrors the filters
+    the job applies in its own poll: force pin, LoRA eligibility, and the alias
+    actually routing to this backend while it is free. Blocking (store read via
+    _gen_routes) — call via asyncio.to_thread from async code."""
+    if entry.get("force") and backend.get("name") != entry["force"]:
+        return False
+    if entry.get("eligible") is not None and backend.get("name") not in entry["eligible"]:
+        return False
+    ready, _allc = _gen_routes(entry["alias"])
+    bid = backend_id(backend)
+    return any(backend_id(b) == bid for b, _cand in ready)
+
+
+def _gen_waiting_pool() -> list:
+    """Snapshot of the media queue as the scheduler sees it (`_gen_waiting` mutates
+    across awaits). Entries that hold a backend slot are out: a claimant stays
+    registered until its job is done, but it is no longer waiting and must not shadow
+    the others out of a second free backend."""
+    return [e for e in _gen_waiting if not e.get("claimed")]
+
+
+def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = None):
+    """The queued generation job this free backend belongs to, or None.
+
+    Media twin of _designated_waiter (spec 2026-09-01, "Designated taker"): overdue
+    jobs first (oldest), else one needing the alias the backend last ran — one alias is
+    one workflow, i.e. the model set already in VRAM — else the oldest job it can
+    serve. THE one place the media designation is computed, so the poll gate and the
+    fresh-arrival gate cannot drift apart. Blocking — via asyncio.to_thread."""
+    return scheduler.designated_taker(
+        pool,
+        can_serve=lambda e: _entry_can_use(e, backend),
+        type_key=lambda e: e["alias"],
+        last_key=backend_last_key.get(backend_id(backend)),
+        now=time.monotonic() if now is None else now,
+        max_wait_s=affinity_max_wait_s)
+
+
+def _may_claim_gen(entry: dict, backend: dict) -> bool:
+    """Is this free backend THIS waiting job's to claim? A lone waiter always passes.
+    Blocking — via asyncio.to_thread."""
+    pool = _gen_waiting_pool()
+    if len(pool) <= 1:                       # only us waiting → nothing to yield to
+        return True
+    return _designated_gen_waiter(backend, pool) is entry
+
+
+def _designated_gen_index(entry: dict, ready: list) -> Optional[int]:
+    """Index in `ready` of the best candidate this waiting job may claim now, or None
+    (→ keep parking). All ready candidates are scanned, not just the best one: every
+    free backend has exactly one designated taker among the waiting jobs, and that
+    taker has the backend in its own ready list, so scanning guarantees that at least
+    one waiter proceeds while a backend is free. Blocking — via asyncio.to_thread."""
+    for i, (b, _cand) in enumerate(ready):
+        if _may_claim_gen(entry, b):
+            return i
+    return None
+
+
+def _gen_reserved(backend: dict) -> bool:
+    """Is this free media backend spoken for by a job already in the queue?
+
+    Spec rule 4: a fresh request never overtakes the waiters — it may dispatch straight
+    to a free backend only while no queued job is designated for it; otherwise it joins
+    the queue as the youngest entry and competes from there. Empty queue → never
+    reserved. Blocking — via asyncio.to_thread."""
+    pool = _gen_waiting_pool()
+    return bool(pool) and _designated_gen_waiter(backend, pool) is not None
 
 
 def _gen_inputs_params(body: dict) -> tuple[dict, dict]:
@@ -2451,6 +2532,9 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
         except (TypeError, ValueError):
             tries = 1                          # malformed config value → no self-retry
         _inflight_inc(bid)                     # hold ONE slot across all self-retries
+        # Type affinity (spec 2026-09-01): remember what this backend is running, so
+        # once it frees it prefers a queued job on the same alias (no workflow reload).
+        backend_last_key[bid] = alias
         # The job row was stamped with the FIRST candidate at creation; re-point it at
         # the backend actually claiming it. A parked job routinely lands somewhere else
         # (a different backend freed first, or one came back while it waited), and a row
@@ -2537,6 +2621,14 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     fails over. Stage-2/hand-off errors are FINAL — once the mesh is in hand the chain
     never restarts stage 1 elsewhere.
 
+    Stage 1 also QUEUES like a plain generation: the job registers in `_gen_waiting`
+    for the whole chain and claims a free backend only when the scheduler designates it
+    for it (spec 2026-09-01). The entry is marked `claimed` while a slot is held — the
+    hand-off health park included, where stage 1 is already done — so it never shadows
+    another waiter out of a backend it is not going to take. It deliberately STAYS in
+    the pool while the chain parks on an unhealthy SUCCESSOR before stage 1: nothing is
+    held there, so the wait just ages the entry into the overdue rule.
+
     Two hand-off modes (`relay`):
       • `path` (default) — both stages on the SAME backend (shared disk); stage 2 gets
         the mesh's absolute output path. Backend needs comfy_output_dir. The one slot is
@@ -2592,312 +2684,331 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     tried: set = set()                       # stage-1 backends that failed with a connection error
     skip_reason = None
     gen_attempts = 0                         # generate() calls across candidates + self-retries
-    while True:
-        cur = await asyncio.to_thread(jobs.get, job_id)
-        if not cur or cur.get("status") not in ("queued", "running"):
-            return                           # cancelled (or externally finished) meanwhile
-        ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per attempt
-        ready, allc = _force_filter(ready, force), _force_filter(allc, force)
-        if eligible is not None:
-            ready = [r for r in ready if r[0].get("name") in eligible]
-            allc = [r for r in allc if r[0].get("name") in eligible]
-        ready = [r for r in ready if r[0].get("name") not in tried]
-        allc = [r for r in allc if r[0].get("name") not in tried]
-        if not allc:
-            await asyncio.to_thread(jobs.fail, job_id,
-                                    skip_reason or f"chain: no healthy backend for '{alias}'"
-                                    + (f" on '{force}'" if force else ""))
-            return
-
-        # pick the first READY candidate that satisfies the chain's per-backend needs
-        picked = None
-        for backend, cand in ready:
-            s2p, outdir, why = await usable(backend)
-            if why:
-                skip_reason = why
-                continue
-            picked = (backend, cand, s2p, outdir)
-            break
-        if picked is None:
-            # nothing ready is usable — park while a usable candidate is merely busy
-            waitable = False
-            for backend, _cand in allc:
-                _s2, _out, why = await usable(backend)
-                if why is None:
-                    waitable = True
-                    break
-                skip_reason = why
-            if not waitable:
+    # In the media queue for the whole chain (see the docstring): registered before
+    # the first pass, dropped again on every exit path.
+    entry = {"job_id": job_id, "alias": alias, "enqueued_at": time.monotonic(),
+             "eligible": eligible, "force": force}
+    _gen_waiting.append(entry)
+    try:
+        while True:
+            entry["claimed"] = False             # a new pass = waiting for a stage-1 slot again
+            cur = await asyncio.to_thread(jobs.get, job_id)
+            if not cur or cur.get("status") not in ("queued", "running"):
+                return                           # cancelled (or externally finished) meanwhile
+            ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per attempt
+            ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+            if eligible is not None:
+                ready = [r for r in ready if r[0].get("name") in eligible]
+                allc = [r for r in allc if r[0].get("name") in eligible]
+            ready = [r for r in ready if r[0].get("name") not in tried]
+            allc = [r for r in allc if r[0].get("name") not in tried]
+            if not allc:
                 await asyncio.to_thread(jobs.fail, job_id,
-                                        skip_reason or f"chain: no usable backend for '{alias}'")
+                                        skip_reason or f"chain: no healthy backend for '{alias}'"
+                                        + (f" on '{force}'" if force else ""))
                 return
-            if time.monotonic() > deadline:
-                await asyncio.to_thread(jobs.fail, job_id,
-                                        f"chain: all usable backends stayed busy past park "
-                                        f"time ({async_park_timeout_s:.0f}s)")
-                return
-            _gen_wait_ping()                     # stage 1 is waiting → keep the fast probe awake
-            await asyncio.sleep(2.0)
-            continue
 
-        backend, stage1_cand, s2, outdir = picked
-        bid = backend_id(backend)
-        adapter = backend_adapters[bid]
-        # Resolve the stage-2 (successor) backend + candidate. Path relay pinned it to
-        # stage 1's backend above (shared disk). Upload relay picks the successor
-        # alias's best candidate — preferring stage 1's backend if it is itself one
-        # (keeps the fast in-process path).
-        if relay == "upload":
-            cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
-            if not cands2:
-                # No candidate configured at all is a config error — fail fast. A
-                # configured successor whose backend is merely in a transient health
-                # dip parks instead (nothing is held yet): re-enter the stage-1 loop,
-                # which re-resolves everything fresh, until the park deadline.
-                raw2 = (await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None
-                if raw2 is None:
-                    raw2 = image_models.get(succ_alias, [])
-                comfy_names = {b["name"] for b in _comfy_backends}
-                if not any(c.get("backend") in comfy_names for c in raw2):
-                    # unconfigured, or every candidate backend is disabled/gone — an
-                    # admin state, not a transient: parking would never recover it.
-                    await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
-                                            "enabled candidate backend for the upload relay")
+            # pick the first READY candidate that satisfies the chain's per-backend needs
+            # and is OURS to claim — a free backend the media queue designates for another
+            # waiter is left to it (type affinity), exactly like for a plain parked job.
+            picked = None
+            for backend, cand in ready:
+                s2p, outdir, why = await usable(backend)
+                if why:
+                    skip_reason = why
+                    continue
+                if not await asyncio.to_thread(_may_claim_gen, entry, backend):
+                    continue                     # another waiter is designated for it
+                picked = (backend, cand, s2p, outdir)
+                break
+            if picked is None:
+                # nothing ready is usable — park while a usable candidate is merely busy
+                waitable = False
+                for backend, _cand in allc:
+                    _s2, _out, why = await usable(backend)
+                    if why is None:
+                        waitable = True
+                        break
+                    skip_reason = why
+                if not waitable:
+                    await asyncio.to_thread(jobs.fail, job_id,
+                                            skip_reason or f"chain: no usable backend for '{alias}'")
                     return
                 if time.monotonic() > deadline:
-                    await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' had no "
-                                            "enabled+healthy candidate backend for the upload relay "
-                                            f"within park time ({async_park_timeout_s:.0f}s)")
+                    await asyncio.to_thread(jobs.fail, job_id,
+                                            f"chain: all usable backends stayed busy past park "
+                                            f"time ({async_park_timeout_s:.0f}s)")
                     return
-                _gen_wait_ping()             # keep the fast probe awake → quick recovery pickup
+                _gen_wait_ping()                     # stage 1 is waiting → keep the fast probe awake
                 await asyncio.sleep(2.0)
                 continue
-            backend2, s2 = next((bc for bc in cands2 if backend_id(bc[0]) == bid), None) or cands2[0]
-        else:
-            backend2 = backend
-        bid2 = backend_id(backend2)
-        adapter2 = backend_adapters.get(bid2)
-        if adapter2 is None:
-            await asyncio.to_thread(jobs.fail, job_id, f"successor backend "
-                                    f"'{backend2.get('name')}' has no adapter")
-            return
-        # `mesh_param` must be a request field of the successor (accepted under param
-        # OR label, exactly like any incoming value) — _apply_mapping silently drops
-        # unknown params, so stage 2 would otherwise run on the workflow's baked-in
-        # mesh path and deliver a stale/WRONG mesh as a "done" job.
-        if not any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
-                   for p, m in (s2.get("mapping") or {}).items()):
-            await asyncio.to_thread(jobs.fail, job_id,
-                                    f"chain mesh param '{mesh_param}' is not a request field "
-                                    f"(param or label) of successor '{succ_alias}' — map the "
-                                    f"successor's mesh-load input or fix 'successor mesh param'")
-            return
-        s1_wf = stage1_cand.get("workflow_json") or {}
-        if export_node not in s1_wf:
-            await asyncio.to_thread(jobs.fail, job_id, f"chain export node '{export_node}' "
-                                    "is not in the mesh workflow")
-            return
-        # The mesh filename's extension is what ComfyUI will WRITE: the export node's
-        # file_format as the adapter effectively applies it — a mapped request param
-        # overrides the raw workflow value, an admin pin (per-backend `fixed`) beats
-        # both (mirrors _apply_mapping/_apply_fixed precedence).
-        ext = str(((s1_wf.get(export_node) or {}).get("inputs") or {}).get("file_format") or "glb")
-        for p, m in (stage1_cand.get("mapping") or {}).items():
-            m = m or {}
-            if str(m.get("node")) == export_node and m.get("field") == "file_format":
-                v = params.get(p)
-                if v in (None, "") and (m.get("label") or "").strip():
-                    v = params.get((m.get("label") or "").strip())
-                if v not in (None, ""):
-                    ext = str(v)
-        for fx in (stage1_cand.get("fixed") or []):
-            if (str(fx.get("node")) == export_node and fx.get("field") == "file_format"
-                    and fx.get("value") not in (None, "")):
-                ext = str(fx["value"])
-        mesh_name = adapter.pinned_output_name(prefix, ext)   # backend names the export file
-        cross = relay == "upload" and bid2 != bid
 
-        # Claim the stage-1 slot: the busy-check and inc run with no await between them
-        # (the dispatch invariant); the awaits above may have let someone else claim it.
-        if backend_busy(backend):
-            await asyncio.sleep(0.5)
-            continue
-        _inflight_inc(bid)
-        # `held` tracks which slot we owe a decrement, so the per-attempt finally never
-        # over/under-counts across the hand-off. `active` = backend to free VRAM on.
-        held = bid
-        active = backend
-        s1_done = False                             # mesh in hand → stage-2 errors are final
-        await asyncio.to_thread(jobs.set_status, job_id, "running")
-        await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
-        await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
-        try:
-            _apply_seconds(params, stage1_cand)     # no-op re-derive (endpoint validated it)
-            await _unload_host_llms(backend)        # opt-in host policy, no-op by default
-            # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
-            req1 = NormalizedRequest(
-                alias=alias, real_model=stage1_cand.get("model"),
-                task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
-                workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
-                node_mapping=stage1_cand.get("mapping") or {},
-                fixed=list(stage1_cand.get("fixed") or [])
-                     + [adapter.export_pin(export_node, prefix)],
-                bypass=(stage1_cand.get("bypass") or []),
-                upload_images=dict(upload_images or {}), raw=request,
-                upload_files=dict(upload_files or {}),
-                upload_prefix=_upload_prefix(job_id, "s1"),
-                loras=body.get("loras"), slot_held=True)
-            # runbook B: retry a sporadic fault on the SAME backend first — the held
-            # slot (`held`) spans the repeats; the last attempt re-raises into the
-            # existing stage-1 failover (next candidate via `tried`).
-            s1_tries = 1 + max(0, int(backend.get("self_retries") or 0))
-            for s1_attempt in range(1, s1_tries + 1):
-                gen_attempts += 1
-                try:
-                    t0 = time.monotonic()
-                    out1 = await adapter.generate(req1)
-                    _record_gen_attempt(bid, conn_fail=False)
-                    _note_gen_speed(alias, bid, time.monotonic() - t0)
-                    break
-                except _GEN_FAILOVER_ERRORS as e:
-                    if s1_attempt >= s1_tries:
-                        raise                # outer handler records + fails over
-                    _record_gen_attempt(bid, conn_fail=True)
-                    logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
-                                   f"{_fault_label(e)} ({type(e).__name__}: {e}) — retrying "
-                                   f"same backend (self-retry {s1_attempt}/{s1_tries - 1})")
-                    await _wait_backend_up(backend)
-            # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
-            # PNG — the mesh/texturing stage bakes it; the UniRig fbx only references its
-            # texture) travel from stage 1 into the final delivery.
-            mesh_extras = [b for b in (out1.blobs or [])
-                           if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
-                                                 for g in keep_globs)]
-            # The path relay only needs the mesh to EXIST on the shared disk (stage 2
-            # reads it by absolute path); only the upload relay needs the bytes. The
-            # adapter fetches (existence-only = cheap 1-byte Range GET; bytes otherwise),
-            # keeping ComfyUI's /view out of the router.
-            need_bytes = relay == "upload"
-            mesh = await adapter.fetch_output(mesh_name, want_bytes=need_bytes)
-            if mesh is None:
-                raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' — "
-                                   "check the export node / file_format")
-            mesh_bytes = mesh if need_bytes else None
-            s1_done = True
-
-            # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
-            if cross:
-                # cross-backend: stage 1 is done — release its slot AND free its VRAM (it
-                # stops being `active`, so the end-of-chain free would never reach it),
-                # then claim stage 2's and upload the mesh into its input dir (released
-                # first, so no A-holds-waits-B cycle).
-                _inflight_dec(held); held = None
-                asyncio.create_task(_free_comfy_vram(backend, "chain stage 1 done"))
-                # Stage 1 ran for minutes — the successor backend picked up front may be
-                # in a transient health dip right now. The mesh bytes are in hand and no
-                # slot is held, so waiting is free: park until it is healthy again (or
-                # the park timeout passes) instead of losing the finished mesh to a
-                # connection error on the upload.
-                h_deadline = time.monotonic() + async_park_timeout_s
-                while not backend_healthy.get(bid2):
-                    cur = await asyncio.to_thread(jobs.get, job_id)
-                    if not cur or cur.get("status") not in ("queued", "running"):
-                        return               # cancelled meanwhile
-                    if time.monotonic() > h_deadline:
-                        await asyncio.to_thread(jobs.fail, job_id,
-                                                f"chain: successor backend '{backend2['name']}' "
-                                                f"stayed unhealthy past park time for the mesh "
-                                                f"hand-off ({async_park_timeout_s:.0f}s)")
+            backend, stage1_cand, s2, outdir = picked
+            bid = backend_id(backend)
+            adapter = backend_adapters[bid]
+            # Resolve the stage-2 (successor) backend + candidate. Path relay pinned it to
+            # stage 1's backend above (shared disk). Upload relay picks the successor
+            # alias's best candidate — preferring stage 1's backend if it is itself one
+            # (keeps the fast in-process path).
+            if relay == "upload":
+                cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
+                if not cands2:
+                    # No candidate configured at all is a config error — fail fast. A
+                    # configured successor whose backend is merely in a transient health
+                    # dip parks instead (nothing is held yet): re-enter the stage-1 loop,
+                    # which re-resolves everything fresh, until the park deadline.
+                    raw2 = (await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None
+                    if raw2 is None:
+                        raw2 = image_models.get(succ_alias, [])
+                    comfy_names = {b["name"] for b in _comfy_backends}
+                    if not any(c.get("backend") in comfy_names for c in raw2):
+                        # unconfigured, or every candidate backend is disabled/gone — an
+                        # admin state, not a transient: parking would never recover it.
+                        await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
+                                                "enabled candidate backend for the upload relay")
                         return
-                    _gen_wait_ping()         # keep the fast probe awake → quick recovery pickup
+                    if time.monotonic() > deadline:
+                        await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' had no "
+                                                "enabled+healthy candidate backend for the upload relay "
+                                                f"within park time ({async_park_timeout_s:.0f}s)")
+                        return
+                    _gen_wait_ping()             # keep the fast probe awake → quick recovery pickup
                     await asyncio.sleep(2.0)
-                if not await _wait_and_hold(backend2, job_id, "stage 2"):
-                    return
-                held = bid2
-                active = backend2
-                await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
-                mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
-                if log_per_call:
-                    logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
-                                f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
-            elif relay == "upload":                         # same backend, still via input dir
-                mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
+                    continue
+                backend2, s2 = next((bc for bc in cands2 if backend_id(bc[0]) == bid), None) or cands2[0]
             else:
-                mesh_ref = f"{outdir}/{mesh_name}"          # shared-disk absolute path
+                backend2 = backend
+            bid2 = backend_id(backend2)
+            adapter2 = backend_adapters.get(bid2)
+            if adapter2 is None:
+                await asyncio.to_thread(jobs.fail, job_id, f"successor backend "
+                                        f"'{backend2.get('name')}' has no adapter")
+                return
+            # `mesh_param` must be a request field of the successor (accepted under param
+            # OR label, exactly like any incoming value) — _apply_mapping silently drops
+            # unknown params, so stage 2 would otherwise run on the workflow's baked-in
+            # mesh path and deliver a stale/WRONG mesh as a "done" job.
+            if not any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
+                       for p, m in (s2.get("mapping") or {}).items()):
+                await asyncio.to_thread(jobs.fail, job_id,
+                                        f"chain mesh param '{mesh_param}' is not a request field "
+                                        f"(param or label) of successor '{succ_alias}' — map the "
+                                        f"successor's mesh-load input or fix 'successor mesh param'")
+                return
+            s1_wf = stage1_cand.get("workflow_json") or {}
+            if export_node not in s1_wf:
+                await asyncio.to_thread(jobs.fail, job_id, f"chain export node '{export_node}' "
+                                        "is not in the mesh workflow")
+                return
+            # The mesh filename's extension is what ComfyUI will WRITE: the export node's
+            # file_format as the adapter effectively applies it — a mapped request param
+            # overrides the raw workflow value, an admin pin (per-backend `fixed`) beats
+            # both (mirrors _apply_mapping/_apply_fixed precedence).
+            ext = str(((s1_wf.get(export_node) or {}).get("inputs") or {}).get("file_format") or "glb")
+            for p, m in (stage1_cand.get("mapping") or {}).items():
+                m = m or {}
+                if str(m.get("node")) == export_node and m.get("field") == "file_format":
+                    v = params.get(p)
+                    if v in (None, "") and (m.get("label") or "").strip():
+                        v = params.get((m.get("label") or "").strip())
+                    if v not in (None, ""):
+                        ext = str(v)
+            for fx in (stage1_cand.get("fixed") or []):
+                if (str(fx.get("node")) == export_node and fx.get("field") == "file_format"
+                        and fx.get("value") not in (None, "")):
+                    ext = str(fx["value"])
+            mesh_name = adapter.pinned_output_name(prefix, ext)   # backend names the export file
+            cross = relay == "upload" and bid2 != bid
 
-            # ── Stage 2: successor, fed the mesh + stage-1 params (name, no_fingers, …) ──
-            # Thread stage-1 params to the successor keyed by their mapping LABEL, never by
-            # the raw/node-based field name. A client field like `value` (or `value_307`) is
-            # tied to a specific node id that changes when the workflow is rebuilt, and a
-            # generic `value` from stage 1 would otherwise collide with the successor's own
-            # `value` param — clobbering the mesh path (seen: face-num 100000 landed on the
-            # mesh-load node). Labels are the stable, unique public names.
-            s1_map = stage1_cand.get("mapping") or {}
-            label_of = {p: (((m or {}).get("label") or "").strip() or p) for p, m in s1_map.items()}
-            s2_params = {label_of.get(k, k): v for k, v in params.items()}
-            s2_params[mesh_param] = mesh_ref
-            req2 = NormalizedRequest(
-                alias=succ_alias, real_model=s2.get("model"),
-                task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
-                workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
-                node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
-                upload_prefix=_upload_prefix(job_id, "s2"),
-                raw=request, output_node=(s2.get("output_node") or None),
-                output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
-                output_cases=(s2.get("output_cases") or None),
-                texture_format=(s2.get("texture_format") or None),
-                dummy_check=(s2.get("dummy_check") is not False),
-                bypass=(s2.get("bypass") or []), slot_held=True)
-            await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
-            await _unload_host_llms(backend2)
-            gen_attempts += 1
-            t2 = time.monotonic()
-            out2 = await adapter2.generate(req2)
-            _record_gen_attempt(bid2, conn_fail=False)
-            _note_gen_speed(succ_alias, bid2, time.monotonic() - t2)
-            blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
-            meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
-            if gen_attempts > 2:             # a clean chain is exactly 2 generate() calls
-                meta["attempts"] = gen_attempts
-            if cross:
-                meta["chain_backends"] = [backend["name"], backend2["name"]]
-            if chain_rig:                                # validate the COMBINED delivery at chain level
-                # V-flip (+ optional jpeg) textures — normalize-once flagged; the knob
-                # lives on the CLIENT-FACING (stage-1) alias, covering kept stage-1 files too
-                normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
-                warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
-                meta["rig"] = chain_rig
-                if warnings:
-                    meta["warnings"] = warnings
-            await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
-            if log_per_call:
-                route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
-                logger.info(f"✓ chain job {job_id} on [{route}] ({alias}→{succ_alias}) "
-                            f"— {len(blobs)} artifact(s)")
-            asyncio.create_task(_free_comfy_vram(active, "chain done"))
-            return
-        except _GEN_FAILOVER_ERRORS as e:
-            _record_gen_attempt(backend_id(active), conn_fail=True)
-            if s1_done:                              # mesh already relayed — a stage-2 loss is final
+            # Claim the stage-1 slot: the busy-check and inc run with no await between them
+            # (the dispatch invariant); the awaits above may have let someone else claim it.
+            if backend_busy(backend):
+                await asyncio.sleep(0.5)
+                continue
+            _inflight_inc(bid)
+            entry["claimed"] = True              # holding a slot → out of the waiting pool
+            backend_last_key[bid] = alias        # type affinity: this backend now runs `alias`
+            # `held` tracks which slot we owe a decrement, so the per-attempt finally never
+            # over/under-counts across the hand-off. `active` = backend to free VRAM on.
+            held = bid
+            active = backend
+            s1_done = False                             # mesh in hand → stage-2 errors are final
+            await asyncio.to_thread(jobs.set_status, job_id, "running")
+            await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
+            await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
+            try:
+                _apply_seconds(params, stage1_cand)     # no-op re-derive (endpoint validated it)
+                await _unload_host_llms(backend)        # opt-in host policy, no-op by default
+                # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
+                req1 = NormalizedRequest(
+                    alias=alias, real_model=stage1_cand.get("model"),
+                    task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
+                    workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
+                    node_mapping=stage1_cand.get("mapping") or {},
+                    fixed=list(stage1_cand.get("fixed") or [])
+                         + [adapter.export_pin(export_node, prefix)],
+                    bypass=(stage1_cand.get("bypass") or []),
+                    upload_images=dict(upload_images or {}), raw=request,
+                    upload_files=dict(upload_files or {}),
+                    upload_prefix=_upload_prefix(job_id, "s1"),
+                    loras=body.get("loras"), slot_held=True)
+                # runbook B: retry a sporadic fault on the SAME backend first — the held
+                # slot (`held`) spans the repeats; the last attempt re-raises into the
+                # existing stage-1 failover (next candidate via `tried`).
+                s1_tries = 1 + max(0, int(backend.get("self_retries") or 0))
+                for s1_attempt in range(1, s1_tries + 1):
+                    gen_attempts += 1
+                    try:
+                        t0 = time.monotonic()
+                        out1 = await adapter.generate(req1)
+                        _record_gen_attempt(bid, conn_fail=False)
+                        _note_gen_speed(alias, bid, time.monotonic() - t0)
+                        break
+                    except _GEN_FAILOVER_ERRORS as e:
+                        if s1_attempt >= s1_tries:
+                            raise                # outer handler records + fails over
+                        _record_gen_attempt(bid, conn_fail=True)
+                        logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
+                                       f"{_fault_label(e)} ({type(e).__name__}: {e}) — retrying "
+                                       f"same backend (self-retry {s1_attempt}/{s1_tries - 1})")
+                        await _wait_backend_up(backend)
+                # keep_from_mesh: files the successor can't make itself (e.g. the basecolor
+                # PNG — the mesh/texturing stage bakes it; the UniRig fbx only references its
+                # texture) travel from stage 1 into the final delivery.
+                mesh_extras = [b for b in (out1.blobs or [])
+                               if keep_globs and any(fnmatch.fnmatch((b.name or "").lower(), g.lower())
+                                                     for g in keep_globs)]
+                # The path relay only needs the mesh to EXIST on the shared disk (stage 2
+                # reads it by absolute path); only the upload relay needs the bytes. The
+                # adapter fetches (existence-only = cheap 1-byte Range GET; bytes otherwise),
+                # keeping ComfyUI's /view out of the router.
+                need_bytes = relay == "upload"
+                mesh = await adapter.fetch_output(mesh_name, want_bytes=need_bytes)
+                if mesh is None:
+                    raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' — "
+                                       "check the export node / file_format")
+                mesh_bytes = mesh if need_bytes else None
+                s1_done = True
+
+                # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
+                if cross:
+                    # cross-backend: stage 1 is done — release its slot AND free its VRAM (it
+                    # stops being `active`, so the end-of-chain free would never reach it),
+                    # then claim stage 2's and upload the mesh into its input dir (released
+                    # first, so no A-holds-waits-B cycle).
+                    _inflight_dec(held); held = None
+                    asyncio.create_task(_free_comfy_vram(backend, "chain stage 1 done"))
+                    # Stage 1 ran for minutes — the successor backend picked up front may be
+                    # in a transient health dip right now. The mesh bytes are in hand and no
+                    # slot is held, so waiting is free: park until it is healthy again (or
+                    # the park timeout passes) instead of losing the finished mesh to a
+                    # connection error on the upload.
+                    h_deadline = time.monotonic() + async_park_timeout_s
+                    while not backend_healthy.get(bid2):
+                        cur = await asyncio.to_thread(jobs.get, job_id)
+                        if not cur or cur.get("status") not in ("queued", "running"):
+                            return               # cancelled meanwhile
+                        if time.monotonic() > h_deadline:
+                            await asyncio.to_thread(jobs.fail, job_id,
+                                                    f"chain: successor backend '{backend2['name']}' "
+                                                    f"stayed unhealthy past park time for the mesh "
+                                                    f"hand-off ({async_park_timeout_s:.0f}s)")
+                            return
+                        _gen_wait_ping()         # keep the fast probe awake → quick recovery pickup
+                        await asyncio.sleep(2.0)
+                    if not await _wait_and_hold(backend2, job_id, "stage 2"):
+                        return
+                    held = bid2
+                    active = backend2
+                    backend_last_key[bid2] = succ_alias   # stage 2 is its own type key
+                    await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
+                    mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
+                    if log_per_call:
+                        logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
+                                    f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
+                elif relay == "upload":                         # same backend, still via input dir
+                    mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
+                else:
+                    mesh_ref = f"{outdir}/{mesh_name}"          # shared-disk absolute path
+
+                # ── Stage 2: successor, fed the mesh + stage-1 params (name, no_fingers, …) ──
+                # Thread stage-1 params to the successor keyed by their mapping LABEL, never by
+                # the raw/node-based field name. A client field like `value` (or `value_307`) is
+                # tied to a specific node id that changes when the workflow is rebuilt, and a
+                # generic `value` from stage 1 would otherwise collide with the successor's own
+                # `value` param — clobbering the mesh path (seen: face-num 100000 landed on the
+                # mesh-load node). Labels are the stable, unique public names.
+                s1_map = stage1_cand.get("mapping") or {}
+                label_of = {p: (((m or {}).get("label") or "").strip() or p) for p, m in s1_map.items()}
+                s2_params = {label_of.get(k, k): v for k, v in params.items()}
+                s2_params[mesh_param] = mesh_ref
+                req2 = NormalizedRequest(
+                    alias=succ_alias, real_model=s2.get("model"),
+                    task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
+                    workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
+                    node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
+                    upload_prefix=_upload_prefix(job_id, "s2"),
+                    raw=request, output_node=(s2.get("output_node") or None),
+                    output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
+                    output_cases=(s2.get("output_cases") or None),
+                    texture_format=(s2.get("texture_format") or None),
+                    dummy_check=(s2.get("dummy_check") is not False),
+                    bypass=(s2.get("bypass") or []), slot_held=True)
+                await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
+                await _unload_host_llms(backend2)
+                gen_attempts += 1
+                t2 = time.monotonic()
+                out2 = await adapter2.generate(req2)
+                _record_gen_attempt(bid2, conn_fail=False)
+                _note_gen_speed(succ_alias, bid2, time.monotonic() - t2)
+                blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
+                meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
+                if gen_attempts > 2:             # a clean chain is exactly 2 generate() calls
+                    meta["attempts"] = gen_attempts
+                if cross:
+                    meta["chain_backends"] = [backend["name"], backend2["name"]]
+                if chain_rig:                                # validate the COMBINED delivery at chain level
+                    # V-flip (+ optional jpeg) textures — normalize-once flagged; the knob
+                    # lives on the CLIENT-FACING (stage-1) alias, covering kept stage-1 files too
+                    normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
+                    warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
+                    meta["rig"] = chain_rig
+                    if warnings:
+                        meta["warnings"] = warnings
+                await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
+                if log_per_call:
+                    route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
+                    logger.info(f"✓ chain job {job_id} on [{route}] ({alias}→{succ_alias}) "
+                                f"— {len(blobs)} artifact(s)")
+                asyncio.create_task(_free_comfy_vram(active, "chain done"))
+                return
+            except _GEN_FAILOVER_ERRORS as e:
+                _record_gen_attempt(backend_id(active), conn_fail=True)
+                if s1_done:                              # mesh already relayed — a stage-2 loss is final
+                    logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
+                    await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
+                                            {"attempts": gen_attempts} if gen_attempts > 2 else None)
+                    asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+                    return
+                logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
+                               f"({type(e).__name__}: {e}) — failing over")
+                tried.add(backend["name"])
+                asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
+                continue
+            except Exception as e:
                 logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
                 await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
                                         {"attempts": gen_attempts} if gen_attempts > 2 else None)
                 asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                 return
-            logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
-                           f"({type(e).__name__}: {e}) — failing over")
-            tried.add(backend["name"])
-            asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
-            continue
-        except Exception as e:
-            logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-            await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
-                                    {"attempts": gen_attempts} if gen_attempts > 2 else None)
-            asyncio.create_task(_free_comfy_vram(active, "chain failure"))
-            return
-        finally:
-            if held is not None:
-                _inflight_dec(held)
+            finally:
+                if held is not None:
+                    _inflight_dec(held)
+    finally:
+        try:
+            _gen_waiting.remove(entry)
+        except ValueError:
+            pass
 
 
 _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
@@ -2946,31 +3057,48 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
     gone that long is the alias treated as having no healthy backend."""
     deadline = time.monotonic() + async_park_timeout_s
     unhealthy_since = None                       # when the candidate set first went empty (flap timer)
-    while True:
-        _gen_wait_ping()                         # this job is waiting → keep the fast probe awake
-        ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per poll
-        ready, allc = _force_filter(ready, force), _force_filter(allc, force)
-        if eligible is not None:
-            ready = [r for r in ready if r[0].get("name") in eligible]
-            allc = [r for r in allc if r[0].get("name") in eligible]
-        if ready:
-            await _run_job(job_id, alias, ready, build_req)
-            return
-        now = time.monotonic()
-        if allc:                                 # candidates exist but are busy → keep parking
-            unhealthy_since = None
-        else:                                    # all candidates transiently unhealthy → grace, not fail
-            unhealthy_since = unhealthy_since or now
-            if now - unhealthy_since > park_health_grace_s:
-                await asyncio.to_thread(jobs.fail, job_id,
-                                        f"no healthy backend for '{alias}' (all candidates down for "
-                                        f">{park_health_grace_s:.0f}s)" + (f" on '{force}'" if force else ""))
+    # In the media queue for the whole wait, so a backend that frees can be handed to
+    # THIS job when the scheduler designates it (same alias / overdue) — see
+    # _designated_gen_index. Removed again on every exit path (finally).
+    entry = {"job_id": job_id, "alias": alias, "enqueued_at": time.monotonic(),
+             "eligible": eligible, "force": force}
+    _gen_waiting.append(entry)
+    try:
+        while True:
+            _gen_wait_ping()                     # this job is waiting → keep the fast probe awake
+            ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per poll
+            ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+            if eligible is not None:
+                ready = [r for r in ready if r[0].get("name") in eligible]
+                allc = [r for r in allc if r[0].get("name") in eligible]
+            # A free candidate is only ours if the scheduler designates it for us;
+            # otherwise it belongs to another waiter and we keep parking (2 s poll).
+            i = (await asyncio.to_thread(_designated_gen_index, entry, ready)) if ready else None
+            if i is not None:
+                entry["claimed"] = True          # holding a slot → out of the waiting pool
+                # designated candidate first, the rest stay as the failover tail
+                await _run_job(job_id, alias, [ready[i]] + ready[:i] + ready[i + 1:], build_req)
                 return
-        if now > deadline:
-            await asyncio.to_thread(jobs.fail, job_id,
-                                    f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
-            return
-        await asyncio.sleep(2.0)
+            now = time.monotonic()
+            if allc:                             # candidates exist but are busy → keep parking
+                unhealthy_since = None
+            else:                                # all candidates transiently unhealthy → grace, not fail
+                unhealthy_since = unhealthy_since or now
+                if now - unhealthy_since > park_health_grace_s:
+                    await asyncio.to_thread(jobs.fail, job_id,
+                                            f"no healthy backend for '{alias}' (all candidates down for "
+                                            f">{park_health_grace_s:.0f}s)" + (f" on '{force}'" if force else ""))
+                    return
+            if now > deadline:
+                await asyncio.to_thread(jobs.fail, job_id,
+                                        f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
+                return
+            await asyncio.sleep(2.0)
+    finally:
+        try:
+            _gen_waiting.remove(entry)
+        except ValueError:
+            pass
 
 
 def _requested_loras(body: dict) -> set:
@@ -3025,9 +3153,12 @@ async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Opt
     if eligible is not None:
         ready = [r for r in ready if r[0].get("name") in eligible]
         allc = [r for r in allc if r[0].get("name") in eligible]
-    if ready:                                            # something is free → dispatch now
-        return ready, False, eligible
-    return allc, True, eligible                          # all busy → park (async: queue, sync: block)
+    # Spec rule 4, "immer in die Queue": a free backend that a WAITING job is designated
+    # for is not up for grabs — this request parks instead and competes from inside the
+    # media queue, so a fresh arrival never overtakes the jobs it just queued behind.
+    if ready and not await asyncio.to_thread(_gen_reserved, ready[0][0]):
+        return ready, False, eligible                    # free and unclaimed → dispatch now
+    return allc, True, eligible                  # busy/reserved → park (async: queue, sync: block)
 
 
 def _upload_prefix(job_id: str, stage: str = "") -> str:
