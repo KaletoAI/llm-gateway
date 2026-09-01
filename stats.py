@@ -498,8 +498,6 @@ code { background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }
 .badge.off  { background: #eceef1; color: #888; }
 .badge.busy { background: #f3e8fd; color: #8250df; }
 tr.off td { color: #aaa; }
-.prio { display: inline-block; min-width: 1.5rem; text-align: center; font-weight: 600;
-        background: #eef0f4; border-radius: 5px; padding: 0 .35rem; }
 .dim { color: #aaa; }
 .host { white-space: nowrap; }
 .hidden { display: none; }
@@ -663,14 +661,14 @@ def _render_routing(snap: dict) -> str:
             "</tbody></table></div>"
         )
 
-    # Aliases — one row per route, in effective-priority order.
+    # Aliases — one row per route, in the backend list order.
     arows = []
     for a in aliases:
         name = a["alias"]
         routes = a["routes"]
         if not routes:
             arows.append(f'<tr class="f"><td><code>{_esc(name)}</code></td>'
-                         '<td colspan="4" class="muted">no enabled backend maps this alias</td></tr>')
+                         '<td colspan="3" class="muted">no enabled backend maps this alias</td></tr>')
             continue
         for i, r in enumerate(routes):
             label = f'<code>{_esc(name)}</code>' if i == 0 else '<span class="dim">↳</span>'
@@ -684,40 +682,37 @@ def _render_routing(snap: dict) -> str:
                 status = '<span class="badge busy">busy</span>'
             else:
                 status = '<span class="badge ok">routable</span>'
-            ovr = ' <span class="badge info">override</span>' if r["overridden"] else ""
             row_cls = "f off" if not r.get("enabled", True) else "f"
             arows.append(
                 f'<tr class="{row_cls}" data-search="{_esc(name)}"><td>{label}</td>'
                 f'<td class="host">{_esc(r["backend"])}</td>'
                 f'<td><code>{_esc(r["model"])}</code></td>'
-                f'<td><span class="prio">{r["priority"]}</span>{ovr}</td>'
                 f"<td>{status}</td></tr>"
             )
     alias_html = (
         '<div class="panel"><h2>Aliases <span class="muted">'
-        "(rows in resolution order = effective priority; lower wins)</span></h2>"
+        "(a call takes the fastest free unpaid host)</span></h2>"
         "<table><thead><tr><th>Alias</th><th>Host</th><th>Real model</th>"
-        "<th>Priority</th><th>Status</th></tr></thead><tbody>" +
-        ("".join(arows) or '<tr><td colspan="5" class="muted">no virtual_models configured</td></tr>') +
+        "<th>Status</th></tr></thead><tbody>" +
+        ("".join(arows) or '<tr><td colspan="4" class="muted">no virtual_models configured</td></tr>') +
         "</tbody></table></div>"
     )
 
-    # Discovered models — how a bare/direct model id routes by backend priority.
+    # Discovered models — which backends a bare/direct model id can route to.
     mrows = []
     for m in models:
         parts = []
         for h in m["hosts"]:
             down = "" if h["healthy"] else ' <span class="badge warn">down</span>'
             busy = ' <span class="badge busy">busy</span>' if h.get("busy") else ""
-            parts.append(f'<span class="host">{_esc(h["backend"])} '
-                         f'<span class="prio">{h["priority"]}</span>{down}{busy}</span>')
+            parts.append(f'<span class="host">{_esc(h["backend"])}{down}{busy}</span>')
         shadow = ' <span class="badge info">alias exists</span>' if m["shadowed_by_alias"] else ""
         mrows.append(f'<tr class="f"><td><code>{_esc(m["model"])}</code>{shadow}</td>'
                      f'<td>{" &nbsp; ".join(parts)}</td></tr>')
     model_html = (
         '<div class="panel"><h2>Discovered models <span class="muted">'
-        "(how a bare / direct model id routes, by backend priority)</span></h2>"
-        "<table><thead><tr><th>Model id</th><th>Hosts (priority)</th></tr></thead><tbody>" +
+        "(where a bare / direct model id can route)</span></h2>"
+        "<table><thead><tr><th>Model id</th><th>Hosts</th></tr></thead><tbody>" +
         ("".join(mrows) or '<tr><td colspan="2" class="muted">nothing discovered yet</td></tr>') +
         "</tbody></table></div>"
     )

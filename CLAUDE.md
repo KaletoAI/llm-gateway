@@ -7,7 +7,8 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 An OpenAI-compatible reverse proxy that fans one endpoint out across many
 backends: local LLM servers (llama.cpp / llama-swap / vLLM / Ollama), cloud APIs
 (Together.ai / OpenAI / OpenRouter), **and ComfyUI image-generation servers**. It
-does per-backend auto-discovery, priority routing with failover, virtual aliases,
+does per-backend auto-discovery, one queued scheduler (fastest free unpaid backend,
+freed-backend type affinity, overdue guard — `scheduler.py`) with failover, virtual aliases,
 per-backend concurrency caps, an optional multi-user auth layer, **call parking**
 (a default FIFO queue instead of 503 when busy; per-alias park time; async via the
 Responses background mode), a full **media-generation subsystem** (image/video/
@@ -25,7 +26,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 ```
 
 - `config.yaml` is gitignored and **hot-reloaded** on save (watchfiles) — no
-  restart for backend/alias/priority changes. Read **only at startup**:
+  restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No test suite, linter, or build step.** Verify by running the server and
   hitting endpoints with `curl` (README "Try it"), `curl localhost:4000/health`
@@ -323,17 +324,21 @@ A backend is a candidate only if enabled, healthy, **not busy** (in-flight cap),
 maps the alias, and exposes the resolved model. Recurring concepts:
 
 - **Route index** (`_route_index` + `rebuild_route_index()`): alias→candidates and
-  bare-model-id pass-through are **precomputed** (pre-sorted by effective priority);
-  `resolve_routes()` only evaluates the live flags (healthy/busy/draining) per
-  request. Rebuilt by `rebuild_backends()`/`rebuild_virtual_models()` and on every
+  bare-model-id pass-through are **precomputed** (insertion order, no sort);
+  `resolve_routes()` evaluates the live flags (healthy/busy/draining) per request and
+  applies the scheduler ordering — unpaid before paid, then fastest (`backend_tps` /
+  `gen_speed`), unmeasured first. A freed backend takes the waiter the scheduler
+  designates for it (`scheduler.designated_taker`: overdue > same type key > oldest;
+  `affinity_max_wait_s`, default 120, Server tab). `priority` routes nothing any more —
+  it only keeps the backend LIST order stable. Rebuilt by `rebuild_backends()`/`rebuild_virtual_models()` and on every
   discovery model-set change — never mutate `backends`/`virtual_models` outside
   those functions or the index goes stale.
 
 - **Aliases** (`virtual_models`): string (same everywhere) or per-backend dict whose
-  value is a model id or `{model, priority}` (per-alias priority override).
-  `alias_entry()` resolves all shapes.
+  value is a model id (old entries may still be `{model, priority}` — `alias_entry()`
+  parses that shape, the priority is ignored).
 - **Backend prefixing** (`split_backend_prefix`): `<backend>/<model>` pins that
-  backend; a bare id/alias routes by priority. `local: true` *also* lists models
+  backend; a bare id/alias goes through the scheduler. `local: true` *also* lists models
   bare (cross-backend implicit alias). `model_prefix` toggles prefixed listing.
 - **Concurrency/busy** (`backend_inflight`, `backend_busy`): incremented in
   `dispatch()`/`generate()`, decremented on completion incl. the streamed `finally`.
@@ -363,8 +368,8 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   parks in the same queue (jobs.py task `response`).
 - **LoRA-aware generation routing**: a backend lacking a requested LoRA is dropped
   from candidates (decided over all candidates incl. busy → parks for the
-  LoRA-backend rather than spilling); a LoRA on no backend is ignored (priority
-  wins); an explicit `backend` force is never overridden. Per-backend LoRA sets
+  LoRA-backend rather than spilling); a LoRA on no backend is ignored (the normal
+  ordering wins); an explicit `backend` force is never overridden. Per-backend LoRA sets
   come from discovery (`backend_loras`).
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =

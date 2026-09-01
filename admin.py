@@ -901,7 +901,11 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
               "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
               "host/IP, which groups correctly for most setups.</p>"
-            + _field("priority", _inp("priority", g("priority", "10"), typ="number"))
+            + _field("cost tier", _checkbox("paid", gb("paid"),
+                     "paid — used only when no unpaid backend is free"))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>paid</b>: this backend bills per request "
+              "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
+              "and reaches for a paid one only when no unpaid backend is free.</p>"
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
             + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
             # ComfyUI-only options — hidden for openai (none of these apply to an LLM backend)
@@ -960,7 +964,8 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
                      _checkbox("local", gb("local"), "local"))
             + "<p class='hint'><b>local</b>: also list each of this backend's models under its plain "
               "id (without the <code>backend/</code> prefix). Several local backends sharing a model id "
-              "then collapse into one entry that routes by priority and fails over — an implicit "
+              "then collapse into one entry the scheduler routes across (fastest free unpaid backend "
+              "first) with failover — an implicit "
               "cross-backend alias.</p>"
             + _field("prompt cache passthrough",
                      _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
@@ -970,12 +975,6 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "again every turn. Off by default: the breakpoints turn a message into a content-part list, "
               "which a strict server may reject. Irrelevant for local models (no token billing) and for "
               "OpenAI models (they cache automatically).</p>"
-            + _field("route by speed",
-                     _checkbox("route_speed", gb("route_speed"), "route_speed"))
-            + "<p class='hint'><b>route_speed</b>: every bare model id this backend serves routes "
-              "fastest-first by measured throughput (tok/s) instead of priority — one switch for the "
-              "whole catalog (hundreds of ids). Chat aliases are unaffected (they keep their own per-alias "
-              "routing). A <code>backend/model</code> pin still forces this backend.</p>"
             + f'<details class="optblock"{" open" if (b or {}).get("sampling_defaults") else ""}>'
             + "<summary>Sampling defaults <span class='muted'>— used when the caller sends none"
               "</span></summary>"
@@ -1094,14 +1093,14 @@ async def backends_page(request: Request):
                               "Delete", f"Remove backend {b['name']} ({b['type']})?"))
         acts = _icon_acts(*acts_list)
         src = "" if b.get("source") == "ui" else " · config"
-        flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local", "route_speed") if b.get(fl))
+        flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local", "paid") if b.get(fl))
         host = f" · host {b['host']}" if b.get("host") else ""
         rst = f" · restart: {b['last_restart_result']}" if b.get("last_restart_result") else ""
         fr = (f" · fail_rate {b['fail_rate']:.2f} ({b['gen_fails']}/{b['gen_attempts']})"
               if b.get("fail_rate") is not None else "")
         smp = (f" · sampling {_sampling_text(b['sampling_defaults'])}"
                if b.get("sampling_defaults") else "")
-        sub = f"{b['url']}{host} · prio {b['priority']} · {b['models']} models{flags}{smp}{fr}{rst}{src}"
+        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Media (comfyui), alphabetical within each
@@ -1336,7 +1335,7 @@ async def backend_save(request: Request):
     # (e.g. enabled) survive an edit; merge the form values over it.
     b = dict(store.get_backend(oname, otype) or store.get_backend(name, new_type) or {})
     b.update({"name": name, "type": new_type, "url": url,
-              "priority": int(f.get("priority") or 10)})
+              "paid": bool(f.get("paid"))})       # unchecked box = absent from the form = False
     mc = (f.get("max_concurrent", "") or "").strip()
     if mc.isdigit():
         b["max_concurrent"] = int(mc)
@@ -1360,7 +1359,7 @@ async def backend_save(request: Request):
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
     # boolean flags: checkbox present → True, absent → drop the key (= False)
-    for flag in ("chat_only", "serverless_only", "local", "route_speed", "auto_restart",
+    for flag in ("chat_only", "serverless_only", "local", "auto_restart",
                  "prompt_cache"):
         if f.get(flag):
             b[flag] = True
@@ -1553,10 +1552,10 @@ def _input_body() -> str:
         inner = " ".join(f"<code>{_esc(i)}</code>" for i in items) or '<span class="muted">none</span>'
         return f'<div style="flex:1;min-width:0;white-space:nowrap;overflow-x:auto">{inner}</div>'
     # Pass-through: every discovered model is callable WITHOUT an alias — bare (routed
-    # by priority across backends that expose it) or as backend/model. Grouped per
-    # backend so the backend/model form is obvious.
-    # model → hosting backends (a bare id routes across all of them by priority;
-    # backend/model pins one). Chat models only — image models (flux.* on localai etc.)
+    # by the scheduler across the backends that expose it) or as backend/model. Grouped
+    # per backend so the backend/model form is obvious.
+    # model → hosting backends (a bare id routes across all of them; backend/model pins
+    # one). Chat models only — image models (flux.* on localai etc.)
     # are filtered out here. The backends column shows just the host names (chips), the
     # model name lives in the first column, so backend/model is easy to read.
     model_hosts: dict = {}
@@ -1571,14 +1570,14 @@ def _input_body() -> str:
                              for bn in sorted(model_hosts[m]))
             mrows += f'<tr><td><code>{_esc(m)}</code></td><td>{hosts}</td></tr>'
         models_tbl = (f'<table class="sortable" data-sk="input-models"><tr><th>model id</th>'
-                      f'<th>on backends — call bare (priority) or <code>backend/id</code></th>'
+                      f'<th>on backends — call bare or <code>backend/id</code></th>'
                       f'</tr>{mrows}</table>')
     else:
         models_tbl = '<p class="muted">none discovered</p>'
     return (f"<h2>Input — what clients can call</h2>"
             f"<p class='hint'>Anything below can be the request <code>model</code>. Aliases are "
             f"shortcuts; every discovered model is <b>also callable without an alias</b> — bare "
-            f"(routed by priority across its backends, with failover) or pinned as "
+            f"(routed across its backends by the scheduler, with failover) or pinned as "
             f"<code>backend/model</code>.</p>"
             + _field("Chat aliases", chips(info.get("virtual_models", [])), wide=True)
             + _field("Generation models", chips(gen), wide=True)
@@ -1608,7 +1607,7 @@ def _route_status(r: dict) -> str:
 
 def _host_chip(h: dict) -> str:
     """A backend chip in the models table, coloured by health/busy. Shows measured
-    throughput (tok/s) once known — the signal the `speed` routing mode ranks on."""
+    throughput (tok/s) once known — the signal the scheduler ranks ready backends on."""
     if not h.get("healthy"):
         kind, suffix = "bad", " down"
     elif h.get("busy"):
@@ -1617,39 +1616,18 @@ def _host_chip(h: dict) -> str:
         kind, suffix = "ok", ""
     tps = h.get("tps") or 0
     spd = f" · {tps:g} tok/s" if tps else ""
-    return f'<span class="badge {kind}">{_esc(h["backend"])} · p{h.get("priority")}{spd}{suffix}</span>'
+    return f'<span class="badge {kind}">{_esc(h["backend"])}{spd}{suffix}</span>'
 
 
-def _models_table(models: list, show_mode: bool = False) -> str:
-    """Bare model id → hosting backends. With show_mode, a per-model priority⇄speed
-    routing toggle (chat routing only — the LLM-models sub-tab). Shadowed ids route
-    via their alias, so their mode is edited in the chat-alias editor, not here."""
-    rmode = store.get_route_mode() if show_mode else {}
+def _models_table(models: list, sk: str = "routing-image-models") -> str:
+    """Bare model id → hosting backends. There is nothing to choose per model any
+    more: every request takes the fastest free unpaid backend of the set."""
     rows = ""
     for m in models:
         chips = " ".join(_host_chip(h) for h in m["hosts"]) or '<span class="muted">none</span>'
         sh = _badge("shadowed by alias", "warn") if m.get("shadowed_by_alias") else ""
-        extra = ""
-        if show_mode:
-            if m.get("shadowed_by_alias"):
-                extra = "<td class='muted'>via alias</td>"
-            elif any(h.get("route_speed") for h in m["hosts"]):
-                # whole-backend route_speed forces speed for this bare id → managed on the
-                # Backends tab; no per-model toggle (it could only clear an explicit override,
-                # which can't override the backend flag anyway).
-                extra = (f"<td class='acts'>{_badge('speed', 'ok')} "
-                         "<span class='muted'>via backend</span></td>")
-            else:
-                mid = m["model"]
-                cur = rmode.get(mid) or ""
-                nxt = "" if cur == "speed" else "speed"
-                href = f'/ui/routing/rmode?model={quote(mid, safe="")}&mode={nxt}'
-                badge = _badge("speed", "ok") if cur == "speed" else _badge("priority")
-                label = "→ priority" if cur == "speed" else "→ speed"
-                extra = f"<td class='acts'>{badge} {_btn(label, href, 'secondary', sm=True)}</td>"
-        rows += f'<tr><td><code>{_esc(m["model"])}</code>{sh}</td><td>{chips}</td>{extra}</tr>'
-    head = "<th>model</th><th>backends (priority order)</th>" + ("<th>routing</th>" if show_mode else "")
-    sk = "routing-llm-models" if show_mode else "routing-image-models"
+        rows += f'<tr><td><code>{_esc(m["model"])}</code>{sh}</td><td>{chips}</td></tr>'
+    head = "<th>model</th><th>backends</th>"
     return (f'<table class="sortable" data-sk="{sk}"><tr>{head}</tr>{rows}</table>'
             if rows else "<p class='muted'>none discovered yet</p>")
 
@@ -1667,17 +1645,15 @@ def _img_status(bm: Optional[dict]) -> str:
 def _routing_chat_body(snap: dict) -> str:
     arows = ""
     for a in snap.get("aliases", []):
-        arows += f'<tr class="grp"><td colspan="4">{_esc(a["alias"])}</td></tr>'
+        arows += f'<tr class="grp"><td colspan="3">{_esc(a["alias"])}</td></tr>'
         if not a["routes"]:
-            arows += '<tr><td colspan="4" class="muted">no mapped backends</td></tr>'
+            arows += '<tr><td colspan="3" class="muted">no mapped backends</td></tr>'
         for r in a["routes"]:
-            prio = (f'{r["priority"]}' +
-                    (" <span class='muted'>(override)</span>" if r.get("overridden") else ""))
             arows += (f'<tr><td>{_esc(r["backend"])}</td><td><code>{_esc(r["model"])}</code></td>'
-                      f'<td>{prio}</td><td>{_route_status(r)}</td></tr>')
+                      f'<td>{_route_status(r)}</td></tr>')
     html = ("<h2>Chat aliases → routes</h2>" + (
         '<table class="sortable" data-sk="routing-chat"><tr><th>alias / backend</th><th>model</th>'
-        f'<th>priority</th><th>status</th></tr>{arows}</table>'
+        f'<th>status</th></tr>{arows}</table>'
         if arows else "<p class='muted'>No chat aliases configured.</p>"))
     conf = snap.get("conflicts", [])
     if conf:
@@ -1699,8 +1675,8 @@ def _routing_chat_body(snap: dict) -> str:
 def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
     """Media aliases → the backends that serve them, in two views behind one picker.
 
-    Unfiltered it stays alias-first: a group per alias with its candidates in
-    priority order — that answers "where does THIS alias run". Pick a backend and it
+    Unfiltered it stays alias-first: a group per alias with its candidates — that
+    answers "where does THIS alias run". Pick a backend and it
     flips to backend-first: one flat row per alias on that backend, carrying what is
     per-BACKEND about it (pinned values, bypassed nodes) beside the shared mapping.
     Keeping the grouped shape while filtered would print a group header above a
@@ -1742,8 +1718,7 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
                      f'<td class="muted">{_esc(others)}</td></tr>')
         head = (f"<h2>Media aliases on <b>{_esc(sel)}</b> "
                 f"<span class='muted' style='font-weight:normal'>· {len(entries)}</span></h2>"
-                f"<p class='hint'>{_img_status(bm)} priority "
-                f"{bm.get('priority', '?') if bm else '?'} — <b>mapping</b> is shared by all of an "
+                f"<p class='hint'>{_img_status(bm)} — <b>mapping</b> is shared by all of an "
                 f"alias's backends, <b>pinned</b> and <b>bypassed</b> are this backend's own.</p>")
         return (head + picker
                 + ('<table class="sortable" data-sk="routing-gen-on"><tr><th>alias</th><th>task</th>'
@@ -1752,19 +1727,18 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
 
     grows = ""
     for alias, cands in sorted(gen_aliases.items()):
-        grows += f'<tr class="grp"><td colspan="4">{_esc(alias)}</td></tr>'
-        ordered = sorted(cands, key=lambda c: bmeta.get(c.get("backend"), {}).get("priority", 100))
-        for c in ordered:
+        grows += f'<tr class="grp"><td colspan="3">{_esc(alias)}</td></tr>'
+        for c in cands:
             bn = c.get("backend", "")
             bm = bmeta.get(bn)
             grows += (f'<tr><td>{_esc(bn)}</td><td>{_esc(c.get("task", ""))}</td>'
-                      f'<td>{bm.get("priority", "?") if bm else "?"}</td><td>{_img_status(bm)}</td></tr>')
+                      f'<td>{_img_status(bm)}</td></tr>')
     return ("<h2>Media Generation aliases → backends</h2>"
-            "<p class='hint'>Tried in backend-priority order with failover (see Mapping). "
-            "Pick a backend to see everything mapped onto it instead.</p>"
+            "<p class='hint'>A job goes to the fastest free unpaid backend of this set, with "
+            "failover (see Mapping). Pick a backend to see everything mapped onto it instead.</p>"
             + picker
             + ('<table class="sortable" data-sk="routing-gen"><tr><th>alias / backend</th><th>task</th>'
-               f'<th>priority</th><th>status</th></tr>{grows}</table>'
+               f'<th>status</th></tr>{grows}</table>'
                if grows else "<p class='muted'>No generation aliases configured.</p>"))
 
 
@@ -1812,13 +1786,12 @@ async def routing_page(request: Request):
         on_llm = [m for m in snap.get("models", []) if any(h.get("type") != "comfyui" for h in m["hosts"])]
         title, body = "LLM models", (
             "<h2>LLM models → backends</h2>"
-            "<p class='hint'>A bare model id routes to these in priority order, failing over. "
-            "<b>shadowed by alias</b> = a chat alias of the same name intercepts the bare id "
-            "(set its routing in the alias editor). <b>routing = speed</b> orders ready backends "
-            "fastest-first by measured throughput (tok/s shown on each chip), priority as tiebreak. "
-            "<b>via backend</b> = a hosting backend's <code>route_speed</code> flag (Backends tab) "
-            "switches all its bare ids to speed at once — no per-model toggle then.</p>"
-            + _models_table([m for m in on_llm if not _is_image_model(m["model"])], show_mode=True))
+            "<p class='hint'>A bare model id goes to the fastest free <b>unpaid</b> backend of "
+            "this set (measured tok/s, shown on each chip; unmeasured backends are probed first), "
+            "failing over on error. <b>shadowed by alias</b> = a chat alias of the same name "
+            "intercepts the bare id.</p>"
+            + _models_table([m for m in on_llm if not _is_image_model(m["model"])],
+                            sk="routing-llm-models"))
     elif sub == "gen":
         title, body = "Media aliases", _routing_gen_body(
             bmeta, (request.query_params.get("backend") or "").strip() or None)
@@ -1841,8 +1814,9 @@ async def routing_page(request: Request):
 
 # ── Tab: Chat (LLM alias management) ────────────────────────────────────────────
 # A chat alias maps to either one model id (same on every backend → stored as a
-# string) or a per-backend table {backend: model | {model, priority}}. config aliases
-# are the base; UI entries (this store) merge over them — exactly the router's shapes.
+# string) or a per-backend table {backend: model}. config aliases are the base; UI
+# entries (this store) merge over them — exactly the router's shapes. Older entries
+# may still carry the {model, priority} shape; the priority is parsed and ignored.
 
 def _chat_summary(value) -> str:
     """One-line routing summary for the list sub-line."""
@@ -1852,8 +1826,7 @@ def _chat_summary(value) -> str:
         parts = []
         for bn, entry in value.items():
             if isinstance(entry, dict):
-                p = entry.get("priority")
-                parts.append(f"{bn}→{entry.get('model')}" + (f" (p{p})" if p is not None else ""))
+                parts.append(f"{bn}→{entry.get('model')}")
             else:
                 parts.append(f"{bn}→{entry}")
         return " · ".join(parts) or "—"
@@ -1884,8 +1857,8 @@ def _chat_value_for(alias: str) -> dict:
 
 
 def _chat_new_form() -> str:
-    """Minimal create form — like registering a generation alias. Backends/priorities
-    are assigned in the editor afterwards."""
+    """Minimal create form — like registering a generation alias. More backends are
+    assigned in the editor afterwards."""
     llm = _llm_backends()
     all_models = sorted({m for b in llm for m in b.get("models", [])})
     bopts = [b["name"] for b in llm] or [("", "(no LLM backends)")]
@@ -1895,33 +1868,31 @@ def _chat_new_form() -> str:
             + _field("alias name", _inp("alias", placeholder="fast"), short=True)
             + _field("backend", _select("backend", bopts), short=True)
             + _field("model", _dl_input("model", "", "cm_all"), short=True)
-            + "<p class='hint'>Pick a first backend + model. Assign more backends and "
-              "priority overrides after creating.</p>"
+            + "<p class='hint'>Pick a first backend + model. Assign more backends after "
+              "creating.</p>"
             + "</form>" + _datalist("cm_all", all_models))
 
 
 def _chat_editor(alias: str) -> str:
     """Editor for an existing alias — same logic as the Mapping editor: a list of
-    assigned backends, each with a model and an optional priority override; add via
-    dropdown, remove via ✕. Model/priority save on Save; add/remove are immediate."""
+    assigned backends, each with the model to use there; add via dropdown, remove via
+    ✕. Models save on Save; add/remove are immediate."""
     llm = _llm_backends()
     meta = {b["name"]: b for b in llm}
     assigned = _chat_value_for(alias)
     rows, dls = "", ""
     for i, (bn, entry) in enumerate(assigned.items()):
         model = entry.get("model", "") if isinstance(entry, dict) else entry
-        prio = entry.get("priority") if isinstance(entry, dict) else None
         b, dlid = meta.get(bn, {}), f"cm_{i}"
         off = "" if b.get("enabled", True) else " <span class='muted'>(disabled)</span>"
-        head = f"{_esc(bn)}{off}<br><span class='muted'>global prio {b.get('priority', '?')}</span>"
+        head = f"{_esc(bn)}{off}"
         rm = (_btn("✕", f"/ui/chat/bdel?alias={_esc(alias)}&backend={_esc(bn)}", "danger",
                    sm=True, icon=True, title="Remove this backend")
               if len(assigned) > 1 else "<span class='muted' title='alias needs ≥1 backend'>—</span>")
         rows += (f"<tr><td>{head}</td><td>{_dl_input('model__' + bn, model, dlid)}</td>"
-                 f"<td>{_inp('prio__' + bn, '' if prio is None else prio, typ='number')}</td>"
                  f"<td class='acts'>{rm}</td></tr>")
         dls += _datalist(dlid, b.get("models", []))
-    rows = rows or "<tr><td colspan=4 class='muted'>no backends — add one below</td></tr>"
+    rows = rows or "<tr><td colspan=3 class='muted'>no backends — add one below</td></tr>"
     add_opts = [b["name"] for b in llm if b["name"] not in assigned]
     add_sel = ""
     if add_opts:
@@ -1945,15 +1916,6 @@ def _chat_editor(alias: str) -> str:
                    "<b>auto</b> = model default; an explicit client <code>reasoning</code> field always wins. "
                    "Lets e.g. <code>tool</code> (off) and <code>tool-thinking</code> (auto/on) share one "
                    "backend+model.</p>")
-    cur_rm = store.get_route_mode().get(alias) or ""
-    rm_opts = "".join(f'<option value="{v}"{" selected" if cur_rm == v else ""}>{_esc(lbl)}</option>'
-                      for v, lbl in (("", "priority (default)"), ("speed", "speed")))
-    rmode_field = (_field("routing", f'<select name="route_mode">{rm_opts}</select>', short=True)
-                   + "<p class='hint' style='margin:-4px 0 10px'>How ready backends are ordered for this "
-                     "alias. <b>priority</b> = configured order (default). <b>speed</b> = fastest first by "
-                     "measured throughput (tok/s, shown in <a href='/ui/routing?sub=llm'>LLM models</a> "
-                     "and <code>/health</code>), priority as the tiebreak; unmeasured backends are probed "
-                     "first. Failover order follows the same ranking.</p>")
     # Voice defaults are TTS-only and irrelevant for the vast majority of chat aliases,
     # so they collapse out of the way — folded open only when this alias has them set.
     # (They live here, not with the media aliases: /v1/audio/speech routes through a
@@ -1989,12 +1951,11 @@ def _chat_editor(alias: str) -> str:
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
             + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
-            + park_field + rsn_field + rmode_field + voice_field + smp_field
+            + park_field + rsn_field + voice_field + smp_field
             + "<h2>Backends</h2>"
-            + "<p class='hint'>Assign backends to this alias, pick the model on each, and optionally "
-              "override that backend's global priority for this alias only. Tried in priority order "
-              "with failover.</p>"
-            + f"<table class='pins'><tr><th>backend</th><th>model</th><th>priority</th><th></th></tr>{rows}</table>"
+            + "<p class='hint'>Assign backends to this alias and pick the model on each. A call "
+              "takes the fastest free unpaid one of them, with failover.</p>"
+            + f"<table class='pins'><tr><th>backend</th><th>model</th><th></th></tr>{rows}</table>"
             + add_sel
             + "</form>" + dls)
 
@@ -2021,18 +1982,9 @@ async def chat_save(request: Request):
         if not key.startswith("model__"):
             continue
         bn = key[len("model__"):]
-        m = (f.get(key) or "").strip()
-        p = (f.get(f"prio__{bn}", "") or "").strip()
-        if p:
-            try:
-                value[bn] = {"model": m, "priority": int(p)}
-            except ValueError:
-                value[bn] = m
-        else:
-            value[bn] = m
+        value[bn] = (f.get(key) or "").strip()
     park_s = (f.get("park_s", "") or "").strip()
     rsn = (f.get("reasoning", "") or "").strip()
-    rmode = (f.get("route_mode", "") or "").strip()
     smp, smp_err = _parse_sampling_form(f)
     if smp_err:
         return HTMLResponse(_page("Chat aliases", f'<p class="bad">{_esc(smp_err)}</p>'
@@ -2045,17 +1997,15 @@ async def chat_save(request: Request):
         store.set_alias_reasoning(orig, None)
         store.set_alias_voice(orig, None)
         store.set_alias_sampling(orig, None)
-        store.set_route_mode(orig, None)
     store.upsert_chat_alias(alias, value)
     store.set_alias_park(alias, park_s if park_s != "" else None)   # blank → global default
     store.set_alias_reasoning(alias, rsn)                           # 'auto'/blank clears
     store.set_alias_voice(alias, {"voice": f.get("voice_ref", ""),  # blank fields clear
                                   "ref_text": f.get("voice_ref_text", "")})
     store.set_alias_sampling(alias, smp)                            # blank clears
-    store.set_route_mode(alias, rmode)                              # only 'speed' persists, else clears
     _apply_chat_aliases()
     logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'}, "
-                f"reasoning={rsn or 'auto'}, routing={rmode or 'priority'}"
+                f"reasoning={rsn or 'auto'}"
                 + (f", sampling={smp}" if smp else "") + ")")
     return RedirectResponse("/ui/mapping", status_code=303)
 
@@ -2091,23 +2041,9 @@ async def chat_del(request: Request):
         store.set_alias_reasoning(alias, None)
         store.set_alias_voice(alias, None)
         store.set_alias_sampling(alias, None)
-        store.set_route_mode(alias, None)
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
     return RedirectResponse("/ui/mapping", status_code=303)
-
-
-async def rmode_toggle(request: Request):
-    """Set/clear the routing mode of a bare model id (LLM models sub-tab). 'speed'
-    sets it, anything else clears (→ priority default). Aliases set their mode in the
-    chat-alias editor instead."""
-    model = _qp(request, "model")
-    mode = _qp(request, "mode")
-    if model:
-        store.set_route_mode(model, mode)
-        _apply_chat_aliases()             # → rebuild_virtual_models reloads route_mode
-        logger.info(f"ui: route mode '{model}' = {mode or 'priority'}")
-    return RedirectResponse("/ui/routing?sub=llm", status_code=303)
 
 
 # ── Tab: Chat Playground ────────────────────────────────────────────────────────
@@ -2151,7 +2087,7 @@ def _anthropic_only(alias: str, anthro: set) -> bool:
 
 def _chat_models() -> list:
     """Everything callable as a chat `model`: aliases first, then bare model ids
-    (priority-routed) and backend/model forms — feeds the model datalist. Anthropic
+    (scheduler-routed) and backend/model forms — feeds the model datalist. Anthropic
     backends and their alias-only entries are left out: they answer /v1/messages
     only, so offering them here would just produce a 503 (and inviting a
     subscription backend into a chat console is exactly what it is not for)."""
@@ -2203,7 +2139,7 @@ def _chatplay_form(vals: dict) -> str:
     cur_bk = v("backend")
     init_models = bk_models[cur_bk] if (cur_bk in bk_models) else all_models   # pre-filter if a backend is picked
     # Backend picker (manual, so it can filter the model datalist on change without a reload).
-    opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (route by priority) —</option>'
+    opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (scheduler picks) —</option>'
     for n in bk_models:
         opts += f'<option{" selected" if n == cur_bk else ""}>{_esc(n)}</option>'
     bk_select = f'<select name="backend" onchange="cpFilterModels(this.value)">{opts}</select>'
@@ -2223,7 +2159,7 @@ def _chatplay_form(vals: dict) -> str:
             + _field("reasoning", "<select name='reasoning'>" + "".join(
                 f'<option value="{x}"{" selected" if (v("reasoning") or "auto") == x else ""}>{x}</option>'
                 for x in ("auto", "on", "off")) + "</select>", short=True)
-            + "<p class='hint'>Non-streaming. Routes by priority with failover, exactly like the API. "
+            + "<p class='hint'>Non-streaming. Routed by the scheduler with failover, exactly like the API. "
               "Pick a <b>backend</b> to pin the call and filter the model list; empty = all backends. "
               "<b>reasoning</b> sends the API's thinking switch (applied via the "
               "<a href='/ui/reasoning'>Reasoning</a> rules; auto = model default — an alias's own "
@@ -2290,7 +2226,7 @@ async def chatplay_send(request: Request):
             pass
     backend = vals["backend"].strip()
     # A picked backend pins the request to it via the '<backend>/<model>' convention
-    # (same as the API); empty = route across all backends by priority.
+    # (same as the API); empty = route across all backends via the scheduler.
     send_model = f"{backend}/{model}" if (backend and not model.startswith(backend + "/")) else model
     # A REAL API call through the gateway's own /v1 endpoint — dispatch, parking,
     # reasoning, stats and quotas all apply, exactly like any external client.
@@ -2560,15 +2496,13 @@ def _reorder_js(alias: str) -> str:
 
 
 def _backends_section(alias: str, cands: list) -> str:
-    """Allowed backends for an alias — a flat list (no primary/fallback). They are
-    tried in **backend-priority** order; on error the job runner moves to the next.
+    """Allowed backends for an alias — a flat list (no primary/fallback). A job takes
+    the fastest free unpaid one of them; on error the job runner moves to the next.
     Add/remove only; adding copies the existing workflow + mapping onto that backend."""
-    prio = {b["name"]: b.get("priority", 100) for b in _comfy_backends()}
     used = [c.get("backend") for c in cands]
     rows = ""
-    for bn in sorted(used, key=lambda n: prio.get(n, 100)):
-        p = prio.get(bn)
-        badge = f" <span class='muted'>prio {p}</span>" if p is not None else ""
+    for bn in used:
+        badge = ""
         rm = (_btn("✕", f"/ui/mapping/cand-del?alias={_esc(alias)}&backend={_esc(bn)}",
                    "danger", sm=True, icon=True, title="Remove this backend")
               if len(used) > 1 else "<span class='muted' title='an alias needs ≥1 backend'>—</span>")
@@ -2958,8 +2892,8 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
               '<button class="btn secondary" formaction="/ui/mapping/update-workflow" '
               'formenctype="multipart/form-data">Update workflow</button></div></div>'
             + "<h2>Backends</h2>"
-            + "<p class='hint'>Allowed backends for this alias — tried in backend-priority order; "
-              "on a connection error the next one is used.</p>"
+            + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free "
+              "unpaid one; on a connection error the next one is used.</p>"
             + _backends_section(alias, cands)
             + _field("retries", _inp("retries", str(retries), typ="number"), short=True)
             + "<p class='hint'>Backends to try after the first on error. Blank = try all eligible · 0 = no failover.</p>"
@@ -3465,7 +3399,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     rows = rows or "<p class='hint'>This alias has no request fields — add some in Mapping.</p>"
     bk_list = [c.get("backend") for c in (store.get(vals.get("model")) or [])]
     sel_bk = vals.get("backend", "")
-    bk_opts = ('<option value="">(auto · priority)</option>'
+    bk_opts = ('<option value="">(auto · scheduler picks)</option>'
                + "".join(f'<option value="{_esc(b)}"{" selected" if b == sel_bk else ""}>{_esc(b)}</option>'
                          for b in bk_list))
     backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
@@ -4479,14 +4413,14 @@ def _dash_backends(bes: list, offline: list) -> str:
         r1h = b.get("reqs_1h", 0)
         r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
         brows += (f"<tr><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
-                  f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td><td>{b.get('models', 0)}</td>"
-                  f"<td>{b.get('priority')}</td></tr>")
+                  f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td>"
+                  f"<td>{b.get('models', 0)}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
     return (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
             f"· click a header to sort{off_hint}</span></h2>"
             f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
             f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
-            f"<th>models</th><th>prio</th></tr>{brows}</table>")
+            f"<th>models</th></tr>{brows}</table>")
 
 
 def _dash_jobs(d: dict, now: int) -> str:
@@ -5586,7 +5520,6 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["GET"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
-    app.add_api_route("/ui/routing/rmode", rmode_toggle, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])
     app.add_api_route("/ui/chat/save", chat_save, methods=["POST"])
     app.add_api_route("/ui/chat/badd", chat_badd, methods=["GET"])

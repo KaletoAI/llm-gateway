@@ -51,7 +51,7 @@ def load_config() -> None:
     global image_models, jobs_cfg
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
-    config_backends = sorted(config["backends"], key=lambda b: b["priority"])
+    config_backends = sorted(config["backends"], key=lambda b: b.get("priority", 100))
     # Chat aliases: config is the base, UI-managed store entries merge over it (see
     # rebuild_virtual_models). `virtual_models` is the effective dict the router reads.
     config_virtual_models = config.get("virtual_models", {})
@@ -77,15 +77,14 @@ def log_config_summary() -> None:
         state = "ENABLED " if is_enabled(b) else "DISABLED"
         cap = backend_max_concurrent(b)
         cap_s = f"  max_concurrent={cap}" if cap is not None else ""
-        logger.info(f"  [{state}] {b['name']:25} priority={b['priority']}  url={b['url']}{cap_s}")
+        tier = "paid" if b.get("paid") else "free"
+        logger.info(f"  [{state}] {b['name']:25} {tier}  url={b['url']}{cap_s}")
     logger.info(f"Loaded {len(virtual_models)} virtual alias(es):")
     for alias, mapping in virtual_models.items():
         if isinstance(mapping, dict):
             for bname, entry in mapping.items():
                 if isinstance(entry, dict):
-                    real, prio = entry.get("model"), entry.get("priority")
-                    suffix = f"  (priority={prio})" if prio is not None else ""
-                    logger.info(f"  {alias:15} → [{bname}] {real}{suffix}")
+                    logger.info(f"  {alias:15} → [{bname}] {entry.get('model')}")
                 else:
                     logger.info(f"  {alias:15} → [{bname}] {entry}")
         else:
@@ -921,9 +920,9 @@ def alias_entry(alias: str, backend_name: str) -> tuple[Optional[str], Optional[
     """(real_model, priority_override) for this alias on this backend.
 
     real_model is None when the alias isn't mapped to this backend.
-    priority_override is parsed from the stored `{model, priority}` shape but is NOT
-    a routing input any more (spec 2026-09-01: unpaid-then-fastest ordering) — it is
-    only surfaced read-only by routing_snapshot.
+    priority_override is parsed from the stored `{model, priority}` shape (old entries
+    still carry it) but is NOT read anywhere — routing is unpaid-then-fastest since
+    spec 2026-09-01, and the UI no longer offers the field.
 
     - alias not in virtual_models → (alias, None)         pass-through
     - alias maps to string         → (string, None)        same model everywhere
@@ -1128,7 +1127,7 @@ def routing_snapshot() -> dict:
         for b in backends:                     # all (incl. disabled) LLM backends, so a
             if b.get("type", "openai") == "comfyui":   # mapping doesn't vanish when off
                 continue                       # chat aliases route only to LLM backends
-            real, prio = alias_entry(name, b["name"])
+            real, _prio = alias_entry(name, b["name"])
             if real is None:
                 continue                       # alias not mapped to this backend
             bid, enbl = backend_id(b), is_enabled(b)
@@ -1138,8 +1137,6 @@ def routing_snapshot() -> dict:
             rows.append({
                 "backend": b["name"],
                 "model": real,
-                "priority": prio if prio is not None else b["priority"],
-                "overridden": prio is not None,
                 "enabled": enbl,
                 "healthy": healthy,
                 "error": backend_error.get(bid) if enbl and not healthy else None,
@@ -1147,7 +1144,6 @@ def routing_snapshot() -> dict:
                 "busy": busy,
                 "routable": enbl and healthy and present,
             })
-        rows.sort(key=lambda r: r["priority"])
         aliases.append({"alias": name, "routes": rows})
     aliases.sort(key=lambda a: a["alias"].lower())
 
@@ -1158,7 +1154,6 @@ def routing_snapshot() -> dict:
             model_hosts.setdefault(mid, []).append({
                 "backend": b["name"],
                 "type": b.get("type", "openai"),
-                "priority": b["priority"],
                 "healthy": healthy,
                 "busy": healthy and backend_busy(b),
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
@@ -1166,7 +1161,6 @@ def routing_snapshot() -> dict:
             })
     models = []
     for mid, hosts in sorted(model_hosts.items(), key=lambda kv: kv[0].lower()):
-        hosts.sort(key=lambda h: h["priority"])
         models.append({
             "model": mid,
             "hosts": hosts,
@@ -1799,8 +1793,8 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                 if disp not in seen and visible({disp, mid, bname}):
                     seen.add(disp)
                     data.append({"id": disp, "object": "model", "created": now, "owned_by": bname})
-                # `local: true` backends ALSO list the bare id; a bare request routes by
-                # priority across every backend that exposes it (like a virtual alias).
+                # `local: true` backends ALSO list the bare id; a bare request routes
+                # across every backend that exposes it (like a virtual alias).
                 if expose_bare and mid not in seen and visible({mid, bname}):
                     seen.add(mid)
                     data.append({"id": mid, "object": "model", "created": now, "owned_by": bname})
@@ -2122,7 +2116,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request, authorization: Optional[str] = Header(None)):
-    # Same priority routing as chat: body["model"] is the alias/model, picked up
+    # Same routing as chat: body["model"] is the alias/model, picked up
     # by get_routes_for(). Embedding responses carry usage.prompt_tokens only
     # (no completion_tokens) → cost falls out of the input-price path for free.
     # Backends that filter out embedding models (chat_only) simply won't be
@@ -2424,7 +2418,7 @@ def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
 # bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
 # purpose (a gateway restart resets the sample — fine) and module-global so
 # adapter rebinds on config hot-reload don't lose it. Display-only: NEVER used
-# to drop a backend from rotation (routing control stays priority / runbook A1).
+# to drop a backend from rotation (the operator decides / runbook A1).
 backend_gen_window: dict = {}
 _GEN_WINDOW_N = 50            # last N attempts …
 _GEN_WINDOW_S = 86400         # … no older than 24 h
@@ -3151,7 +3145,7 @@ def _requested_loras(body: dict) -> set:
 def _lora_eligible_names(all_cands: list, body: dict) -> Optional[set]:
     """LoRA-aware backend eligibility: backends lacking a requested LoRA are dropped —
     but only for LoRAs installed on SOME candidate; a LoRA installed nowhere is ignored
-    so priority still decides (per spec). Decided over ALL candidates (incl. busy), so
+    so the normal ordering still decides (per spec). Decided over ALL candidates (incl. busy), so
     the eligible backend is parked-for rather than spilling to a backend without the
     LoRA. None = no constraint."""
     req_loras = _requested_loras(body)
@@ -3650,7 +3644,7 @@ def dashboard_snapshot() -> dict:
         # job store (an LLM and a ComfyUI backend may share a name → pick by type).
         src_1h = jobs_1h if b.get("type") == "comfyui" else calls_1h
         bes.append({
-            "name": b["name"], "type": b.get("type", "openai"), "priority": b["priority"],
+            "name": b["name"], "type": b.get("type", "openai"),
             "enabled": en, "healthy": en and backend_healthy.get(bid, False),
             "busy": en and backend_busy(b), "inflight": backend_inflight.get(bid, 0),
             "draining": is_draining(b),
@@ -3684,7 +3678,7 @@ def dashboard_snapshot() -> dict:
 def _comfy_watch_info(b: dict) -> dict:
     """Executor-watchdog + rolling fail-rate fields for comfy backends (merged
     into /health + UI snapshot). fail_rate is display-only (runbook C): the
-    operator decides — routing control stays priority (A1)."""
+    operator decides — it never reorders routing (A1)."""
     if b.get("type") != "comfyui":
         return {}
     info: dict = {}
@@ -3704,7 +3698,7 @@ def gateway_info() -> dict:
     config_ids = {backend_id(b) for b in config_backends}
     return {
         "backends": [{
-            "name": b["name"], "type": b.get("type", "openai"), "priority": b["priority"],
+            "name": b["name"], "type": b.get("type", "openai"),
             "enabled": is_enabled(b), "healthy": backend_healthy.get(backend_id(b), False),
             "error": backend_error.get(backend_id(b)),      # why it is down (kind/status/detail)
             "inflight": backend_inflight.get(backend_id(b), 0), "draining": is_draining(b),
@@ -3918,7 +3912,7 @@ def llm_backends_info() -> list[dict]:
     """LLM (non-ComfyUI) backends + their discovered model ids — feeds the chat-alias
     editor's per-backend model pickers."""
     return [{"name": b["name"], "type": b.get("type", "openai"),
-             "priority": b["priority"], "enabled": is_enabled(b),
+             "enabled": is_enabled(b),
              "models": sorted(backend_models.get(backend_id(b), set()))}
             for b in backends if b.get("type", "openai") != "comfyui"]
 

@@ -4,8 +4,9 @@ An OpenAI-compatible reverse proxy that fans one endpoint out across many
 backends — local LLM servers (llama.cpp / llama-swap / vLLM / Ollama …), cloud
 APIs (together.ai, OpenAI, OpenRouter …), **and ComfyUI image-generation
 servers**. Callers see a single OpenAI endpoint; the gateway handles discovery,
-priority routing, failover, virtual aliases, per-backend concurrency, an
-optional multi-user layer, call parking, and a built-in management console.
+one queue with a unified scheduler, failover, virtual aliases, per-backend
+concurrency, an optional multi-user layer, call parking, and a built-in
+management console.
 
 It sits between OpenAI-compatible clients (N8N, LibreChat, Open WebUI, LangChain
 code, image clients like anima-verse, …) and a fleet of backends.
@@ -18,7 +19,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Quick start](#quick-start)
 - [Configuration](#configuration) — backends, aliases, knobs
 - [Authentication & multi-user](#authentication--multi-user) — keys, allow-lists, quotas
-- [Routing](#routing) — priority, prefixing, `local`, concurrency, parking
+- [Routing](#routing) — the scheduler, prefixing, `local`, concurrency, parking
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
@@ -38,13 +39,15 @@ code, image clients like anima-verse, …) and a fleet of backends.
   image generation all go through the same gateway.
 - **Auto-discovery.** Each backend's catalog is polled — `/v1/models` for LLMs,
   `/object_info` for ComfyUI (models + installed LoRAs). No manual registry.
-- **Strict priority routing + failover.** `priority` is a first-class deployment
-  ordering: alias `fast` routes to a local box first, a cloud provider as
-  fallback — exactly that, every time, no routing-strategy ceremony.
+- **One queue, one scheduling rule + failover.** Every request queues; the
+  **fastest free unpaid** backend that can serve it takes it, a backend that
+  frees up prefers the request type it just ran (no model reload), and nothing
+  waits longer than `affinity_max_wait_s` for that preference.
 - **Virtual aliases.** `fast`, `vision`, `translator` map to different real model
-  IDs per backend; an alias can even override a backend's priority for itself.
+  IDs per backend.
 - **Cloud-as-backend.** A per-backend `api_key` wires in any OpenAI-compatible
-  provider as just another prioritised backend.
+  provider as just another backend; mark it `paid: true` and it is used only
+  when no unpaid backend is free.
 - **Multi-user.** Optional per-user API keys with model/alias/backend allow-lists
   (which also filter what each key sees in `/v1/models`) and monthly cost quotas.
 - **Call parking (default).** When every matching backend is busy, the call
@@ -103,12 +106,11 @@ model_prefix: true                     # list models as <backend>/<model>
 backends:
   - name: local-gpu
     url: http://192.168.1.10:8080      # llama-swap / llama.cpp / vLLM / …
-    priority: 1                        # 1 = preferred
     max_concurrent: 1                  # single-slot llama.cpp → one at a time
     # local: true                      # ALSO list its models bare (see below)
   - name: together                     # cloud fallback (OpenAI-compatible)
     url: https://api.together.xyz
-    priority: 99
+    paid: true                         # only used when no unpaid backend is free
     api_key: "tgp_v1_…"                # sent as Bearer to this backend
     chat_only: true                    # drop non-chat models at discovery
     serverless_only: true              # drop dedicated-endpoint-only models
@@ -118,13 +120,9 @@ virtual_models:                        # chat aliases
   "fast":                              # per-backend mapping
     local-gpu: "Qwen3.5-9B"
     together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
-  "cheap":                             # per-alias priority override
-    local-cpu: { model: "gemma-3-9b-it", priority: 1 }
-    local-gpu: { model: "Qwen3.5-9B",    priority: 2 }
 ```
 
-A backend's value under an alias is normally just the model name; make it
-`{model, priority}` to override that backend's priority **for this alias only**.
+A backend's value under an alias is just the model name to call there.
 
 ---
 
@@ -187,24 +185,46 @@ narrows by namespace too.
 
 ## Routing
 
-For each request the gateway walks backends in **priority order** (1 = first) and
-takes the first that is (1) enabled, (2) healthy (last discovery poll ok), (3)
-**not busy** (below its `max_concurrent` in-flight cap), (4) mapped for the alias
-(or exposes the bare/real model), and (5) actually has the resolved model. If
-that backend errors on the forward, the remaining matching backends are tried in
-order. When every match is busy the call **parks** (queues) by default until a
-backend frees, and only `503`s if the park time runs out (below).
+A backend is a **candidate** for a request when it is (1) enabled, (2) healthy
+(last discovery poll ok), (3) mapped for the alias (or exposes the bare/real
+model), and (4) actually has the resolved model. Every request then goes through
+one queue, and one rule set decides who runs where — LLM calls and media jobs
+alike:
+
+- **Fastest free unpaid backend first.** Ready (not busy) candidates are ordered
+  by `(paid, speed)`: unpaid before paid, then fastest first. Speed is measured —
+  tok/s per LLM backend, seconds per media job per alias+backend — and a backend
+  that has never been measured sorts first, so it gets probed once. `paid: true`
+  is the cost guard: a paid backend (a cloud API) is used **only when no unpaid
+  candidate is free**, which is the old "spill to the cloud" behaviour without
+  per-backend priority numbers.
+- **A freed backend prefers what it just ran.** When a backend frees, it takes
+  the oldest waiting request whose *type key* matches what it last ran — the
+  generation alias for media (same workflow = same loaded models), the real model
+  id for LLMs (no llama-swap model reload). Only the request the scheduler
+  designates may claim that backend; the others stay queued.
+- **Nobody waits on that preference forever.** A request queued longer than
+  `affinity_max_wait_s` (default **120 s**, Server tab, hot-reloaded) counts as
+  *overdue* and is served strictly oldest-first by the next free backend that can
+  run it.
+
+If the chosen backend errors on the forward, the remaining candidates are tried
+in the same order. When every candidate is busy the call **parks** (queues) by
+default until one frees, and only `503`s if the park time runs out (below).
+`priority` is no longer a routing input — the key may stay in a config for
+listing order, but nothing routes by it.
 
 ### Provider-prefixed model names
 
 With `model_prefix: true` (default), `/v1/models` lists every model as
 `<backend>/<model>` so the provider is visible. Input is liberal: a prefixed id
-routes to exactly that backend; a bare id or an alias routes by priority. Backend
+routes to exactly that backend; a bare id or an alias goes through the
+scheduler. Backend
 names never collide with vendor prefixes (`moonshotai/…`), so the leading segment
 disambiguates. `model_prefix: false` → legacy bare, de-duplicated listing.
 
 **`local: true`** on a backend *additionally* lists its models bare (alongside
-the prefixed id). A bare request then routes by priority across every `local`
+the prefixed id). A bare request then routes across every `local`
 backend that serves it — same failover/busy-spill as a virtual alias; shared ids
 collapse to one entry. Independent of `model_prefix`.
 
@@ -286,15 +306,19 @@ or a `503` (with `Retry-After`) if the wait runs out.
   `alias_park`): blank = the global default (`park_timeout_s`, **60 s**, Server
   tab), `0` = parking off for that alias (immediate `503` when busy). `max_parked`
   caps the queue.
-- **Fair:** when a slot frees, the oldest waiting call whose alias can use that
-  backend is dispatched first (no head-of-line blocking across aliases). Live
-  queue is visible in the **Parked calls** panel on the Dashboard.
+- **Fair:** when a slot frees, the scheduler designates one waiter for it —
+  overdue first, else the one whose type key the backend just ran, else the
+  oldest it can serve (no head-of-line blocking across aliases). Live queue is
+  visible in the **Parked calls** panel on the Dashboard.
+- **A backend reserved for a designated waiter is not overtaken.** With parking
+  off for an alias (`park_s: 0`) or a full queue, a fresh request that finds only
+  such a backend free gets a `503` + `Retry-After` instead of jumping the queue.
 - **On timeout** the call leaves the queue with a `503` + `Retry-After`.
 - **A backend that comes back is picked up immediately.** Waiting work is never
   pinned to the backend it was queued for: a parked call re-evaluates its routes
   whenever a backend goes healthy or gains models, and a parked generation job
   re-resolves its candidates every 2 s — so a returning or newly added backend is
-  used the moment it is available, priority order included. To keep *noticing* it
+  used the moment it is available. To keep *noticing* it
   fast, unhealthy backends are re-polled every `fast_probe_interval_s` (**3 s**,
   Server tab; `0` = off) for as long as something is waiting, instead of only once
   per `health_check_interval`. Nothing waiting → no extra polling.
@@ -498,7 +522,7 @@ backends:
     auth_mode: subscription        # → Authorization: Bearer + OAuth beta header
     # auth_mode: api_key           # → x-api-key (console.anthropic.com key)
     models: [claude-sonnet-5]      # fallback list; discovery tries GET /v1/models first
-    priority: 1
+    paid: true                     # a subscription/API backend — used when no free local one
 ```
 
 Then check the Backends tab: the row should read **UP** with the model count
@@ -552,7 +576,6 @@ backends:
   - name: gpu-3090
     type: comfyui
     url: http://192.168.1.20:8188
-    priority: 1
     max_concurrent: 1        # one generation at a time on this GPU
     # poll_interval: 1.0     # seconds between /history polls (Backends tab)
     # max_wait: 600          # hard cap for a single generation (Backends tab)
@@ -653,7 +676,7 @@ LoRAs are first-class:
 - **LoRA-aware routing** — a backend that lacks a requested LoRA is dropped from
   the candidate set (decided over all candidates incl. busy, so the request parks
   for the backend that has it rather than spilling to one that doesn't). A LoRA
-  installed on no backend is ignored (priority decides). An explicit `backend`
+  installed on no backend is ignored (the normal ordering decides). An explicit `backend`
   pin is never overridden.
 - **`GET /v1/generations/{alias}/loras`** returns the LoRA filenames valid for an
   alias (the union installed across its backends) — for building a correct picker.
@@ -721,8 +744,8 @@ locked). Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
-| **Server** | runtime + restart-required settings (API key, caps, park time/queue, stats/jobs, TTL/prune) |
-| **Backends** | add/edit/remove backends (LLM + ComfyUI) |
+| **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
+| **Backends** | add/edit/remove backends (LLM + ComfyUI), incl. the `paid` cost tier |
 | **Input** | what clients can call — chat aliases, generation models, endpoints |
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s` + reasoning default) |
@@ -788,7 +811,7 @@ stats:
 |---|---|---|
 | `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|image` |
 | `GET` | `/v1/models/{id}` | single-model lookup |
-| `POST` | `/v1/chat/completions` | chat; priority + failover; streaming; parking; `reasoning: off\|on\|auto` |
+| `POST` | `/v1/chat/completions` | chat; scheduled dispatch + failover; streaming; parking; `reasoning: off\|on\|auto` |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
 | `POST` | `/v1/audio/speech` | TTS / voice cloning; same routing; binary audio passthrough (WAV …); `voice` + `params.ref_text` forward verbatim, per-alias voice defaults fill them in |
@@ -847,7 +870,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/health` | per-backend health/model/priority + busy/inflight + conflicts |
+| `GET` | `/health` | per-backend health/models/`paid`/tok-s + busy/inflight + conflicts |
 | `*` | `/ui/**` | the management console |
 
 Every proxied LLM response carries **`x-gateway-backend`** (which backend served

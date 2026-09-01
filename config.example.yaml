@@ -22,12 +22,12 @@ log_per_call: true
 # This makes the provider visible when the same model id exists on several
 # backends. The prefix is stripped again before forwarding. Both forms are
 # always accepted on input — a prefixed id routes to exactly that backend, a
-# bare id/alias still routes by priority. Set false for legacy bare listing.
+# bare id/alias goes through the scheduler. Set false for legacy bare listing.
 model_prefix: true
 
 # Max in-flight requests per backend before it's treated as "busy" and skipped
-# in priority routing — the request spills to the next backend in the list
-# instead of queueing/overloading a slow one. Missing/0 = unlimited (default).
+# by the scheduler — the request spills to another candidate instead of
+# queueing/overloading a slow one. Missing/0 = unlimited (default).
 # This global value applies to every backend that doesn't set its own
 # `max_concurrent` (see below). Busy backends are flagged on the routing tab.
 # max_concurrent: 1
@@ -54,6 +54,14 @@ model_prefix: true
 # before it's declared "no healthy backend"; a genuinely-offline alias still fails
 # after it (not the full park deadline).
 # park_health_grace_s: 90
+#
+# Scheduling: every request queues, and the fastest free UNPAID candidate takes it
+# (speed = measured tok/s per LLM backend, seconds per media alias+backend; never
+# measured = probed first). A backend that frees up prefers the oldest waiter of the
+# type it just ran, so the loaded model/workflow stays loaded. This may hold a queued
+# request back at most affinity_max_wait_s seconds; beyond that it is "overdue" and
+# the next free capable backend takes it, strictly oldest-first. Server tab too.
+# affinity_max_wait_s: 120
 
 # Optional call-stats sink: SQLite DB; the dashboard is built into the /ui console
 # (Statistic tab) — no separate server/port anymore. When enabled, every call is
@@ -67,8 +75,11 @@ stats:
   db_path: stats.db
   retention_days: 0   # 0 = keep forever; otherwise prune older rows hourly
 
-# Backends, in priority order (1 = preferred).
+# Backends. The list order is display order only — the scheduler decides who runs
+# what (see affinity_max_wait_s above).
 #   enabled: false  → fully out of rotation (no health-check, no routing)
+#   paid: true      → this backend costs money per request (cloud API); it is used
+#                     only when NO unpaid backend is free
 #   api_key         → sent as `Authorization: Bearer <key>` to this backend
 #                     (use for cloud APIs like together.ai, OpenAI, OpenRouter, …)
 #   max_concurrent  → per-backend in-flight cap; overrides the global one above.
@@ -77,31 +88,29 @@ stats:
 #                     cloud API that handles concurrency itself.
 #   local           → ALSO list this backend's models bare (without the
 #                     `<backend>/` prefix), alongside the prefixed id. A bare
-#                     request then routes by priority across every `local` backend
+#                     request then routes across every `local` backend
 #                     that serves it — same failover as a virtual alias. Does not
 #                     affect model_prefix; the prefixed id stays listed too.
 backends:
   - name: local-gpu
     url: http://192.168.1.10:8080      # e.g. llama-swap, llama.cpp server, vLLM, …
-    priority: 1
     max_concurrent: 1                   # single-slot llama.cpp → 1 request at a time
 
   - name: local-cpu
     url: http://192.168.1.11:8080
-    priority: 2
     max_concurrent: 1
     # enabled: false                    # set to take this backend out of rotation
 
   # - name: together                    # Cloud fallback (OpenAI-compatible)
   #   url: https://api.together.xyz
-  #   priority: 99
+  #   paid: true                        # only used when no unpaid backend is free
   #   api_key: "tgp_v1_…"               # https://api.together.xyz/settings/api-keys
   #   chat_only: true                   # skip image/video/embedding models
   #   serverless_only: true             # skip dedicated-endpoint-only models
 
   # - name: openrouter                  # Cloud fallback (OpenAI-compatible)
   #   url: https://openrouter.ai/api    # NOTE: /api only — the gateway appends /v1/…
-  #   priority: 98
+  #   paid: true                        # only used when no unpaid backend is free
   #   api_key: "sk-or-v1-…"             # https://openrouter.ai/settings/keys
   #   chat_only: true                   # drop image/audio-output-only models
   #   serverless_only: false            # keep :free models; true = paid-only
@@ -117,7 +126,7 @@ backends:
   #                                     # within hours)
   #   auth_mode: subscription           # subscription (OAuth setup-token) | api_key
   #   models: [claude-sonnet-5]         # fallback list if GET /v1/models is denied
-  #   priority: 1
+  #   paid: true                        # subscription/API cost → unpaid backends first
   #   # LICENCE: a Claude subscription covers YOUR use of Claude Code — not
   #   # re-serving Claude as an API to other clients or people. The gateway
   #   # enforces that: this backend never appears on /v1/chat/completions,
@@ -126,17 +135,12 @@ backends:
 # Virtual models — pseudo model names that map to real model IDs on backends.
 #   string  → same model on every backend
 #   dict    → per-backend mapping; backend keys without an entry are skipped.
-#             A backend's value is either:
-#               "model-id"                       → just the model name
-#               {model: "model-id", priority: N} → model name + a priority that
-#                                                   overrides the backend's global
-#                                                   priority *for this alias only*
+#             A backend's value is the model id to call there.
 #
-# Routing: when a request comes in for `model: "fast"`, the gateway walks backends in
-# priority order and picks the first one that (a) is healthy and (b) exposes the
-# mapped model. The remaining backends become fallback if the chosen one errors.
-# A per-alias `priority` reorders that walk for this alias; backends without an
-# override keep their global priority (same numeric scale as the backends list).
+# Routing: when a request comes in for `model: "fast"`, every backend that is healthy
+# and exposes the mapped model is a candidate; the request goes to the fastest free
+# unpaid one of them (queueing if all are busy). The rest become fallback if the
+# chosen one errors.
 virtual_models:
   "translator":  "Aya-Expanse-8B"        # same model on every backend
   "caption":     "llama-joycaption-beta-one"
@@ -147,15 +151,6 @@ virtual_models:
     local-gpu:   "Qwen3.5-9B"
     local-cpu:   "gemma-3-9b-it"
     # together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
-  # Per-alias priority override: prefer the CPU box for 'cheap', even though
-  # local-gpu has the higher global priority (1 vs 2) in the backends list.
-  "cheap":
-    local-cpu:
-      model:     "gemma-3-9b-it"
-      priority:  1
-    local-gpu:
-      model:     "Qwen3.5-9B"
-      priority:  2
 
 # ── Generation (image / video / TTS) — Phase 1 ────────────────────────────────
 # A ComfyUI backend speaks a different protocol than OpenAI, so it declares
@@ -167,18 +162,17 @@ virtual_models:
 #                       or /view read fails fast → failover, not a max_wait stall
 #   disconnect_grace  → seconds of continuous unreachability tolerated mid-run before
 #                       failing over to the next candidate (default 30)
-# (Backends still take `priority`, `enabled`, `max_concurrent` like any other.)
+# (Backends still take `paid`, `enabled`, `max_concurrent` like any other.)
 #
 #   - name: ct452-comfy
 #     type: comfyui
 #     url: http://192.168.1.20:8188
-#     priority: 1
 #     max_concurrent: 1               # one generation at a time on this GPU
 #     poll_interval: 1.0
 #     max_wait: 600
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
-# maps to an ORDERED list of candidates (first healthy + not-busy one is used;
+# maps to a list of candidates (the fastest free unpaid one is used;
 # cross-candidate failover + VRAM coordination come in later phases). A candidate
 # names the backend, the task, the workflow file (API-format JSON), and optionally
 # a model/checkpoint to inject into the workflow's loader node.
