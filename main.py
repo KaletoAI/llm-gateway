@@ -25,6 +25,7 @@ import admin
 import anthropic_bridge
 import jobs
 import reasoning
+import scheduler
 import stats
 import store
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
@@ -208,6 +209,28 @@ backend_tps: dict[str, float] = {}                             # bid → EWMA ou
 host_backends: dict[str, list] = {}                            # host → [bid, …] (rebuild_backends)
 hosts_meta: dict[str, dict] = {}                               # host → {label, avoid_llm_during_media, …}
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
+gen_speed: dict = {}                                           # "alias|bid" → EMA seconds of a successful media job
+backend_last_key: dict = {}                                    # bid → type key last DISPATCHED (media: alias, LLM: real model)
+
+
+def _note_gen_speed(alias: str, bid: str, seconds: float) -> None:
+    """Fold one successful media generation into the alias+backend duration EMA.
+    This is the media counterpart of _note_speed (tok/s): a mesh/image job has no
+    token count, so wall-clock seconds per job is the only comparable signal."""
+    if seconds <= 0:
+        return
+    k = f"{alias}|{bid}"
+    gen_speed[k] = scheduler.ema(gen_speed.get(k), seconds)
+
+
+def _gen_speed_of(alias: str):
+    """speed_of callable for scheduler.order_ready over media candidates: higher is
+    better, and an unmeasured backend sorts first (probe-once)."""
+    def speed(backend: dict, _cand) -> float:
+        s = gen_speed.get(f"{alias}|{backend_id(backend)}")
+        return float("inf") if s is None else 1.0 / max(s, 0.001)
+    return speed
+
 
 # ── Health / Discovery ────────────────────────────────────────────────────────
 
@@ -636,6 +659,18 @@ async def lifespan(app: FastAPI):
         stats.init(stats_cfg.get("db_path", "stats.db"), stats_cfg.get("blob_dir", "calls"))
         prune_task = asyncio.create_task(stats.prune_loop(stats_cfg.get("retention_days", 0)))
         logger.info("stats: recording on; dashboard at /ui → Statistic")
+        # Seed the media gen-speed EMA from history so a restart does not have to
+        # re-probe every backend once per alias. Best-effort: a missing/odd stats DB
+        # must never hold up the boot.
+        try:
+            for seed_alias, seed_bname, seed_avg_ms in stats.gen_speed_rows():
+                seed_b = next((b for b in backends if b["name"] == seed_bname
+                               and b.get("type") == "comfyui"), None)
+                if seed_b is not None and seed_avg_ms:
+                    gen_speed.setdefault(f"{seed_alias}|{backend_id(seed_b)}",
+                                         float(seed_avg_ms) / 1000.0)
+        except Exception as e:
+            logger.info(f"gen-speed seed skipped: {e}")
     # snapshot the restart-only server state actually in effect, so the UI can flag
     # when an edited setting needs a restart to apply.
     _server_runtime.update(
@@ -2306,7 +2341,7 @@ async def _unload_host_llms(backend: dict) -> None:
                 pass
 
 
-async def _run_job(job_id: str, candidates: list, build_req) -> None:
+async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None:
     """Run a generation job, failing over to the next candidate on connection-type
     errors. A backend with `self_retries: n` gets n extra attempts on ITSELF first
     (runbook B: for sporadic driver faults the same host is the cheapest second
@@ -2339,8 +2374,10 @@ async def _run_job(job_id: str, candidates: list, build_req) -> None:
                     await _unload_host_llms(backend)   # opt-in host policy, no-op by default
                     req = build_req(backend, cand)
                     req.slot_held = True               # we hold it — generate() must not double-count
+                    t0 = time.monotonic()
                     out = await adapter.generate(req)
                     _record_gen_attempt(bid, conn_fail=False)
+                    _note_gen_speed(alias, bid, time.monotonic() - t0)
                     meta = dict(out.meta or {})
                     if attempts > 1:
                         meta["attempts"] = attempts    # retries must stay visible (runbook B)
@@ -2627,8 +2664,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             for s1_attempt in range(1, s1_tries + 1):
                 gen_attempts += 1
                 try:
+                    t0 = time.monotonic()
                     out1 = await adapter.generate(req1)
                     _record_gen_attempt(bid, conn_fail=False)
+                    _note_gen_speed(alias, bid, time.monotonic() - t0)
                     break
                 except _GEN_FAILOVER_ERRORS as e:
                     if s1_attempt >= s1_tries:
@@ -2722,8 +2761,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
             await _unload_host_llms(backend2)
             gen_attempts += 1
+            t2 = time.monotonic()
             out2 = await adapter2.generate(req2)
             _record_gen_attempt(bid2, conn_fail=False)
+            _note_gen_speed(succ_alias, bid2, time.monotonic() - t2)
             blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
             meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
             if gen_attempts > 2:             # a clean chain is exactly 2 generate() calls
@@ -2823,7 +2864,7 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
             ready = [r for r in ready if r[0].get("name") in eligible]
             allc = [r for r in allc if r[0].get("name") in eligible]
         if ready:
-            await _run_job(job_id, ready, build_req)
+            await _run_job(job_id, alias, ready, build_req)
             return
         now = time.monotonic()
         if allc:                                 # candidates exist but are busy → keep parking
@@ -2998,10 +3039,10 @@ async def run_generation(body: dict, request: Request,
         await _run_gen_parked(job_id, alias, force, build_req, eligible)   # sync: block through the park
         return await _job_view(job_id, request)
     if mode == "async":
-        _spawn_gen(job_id, _run_job(job_id, routes, build_req))
+        _spawn_gen(job_id, _run_job(job_id, alias, routes, build_req))
         return {"job_id": job_id, "status": "queued"}
 
-    await _run_job(job_id, routes, build_req)      # sync: block until done/failed
+    await _run_job(job_id, alias, routes, build_req)      # sync: block until done/failed
     return await _job_view(job_id, request)
 
 

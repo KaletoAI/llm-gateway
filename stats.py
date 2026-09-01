@@ -100,6 +100,21 @@ def count_by_backend_since(ts: int) -> dict:
             _q("SELECT backend, COUNT(*) FROM calls WHERE ts > ? GROUP BY backend", ts)}
 
 
+def gen_speed_rows() -> list:
+    """(alias, backend, avg_duration_ms) of successful media calls — boot seed for
+    the scheduler's gen-speed EMA, so a fresh process routes on measured durations
+    instead of probing every backend once. `status` holds the HTTP code, so a
+    success is 200; the media endpoints are the two /…/generations paths plus the
+    image edit. Empty if stats are off."""
+    if _DB_PATH is None:
+        return []
+    return _q("SELECT alias, backend, AVG(duration_ms) FROM calls "
+              "WHERE status = 200 AND alias IS NOT NULL AND alias != '' "
+              "AND backend IS NOT NULL AND backend != '' "
+              "AND (endpoint LIKE '%/generations' OR endpoint = '/v1/images/edits') "
+              "GROUP BY alias, backend")
+
+
 def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 20,
             user: Optional[str] = None) -> dict:
     """Aggregated call stats for the in-UI dashboard (data only, no HTML). If
