@@ -136,6 +136,11 @@ def rebuild_backends() -> None:
         for b in store.list_backends():
             merged[backend_id(b)] = b      # store overrides config per (name, type)
     backends = sorted(merged.values(), key=lambda b: b.get("priority", _DEFAULT_PRIORITY))
+    for b in backends:
+        # Cost tier for the scheduler (spec 2026-09-01): a paid backend is a candidate
+        # only when no unpaid one is free. Normalized here — config and store entries
+        # may omit the key entirely.
+        b["paid"] = bool(b.get("paid"))
     backend_hosts = {backend_id(b): backend_host(b) for b in backends}
     host_backends = {}
     for bid, h in backend_hosts.items():
@@ -174,7 +179,7 @@ def rebuild_virtual_models() -> None:
     Also refreshes the per-alias park times, reasoning defaults, voice defaults
     and sampling defaults. Call after config reload or any store chat-alias
     change."""
-    global virtual_models, alias_park_s, alias_reasoning, alias_voice, alias_sampling, route_mode
+    global virtual_models, alias_park_s, alias_reasoning, alias_voice, alias_sampling
     merged = dict(config_virtual_models)
     if store.is_active():
         merged.update(store.list_chat_aliases())
@@ -186,10 +191,6 @@ def rebuild_virtual_models() -> None:
     alias_reasoning = store.get_alias_reasoning() if store.is_active() else {}
     alias_voice = store.get_alias_voice() if store.is_active() else {}
     alias_sampling = store.get_alias_sampling() if store.is_active() else {}
-    rm = dict(config.get("route_mode") or {}) if isinstance(config, dict) else {}
-    if store.is_active():
-        rm.update(store.get_route_mode())
-    route_mode = rm
     apply_voice_library()
     apply_reasoning_rules()                # refresh the store-backed reasoning rule cache
     rebuild_route_index()                  # alias mappings changed
@@ -256,7 +257,7 @@ def backend_auth_headers(backend: dict) -> dict:
 
 # ── In-flight cap / "busy" routing ─────────────────────────────────────────────
 # Per-backend live request counter. A backend at/above its `max_concurrent` cap is
-# "busy": priority routing skips it (spilling to the next backend) and the routing
+# "busy": routing skips it (spilling to the next backend) and the routing
 # dashboard flags it. Lets one slow llama.cpp box (--parallel 1) shed concurrent
 # load onto the rest of the fleet instead of queueing/overflowing.
 
@@ -297,9 +298,9 @@ def _inflight_dec(name: str) -> None:
 
 # ── Speed signal (throughput EWMA) ──────────────────────────────────────────────
 # Per-backend generation throughput in output tokens/sec, folded from each completed
-# call. Powers the opt-in `speed` routing mode (resolve_routes reorders ready
-# candidates fastest-first). Runtime-only — no persistence; unmeasured backends fall
-# back to priority order (sorted first so they get probed once, see resolve_routes).
+# call. This is the LLM speed signal of the unified scheduler: resolve_routes orders
+# ready candidates fastest-first within their cost tier. Runtime-only — no
+# persistence; unmeasured backends sort first so each gets probed once.
 _TPS_ALPHA = 0.3                        # EWMA weight of the newest sample (higher = more reactive)
 _TPS_MIN_TOKENS = 16                    # ignore tiny completions — fixed overhead dominates their tok/s
 
@@ -358,7 +359,6 @@ alias_park_s: dict = {}                 # alias → park seconds (config + store
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
 alias_voice: dict = {}                  # alias → {voice, ref_text} TTS defaults (store). Client wins.
 alias_sampling: dict = {}               # alias → {param: value} sampling defaults (store). Client wins.
-route_mode: dict = {}                   # routing key (alias OR bare model id) → "speed" (config+store); absent → priority
 voice_library: dict = {}                # name → {ref_text, file, remote, shipped} (store voice_library)
 _parked: list = []                     # ordered FIFO of live parked-call entries (rich, for the console)
 _park_seq: list = [0]
@@ -907,13 +907,15 @@ def alias_entry(alias: str, backend_name: str) -> tuple[Optional[str], Optional[
     """(real_model, priority_override) for this alias on this backend.
 
     real_model is None when the alias isn't mapped to this backend.
-    priority_override is None unless this alias sets one for this backend.
+    priority_override is parsed from the stored `{model, priority}` shape but is NOT
+    a routing input any more (spec 2026-09-01: unpaid-then-fastest ordering) — it is
+    only surfaced read-only by routing_snapshot.
 
     - alias not in virtual_models → (alias, None)         pass-through
     - alias maps to string         → (string, None)        same model everywhere
     - alias maps to dict, value …
         … string                   → (string, None)        per-backend model
-        … object {model, priority} → (model, priority)     model + per-alias prio
+        … object {model, priority} → (model, priority)     model + stored (unused) prio
     """
     mapping = virtual_models.get(alias)
     if mapping is None:
@@ -950,48 +952,38 @@ def split_backend_prefix(model: str) -> tuple[Optional[str], str]:
 
 # ── Route index (precomputed candidates; health/busy/drain stay live checks) ────
 # The static routing inputs — which enabled LLM backend maps an alias to which real
-# model at what effective priority, and which bare model ids pass through — change
-# only on config/store edits or a discovery model-set change. They are precomputed
-# here (pre-sorted by priority) instead of rescanned and re-sorted on every request;
-# resolve_routes() then only evaluates the live flags (healthy / busy / draining).
+# model, and which bare model ids pass through — change only on config/store edits or
+# a discovery model-set change. They are precomputed here instead of rescanned on
+# every request; resolve_routes() then only evaluates the live flags (healthy / busy /
+# draining) and applies the scheduler's ordering.
 # Rebuilt by rebuild_backends() / rebuild_virtual_models() and by refresh_backend()
 # whenever a backend's model set changes. Swapped atomically (built local, then
 # assigned) — safe for the off-loop readers (get_gen_routes runs in a thread).
 _backend_names: set = set()            # all backend names — split_backend_prefix test
-_llm_backends: list = []               # enabled non-ComfyUI backends, priority order
+_llm_backends: list = []               # enabled non-ComfyUI backends
 _comfy_backends: list = []             # enabled ComfyUI backends (generation routing)
-_route_index: dict = {}                # alias/model-id → [(backend, real_model)] pre-sorted
-# Routing keys whose ready-candidates sort fastest-first (speed mode). Precomputed here so
-# resolve_routes only does an O(1) membership test. Union of: explicit per-key speed
-# (route_mode "speed" — aliases and bare ids) and every bare model id served by a backend
-# with the per-backend `route_speed` flag. Aliases are governed by route_mode ONLY — the
-# backend flag never leaks into alias routing (the `mid not in virtual_models` guard below).
-_speed_keys: set = set()
+_route_index: dict = {}                # alias/model-id → [(backend, real_model)] candidates
 
 
 def rebuild_route_index() -> None:
-    global _backend_names, _llm_backends, _comfy_backends, _route_index, _speed_keys
+    """Recompute the per-key candidate lists. The index no longer sorts: dispatch
+    order is decided per request by the scheduler (unpaid before paid, then fastest
+    first), so candidates keep their insertion order as the stable tiebreak."""
+    global _backend_names, _llm_backends, _comfy_backends, _route_index
     _backend_names = {b["name"] for b in backends}
     _llm_backends = [b for b in enabled_backends() if b.get("type", "openai") != "comfyui"]
     _comfy_backends = [b for b in enabled_backends() if b.get("type") == "comfyui"]
     index: dict[str, list] = {}
-    speed_keys = {k for k, v in route_mode.items() if v == "speed"}   # explicit per-key overrides
     for alias in virtual_models:                       # aliases (they shadow same-named real ids)
         for b in _llm_backends:
-            real, prio = alias_entry(alias, b["name"])
+            real, _prio = alias_entry(alias, b["name"])
             if real is not None and real in backend_models.get(backend_id(b), set()):
-                index.setdefault(alias, []).append(
-                    (prio if prio is not None else b["priority"], b, real))
+                index.setdefault(alias, []).append((b, real))
     for b in _llm_backends:                            # bare model ids → pass-through routing
-        speed_backend = bool(b.get("route_speed"))     # whole-backend speed switch (bare ids only)
         for mid in backend_models.get(backend_id(b), set()):
             if mid not in virtual_models:
-                index.setdefault(mid, []).append((b["priority"], b, mid))
-                if speed_backend:
-                    speed_keys.add(mid)
-    _route_index = {k: [(b, r) for _, b, r in sorted(rows, key=lambda x: x[0])]
-                    for k, rows in index.items()}
-    _speed_keys = speed_keys
+                index.setdefault(mid, []).append((b, mid))
+    _route_index = index
 
 
 def serves_path(backend: dict, path: str) -> bool:
@@ -1017,13 +1009,15 @@ def serves_path(backend: dict, path: str) -> bool:
 
 
 def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list, list]:
-    """(ready, busy) (backend, real_model) candidate lists, each in priority order.
+    """(ready, busy) (backend, real_model) candidate lists.
 
-    `ready` is routable now; `busy` maps + serves the alias but sits at its
-    in-flight cap (→ parkable). A '<backend>/<model>' alias resolves to a single
-    backend in whichever bucket. Drives both normal routing (ready) and call
-    parking (busy). Candidates come pre-resolved and pre-sorted from
-    `_route_index`; only healthy/busy/draining — and the endpoint a backend is
+    `ready` is routable now and comes back in DISPATCH order: unpaid backends before
+    paid ones, fastest (measured tok/s) first inside each tier, unmeasured backends
+    first so each gets probed once — then the shared-GPU demotion on top. `busy` maps
+    + serves the alias but sits at its in-flight cap (→ parkable). A
+    '<backend>/<model>' alias resolves to a single backend in whichever bucket. Drives
+    both normal routing (ready) and call parking (busy). Candidates come pre-resolved
+    from `_route_index`; only healthy/busy/draining — and the endpoint a backend is
     allowed to serve (`serves_path`) — are evaluated per request.
     """
     bname, bare = split_backend_prefix(alias)
@@ -1048,16 +1042,16 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
             continue
         (busy if backend_busy(b) else ready).append((b, real))
     if len(ready) > 1:
-        # Speed routing (opt-in per alias / bare model id / whole backend via route_speed):
-        # reorder ready candidates fastest-first by measured throughput. Unmeasured backends
-        # sort FIRST (inf) so each is probed once; priority is the stable tiebreak (ready came
-        # pre-sorted). Cold start (all unmeasured) ⇒ identical to priority routing. `_speed_keys`
-        # is precomputed in rebuild_route_index (explicit route_mode ∪ route_speed backends).
-        if alias in _speed_keys:
-            ready.sort(key=lambda br: -backend_tps.get(backend_id(br[0]), float("inf")))
+        # Unified scheduling (spec 2026-09-01): unpaid before paid, then fastest
+        # first by measured tok/s; unmeasured backends sort first so each gets
+        # probed once. Priority and the per-key speed switch are gone.
+        ready = scheduler.order_ready(
+            ready,
+            lambda b, real: backend_tps.get(backend_id(b), float("inf")),
+            lambda b: bool(b.get("paid")))
         # Shared-GPU consideration: candidates whose host is generating media go
-        # LAST (stable — priority/speed order kept within both groups), never dropped.
-        # Runs after the speed sort so the shared-GPU guarantee stays dominant.
+        # LAST (stable — the scheduler order is kept within both groups), never
+        # dropped. Runs after the sort so the shared-GPU guarantee stays dominant.
         mb = _media_busy_hosts()
         if mb:
             ready.sort(key=lambda br: backend_hosts.get(backend_id(br[0]), "") in mb)
@@ -1065,8 +1059,8 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
 
 
 def get_routes_for(alias: str) -> list[tuple[dict, str]]:
-    """(backend, real_model) pairs to try, in priority order — ready (non-busy)
-    backends only. Thin wrapper over resolve_routes() preserving prior behaviour."""
+    """(backend, real_model) pairs to try, in dispatch order (see resolve_routes) —
+    ready (non-busy) backends only. Thin wrapper over resolve_routes()."""
     return resolve_routes(alias)[0]
 
 
@@ -1154,7 +1148,7 @@ def routing_snapshot() -> dict:
                 "healthy": healthy,
                 "busy": healthy and backend_busy(b),
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
-                "route_speed": bool(b.get("route_speed")),
+                "paid": bool(b.get("paid")),
             })
     models = []
     for mid, hosts in sorted(model_hosts.items(), key=lambda kv: kv[0].lower()):
@@ -1563,6 +1557,9 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
                 body=cand_body, raw=request, stream=bool(body.get("stream")),
                 stats_endpoint=stats_endpoint, reasoning=body.get("_reasoning"),
             )
+            # Type affinity (spec 2026-09-01): remember what this backend last ran, so
+            # a freed backend prefers a waiter needing the same model (no reload).
+            backend_last_key[backend_id(backend)] = real_model
             resp = await adapter.dispatch(req)
             # A backend answered — the adapter has written (or will write) the stats
             # row, so the error handler must not add a second one for this request.
@@ -3463,7 +3460,7 @@ def gateway_info() -> dict:
             "models": len(backend_models.get(backend_id(b), set())), "url": b["url"],
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
-            "local": bool(b.get("local")), "route_speed": bool(b.get("route_speed")),
+            "local": bool(b.get("local")), "paid": bool(b.get("paid")),
             "sampling_defaults": b.get("sampling_defaults") or None,
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
@@ -3529,7 +3526,7 @@ def set_backend_enabled(bid: str, on: bool) -> bool:
     entry = dict(store.get_backend(b["name"], b.get("type", "openai")) or
                  {k: b[k] for k in ("name", "type", "url", "priority", "max_concurrent",
                                     "api_key", "chat_only", "serverless_only", "local",
-                                    "route_speed") if k in b})
+                                    "paid") if k in b})
     entry.update({"name": b["name"], "type": b.get("type", "openai"), "enabled": bool(on)})
     store.upsert_backend(entry)
     logger.info(f"[{b['name']}] {'enabled' if on else 'disabled'} via console")
@@ -3712,9 +3709,8 @@ async def health():
                 "busy": is_enabled(b) and backend_busy(b),
                 "inflight": backend_inflight.get(backend_id(b), 0),
                 "max_concurrent": backend_max_concurrent(b),
-                "priority": b["priority"],
+                "paid": bool(b.get("paid")),
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
-                "route_speed": bool(b.get("route_speed")),
                 "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
                 **_comfy_watch_info(b),
