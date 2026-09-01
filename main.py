@@ -1637,8 +1637,12 @@ def _designated_index(entry, ready) -> Optional[int]:
     again when every ready backend is somebody else's (the rightful waiter claims it on
     the same broadcast wake). A lone waiter always passes.
 
-    Every ready backend has exactly one designated taker, and that taker has the backend
-    in its own ready list — so whenever a backend is free at least one waiter proceeds.
+    Every ready backend has exactly one designated taker among the WAITING pool, and that
+    taker has the backend in its own ready list — so on every wake at least one waiter
+    proceeds while a backend is free. A designation is never left behind by an entry that
+    stopped waiting: claiming a backend and leaving the queue (dispatch, timeout, cancel)
+    both drop the entry out of the pool and re-broadcast, so the rest re-evaluate at once
+    (see `_park_and_dispatch`).
     """
     if not ready:
         return None
@@ -1667,6 +1671,11 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
             i = _designated_index(entry, ready)
             if i is not None:
                 entry["claimed"] = True    # out of the waiting pool (see _designated_index)
+                # We hold a designation no more: let the rest re-evaluate the backends we
+                # are NOT taking. They only resume once we await below, by which time our
+                # own candidate is in-flight (no double claim) — and re-checking is free,
+                # the loop arms its event before looking.
+                _notify_slot_free()
                 # Try the designated candidate first, the rest stay as failover tail.
                 cands = [ready[i]] + ready[:i] + ready[i + 1:]
                 return await _dispatch_over(cands, path, alias, body, request, stats_endpoint=stats_endpoint)
@@ -1686,6 +1695,10 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
             _parked.remove(entry)
         except ValueError:
             pass
+        if _parked:
+            # Leaving the queue — dispatched, timed out or cancelled — releases whatever
+            # this entry was designated for, so the remaining waiters must look again.
+            _notify_slot_free()
 
 
 def _apply_alias_sampling(alias: str, body: dict) -> None:
