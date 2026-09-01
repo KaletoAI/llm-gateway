@@ -105,6 +105,17 @@ hot-reload-safe.
   `_HOP_BY_HOP` drops `x-api-key` alongside `authorization` — both are GATEWAY
   credentials (Claude Code sends the former), and forwarding either would hand the
   caller's key to the backend.
+  Going the other way, every response builder keeps only its OWN headers
+  (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
+  `content-length` would describe a body the gateway re-serializes — with ONE
+  exception: `_ratelimit_headers()` carries the upstream's `retry-after` through,
+  because that header is not diagnostics but an instruction to the caller. It is
+  merged in at all four places that rebuild a response from an upstream one
+  (`_dispatch_once`, both stream error paths, `_anthropic_error`), covered by
+  `test_ratelimit_headers.py`. Dropping it fails silently — the client still gets
+  its 429 and just retries blind: measured 2026-09-01 on prod, one Claude Code
+  request became ~10 upstream calls in 20 s against `api.anthropic.com`, which had
+  said exactly how long to wait.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
   sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the

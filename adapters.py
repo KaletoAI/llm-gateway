@@ -487,11 +487,30 @@ _ANTHROPIC_ERROR_TYPE = {400: "invalid_request_error", 401: "authentication_erro
                          529: "overloaded_error"}
 
 
+def _ratelimit_headers(headers) -> dict:
+    """The upstream's `retry-after`, lowercased — the ONE response header of a
+    backend error that is not diagnostics but an instruction to the caller.
+
+    Everything else a backend sends is either the gateway's own business or
+    describes a body the gateway is about to re-serialize (`content-length`), so
+    the response builders below keep only `x-gateway*`/`x-reasoning*`. Dropping
+    this one with them is silent: the client still gets its 429 and simply retries
+    on a blind 1-2-4-8 s backoff. Measured 2026-09-01 on prod — one Claude Code
+    request turned into ~10 upstream calls inside 20 s, against a rate limit that
+    had told the gateway exactly how long to wait."""
+    val = None
+    for k, v in (headers or {}).items():
+        if k.lower() == "retry-after":
+            val = v
+    return {"retry-after": val} if val else {}
+
+
 def _anthropic_error(status: int, etype: str, message: str, headers=None) -> JSONResponse:
     """An error in the shape Claude Code expects — it parses `error.message` and
     shows it; an OpenAI-shaped error body would surface as an unhelpful blank."""
     keep = {k: v for k, v in (headers or {}).items()
             if k.lower().startswith(("x-gateway", "x-reasoning"))}
+    keep.update(_ratelimit_headers(headers))
     return JSONResponse({"type": "error", "error": {"type": etype, "message": message[:2000]}},
                         status_code=status, headers=keep)
 
@@ -764,7 +783,7 @@ class OpenAIAdapter(BackendAdapter):
                          response_text=err.decode("utf-8", "ignore"))
             return Response(content=err, status_code=resp.status_code,
                             media_type=resp.headers.get("content-type"),
-                            headers=call.rheaders)
+                            headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
         async def generate():
             try:
@@ -819,7 +838,7 @@ class OpenAIAdapter(BackendAdapter):
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
         out = Response(resp.content, status_code=resp.status_code,
                        media_type=resp.headers.get("content-type", "application/json"),
-                       headers=call.rheaders)
+                       headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
         out.parsed_json = resp_json    # internal callers (Responses bridge) reuse this — no re-parse
         return out
 
@@ -961,7 +980,8 @@ class AnthropicAdapter(OpenAIAdapter):
             self._record(req, call, resp.status_code, 0, 0,
                          response_text=err.decode("utf-8", "ignore"))
             return Response(content=err, status_code=resp.status_code,
-                            media_type=resp.headers.get("content-type"), headers=call.rheaders)
+                            media_type=resp.headers.get("content-type"),
+                            headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
         counted = {"in": 0, "out": 0, "read": 0, "write": 0, "text": []}
 
