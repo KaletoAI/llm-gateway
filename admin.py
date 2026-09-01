@@ -4245,6 +4245,71 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     return out + _FBX_VIEWER_JS if has_fbx else out
 
 
+def _stage2_section(s2: dict) -> str:
+    """The chain hand-off, for the job view: what stage 2 was actually HANDED and which
+    of it the successor mapped. Stage-1 params are threaded to the successor by mapping
+    LABEL, and `_apply_mapping` silently skips a name the successor does not bind — so a
+    param that never arrives (a renamed label on either side) is invisible in the result
+    and used to be answerable only from the backend's own ComfyUI history.
+
+    `s2` is recorded at run time by `_run_chain` (meta.chain_stage2); only the node/field
+    DETAIL is looked up in the alias config live, and marked as such — the mapping may
+    have changed since the run. `applied` is absent when stage 2 never reported back
+    (a failed hand-off); the rows then say what the CURRENT config would bind, and say so."""
+    alias2, b2 = s2.get("alias") or "?", s2.get("backend") or "?"
+    params = s2.get("params") or {}
+    mesh_param = s2.get("mesh_param") or ""
+    applied = s2.get("applied")               # None → stage 2 never got that far
+    mapping2 = {}
+    if store.is_active():
+        cs = store.get(alias2) or []
+        c2 = next((x for x in cs if x.get("backend") == b2), cs[0] if cs else None) or {}
+        mapping2 = c2.get("mapping") or {}
+
+    def target(k):                            # (node, field) the successor binds `k` to, per CURRENT config
+        for p, m in mapping2.items():
+            m = m or {}
+            if p == k or ((m.get("label") or "").strip() == k):
+                return str(m.get("node")), str(m.get("field") or "")
+        return None, None
+
+    rows, n_app, n_drop = [], 0, 0
+    for k, v in params.items():
+        if k == mesh_param:                   # the mesh itself gets its own line below
+            continue
+        node, field = target(k)
+        if applied is None:                   # unverified: describe the binding, don't claim it ran
+            hit = node is not None
+            tag = (f"<span class='muted' title='from the successor alias config as it "
+                   f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if hit else
+                   "<span class='muted'>not mapped by successor</span>")
+        else:
+            hit = k in applied
+            # node None while applied says otherwise = the mapping moved since the run;
+            # still say "applied", never leave the cell blank.
+            tag = ((f"<span class='muted' title='from the successor alias config as it "
+                    f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if node else
+                    "<span class='muted'>applied</span>")
+                   if hit else "<span class='muted'>dropped · not mapped by successor</span>")
+        n_app, n_drop = (n_app + 1, n_drop) if hit else (n_app, n_drop + 1)
+        s = "" if hit else " style='text-decoration:line-through;opacity:.55'"
+        rows.append(f"<tr><td{s}><code>{_esc(k)}</code></td><td{s}>{_esc(str(v))}</td>"
+                    f"<td>{tag}</td></tr>")
+    verb = "applied" if applied is not None else "mapped"
+    tally = (f"{len(rows)} param(s) handed · {n_app} {verb} · {n_drop} dropped"
+             if rows else "no params handed besides the mesh")
+    warn = ("" if applied is not None else
+            " <span class='bad'>· stage 2 did not report back — bindings shown are from "
+            "the current alias config</span>")
+    mesh = (f"<p style='margin:6px 0'><code>{_esc(mesh_param)}</code> "
+            f"<span class='muted'>← the relayed mesh</span><br>"
+            f"<code style='font-size:12px'>{_esc(str(s2.get('mesh_ref') or ''))}</code></p>")
+    tbl = f"<table>{''.join(rows)}</table>" if rows else ""
+    return (f"<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2 · "
+            f"{_esc(alias2)} · {_esc(b2)} · {_esc(s2.get('relay') or 'path')} hand-off</span></h3>"
+            f"<p class='hint' style='margin:2px 0 8px'>{tally}{warn}</p>{mesh}{tbl}")
+
+
 async def job_detail_page(job_id: str, request: Request):
     """Input (prompt/params/reference images) + output artifacts of one job."""
     if not jobs.is_active():
@@ -4330,6 +4395,13 @@ async def job_detail_page(job_id: str, request: Request):
                   f"<ul class='muted' style='margin:4px 0 0 18px;font-size:12px'>{ids}</ul>")
     if not inbox:
         inbox = "<p class='muted'>No stored inputs (job predates this feature).</p>"
+    # Chain hand-off: what stage 2 was handed. Recorded per run; a job from before that
+    # says so rather than being reconstructed from today's config, which may have moved.
+    if meta.get("chain_stage2"):
+        inbox += _stage2_section(meta["chain_stage2"])
+    elif meta.get("chain") or cand.get("successor"):
+        inbox += ("<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2</span></h3>"
+                  "<p class='muted'>Hand-off params not recorded (job predates this feature).</p>")
     if st in ("queued", "running"):
         outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
     elif st == "failed":

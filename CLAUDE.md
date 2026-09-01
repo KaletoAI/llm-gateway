@@ -308,6 +308,15 @@ hot-reload-safe.
   successor's mapping (param or label) and the mesh extension honors pins/mapped
   params on the export node's `file_format`. The job row's `backend` is re-pointed
   at claim and hand-off (`jobs.set_backend`) so cancel interrupts the LIVE backend.
+  Stage-1 params are threaded to the successor by mapping **label** (never the raw
+  node-based name), and `_apply_mapping` SILENTLY skips a name the successor does not
+  bind — so what stage 2 was handed is recorded on the job (`meta.chain_stage2`:
+  alias/backend/relay/mesh_param/mesh_ref/params, plus stage 2's `applied` on success)
+  and rendered by `admin._stage2_section` as handed / applied / dropped. Recorded at
+  run time, never re-derived from config (the mapping may have moved since); written
+  into `jobs.complete`'s meta AND, via `fail_meta()`, onto a failed row — a stage-2
+  failure is when the hand-off matters most. Without it, "did my param reach the
+  rigger?" was only answerable from the backend's own ComfyUI history.
   Chain stages run with `slot_held` (the chain claims the one slot itself — no
   double count). Two hand-offs:
   `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot

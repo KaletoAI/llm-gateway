@@ -2680,6 +2680,16 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         s2, why = await stage2_for(backend)
         return s2, outdir, why
 
+    def fail_meta() -> Optional[dict]:
+        """Extra meta for a chain `jobs.fail`. A stage-2 failure is exactly when the
+        hand-off matters most, so what stage 2 was handed is kept on the failed row too
+        (`jobs.fail` merges; `complete`'s _mark_done rewrites, hence the explicit key
+        there). `s2_info` is None until the hand-off, so a stage-1 failure carries only
+        the attempt count, as before."""
+        m = {**({"attempts": gen_attempts} if gen_attempts > 2 else {}),
+             **({"chain_stage2": s2_info} if s2_info else {})}
+        return m or None
+
     deadline = time.monotonic() + async_park_timeout_s
     tried: set = set()                       # stage-1 backends that failed with a connection error
     skip_reason = None
@@ -2833,6 +2843,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             held = bid
             active = backend
             s1_done = False                             # mesh in hand → stage-2 errors are final
+            s2_info = None                              # what stage 2 was actually handed (job view)
             await asyncio.to_thread(jobs.set_status, job_id, "running")
             await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
             await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
@@ -2942,6 +2953,14 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 label_of = {p: (((m or {}).get("label") or "").strip() or p) for p, m in s1_map.items()}
                 s2_params = {label_of.get(k, k): v for k, v in params.items()}
                 s2_params[mesh_param] = mesh_ref
+                # What stage 2 was HANDED, recorded for the job view — the threading is
+                # label-keyed and a successor silently ignores what it doesn't map, so
+                # "did my param reach the rigger?" is otherwise only answerable from the
+                # backend's own ComfyUI history. Recorded, never re-derived from config:
+                # the alias mapping may have changed since the run. `applied` (what the
+                # successor actually mapped) is filled in from out2 below.
+                s2_info = {"alias": succ_alias, "backend": backend2["name"], "relay": relay,
+                           "mesh_param": mesh_param, "mesh_ref": mesh_ref, "params": s2_params}
                 req2 = NormalizedRequest(
                     alias=succ_alias, real_model=s2.get("model"),
                     task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
@@ -2962,7 +2981,12 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 _record_gen_attempt(bid2, conn_fail=False)
                 _note_gen_speed(succ_alias, bid2, time.monotonic() - t2)
                 blobs = list(out2.blobs) + mesh_extras       # successor result + kept mesh-stage files
-                meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias]}
+                # out2.meta["applied"] is STAGE 2's applied set (the merge below makes it the
+                # row's top-level one); copied in here so the job view can mark each handed
+                # param as applied-or-dropped without guessing which stage it came from.
+                s2_info["applied"] = list(out2.meta.get("applied") or [])
+                meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias],
+                        "chain_stage2": s2_info}
                 if gen_attempts > 2:             # a clean chain is exactly 2 generate() calls
                     meta["attempts"] = gen_attempts
                 if cross:
@@ -2986,8 +3010,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 _record_gen_attempt(backend_id(active), conn_fail=True)
                 if s1_done:                              # mesh already relayed — a stage-2 loss is final
                     logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-                    await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
-                                            {"attempts": gen_attempts} if gen_attempts > 2 else None)
+                    await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}", fail_meta())
                     asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                     return
                 logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
@@ -2997,8 +3020,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 continue
             except Exception as e:
                 logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}",
-                                        {"attempts": gen_attempts} if gen_attempts > 2 else None)
+                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}", fail_meta())
                 asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                 return
             finally:
