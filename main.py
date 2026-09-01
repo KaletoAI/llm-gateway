@@ -2202,9 +2202,18 @@ def _force_filter(routes: list, force: str) -> list:
 
 def _entry_can_use(entry: dict, backend: dict) -> bool:
     """May this waiting generation job run on `backend` right now? Mirrors the filters
-    the job applies in its own poll: force pin, LoRA eligibility, and the alias
-    actually routing to this backend while it is free. Blocking (store read via
-    _gen_routes) — call via asyncio.to_thread from async code."""
+    the job applies in its own poll: its own `exclude` list, the force pin, LoRA
+    eligibility, and the alias actually routing to this backend while it is free.
+
+    `exclude` (backend NAMES) is how a waiter declares a candidate it would refuse for
+    a reason the routing tables cannot show — the chain maintains it from its per-pass
+    `usable()` verdicts and its `tried` failover set. Without it a chain could be
+    designated for a backend it will never claim and, once overdue, hold that idle
+    backend against every other waiter until its own park deadline.
+
+    Blocking (store read via _gen_routes) — call via asyncio.to_thread from async code."""
+    if backend.get("name") in (entry.get("exclude") or ()):
+        return False
     if entry.get("force") and backend.get("name") != entry["force"]:
         return False
     if entry.get("eligible") is not None and backend.get("name") not in entry["eligible"]:
@@ -2250,10 +2259,14 @@ def _may_claim_gen(entry: dict, backend: dict) -> bool:
 
 def _designated_gen_index(entry: dict, ready: list) -> Optional[int]:
     """Index in `ready` of the best candidate this waiting job may claim now, or None
-    (→ keep parking). All ready candidates are scanned, not just the best one: every
-    free backend has exactly one designated taker among the waiting jobs, and that
-    taker has the backend in its own ready list, so scanning guarantees that at least
-    one waiter proceeds while a backend is free. Blocking — via asyncio.to_thread."""
+    (→ keep parking). All ready candidates are scanned, not just the best one, and that
+    is what guarantees progress: every free backend has exactly one designated taker
+    among the waiting jobs; `_entry_can_use` rejects every backend a waiter would
+    refuse (`exclude`, force pin, LoRA eligibility, routability), so the taker really
+    can claim it, and it has the backend in its own ready list — hence on every poll at
+    least one waiter proceeds while a backend is free. The chain rebuilds its `exclude`
+    set once per pass, so a designation it cannot honour is released within one 2 s
+    poll. Blocking — via asyncio.to_thread."""
     for i, (b, _cand) in enumerate(ready):
         if _may_claim_gen(entry, b):
             return i
@@ -2712,15 +2725,27 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             # and is OURS to claim — a free backend the media queue designates for another
             # waiter is left to it (type affinity), exactly like for a plain parked job.
             picked = None
+            # Backends this chain would refuse — the failover set plus everything
+            # usable() rejects this pass. Published on the queue entry so the scheduler
+            # never designates one of them for us and leaves it idle for the others.
+            # EVERY ready candidate is judged, not just up to the pick: we may still
+            # end up parking (unhealthy successor, lost busy-race) with the pick in
+            # hand, and an unjudged free backend would stay designated for us
+            # throughout that wait.
+            rejected = set(tried)
             for backend, cand in ready:
                 s2p, outdir, why = await usable(backend)
                 if why:
-                    skip_reason = why
+                    rejected.add(backend["name"])
+                    if picked is None:
+                        skip_reason = why        # first-pick reporting, unchanged
                     continue
+                if picked is not None:
+                    continue                     # picked already — only completing `rejected`
                 if not await asyncio.to_thread(_may_claim_gen, entry, backend):
                     continue                     # another waiter is designated for it
                 picked = (backend, cand, s2p, outdir)
-                break
+            entry["exclude"] = set(rejected)
             if picked is None:
                 # nothing ready is usable — park while a usable candidate is merely busy
                 waitable = False
@@ -2730,6 +2755,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                         waitable = True
                         break
                     skip_reason = why
+                    rejected.add(backend["name"])
+                entry["exclude"] = set(rejected)
                 if not waitable:
                     await asyncio.to_thread(jobs.fail, job_id,
                                             skip_reason or f"chain: no usable backend for '{alias}'")
