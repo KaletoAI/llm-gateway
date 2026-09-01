@@ -172,6 +172,28 @@ def median_duration(alias: str, backend: Optional[str] = None, limit: int = 10) 
     return float(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2)
 
 
+def gen_speed_rows() -> list:
+    """(alias, backend, avg_duration_ms) over all DONE jobs — boot seed for the
+    scheduler's gen-speed EMA, so a restart routes on measured durations instead of
+    probing every backend once per alias. The job store is the only place media
+    runtimes are kept (stats.calls never sees a ComfyUI generation).
+
+    Accepted skew, no action: a chain job counts both stages under its stage-1 alias,
+    and a job's parked wait time sits inside created→updated. Both make the seed
+    pessimistic, and the EMA (alpha 0.3) corrects it within a few real jobs.
+    Empty if the job store is off."""
+    if not _active:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT alias, backend, AVG((updated - created) * 1000.0) FROM jobs "
+            f"WHERE status = 'done' AND task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))}) "
+            "AND alias IS NOT NULL AND alias != '' "
+            "AND backend IS NOT NULL AND backend != '' "
+            "GROUP BY alias, backend", _NON_MEDIA_TASKS).fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
 def neighbors(job_id: str, media_only: bool = True) -> tuple:
     """(newer_id, older_id) around a job in the media list's created-DESC order
     (rowid tiebreak) — drives the detail page's prev/next navigation. None at the

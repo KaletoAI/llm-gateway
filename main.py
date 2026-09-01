@@ -645,6 +645,18 @@ async def lifespan(app: FastAPI):
                   jobs_cfg.get("blob_dir", "jobs"),
                   jobs_cfg.get("default_ttl_s", 86400))
         jobs_prune_task = asyncio.create_task(jobs.prune_loop(jobs_cfg.get("prune_interval_s", 3600)))
+        # Seed the media gen-speed EMA from the job store so a restart does not have
+        # to re-probe every backend once per alias. Best-effort: a missing/odd jobs DB
+        # must never hold up the boot.
+        try:
+            for seed_alias, seed_bname, seed_avg_ms in jobs.gen_speed_rows():
+                seed_b = next((b for b in backends if b["name"] == seed_bname
+                               and b.get("type") == "comfyui"), None)
+                if seed_b is not None and seed_avg_ms:
+                    gen_speed.setdefault(f"{seed_alias}|{backend_id(seed_b)}",
+                                         float(seed_avg_ms) / 1000.0)
+        except Exception as e:
+            logger.info(f"gen-speed seed skipped: {e}")
 
     log_config_summary()
     await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
@@ -659,18 +671,6 @@ async def lifespan(app: FastAPI):
         stats.init(stats_cfg.get("db_path", "stats.db"), stats_cfg.get("blob_dir", "calls"))
         prune_task = asyncio.create_task(stats.prune_loop(stats_cfg.get("retention_days", 0)))
         logger.info("stats: recording on; dashboard at /ui → Statistic")
-        # Seed the media gen-speed EMA from history so a restart does not have to
-        # re-probe every backend once per alias. Best-effort: a missing/odd stats DB
-        # must never hold up the boot.
-        try:
-            for seed_alias, seed_bname, seed_avg_ms in stats.gen_speed_rows():
-                seed_b = next((b for b in backends if b["name"] == seed_bname
-                               and b.get("type") == "comfyui"), None)
-                if seed_b is not None and seed_avg_ms:
-                    gen_speed.setdefault(f"{seed_alias}|{backend_id(seed_b)}",
-                                         float(seed_avg_ms) / 1000.0)
-        except Exception as e:
-            logger.info(f"gen-speed seed skipped: {e}")
     # snapshot the restart-only server state actually in effect, so the UI can flag
     # when an edited setting needs a restart to apply.
     _server_runtime.update(
