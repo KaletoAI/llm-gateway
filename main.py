@@ -355,6 +355,12 @@ async_park_timeout_s: float = 600.0
 # ~30 s) without hanging a genuinely-offline alias to the full park deadline.
 park_health_grace_s: float = 90.0
 max_parked: int = 100
+# Freed-backend type affinity (spec 2026-09-01): a woken parked call claims a freed
+# backend only if the scheduler designates IT for that backend, so a backend prefers a
+# waiter that needs the model it just ran (no reload). The affinity may hold a queued
+# call back at most this long — beyond it the call counts as overdue and is served
+# strictly oldest-first by the next free backend that can run it.
+affinity_max_wait_s: float = 120.0
 alias_park_s: dict = {}                 # alias → park seconds (config + store); absent → default, 0 → off
 alias_reasoning: dict = {}              # alias → "off"|"on" default (store); absent → auto. Client wins.
 alias_voice: dict = {}                  # alias → {voice, ref_text} TTS defaults (store). Client wins.
@@ -1577,20 +1583,61 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
     raise HTTPException(503, f"All backends failed: {last_error}")
 
 
+def _designated_index(entry, ready) -> Optional[int]:
+    """Index in `ready` of the best candidate this parked call may claim now, or None.
+
+    Type affinity (spec 2026-09-01, "Designated taker"): a freed backend belongs to the
+    waiter `scheduler.designated_taker` picks for it over the whole park queue — overdue
+    oldest, else the one needing the model the backend last ran, else the oldest it can
+    serve. A woken entry therefore dispatches to the best ready candidate it is
+    designated for, and parks again when every ready backend is somebody else's (the
+    rightful waiter claims it on the same broadcast wake). A lone waiter always passes.
+
+    Every ready backend has exactly one designated taker, and that taker has the backend
+    in its own ready list — so whenever a backend is free at least one waiter proceeds.
+    """
+    if not ready:
+        return None
+    # Snapshot (`_parked` mutates across awaits) minus the entries that already claimed a
+    # backend: a claimant stays in `_parked` until its response is done, but it is no
+    # longer waiting and must not shadow the others out of a second free backend.
+    pool = [e for e in _parked if not e.get("claimed")]
+    if len(pool) <= 1:                       # only us waiting → nothing to yield to
+        return 0
+    now = time.monotonic()
+    for i, (b, _real) in enumerate(ready):
+        bid, bname = backend_id(b), b["name"]
+        chosen = scheduler.designated_taker(
+            pool,
+            can_serve=lambda e: any(backend_id(rb) == bid for rb, _ in
+                                    resolve_routes(e["alias"], e["path"])[0]),
+            type_key=lambda e: alias_entry(e["alias"], bname)[0] or e["alias"],
+            last_key=backend_last_key.get(bid),
+            now=now, max_wait_s=affinity_max_wait_s)
+        if chosen is entry:
+            return i
+    return None
+
+
 async def _park_and_dispatch(alias, path, body, request, deadline, source="?", stats_endpoint=None):
     """Hold a request in the park queue until a mapping backend frees (then dispatch),
     or until `deadline` (→ 503). The entry stays in `_parked` for the whole wait so it
     keeps its FIFO position and shows in the console; `_notify_slot_free` wakes it."""
-    entry = {"id": _next_park_id(), "alias": alias, "source": source,
-             "enqueued": time.time(), "deadline": deadline, "event": asyncio.Event()}
+    entry = {"id": _next_park_id(), "alias": alias, "path": path, "source": source,
+             "enqueued": time.time(), "enqueued_at": time.monotonic(),
+             "deadline": deadline, "event": asyncio.Event()}
     _parked.append(entry)
     try:
         while True:
             entry["event"].clear()                     # arm before checking → no lost wakeup
             ready, busy = resolve_routes(alias, path)
-            if ready:
-                return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
-            if not busy:
+            i = _designated_index(entry, ready)
+            if i is not None:
+                entry["claimed"] = True    # out of the waiting pool (see _designated_index)
+                # Try the designated candidate first, the rest stay as failover tail.
+                cands = [ready[i]] + ready[:i] + ready[i + 1:]
+                return await _dispatch_over(cands, path, alias, body, request, stats_endpoint=stats_endpoint)
+            if not ready and not busy:
                 raise HTTPException(503, f"No healthy backend for model '{alias}'")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -3563,7 +3610,7 @@ def apply_server_settings() -> None:
     port is set by the launch command, so it is informational here."""
     global api_key, log_per_call, model_prefix, max_concurrent_default, health_check_interval
     global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked
-    global fast_probe_interval_s
+    global fast_probe_interval_s, affinity_max_wait_s
     s = store.get_settings() if store.is_active() else {}
     if "api_key" in s:
         api_key = s["api_key"] or None
@@ -3596,6 +3643,11 @@ def apply_server_settings() -> None:
     if "max_parked" in s:
         try:
             max_parked = int(s["max_parked"])
+        except (TypeError, ValueError):
+            pass
+    if "affinity_max_wait_s" in s:
+        try:
+            affinity_max_wait_s = float(s["affinity_max_wait_s"])
         except (TypeError, ValueError):
             pass
     if "fast_probe_interval_s" in s:
@@ -3633,6 +3685,9 @@ def server_info() -> dict:
             # the stored value (apply then drops it → the setting looks unsaveable).
             "park_timeout_s": int(park_timeout_s) if park_timeout_s == int(park_timeout_s) else park_timeout_s,
             "max_parked": max_parked,
+            "affinity_max_wait_s": (int(affinity_max_wait_s)
+                                    if affinity_max_wait_s == int(affinity_max_wait_s)
+                                    else affinity_max_wait_s),
             "fast_probe_interval_s": (int(fast_probe_interval_s)
                                       if fast_probe_interval_s == int(fast_probe_interval_s)
                                       else fast_probe_interval_s),

@@ -5391,6 +5391,9 @@ _SRV_RUNTIME = [
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
     ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Mapping; 0 = off)"),
     ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
+    ("affinity_max_wait_s", "float", "affinity max wait",
+     "seconds — a queued request older than this beats the same-type preference and takes "
+     "the next free backend"),
     ("fast_probe_interval_s", "int", "fast probe interval",
      "seconds — how often an UNHEALTHY backend is re-checked while calls or jobs wait for "
      "capacity, so one that came back is picked up in seconds instead of a whole health "
@@ -5502,6 +5505,12 @@ async def server_save(request: Request):
             raw = (f.get(k, "") or "").strip()
             try:                                          # unit fields (TTL/prune) edited in hours/min → store seconds
                 vals[k] = int(round(float(raw) * _SRV_UNITS.get(k, 1)))
+            except ValueError:
+                vals[k] = ""
+        elif kind == "float":
+            raw = (f.get(k, "") or "").strip()
+            try:
+                vals[k] = float(raw)
             except ValueError:
                 vals[k] = ""
         else:
