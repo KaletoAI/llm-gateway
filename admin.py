@@ -2502,11 +2502,10 @@ def _backends_section(alias: str, cands: list) -> str:
     used = [c.get("backend") for c in cands]
     rows = ""
     for bn in used:
-        badge = ""
         rm = (_btn("✕", f"/ui/mapping/cand-del?alias={_esc(alias)}&backend={_esc(bn)}",
                    "danger", sm=True, icon=True, title="Remove this backend")
               if len(used) > 1 else "<span class='muted' title='an alias needs ≥1 backend'>—</span>")
-        rows += f"<tr><td>{_esc(bn)}{badge}</td><td class='acts'>{rm}</td></tr>"
+        rows += f"<tr><td>{_esc(bn)}</td><td class='acts'>{rm}</td></tr>"
     add_opts = [b["name"] for b in _comfy_backends() if b["name"] not in used]
     add_sel = ""
     if add_opts:

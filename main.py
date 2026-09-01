@@ -2793,6 +2793,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                                 "enabled+healthy candidate backend for the upload relay "
                                                 f"within park time ({async_park_timeout_s:.0f}s)")
                         return
+                    # A successor wait must not hold stage-1 designations: while we sit
+                    # here we claim nothing, so release every stage-1 backend of this pass
+                    # (rebuilt from scratch next pass → self-heals once the successor is back).
+                    entry["exclude"] = {b["name"] for b, _ in ready} | rejected
                     _gen_wait_ping()             # keep the fast probe awake → quick recovery pickup
                     await asyncio.sleep(2.0)
                     continue

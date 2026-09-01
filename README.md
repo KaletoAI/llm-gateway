@@ -522,7 +522,7 @@ backends:
     auth_mode: subscription        # → Authorization: Bearer + OAuth beta header
     # auth_mode: api_key           # → x-api-key (console.anthropic.com key)
     models: [claude-sonnet-5]      # fallback list; discovery tries GET /v1/models first
-    paid: true                     # a subscription/API backend — used when no free local one
+    paid: true                     # a subscription/API backend — used when no free unpaid one
 ```
 
 Then check the Backends tab: the row should read **UP** with the model count
