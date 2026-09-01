@@ -1502,9 +1502,13 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
     request.state.gw_body = body
     request.state.gw_endpoint = stats_endpoint or path
     ready, busy = resolve_routes(alias, path)
-    if ready:
+    # Spec rule 4: always into the queue. A free backend that a parked call is designated
+    # for is NOT up for grabs — this request parks instead and competes from inside the
+    # pool, so a fresh arrival can never overtake the waiters it just queued behind.
+    reserved = bool(ready) and _reserved_for_waiter(ready[0][0])
+    if ready and not reserved:
         return await _dispatch_over(ready, path, alias, body, request, stats_endpoint=stats_endpoint)
-    if not busy:
+    if not ready and not busy:
         # Say WHY when the only backends that could serve this alias are Anthropic
         # ones: they answer /v1/messages alone (see serves_path), and "no healthy
         # backend" would send the caller hunting a fault that isn't there. Only off
@@ -1525,6 +1529,11 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
         deadline = time.monotonic() + ptime
     if len(_parked) >= max_parked:
         raise HTTPException(503, f"park queue full ({max_parked}) — retry later", headers={"Retry-After": "2"})
+    if reserved:
+        # We stepped aside for a backend that is free RIGHT NOW: wake the pool so its
+        # designated taker claims it instead of leaving it idle until the next slot
+        # frees. One broadcast per gated arrival — each waiter just re-checks itself.
+        _notify_slot_free()
     return await _park_and_dispatch(alias, path, body, request, deadline,
                                     source=_source_of(request), stats_endpoint=stats_endpoint)
 
@@ -1583,38 +1592,62 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
     raise HTTPException(503, f"All backends failed: {last_error}")
 
 
+def _waiting_pool() -> list:
+    """Snapshot of the park queue as the scheduler sees it (`_parked` mutates across
+    awaits). Entries that already claimed a backend are out: a claimant stays in
+    `_parked` until its response is done, but it is no longer waiting and must not
+    shadow the others out of a second free backend."""
+    return [e for e in _parked if not e.get("claimed")]
+
+
+def _designated_waiter(backend, pool: list, now: Optional[float] = None):
+    """The parked call this backend belongs to, or None if it belongs to none of them.
+
+    Type affinity (spec 2026-09-01, "Designated taker"): overdue waiters first (oldest),
+    else the one needing the model the backend last ran, else the oldest it can serve.
+    THE one place the designation is computed — the wake gate and the fresh-arrival gate
+    both go through here so they cannot drift apart.
+    """
+    bid, bname = backend_id(backend), backend["name"]
+    return scheduler.designated_taker(
+        pool,
+        can_serve=lambda e: any(backend_id(rb) == bid for rb, _ in
+                                resolve_routes(e["alias"], e["path"])[0]),
+        type_key=lambda e: alias_entry(e["alias"], bname)[0] or e["alias"],
+        last_key=backend_last_key.get(bid),
+        now=time.monotonic() if now is None else now,
+        max_wait_s=affinity_max_wait_s)
+
+
+def _reserved_for_waiter(backend) -> bool:
+    """Is this free backend spoken for by someone already in the queue?
+
+    Spec rule 4: a fresh request never overtakes the waiters — it may dispatch straight
+    to a backend only when no parked call is designated for it; otherwise it joins the
+    queue as the youngest entry and competes from there. Empty queue → never reserved.
+    """
+    pool = _waiting_pool()
+    return bool(pool) and _designated_waiter(backend, pool) is not None
+
+
 def _designated_index(entry, ready) -> Optional[int]:
     """Index in `ready` of the best candidate this parked call may claim now, or None.
 
-    Type affinity (spec 2026-09-01, "Designated taker"): a freed backend belongs to the
-    waiter `scheduler.designated_taker` picks for it over the whole park queue — overdue
-    oldest, else the one needing the model the backend last ran, else the oldest it can
-    serve. A woken entry therefore dispatches to the best ready candidate it is
-    designated for, and parks again when every ready backend is somebody else's (the
-    rightful waiter claims it on the same broadcast wake). A lone waiter always passes.
+    A woken entry dispatches to the best ready candidate it is designated for, and parks
+    again when every ready backend is somebody else's (the rightful waiter claims it on
+    the same broadcast wake). A lone waiter always passes.
 
     Every ready backend has exactly one designated taker, and that taker has the backend
     in its own ready list — so whenever a backend is free at least one waiter proceeds.
     """
     if not ready:
         return None
-    # Snapshot (`_parked` mutates across awaits) minus the entries that already claimed a
-    # backend: a claimant stays in `_parked` until its response is done, but it is no
-    # longer waiting and must not shadow the others out of a second free backend.
-    pool = [e for e in _parked if not e.get("claimed")]
+    pool = _waiting_pool()
     if len(pool) <= 1:                       # only us waiting → nothing to yield to
         return 0
     now = time.monotonic()
     for i, (b, _real) in enumerate(ready):
-        bid, bname = backend_id(b), b["name"]
-        chosen = scheduler.designated_taker(
-            pool,
-            can_serve=lambda e: any(backend_id(rb) == bid for rb, _ in
-                                    resolve_routes(e["alias"], e["path"])[0]),
-            type_key=lambda e: alias_entry(e["alias"], bname)[0] or e["alias"],
-            last_key=backend_last_key.get(bid),
-            now=now, max_wait_s=affinity_max_wait_s)
-        if chosen is entry:
+        if _designated_waiter(b, pool, now) is entry:
             return i
     return None
 
