@@ -20,7 +20,7 @@ class _Stub(BaseHTTPRequestHandler):
     """Scripted Meshy: POST → id; GET polls walk `script`; assets under /asset/<fmt>."""
     script: list = []          # task objects returned by successive GETs (last one repeats)
     poll_status = 200          # status a task poll answers with (non-200 → error body)
-    post_status = 200
+    post_status = 202          # the real Meshy answers a task create with 202 Accepted
     posted: list = []
     balance = 120
     seen_auth: list = []
@@ -55,10 +55,10 @@ class _Stub(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         _Stub.posted.append((self.path, json.loads(self.rfile.read(n) or b"{}")))
-        if _Stub.post_status != 200:
+        if _Stub.post_status >= 400:
             return self._json(_Stub.post_status, {"message": "NoMoreConcurrentTasks"
                                                   if _Stub.post_status == 429 else "no credits"})
-        self._json(200, {"result": "task-1"})
+        self._json(_Stub.post_status, {"result": "task-1"})
 
 
 def _ctx():
@@ -88,7 +88,7 @@ class TestMeshyAdapter(unittest.TestCase):
 
     def setUp(self):
         _Stub.script, _Stub.posted, _Stub.seen_auth = [], [], []
-        _Stub.post_status, _Stub.poll_status, _Stub.balance = 200, 200, 120
+        _Stub.post_status, _Stub.poll_status, _Stub.balance = 202, 200, 120
         self.ctx, self.counts = _ctx()
         self.backend = {"name": "meshy", "type": "meshy", "url": self.url, "api_key": "msy_test",
                         "poll_interval": 0.01, "max_wait": 2}

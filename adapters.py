@@ -2971,7 +2971,10 @@ class MeshyAdapter(BackendAdapter):
                     raise MeshyBusy(f"Meshy queue full: {_meshy_msg(pr)}")
                 if pr.status_code >= 500:
                     raise ConnectionError(f"Meshy {pr.status_code}: {_meshy_msg(pr)}")
-                if pr.status_code != 200:
+                # Meshy ACCEPTS a task with 202 (measured 2026-09-02 on prod: the first live
+                # job died as "rejected (202)" while Meshy had created and billed it) — any
+                # 2xx that carries a task id is a success, not just 200.
+                if not 200 <= pr.status_code < 300:
                     raise RuntimeError(f"Meshy rejected the task ({pr.status_code}): {_meshy_msg(pr)}")
                 task_id = str((pr.json() or {}).get("result") or "")
                 if not task_id:
