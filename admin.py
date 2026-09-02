@@ -3616,27 +3616,14 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             + pg_switch_js)
 
 
-# Polls ONLY the result column (not a full-page meta-refresh), so the form stays
-# editable while a job runs — pick new params and Generate again without losing them.
-_PG_POLL_JS = ("<script>(function(){var rc=document.getElementById('resultcol');"
-               "if(!rc)return;var job=rc.getAttribute('data-poll-job');if(!job)return;"
-               "var t=setInterval(function(){"
-               "fetch('/ui/playground/status/'+encodeURIComponent(job),{cache:'no-store'})"
-               ".then(function(r){return r.text();}).then(function(h){rc.innerHTML=h;"
-               "if(h.indexOf('data-jobdone')>=0){clearInterval(t);}}).catch(function(){});"
-               "},2000);})();</script>")
-
-
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None, kept: Optional[set] = None, poll_job: str = "") -> str:
-    pa = f' data-poll-job="{_esc(poll_job)}"' if poll_job else ""
-    # model-viewer must load with the PAGE: the poller swaps #resultcol via
-    # innerHTML, and innerHTML-inserted <script> tags never execute — a GLB result
-    # arriving through the poll would otherwise sit in an undefined custom element
-    # (an empty dark box). Loaded up front, swapped-in tags upgrade automatically.
+                     oi: Optional[dict] = None, kept: Optional[set] = None) -> str:
+    # model-viewer loads with the page and stays loaded: _LIVE_JS never re-inserts a
+    # <script>, so a viewer arriving through a live update upgrades against the
+    # definition that is already there.
     return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
             f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
-            f'<div class="col"><div id="resultcol"{pa}>{result_html}</div></div></div>{_PG_POLL_JS}')
+            f'<div class="col"><div id="resultcol">{result_html}</div></div></div>')
 
 
 def _job_result_html(job_id: str, job: Optional[dict]):
@@ -3714,10 +3701,10 @@ async def playground_page(request: Request):
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping")) if cand else {}
     kept = set(_pg_images.get(_session_user(request) or "default", {}).keys())
-    poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
     return HTMLResponse(_page("Media Playground",
-                              _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
-                              "playground", subnav=_subnav("playground", "media")))
+                              _playground_body(aliases, vals, cand, result_html, oi, kept),
+                              "playground", refresh=refresh,
+                              subnav=_subnav("playground", "media")))
 
 
 async def generate(request: Request):
@@ -3782,7 +3769,7 @@ async def generate(request: Request):
         return HTMLResponse(_page("Media Playground",
                                   _playground_body(aliases, vals, cand, result_html, kept=set(stash.keys())),
                                   "playground", subnav=_subnav("playground", "media")))
-    # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
+    # Redirect to the GET view (form re-populated + live-updating) — instant feedback.
     q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
@@ -3822,14 +3809,6 @@ async def result(job_id: str, n: int, anim: str = ""):
     if name:
         headers = {"Content-Disposition": jobs.content_disposition(name)}
     return FileResponse(path, media_type=mime, headers=headers)
-
-
-async def playground_status(job_id: str):
-    """Result-column fragment for the JS poller (so the form isn't reloaded mid-edit)."""
-    html, refresh = _job_result_html(job_id, jobs.get(job_id))
-    if not refresh:                              # done/failed → marker tells the poller to stop
-        html += "<span data-jobdone hidden></span>"
-    return HTMLResponse(html)
 
 
 # ── Playground sub-tab: Voice (direct /v1/audio/speech, synchronous) ─────────────
@@ -5847,7 +5826,6 @@ def register(app) -> None:
     app.add_api_route("/ui/playground/voice-lib/{name}", voice_lib_play, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
-    app.add_api_route("/ui/playground/status/{job_id}", playground_status, methods=["GET"])
     app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])

@@ -117,6 +117,14 @@ class LiveScriptPresence(unittest.TestCase):
         self.assertIn("|master", admin._SCROLL_JS)
         self.assertIn("beforeunload", admin._SCROLL_JS)
 
+    def test_playground_uses_the_shared_live_mechanism(self):
+        # The result column had its own poller because a full-page reload would have
+        # wiped the form mid-edit. The morph's dirty-input rule covers that now.
+        self.assertFalse(hasattr(admin, "_PG_POLL_JS"),
+                         "_PG_POLL_JS should be gone — the live morph replaces it")
+        self.assertFalse(hasattr(admin, "playground_status"),
+                         "the result-fragment route should be gone")
+
 
 # Fixtures for the identity tests below. Built from what the three row templates
 # actually read — nothing invented: `_job_row` needs id/status plus the created/
