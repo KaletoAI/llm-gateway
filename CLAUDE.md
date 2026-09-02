@@ -199,7 +199,42 @@ hot-reload-safe.
   existing action links keep working unchanged and still land in the right tab.
   The Media list groups by `task` in `_TASK_OPTIONS` order (unknown tasks trail
   alphabetically, so a typo stays visible) with a per-group count; the task is the
-  header, so the row shows what differs WITHIN a group (backends · mapped params). POST bodies parsed by
+  header, so the row shows what differs WITHIN a group (backends · mapped params).
+  **Auto-update is one mechanism, not six** (`_LIVE_JS`): `_page(refresh=N)` marks
+  `<main data-live="N">` and a global poller re-fetches the SAME url and MORPHS the
+  response's `<main>` into the live one — nodes matched by `id`, `data-k` or `data-sk`
+  (`keyOf`), falling back to position+tag. Nothing is ever reloaded, so scroll, sort
+  order, a focused filter, an open form, playing media and the model-viewer camera
+  survive an update; a response without `data-live` stops the poller (what the meta
+  tag's absence used to mean). The three live row templates carry a key themselves —
+  `_job_row` → `job-<job id>`, `_call_row` → `call-<call id>`, `_dash_backends`' row
+  → `bk-<backend name>` — because those lists are newest-first (and the backends panel
+  re-sorts ready→busy→off): without a key the reconciler matches POSITIONALLY and a
+  list that gains one row rewrites EVERY row, which is the one thing the mechanism
+  exists to avoid. `data-sk` counts as a key for the same reason one level up — the
+  dashboard renders three of its four tables conditionally, and an unkeyed table node
+  would be reused for a DIFFERENT logical table when a panel comes or goes. Never
+  touched: `<script>` (a re-inserted `_JOB_TICK` would double its `setInterval`),
+  `[data-live-skip]` subtrees, focused/dirty form controls, media with an unchanged
+  `src`, and `<details open>`. Post-morph hooks in `window.gwLiveHooks` re-apply sort
+  and filter, because the server always renders insertion order; the sort hook also
+  `wire()`s every sortable table, since a table the morph INSERTS mid-session never
+  went through the load-time binding and would otherwise ignore header clicks until a
+  real reload. This replaced four `<meta http-equiv="refresh">` pages (Dashboard,
+  Media Jobs, Job detail, Backends while draining) and both hand-rolled fragment
+  pollers: `_PG_POLL_JS` + `/ui/playground/status/{job_id}` (the media playground's
+  result column — the dirty-input rule is what keeps the form editable now) and
+  `_VU_POLL_JS` + `/ui/playground/voice-upload-status`, whose terminating
+  `location.replace(…&vu=done)` reload, the `vu=done` parameter and its branch left
+  with it (one tick now refreshes the progress column AND the voice-library table).
+  `voice_upload` therefore 303-redirects to the GET view: the poller re-fetches
+  `location.href`, and a POST-only URL answers a GET with 405. Of the state-restore
+  hacks the reload needed, only `_FILTER_JS`'s focus/caret save+restore and its
+  `beforeunload` save are gone; `_SCROLL_JS`'s `<main>` restore STAYS, because
+  `<main>` is the page's scroll container (`body{overflow:hidden}` +
+  `main{overflow-y:auto}`) and that restore serves REAL navigation (F5, a nav link
+  back to a long list, a POST's 303), which the morph does not cover — it is merely
+  inert from the first tick onward. POST bodies parsed by
   hand (`parse_qs`) to stay `python-multipart`-free.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone

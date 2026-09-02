@@ -766,6 +766,18 @@ locked). Tabs:
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
+**Live views update in place — the page is never reloaded.** Anything that moves
+on its own (the Dashboard, Media Jobs, a running job's detail page, the Backends
+tab while a backend drains, the Media Playground while a job generates, the Voice
+sub-tab while a reference uploads) re-fetches its own URL every few seconds and
+patches only the parts of the page that actually changed. So an update never
+interrupts you: your scroll position, a sort order you clicked, half-typed text in
+a filter or a form field, an open `<details>`, playing audio/video and the 3D
+viewer's camera angle all stay exactly where they were, and you can keep editing
+the playground form while the job you just started renders into the column beside
+it. Updating stops on its own once there is nothing live left to watch (the job
+finished, the drain completed) — no timer keeps running in the background.
+
 ---
 
 ## Stats & routing dashboard
