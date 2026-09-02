@@ -2409,6 +2409,20 @@ _GEN_FAILOVER_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.ReadEr
                         ConnectionError, TimeoutError)
 
 
+def _err_text(e: BaseException) -> str:
+    """The text of an exception, never empty — falls back to the class name.
+
+    Several exceptions that reach a job row carry NO message at all: every httpx
+    timeout is constructed as `WriteTimeout("")` when it comes off the transport, so
+    `str(e)` is "". Measured 2026-09-02 on prod: a chain's stage-2 create POST timed
+    out and the job's error read exactly "chain failed: " — nothing after the colon,
+    the journal line equally blank, and the only way to learn WHAT failed was to
+    re-derive it. A class name ("WriteTimeout") is a poor message but an infinitely
+    better one than none, so every `{e}` that ends up in a job row or a log line goes
+    through here."""
+    return str(e) or type(e).__name__
+
+
 # ── Per-backend rolling generation fail-rate (runbook C) ────────────────────────
 def _fault_label(e: BaseException) -> str:
     """How to name a failover-worthy generation fault in a log line. Three distinct
@@ -2434,16 +2448,20 @@ def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
     instead of the workflow (measured 2026-08-25). The `max_wait` hint belongs ONLY on
     the adapter's own TimeoutError — an httpx timeout is a transport fault and naming
     max_wait there would mislead exactly the same way."""
+    # `_err_text`, not `{last}`: an httpx timeout stringifies to "" and would leave the
+    # message ending in a bare colon (see _err_text). None only reaches here when no
+    # candidate was ever tried, which has no exception to name.
+    txt = _err_text(last) if last is not None else "no candidate was tried"
     if isinstance(last, adapters.MeshyNoCredits):
-        return f"no candidate backend could run it — Meshy account out of credits: {last}"
+        return f"no candidate backend could run it — Meshy account out of credits: {txt}"
     if isinstance(last, adapters.MeshyBusy):
-        return f"no candidate backend could run it — Meshy queue limit reached: {last}"
+        return f"no candidate backend could run it — Meshy queue limit reached: {txt}"
     if isinstance(last, TimeoutError):
         return (f"no candidate backend finished in time — the gateway's per-backend "
-                f"`max_wait` (default 600s; raise it in Backends for slow workflows): {last}")
+                f"`max_wait` (default 600s; raise it in Backends for slow workflows): {txt}")
     if isinstance(last, httpx.TimeoutException):
-        return f"no candidate backend answered in time (transport timeout): {last}"
-    return f"all candidate backends unreachable (connection): {last}"
+        return f"no candidate backend answered in time (transport timeout): {txt}"
+    return f"all candidate backends unreachable (connection): {txt}"
 
 
 # bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
@@ -2625,8 +2643,8 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     # content error (ComfyUI validation/execution) — final, never retried:
                     # it would fail identically on any attempt and any backend.
                     _record_gen_attempt(bid, conn_fail=False)
-                    logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {e}")
-                    await asyncio.to_thread(jobs.fail, job_id, str(e),
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {_err_text(e)}")
+                    await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
                                             {"attempts": attempts} if attempts > 1 else None)
                     asyncio.create_task(_free_comfy_vram(backend, "job failure"))
                     return
@@ -3127,8 +3145,12 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             except _GEN_FAILOVER_ERRORS as e:
                 _record_gen_attempt(backend_id(active), conn_fail=True)
                 if s1_done:                              # mesh already relayed — a stage-2 loss is final
-                    logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-                    await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}", fail_meta())
+                    # `_err_text`: this is the branch an httpx WriteTimeout lands in, and
+                    # its str() is empty — the row used to read "chain failed: " (2026-09-02).
+                    logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) "
+                                   f"{_fault_label(e)}: {_err_text(e)}")
+                    await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}",
+                                            fail_meta())
                     asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                     return
                 logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
@@ -3137,8 +3159,9 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
                 continue
             except Exception as e:
-                logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) failed: {e}")
-                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {e}", fail_meta())
+                logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) "
+                               f"failed: {_err_text(e)}")
+                await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}", fail_meta())
                 asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                 return
             finally:

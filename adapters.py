@@ -46,9 +46,19 @@ logger = logging.getLogger(__name__)
 _CHAT_TIMEOUT = 300.0
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
-_UPLOAD_TIMEOUT = 20.0
+_UPLOAD_TIMEOUT = 20.0             # floor; the real budget scales with the file (_upload_timeout_for)
 _COMFY_STUCK_AFTER_S = 90.0        # default: pending-with-idle-executor this long → stuck
 _COMFY_RESTART_WAIT_S = 120.0      # restart(): max wait for the server to come back
+
+
+def _upload_timeout_for(nbytes: int) -> float:
+    """Seconds to allow one ComfyUI `/upload/image` POST of `nbytes`.
+
+    A flat 20 s was sized for LAN image posts, but the chain relays MESHES through the
+    same endpoint: measured 2026-09-02 on prod, a no-remesh Meshy humanoid came back at
+    70 MB — on a 20 s budget that upload is a coin flip, and a lost mesh fails the whole
+    (already paid for) chain. Budget a conservative 1 MiB/s on top of the flat floor."""
+    return max(_UPLOAD_TIMEOUT, 20.0 + max(0, nbytes) / (1024 * 1024))
 
 
 class ComfyExecutorStuck(Exception):
@@ -2297,7 +2307,8 @@ class ComfyUIAdapter(BackendAdapter):
         url = self.backend["url"].rstrip("/")
         return await client.post(f"{url}/upload/image",
                                  files={"image": (name, data, content_type)},
-                                 data={"overwrite": "true"}, timeout=_UPLOAD_TIMEOUT)
+                                 data={"overwrite": "true"},
+                                 timeout=_upload_timeout_for(len(data)))
 
     async def _upload_image(self, client: httpx.AsyncClient, data: bytes, name: str) -> str:
         """Upload one input image into this backend's ComfyUI input dir; returns the
@@ -3061,8 +3072,23 @@ class MeshyAdapter(BackendAdapter):
         started = time.monotonic()
         log_on = self.ctx.log_enabled()
         try:
+            # The client default stays SHORT (30 s): every poll runs on it, and the
+            # disconnect_grace logic below only reacts as fast as a poll gives up.
             async with httpx.AsyncClient(timeout=_MESHY_HTTP_TIMEOUT) as client:
-                pr = await client.post(self._api(f"/{endpoint}"), json=body, headers=self._headers())
+                # The create POST is the one call that carries the whole INPUT in its
+                # body — image data URIs, and for rigging the entire mesh as base64.
+                # Measured 2026-09-02 on prod: a no-remesh 70 MB GLB became a ~93 MB
+                # JSON body, the POST hit the 30 s client timeout, and httpx's
+                # WriteTimeout has an EMPTY str() — the job died as "chain failed: "
+                # with nothing after the colon. So the create gets its OWN size-scaled
+                # budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
+                raw = json.dumps(body)              # serialised ONCE, sent as content=
+                mb = len(raw) / (1024 * 1024)       # ASCII JSON: chars == bytes
+                pr = await client.post(
+                    self._api(f"/{endpoint}"), content=raw,
+                    headers={**self._headers(), "Content-Type": "application/json"},
+                    timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
+                                          write=max(60.0, mb * 4), pool=30.0))
                 if pr.status_code == 402:
                     raise MeshyNoCredits(f"Meshy: {_meshy_msg(pr)}")
                 if pr.status_code == 429:

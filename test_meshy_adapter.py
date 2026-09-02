@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
@@ -249,6 +250,37 @@ class TestMeshyAdapter(unittest.TestCase):
         out = self._run(self.ad.generate(self._req(
             endpoint="rigging", files={"input_mesh_path": ("h.glb", GLB)}, animations=True)))
         self.assertEqual([b.name for b in out.blobs], ["rigged.glb", "walking.glb", "running.glb"])
+
+    def test_create_post_timeout_scales_with_body(self):
+        """The task-create POST carries the whole input (a rigging mesh as base64), so it
+        gets its OWN size-scaled timeout while the CLIENT default stays short for polls.
+
+        Measured 2026-09-02 on prod: a 70 MB GLB → ~93 MB body → the flat 30 s client
+        timeout fired mid-upload and the chain died on an httpx WriteTimeout."""
+        _Stub.script = [{"status": "SUCCEEDED", "progress": 100, "consumed_credits": 5,
+                         "result": {"rigged_character_glb_url": f"{self.url}/asset/glb"}}]
+        big = b"glTF" + b"\x00" * (5 * 1024 * 1024)          # ~5 MiB mesh → ~6.7 MiB body
+        seen: dict = {}
+        orig = httpx.AsyncClient.post
+
+        async def spy(client, url, *a, **kw):
+            if str(url).endswith("/rigging"):
+                seen["timeout"] = kw.get("timeout")
+                seen["client_default"] = client.timeout
+            return await orig(client, url, *a, **kw)
+
+        with unittest.mock.patch.object(httpx.AsyncClient, "post", spy):
+            self._run(self.ad.generate(self._req(
+                endpoint="rigging", files={"input_mesh_path": ("h.glb", big)})))
+        t = seen.get("timeout")
+        self.assertIsInstance(t, httpx.Timeout)              # a per-request override, not None
+        self.assertGreaterEqual(t.read, 20.0)
+        self.assertGreaterEqual(t.write, 20.0)
+        self.assertGreater(t.write, adapters._MESHY_HTTP_TIMEOUT)   # genuinely more than the default
+        # …and the polls still run on the short client default: disconnect_grace only
+        # reacts as fast as a poll gives up.
+        self.assertEqual(seen["client_default"].read, adapters._MESHY_HTTP_TIMEOUT)
+        self.assertEqual(seen["client_default"].write, adapters._MESHY_HTTP_TIMEOUT)
 
     def test_rigging_missing_mesh_is_input_error(self):
         with self.assertRaises(meshy.MeshyInput):

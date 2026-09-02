@@ -142,6 +142,26 @@ class MeshyChainStage2(unittest.TestCase):
                                                    "n", None, "/out"))
 
 
+class UploadTimeout(unittest.TestCase):
+    """The chain relays MESHES through ComfyUI's /upload/image, not LAN-sized images:
+    measured 2026-09-02, a no-remesh Meshy humanoid came back at 70 MB, which the flat
+    20 s budget could not push through. The budget must grow with the file."""
+
+    def test_small_upload_keeps_the_flat_floor(self):
+        self.assertEqual(adapters._upload_timeout_for(0), adapters._UPLOAD_TIMEOUT)
+        # a LAN-sized image is still essentially the old flat budget
+        self.assertLess(adapters._upload_timeout_for(64 * 1024),
+                        adapters._UPLOAD_TIMEOUT + 0.1)
+
+    def test_large_upload_gets_at_least_one_mib_per_second(self):
+        mb = 1024 * 1024
+        self.assertAlmostEqual(adapters._upload_timeout_for(70 * mb), 90.0)
+        self.assertGreaterEqual(adapters._upload_timeout_for(70 * mb), 70.0)   # ≥1 MiB/s
+        # monotonic: a bigger file never gets a smaller budget
+        self.assertGreater(adapters._upload_timeout_for(100 * mb),
+                           adapters._upload_timeout_for(50 * mb))
+
+
 class BaseDefaults(unittest.TestCase):
     def test_base_adapter_refuses_chain_roles(self):
         base = adapters.OpenAIAdapter({"name": "llm", "type": "openai", "url": "http://x"}, _ctx())
