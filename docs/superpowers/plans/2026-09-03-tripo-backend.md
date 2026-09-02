@@ -313,6 +313,7 @@ git commit -m "cloudtask: shared TaskState + option-form schema; meshy declares 
 - Produces (Task 4, 6, 7 nutzen es) — exakt dieselben Namen wie `meshy.py`:
   - `KIND = "tripo"`, `VENDOR = "Tripo"`, `URL = "https://openapi.tripo3d.ai"`, `API = "/v3"`, `POLL_INTERVAL_DEFAULT = 2.0`, `MAX_WAIT_DEFAULT = 900`
   - `ENDPOINTS = ("image-to-model", "multiview-to-model", "rig")`, `RIG_ENDPOINT = "rig"`
+  - `SUCCESS_STATUS = "success"` (der terminale Erfolgsstatus; die Adapter-Basis vergleicht `state.status == mod.SUCCESS_STATUS`)
   - `AI_MODELS = ("v3.1-20260211", "v3.0-20250812", "v2.5-20250123", "P1-20260311", "P2-20260801")`
   - `RIG_MODELS = ("v1.0-20240301", "v2.5-20260210")`, `RIG_TYPES = ("biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic")`, `SPECS = ("mixamo", "tripo")`
   - `FORMATS = ("glb", "fbx", "obj", "stl", "usdz", "3mf", "gltf")`, `RIG_FORMATS = ("glb", "fbx")`, `NATIVE_FORMAT = "glb"`
@@ -590,6 +591,7 @@ KIND, VENDOR, URL, API = "tripo", "Tripo", "https://openapi.tripo3d.ai", "/v3"
 POLL_INTERVAL_DEFAULT, MAX_WAIT_DEFAULT = 2.0, 900
 ENDPOINTS = ("image-to-model", "multiview-to-model", "rig")
 RIG_ENDPOINT = "rig"
+SUCCESS_STATUS = "success"
 AI_MODELS = ("v3.1-20260211", "v3.0-20250812", "v2.5-20250123", "P1-20260311", "P2-20260801")
 RIG_MODELS = ("v1.0-20240301", "v2.5-20260210")
 RIG_TYPES = ("biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic")
