@@ -289,14 +289,21 @@ details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129
 # `saved=1` is stripped from that query: it is a transient banner flag the Save redirect
 # appends, and keying on it made every Save read as a fresh URL — the whole point of
 # Save being the ONE action that must not move the pane you were working in.
-# `<main>` is deliberately NOT tracked any more: the live morph updates it in place
-# instead of reloading the page, so the window scroll is simply never lost, and the
-# only thing that still moves it is real navigation — where restoring a stale offset
-# would fight the browser's own scroll restoration rather than help it.
+# `<main>` is tracked as a pane too, and stays tracked under the live morph. It is the
+# page's scroll container, not the window: `body{overflow:hidden}` + `main{overflow-y:
+# auto}` mean `<main>.scrollTop` IS the page scroll. What this block preserves is that
+# position across REAL navigation — F5, a nav link back to a long list (Media Jobs, LLM
+# Calls, the LoRA list), a form POST's 303 — none of which the morph covers. It does
+# NOT exist for the live update any more: the morph patches `<main>`'s children and
+# never replaces the container, so the position is simply never lost there and the
+# restore, which runs once at load, is inert from the first tick onward. The browser's
+# own scroll restoration is no substitute: it applies to history navigation (Back /
+# Forward), not to F5 or to re-clicking the same nav link.
 _SCROLL_JS = ("<script>(function(){"
               "var q=location.search.replace(/([?&])saved=[^&]*&?/,'$1').replace(/[?&]$/,'');"
               "var b='scr:'+location.pathname;"
-              "function t(){var o=[];"
+              "function t(){var o=[],m=document.querySelector('main');"
+              "if(m)o.push([m,b+q+'|main']);"
               "[].slice.call(document.querySelectorAll('.col')).forEach(function(e,j){"
               "o.push([e,j===0?b+'|master':b+q+'|c'+j]);});return o;}"
               "try{t().forEach(function(p){var v=sessionStorage.getItem(p[1]);"

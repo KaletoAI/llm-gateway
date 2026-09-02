@@ -103,12 +103,19 @@ class LiveScriptPresence(unittest.TestCase):
         self.assertNotIn("beforeunload", admin._FILTER_JS)
         self.assertNotIn("selectionStart", admin._FILTER_JS)
         self.assertIn("sessionStorage.setItem", admin._FILTER_JS)
+        # …and the load-time restore itself must not vanish with them: over-removal is
+        # the direction this task is exposed to, and a missing getItem would be silent.
+        self.assertIn("sessionStorage.getItem", admin._FILTER_JS)
 
-    def test_scroll_keeps_master_column_but_drops_main_restore(self):
-        # <main> is never replaced any more, so its scrollTop needs no restoring.
-        # The .col/|master key survives: it is a master/detail navigation feature.
+    def test_scroll_memory_survives_for_real_navigation(self):
+        # All three parts stay. <main> is the page's scroll container (body is
+        # overflow:hidden), so its position is what F5 or a nav link back to a long
+        # list would otherwise lose — the morph covers live updates, not navigation.
+        # beforeunload is asserted too: without it the saves never reach the store,
+        # and a partial revert that drops only the listener would look green.
+        self.assertIn("|main", admin._SCROLL_JS)
         self.assertIn("|master", admin._SCROLL_JS)
-        self.assertNotIn("'|main'", admin._SCROLL_JS)
+        self.assertIn("beforeunload", admin._SCROLL_JS)
 
 
 # Fixtures for the identity tests below. Built from what the three row templates
