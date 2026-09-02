@@ -37,6 +37,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import anthropic_bridge
+import meshy
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,18 @@ _COMFY_RESTART_WAIT_S = 120.0      # restart(): max wait for the server to come 
 class ComfyExecutorStuck(Exception):
     """ComfyUI answers HTTP but its prompt executor is not draining the queue
     (queue_pending non-empty, queue_running empty, same head across checks)."""
+
+
+class MeshyNoCredits(ConnectionError):
+    """Meshy account has no credits (balance 0 on discovery, 402 on submit). A
+    ConnectionError on purpose: _GEN_FAILOVER_ERRORS moves the job to the next
+    candidate without touching that tuple; _fault_label names it apart."""
+
+
+class MeshyBusy(ConnectionError):
+    """Meshy refused the task with 429 (NoMoreConcurrentTasks / RateLimitExceeded):
+    the account's queue limit is full — other API keys of the same account fill it
+    too, so the gateway's own max_concurrent cannot rule it out. Failover-class."""
 
 
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
@@ -203,6 +216,8 @@ class NormalizedRequest:
                                                     # for workflows that legitimately export a 1x1/2x2 texture)
     bypass: list = field(default_factory=list)      # per-backend node ids to bypass (ComfyUI mode-4: remove
                                                     # the node, rewire consumers to its same-typed input)
+    meshy: Optional[dict] = None                    # Meshy alias candidate block {endpoint, options}
+                                                    # (cand["meshy"]); None on ComfyUI candidates
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
 
@@ -276,6 +291,7 @@ class BackendAdapter(ABC):
     dispatch; the router (main.py) stays protocol-agnostic."""
 
     type: str = "base"
+    serves_generation: bool = False   # True → the backend is a POST /v1/generations candidate
 
     def __init__(self, backend: dict, ctx: AdapterContext):
         self.backend = backend
@@ -304,6 +320,11 @@ class BackendAdapter(ABC):
         """Run a generation task (image/video/audio) and return its artifacts.
         Owns the in-flight counter lifecycle. Default: unsupported."""
         raise NotImplementedError(f"{self.type} adapter has no generate path")
+
+    async def cancel(self) -> None:
+        """Best-effort: stop whatever this backend is running for the gateway (a
+        cancelled job). Default no-op — a cloud task API has nothing to interrupt."""
+        return None
 
 
 # ── OpenAI-compatible adapter (the only one in Phase 0) ───────────────────────
@@ -1044,6 +1065,10 @@ _MIME_BY_EXT = {
     ".glb": ("model/gltf-binary", "file"), ".gltf": ("model/gltf+json", "file"),
     ".obj": ("model/obj", "file"), ".fbx": ("application/octet-stream", "file"),
     ".ply": ("application/octet-stream", "file"), ".stl": ("model/stl", "file"),
+    # Meshy target formats beyond the ComfyUI set — without them a delivered mesh
+    # falls through to the ("application/octet-stream", "image") default and would be
+    # stored/rendered as an IMAGE.
+    ".usdz": ("model/vnd.usdz+zip", "file"), ".3mf": ("model/3mf", "file"),
 }
 
 
@@ -1451,6 +1476,31 @@ def image_params(wf: dict, mapping: dict) -> list:
     return [p for p, m in (mapping or {}).items() if is_image_field(wf, (m or {}).get("node"))]
 
 
+# Workflow fields that take a path to a client file. A mapped node is a plain
+# Primitive/string node either way, so the workflow itself never says "this is a
+# file" — the NAME is the only signal there is.
+_FILE_FIELDS = ("file_path", "mesh_path", "path", "filename", "file")
+
+
+def is_file_param(param: str, m: Optional[dict]) -> bool:
+    """A mapped NON-image param that takes a client file (a mesh): its public name or the
+    workflow field says so. Heuristic on purpose — the mapping has no kind flag, and every
+    rig/shrink alias in the wild names it `input_mesh_path`. Never true for image loaders
+    (the caller checks is_image_field first)."""
+    names = {(param or "").lower(), ((m or {}).get("label") or "").lower()}
+    if any(("path" in n or "mesh" in n or n.endswith("_file")) for n in names if n):
+        return True
+    return ((m or {}).get("field") or "").lower() in _FILE_FIELDS
+
+
+def file_params(wf: dict, mapping: dict) -> list:
+    """Mapped params rendered as file uploads: not an image loader, and is_file_param.
+    Deliberately NOT part of public_fields' `images` list — that schema means images
+    (the API carries these under `files`, with no placeholder/empty-mode semantics)."""
+    return [p for p, m in (mapping or {}).items()
+            if not is_image_field(wf, (m or {}).get("node")) and is_file_param(p, m)]
+
+
 def slot_empty_mode(m: dict) -> str:
     """What a mapped image slot does when the request sends no image for it:
     'placeholder' (8×8 black, the default) · 'required' (no fallback → ComfyUI errors
@@ -1462,6 +1512,44 @@ def slot_empty_mode(m: dict) -> str:
     if mode in ("placeholder", "required", "disable"):
         return mode
     return "required" if (m or {}).get("no_placeholder") else "placeholder"
+
+
+def public_fields(cand: dict) -> tuple[list, list]:
+    """The public request fields of a generation alias candidate — what the schema
+    endpoint advertises, the playground renders and the OpenAI shims map reference
+    images onto. ONE seam for both candidate kinds: a ComfyUI candidate derives them
+    from workflow + mapping (labels are the external names), a Meshy candidate from
+    its fixed label table (meshy.public_fields)."""
+    if cand.get("meshy") is not None:
+        return meshy.public_fields(cand)
+    wf = cand.get("workflow_json") or {}
+    mapping = cand.get("mapping") or {}
+    params, images = [], []
+    for p, m in mapping.items():
+        m = m or {}
+        name = (m.get("label") or "").strip() or p
+        node, fld = m.get("node"), m.get("field")
+        if is_image_field(wf, node):
+            mode = slot_empty_mode(m)
+            images.append({"name": name, "on_empty": mode, "required": mode == "required"})
+            continue
+        cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
+        if isinstance(cur, list):                # linked to another node — no scalar default
+            cur = None
+        typ = ("bool" if isinstance(cur, bool) else
+               "int" if isinstance(cur, int) else
+               "float" if isinstance(cur, float) else "string")
+        entry: dict = {"name": name, "type": typ}
+        # Advertise ONLY the LABEL (`name`). The internal param key can be node-based
+        # (`value_307`) and changes when the workflow is rebuilt, so it must never be a
+        # public field — the adapter still accepts it on input, but clients bind to the
+        # stable label. Set a label on every param for a fully node-id-free schema.
+        if cur is not None:
+            entry["default"] = cur
+        if name == "seed" or (p == "seed" and name == p):
+            entry["auto"] = "random unless sent"
+        params.append(entry)
+    return params, images
 
 
 def slot_empty_bypass(m: dict) -> list:
@@ -2039,6 +2127,7 @@ class ComfyUIAdapter(BackendAdapter):
     submits a parametrized workflow and polls /history, then fetches /view."""
 
     type = "comfyui"
+    serves_generation = True
 
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
@@ -2086,6 +2175,14 @@ class ComfyUIAdapter(BackendAdapter):
             raise ComfyExecutorStuck(
                 f"executor stuck: {len(pending)} prompt(s) pending, none running for "
                 f"{int(time.time() - self._stuck_since)}s (head {head})")
+
+    async def cancel(self) -> None:
+        """POST /interrupt — frees the GPU of the running prompt (main.cancel_generation)."""
+        try:
+            async with _pooled_client(self.ctx) as client:
+                await client.post(f"{self.backend['url'].rstrip('/')}/interrupt", timeout=5.0)
+        except Exception:
+            pass
 
     async def restart(self) -> str:
         """Restart the ComfyUI service via the ComfyUI-Manager reboot endpoint.
@@ -2840,13 +2937,176 @@ class ComfyUIAdapter(BackendAdapter):
         return blobs
 
 
+# ── Meshy.ai (cloud image → 3D) ───────────────────────────────────────────────
+
+_MESHY_API = "/openapi/v1"
+_MESHY_DISCOVERY_TIMEOUT = 8.0
+_MESHY_HTTP_TIMEOUT = 30.0
+_MESHY_DOWNLOAD_TIMEOUT = 120.0
+
+
+class MeshyAdapter(BackendAdapter):
+    """Meshy.ai task API: POST a task, poll GET …/{id}, download the model urls.
+    The request/response SHAPE lives in meshy.py (pure); this class owns the HTTP,
+    the in-flight slot and the credit balance seen at discovery."""
+
+    type = "meshy"
+    serves_generation = True
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self.credits: Optional[int] = None
+        self.credits_at: float = 0.0
+
+    def _headers(self) -> dict:
+        key = (self.backend.get("api_key") or "").strip()
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
+    def _api(self, path: str) -> str:
+        return f"{self.backend['url'].rstrip('/')}{_MESHY_API}{path}"
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        r = await client.get(self._api("/balance"), headers=self._headers(),
+                             timeout=_MESHY_DISCOVERY_TIMEOUT)
+        r.raise_for_status()                       # 401 → auth kind in main._classify_error
+        bal = int((r.json() or {}).get("balance") or 0)
+        self.credits, self.credits_at = bal, time.time()
+        if bal <= 0:
+            raise MeshyNoCredits("no credits left on the Meshy account")
+        return Capabilities(models=set(meshy.AI_MODELS), pricing={}, loras=set())
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        b = self.backend
+        cand = {"model": req.real_model, "meshy": req.meshy or {}}
+        endpoint = meshy.endpoint_of(cand)
+        opts = meshy.options_of(cand)
+        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {})   # MeshyInput → final
+        poll_interval = float(b.get("poll_interval", 5.0))
+        max_wait = float(b.get("max_wait", 900))
+        if not req.slot_held:
+            self.ctx.inflight_inc(self.bid)
+        started = time.monotonic()
+        log_on = self.ctx.log_enabled()
+        try:
+            async with httpx.AsyncClient(timeout=_MESHY_HTTP_TIMEOUT) as client:
+                pr = await client.post(self._api(f"/{endpoint}"), json=body, headers=self._headers())
+                if pr.status_code == 402:
+                    raise MeshyNoCredits(f"Meshy: {_meshy_msg(pr)}")
+                if pr.status_code == 429:
+                    raise MeshyBusy(f"Meshy queue full: {_meshy_msg(pr)}")
+                if pr.status_code >= 500:
+                    raise ConnectionError(f"Meshy {pr.status_code}: {_meshy_msg(pr)}")
+                # Meshy ACCEPTS a task with 202 (measured 2026-09-02 on prod: the first live
+                # job died as "rejected (202)" while Meshy had created and billed it) — any
+                # 2xx that carries a task id is a success, not just 200.
+                if not 200 <= pr.status_code < 300:
+                    raise RuntimeError(f"Meshy rejected the task ({pr.status_code}): {_meshy_msg(pr)}")
+                task_id = str((pr.json() or {}).get("result") or "")
+                if not task_id:
+                    raise RuntimeError("Meshy returned no task id")
+                if log_on:
+                    logger.info(f"→ [{self.name}] meshy {endpoint} task {task_id}")
+                state = await self._poll(client, endpoint, task_id, opts["target_formats"],
+                                         poll_interval, max_wait)
+                blobs = []
+                for fmt, url in state.downloads:
+                    data = await self._download(client, url)
+                    mime, kind = _mime_and_kind(f"model.{fmt}")
+                    blobs.append(GenBlob(data=data, mime=mime, kind=kind, name=f"model.{fmt}"))
+                if opts.get("thumbnail") and state.thumbnail:
+                    try:
+                        thumb = await self._download(client, state.thumbnail)
+                        blobs.append(GenBlob(data=thumb, mime="image/png", kind="image", name="preview.png"))
+                    except Exception as e:           # a preview is a courtesy, the mesh is the job
+                        logger.warning(f"[{self.name}] meshy thumbnail download failed: {e}")
+        finally:
+            if not req.slot_held:
+                self.ctx.inflight_dec(self.bid)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if log_on:
+            logger.info(f"← [{self.name}] {len(blobs)} artifact(s) in {elapsed_ms} ms, "
+                        f"{state.credits} credits")
+        return GenOutput(blobs=blobs, meta={
+            "backend": self.name, "meshy_task_id": task_id, "endpoint": endpoint,
+            "ai_model": body.get("ai_model"), "request": meshy.request_summary(body),
+            "consumed_credits": state.credits, "elapsed_ms": elapsed_ms,
+        })
+
+    async def _poll(self, client, endpoint, task_id, formats, poll_interval, max_wait) -> "meshy.TaskState":
+        # A poll that answers is not proof the task is running. A revoked key (401) or a
+        # task that is gone (404) would otherwise be reported as a max_wait TimeoutError —
+        # the wrong cause, AND only after holding the in-flight slot for the full wait.
+        # So: a 4xx is a verdict about the TASK (three in a row, so one edge hiccup does
+        # not end a job) → final RuntimeError; transport errors, 5xx and a 429 are about
+        # the SERVICE and get `disconnect_grace` seconds of CONTINUOUS failure before the
+        # failover-class ConnectionError — same key and default as ComfyUIAdapter._poll.
+        # 429 sits on the service side deliberately: a poll-rate limit says nothing about
+        # the task, which is running and already paid for — ending it would burn credits.
+        # Any 200 resets both counters: only an unbroken run of failures means anything.
+        grace = float(self.backend.get("disconnect_grace", 30))
+        deadline = time.monotonic() + max_wait
+        client_errs, gone_since = 0, None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                r = await client.get(self._api(f"/{endpoint}/{task_id}"), headers=self._headers())
+            except httpx.HTTPError as e:            # one failed poll is not a verdict
+                gone_since = gone_since or time.monotonic()
+                if time.monotonic() - gone_since > grace:
+                    raise ConnectionError(
+                        f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
+                        f": {type(e).__name__}: {e}")
+                continue
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                client_errs += 1
+                if client_errs >= 3:
+                    raise RuntimeError(f"Meshy task {task_id}: poll answered "
+                                       f"{r.status_code} — {_meshy_msg(r)}")
+                continue
+            if r.status_code != 200:                # 5xx / 429 — the service, not this task
+                gone_since = gone_since or time.monotonic()
+                if time.monotonic() - gone_since > grace:
+                    raise ConnectionError(
+                        f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
+                        f": HTTP {r.status_code}")
+                continue
+            client_errs, gone_since = 0, None
+            state = meshy.parse_task(r.json() or {}, formats)     # MeshyInput → final
+            if state.error:            # FAILED/CANCELED — or a status this gateway does not know
+                raise RuntimeError(f"Meshy task {task_id} {state.status.lower()}: {state.error}")
+            if state.status == "SUCCEEDED":
+                return state
+        raise TimeoutError(f"Meshy task {task_id} not finished within max_wait={max_wait:.0f}s "
+                           f"(still running at Meshy — fetch it by id from the Meshy dashboard)")
+
+    @staticmethod
+    async def _download(client, url: str) -> bytes:
+        # NO auth header: signed asset URLs on assets.meshy.ai; the bearer must not leak there.
+        r = await client.get(url, timeout=_MESHY_DOWNLOAD_TIMEOUT, follow_redirects=True)
+        if r.status_code != 200:
+            raise RuntimeError(f"Meshy asset download failed ({r.status_code}) for {url.split('?')[0]}")
+        return r.content
+
+
+def _meshy_msg(r) -> str:
+    try:
+        return str((r.json() or {}).get("message") or r.text[:200])
+    except Exception:
+        return r.text[:200]
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 ADAPTERS: dict[str, type[BackendAdapter]] = {
     "openai": OpenAIAdapter,
     "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
+    "meshy": MeshyAdapter,
 }
+
+# Backend types that take POST /v1/generations work (main routes generation to these
+# and keeps them OUT of the chat catalogs). Derived from the classes, not listed twice.
+GEN_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if cls.serves_generation)
 
 
 def make_adapter(backend: dict, ctx: AdapterContext) -> BackendAdapter:

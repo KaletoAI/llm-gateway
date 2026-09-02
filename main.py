@@ -21,6 +21,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from watchfiles import awatch
 
+import adapters
 import admin
 import anthropic_bridge
 import jobs
@@ -30,7 +31,7 @@ import stats
 import store
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
                       input_path_ref, is_image_field, lora_counterpart, lora_groups,
-                      make_adapter, normalize_delivery, slot_empty_mode, validate_delivery)
+                      make_adapter, normalize_delivery, validate_delivery)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
 from responses_bridge import (chat_to_responses, response_shell, responses_stream,
@@ -139,8 +140,8 @@ def rebuild_backends() -> None:
     for b in backends:
         # Cost tier for the scheduler (spec 2026-09-01): a paid backend is a candidate
         # only when no unpaid one is free. Normalized here — config and store entries
-        # may omit the key entirely.
-        b["paid"] = bool(b.get("paid"))
+        # may omit the key entirely. A Meshy backend bills per task, so it is ALWAYS paid.
+        b["paid"] = True if b.get("type") == "meshy" else bool(b.get("paid"))
     backend_hosts = {backend_id(b): backend_host(b) for b in backends}
     host_backends = {}
     for bid, h in backend_hosts.items():
@@ -242,6 +243,12 @@ def backend_id(backend: dict) -> str:
     and a type-scoped routing reference, so an LLM and a ComfyUI backend may share a
     name. All runtime state (models/health/inflight/adapters) is keyed by this id."""
     return f'{backend.get("type", "openai")}:{backend["name"]}'
+
+
+def _is_gen(b: dict) -> bool:
+    """A generation backend (ComfyUI, Meshy): routed by POST /v1/generations, never
+    listed in the chat catalogs. Type-agnostic replacement for `type == "comfyui"`."""
+    return b.get("type") in adapters.GEN_TYPES
 
 
 def enabled_backends() -> list[dict]:
@@ -664,7 +671,7 @@ async def lifespan(app: FastAPI):
         try:
             for seed_alias, seed_bname, seed_avg_ms in jobs.gen_speed_rows():
                 seed_b = next((b for b in backends if b["name"] == seed_bname
-                               and b.get("type") == "comfyui"), None)
+                               and _is_gen(b)), None)
                 if seed_b is not None and seed_avg_ms:
                     gen_speed.setdefault(f"{seed_alias}|{backend_id(seed_b)}",
                                          float(seed_avg_ms) / 1000.0)
@@ -826,7 +833,7 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     # is offline) instead of a misleading 403. Disabled backends keep their last model set.
     is_alias = model in virtual_models
     for b in backends:
-        if b.get("type", "openai") == "comfyui" or b.get("name") not in allow:
+        if _is_gen(b) or b.get("name") not in allow:
             continue
         served = backend_models.get(backend_id(b), set())
         if bare in served:                                       # real model on a granted backend
@@ -974,7 +981,7 @@ def split_backend_prefix(model: str) -> tuple[Optional[str], str]:
 # assigned) — safe for the off-loop readers (get_gen_routes runs in a thread).
 _backend_names: set = set()            # all backend names — split_backend_prefix test
 _llm_backends: list = []               # enabled non-ComfyUI backends
-_comfy_backends: list = []             # enabled ComfyUI backends (generation routing)
+_gen_backends: list = []               # enabled generation backends (ComfyUI, Meshy)
 _route_index: dict = {}                # alias/model-id → [(backend, real_model)] candidates
 
 
@@ -982,10 +989,10 @@ def rebuild_route_index() -> None:
     """Recompute the per-key candidate lists. The index no longer sorts: dispatch
     order is decided per request by the scheduler (unpaid before paid, then fastest
     first), so candidates keep their insertion order as the stable tiebreak."""
-    global _backend_names, _llm_backends, _comfy_backends, _route_index
+    global _backend_names, _llm_backends, _gen_backends, _route_index
     _backend_names = {b["name"] for b in backends}
-    _llm_backends = [b for b in enabled_backends() if b.get("type", "openai") != "comfyui"]
-    _comfy_backends = [b for b in enabled_backends() if b.get("type") == "comfyui"]
+    _llm_backends = [b for b in enabled_backends() if not _is_gen(b)]
+    _gen_backends = [b for b in enabled_backends() if _is_gen(b)]
     index: dict[str, list] = {}
     for alias in virtual_models:                       # aliases (they shadow same-named real ids)
         for b in _llm_backends:
@@ -1097,7 +1104,7 @@ def alias_model_conflicts() -> list[dict]:
     out = []
     for name in virtual_models:
         hosting = [b["name"] for b in enabled_backends()
-                   if b.get("type", "openai") != "comfyui"
+                   if not _is_gen(b)
                    and name in backend_models.get(backend_id(b), set())]
         if not hosting:
             continue
@@ -1125,7 +1132,7 @@ def routing_snapshot() -> dict:
     for name in virtual_models:
         rows = []
         for b in backends:                     # all (incl. disabled) LLM backends, so a
-            if b.get("type", "openai") == "comfyui":   # mapping doesn't vanish when off
+            if _is_gen(b):                     # mapping doesn't vanish when off
                 continue                       # chat aliases route only to LLM backends
             real, _prio = alias_entry(name, b["name"])
             if real is None:
@@ -1217,7 +1224,7 @@ async def probe_reasoning(backend_name: str, model: str, adapter: str, param: di
     the /ui Reasoning-tab live test drives this. Returns a plain dict for the UI."""
     requested = requested if requested in ("off", "on") else "off"
     b = next((x for x in backends if x.get("name") == backend_name
-              and x.get("type", "openai") != "comfyui"), None)
+              and not _is_gen(x)), None)
     if b is None:
         return {"error": f"backend '{backend_name}' not found or not an LLM backend"}
     if b.get("type") == "anthropic":
@@ -1314,7 +1321,7 @@ def _local_whisper():
 def _whisper_route() -> Optional[tuple[dict, str]]:
     """First healthy LLM backend serving a whisper* model (fallback transcription)."""
     for b in enabled_backends():
-        if b.get("type", "openai") == "comfyui":
+        if _is_gen(b):
             continue
         for m in sorted(backend_models.get(backend_id(b), set())):
             if "whisper" in m.lower() and backend_healthy.get(backend_id(b)):
@@ -1781,7 +1788,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
     if typ != "image":
         for backend in enabled_backends():
-            if (backend.get("type", "openai") == "comfyui" or is_draining(backend)
+            if (_is_gen(backend) or is_draining(backend)
                     or not backend_healthy.get(backend_id(backend))):
                 continue                          # comfy / draining / down → not offered
             bname = backend["name"]
@@ -1823,7 +1830,7 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     now = int(time.time())
     if model_id in virtual_models:
         return {"id": model_id, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"}
-    llm = [b for b in enabled_backends() if b.get("type", "openai") != "comfyui"]
+    llm = [b for b in enabled_backends() if not _is_gen(b)]
     bname, bare = split_backend_prefix(model_id)
     if bname is not None:
         b = next((b for b in llm if b["name"] == bname), None)
@@ -2142,6 +2149,20 @@ async def audio_speech(request: Request, authorization: Optional[str] = Header(N
 # by id (TTL) — sync mode also returns them inline. No VRAM coordinator yet
 # (Phase 2): candidates are filtered by health + the existing busy cap only.
 
+def _gen_backend_for(name: str, cand: Optional[dict],
+                     pool: Optional[list] = None) -> Optional[dict]:
+    """The generation backend `name` of the SAME KIND as `cand` (Meshy candidate ↔ meshy
+    backend, workflow candidate ↔ comfyui backend). Backends are keyed (name, type), so a
+    ComfyUI and a Meshy backend may share a name; a bare-name match could route a Meshy
+    alias onto a GPU box (or a workflow alias onto the cloud API) and fail opaquely.
+    `pool` defaults to the enabled generation backends."""
+    want_meshy = cand is not None and cand.get("meshy") is not None
+    for b in (pool if pool is not None else _gen_backends):
+        if b.get("name") == name and (b.get("type") == "meshy") == want_meshy:
+            return b
+    return None
+
+
 def _gen_routes(alias: str) -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
     **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
@@ -2161,12 +2182,14 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     candidates = store.get(alias) if store.is_active() else None
     if candidates is None:
         candidates = image_models.get(alias, [])
-    # generation routes only to ComfyUI backends, so a name shared with an LLM backend
-    # resolves to the right one.
-    comfy = [b for b in _comfy_backends if not is_draining(b)]
+    # generation routes only to generation backends (ComfyUI, Meshy), so a name shared
+    # with an LLM backend resolves to the right one — and, since backends are keyed
+    # (name, type), the candidate's own KIND picks between a same-named ComfyUI and
+    # Meshy backend (see _gen_backend_for).
+    gen = [b for b in _gen_backends if not is_draining(b)]
     allc = []
     for cand in candidates:
-        b = next((b for b in comfy if b["name"] == cand.get("backend")), None)
+        b = _gen_backend_for(cand.get("backend"), cand, gen)
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
         allc.append((b, cand))
@@ -2390,6 +2413,10 @@ _GEN_FAILOVER_ERRORS = (httpx.ConnectError, httpx.TimeoutException, httpx.ReadEr
 def _fault_label(e: BaseException) -> str:
     """How to name a failover-worthy generation fault in a log line. Three distinct
     causes hide behind one failover path — say which one it was."""
+    if isinstance(e, adapters.MeshyNoCredits):
+        return "no credits left"
+    if isinstance(e, adapters.MeshyBusy):
+        return "Meshy queue full"
     if isinstance(e, TimeoutError):            # the adapter's own max_wait cap
         return "did not finish in time"
     if isinstance(e, httpx.TimeoutException):  # a single HTTP round trip timed out
@@ -2407,6 +2434,10 @@ def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
     instead of the workflow (measured 2026-08-25). The `max_wait` hint belongs ONLY on
     the adapter's own TimeoutError — an httpx timeout is a transport fault and naming
     max_wait there would mislead exactly the same way."""
+    if isinstance(last, adapters.MeshyNoCredits):
+        return f"no candidate backend could run it — Meshy account out of credits: {last}"
+    if isinstance(last, adapters.MeshyBusy):
+        return f"no candidate backend could run it — Meshy queue limit reached: {last}"
     if isinstance(last, TimeoutError):
         return (f"no candidate backend finished in time — the gateway's per-backend "
                 f"`max_wait` (default 600s; raise it in Backends for slow workflows): {last}")
@@ -2453,6 +2484,8 @@ async def _wait_backend_up(backend: dict, timeout_s: float = 30.0) -> None:
     """Give a crashed-and-systemd-restarting ComfyUI time to come back before a
     self-retry: poll /system_stats until it answers (or timeout_s passes). Never
     raises — a still-down backend just makes the retry fail fast into failover."""
+    if backend.get("type") != "comfyui":
+        return                      # a cloud task API has no VRAM to free / no host siblings
     url = (backend.get("url") or "").rstrip("/")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -2483,6 +2516,8 @@ async def _free_comfy_vram(backend: dict, why: str) -> None:
     Skipped while ANOTHER generation runs there — the free would drop its cache.
     Policy: host flag `comfy_free_after_job`; absent = ON for shared hosts only
     (a dedicated comfy box keeps its cache for speed)."""
+    if backend.get("type") != "comfyui":
+        return                      # a cloud task API has no VRAM to free / no host siblings
     bid = backend_id(backend)
     host = backend_hosts.get(bid, "")
     if not _host_flag(host, "comfy_free_after_job", _shared_host(host)):
@@ -2503,6 +2538,8 @@ async def _unload_host_llms(backend: dict) -> None:
     VRAM a loaded llama-swap model holds. Host flag `llm_unload_before_media`,
     default OFF — llama-swap's TTL usually clears the model anyway (endpoint
     verified on k12-gpu: llama-swap GET /unload → 200; other servers ignore it)."""
+    if backend.get("type") != "comfyui":
+        return                      # a cloud task API has no VRAM to free / no host siblings
     bid = backend_id(backend)
     host = backend_hosts.get(bid, "")
     if not _host_flag(host, "llm_unload_before_media", False):
@@ -2791,8 +2828,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     raw2 = (await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None
                     if raw2 is None:
                         raw2 = image_models.get(succ_alias, [])
-                    comfy_names = {b["name"] for b in _comfy_backends}
-                    if not any(c.get("backend") in comfy_names for c in raw2):
+                    gen_names = {b["name"] for b in _gen_backends}
+                    if not any(c.get("backend") in gen_names for c in raw2):
                         # unconfigured, or every candidate backend is disabled/gone — an
                         # admin state, not a transient: parking would never recover it.
                         await asyncio.to_thread(jobs.fail, job_id, f"successor '{succ_alias}' has no "
@@ -3073,25 +3110,33 @@ def _spawn_gen(job_id: str, coro) -> None:
 
 
 async def cancel_generation(job_id: str) -> bool:
-    """Cancel a queued/running generation job: best-effort interrupt the ComfyUI prompt
-    (free the GPU), cancel the worker task, mark the job failed. Returns False if the job
-    is already finished/unknown."""
+    """Cancel a queued/running generation job: best-effort interrupt on the backend
+    (adapter.cancel — ComfyUI /interrupt frees the GPU; a cloud task API has nothing
+    to stop, Meshy finishes and bills the task), cancel the worker task, mark the job
+    failed. Returns False if the job is already finished/unknown."""
     job = await asyncio.to_thread(jobs.get, job_id)
     if not job or job.get("status") not in ("queued", "running"):
         return False
-    b = next((x for x in backends if x.get("name") == job.get("backend")
-              and x.get("type") == "comfyui"), None)
-    if b and b.get("url"):
-        try:
-            await http_client.post(f"{b['url'].rstrip('/')}/interrupt", timeout=5.0)
-        except Exception:
-            pass
+    # The job row names the backend by NAME, which is unique only per TYPE — so the
+    # alias's candidate for that name decides the kind, or an /interrupt would hit an
+    # unrelated same-named ComfyUI. A row whose alias is gone (legacy/deleted) falls
+    # back to the bare name match: cancelling the worker task still beats not cancelling.
+    job_alias = job.get("alias") or ""
+    cands = (await asyncio.to_thread(store.get, job_alias)
+             if store.is_active() else None) or image_models.get(job_alias) or []
+    cand = next((c for c in cands if c.get("backend") == job.get("backend")), None)
+    pool = [x for x in backends if _is_gen(x)]       # incl. disabled: cancel must still reach it
+    b = (_gen_backend_for(job.get("backend"), cand, pool) if cand is not None
+         else next((x for x in pool if x.get("name") == job.get("backend")), None))
+    adapter = backend_adapters.get(backend_id(b)) if b else None
+    if adapter is not None:
+        await adapter.cancel()
     t = _gen_tasks.get(job_id)
     if t and not t.done():
         t.cancel()
     await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
     if b:
-        asyncio.create_task(_free_comfy_vram(b, "cancel"))
+        asyncio.create_task(_free_comfy_vram(b, "cancel"))     # no-op for non-ComfyUI (step 3)
     return True
 
 
@@ -3263,9 +3308,18 @@ async def run_generation(body: dict, request: Request,
             texture_format=(cand.get("texture_format") or None),
             dummy_check=(cand.get("dummy_check") is not False),   # default on; alias opt-out
             bypass=(cand.get("bypass") or []),                    # per-backend node bypass
+            meshy=cand.get("meshy"),                              # Meshy candidate block (None on ComfyUI)
         )
 
     first, cand0 = routes[0]
+    # Chains are a ComfyUI mechanism (export node → mesh path/upload hand-off): a Meshy
+    # stage 1 reaches ComfyUIAdapter-only hooks inside _run_chain and dies with an
+    # AttributeError in the spawned task. Refuse it here, NAMED — and before jobs.create,
+    # so a misconfigured alias leaves no orphan queued row.
+    _succ0 = cand0.get("successor") or {}
+    if cand0.get("meshy") is not None and (_succ0.get("alias") or "").strip():
+        raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and cannot be a "
+                                 f"chain stage (successor configured)")
     task = cand0.get("task", body.get("task", "text2img"))
     owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
@@ -3356,6 +3410,14 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     a dropped file would not degrade the job, it would run the workflow against its
     baked-in default and hand back a confidently wrong result."""
     wf, mapping = await asyncio.to_thread(_gen_alias_mapping, alias)
+    # Same lookup as every other alias read (_gen_routes, gen_alias_schema): store first,
+    # config `image_models` for aliases the store doesn't hold — a config-defined Meshy
+    # alias must hit the 400 below too, not fall through and drop the files silently.
+    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
+        or image_models.get(alias)
+    if cands and cands[0].get("meshy") is not None:
+        raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and accepts no `files`"
+                                 f" — send images under `images`")
     if not mapping:
         return {}                       # no candidate at all → run_generation 503s in a moment
     out = {}
@@ -3430,33 +3492,11 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     if not cands:
         raise HTTPException(404, f"generation alias '{alias}' not found")
     cand = cands[0]
+    # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; Meshy:
+    # the endpoint's fixed label table) — see adapters.public_fields.
+    params, images = adapters.public_fields(cand)
     wf = cand.get("workflow_json") or {}
     mapping = cand.get("mapping") or {}
-    params, images = [], []
-    for p, m in mapping.items():
-        m = m or {}
-        name = (m.get("label") or "").strip() or p
-        node, fld = m.get("node"), m.get("field")
-        if is_image_field(wf, node):
-            mode = slot_empty_mode(m)
-            images.append({"name": name, "on_empty": mode, "required": mode == "required"})
-            continue
-        cur = (wf.get(node, {}).get("inputs") or {}).get(fld)
-        if isinstance(cur, list):                # linked to another node — no scalar default
-            cur = None
-        typ = ("bool" if isinstance(cur, bool) else
-               "int" if isinstance(cur, int) else
-               "float" if isinstance(cur, float) else "string")
-        entry: dict = {"name": name, "type": typ}
-        # Advertise ONLY the LABEL (`name`). The internal param key can be node-based
-        # (`value_307`) and changes when the workflow is rebuilt, so it must never be a
-        # public field — the adapter still accepts it on input, but clients bind to the
-        # stable label. Set a label on every param for a fully node-id-free schema.
-        if cur is not None:
-            entry["default"] = cur
-        if name == "seed" or (p == "seed" and name == p):
-            entry["auto"] = "random unless sent"
-        params.append(entry)
     kinds = sorted(k for _, k in lora_groups(wf, mapping) if k)
     out: dict = {"object": "generation.schema", "alias": alias,
                  "backends": [c.get("backend") for c in cands],
@@ -3547,6 +3587,8 @@ def _gen_image_slots(alias: str) -> list:
     if not routes:
         return []
     _, cand = routes[0]
+    if cand.get("meshy") is not None:
+        return [i["name"] for i in adapters.public_fields(cand)[1]]   # labels ARE the params
     return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
 
 
@@ -3672,7 +3714,7 @@ def dashboard_snapshot() -> dict:
         bid, en = backend_id(b), is_enabled(b)
         # requests handled in the last hour: LLM calls from stats, image jobs from the
         # job store (an LLM and a ComfyUI backend may share a name → pick by type).
-        src_1h = jobs_1h if b.get("type") == "comfyui" else calls_1h
+        src_1h = jobs_1h if _is_gen(b) else calls_1h
         bes.append({
             "name": b["name"], "type": b.get("type", "openai"),
             "enabled": en, "healthy": en and backend_healthy.get(bid, False),
@@ -3683,7 +3725,7 @@ def dashboard_snapshot() -> dict:
             "reqs_1h": src_1h.get(b["name"], 0),
             "sampling_defaults": b.get("sampling_defaults") or None,
         })
-    is_comfy = lambda b: b.get("type") == "comfyui"
+    is_comfy = _is_gen
     return {
         "backends": bes,
         "llm_inflight": sum(backend_inflight.get(backend_id(b), 0) for b in backends if not is_comfy(b)),
@@ -3723,6 +3765,25 @@ def _comfy_watch_info(b: dict) -> dict:
     return info
 
 
+def _meshy_info(b: dict) -> dict:
+    """Credit balance seen at the last discovery of a Meshy backend, plus the same
+    rolling fail-rate the comfy backends carry (merged into /health + the UI
+    snapshot); {} for every other type. fail_rate is display-only — it never
+    reorders routing."""
+    if b.get("type") != "meshy":
+        return {}
+    info: dict = {}
+    fs = _gen_fail_stats(backend_id(b))      # same rolling fail-rate as comfy backends
+    if fs:
+        info.update(fs)
+    ad = backend_adapters.get(backend_id(b))
+    if ad is None:
+        return info
+    info.update({"credits": getattr(ad, "credits", None),
+                 "credits_at": int(getattr(ad, "credits_at", 0) or 0) or None})
+    return info
+
+
 def gateway_info() -> dict:
     """Snapshot the UI's Backends/Input/Server tabs read from."""
     config_ids = {backend_id(b) for b in config_backends}
@@ -3740,7 +3801,7 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            **_comfy_watch_info(b),
+            **_comfy_watch_info(b), **_meshy_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
@@ -3944,12 +4005,13 @@ def llm_backends_info() -> list[dict]:
     return [{"name": b["name"], "type": b.get("type", "openai"),
              "enabled": is_enabled(b),
              "models": sorted(backend_models.get(backend_id(b), set()))}
-            for b in backends if b.get("type", "openai") != "comfyui"]
+            for b in backends if not _is_gen(b)]
 
 
 # Wire the UI to the generation core, the ComfyUI backends, the status snapshot,
 # and the backend-change hook.
 admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
+           gen_backends=lambda: [b for b in backends if _is_gen(b)],
            gateway_info=gateway_info,
            apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
@@ -3966,7 +4028,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            set_backend_enabled=set_backend_enabled,
            restart_comfy=restart_comfy_backend,
            llm_backend_names=lambda: sorted({b["name"] for b in backends
-                                             if b.get("type", "openai") != "comfyui"}),
+                                             if not _is_gen(b)}),
            resolve_for_backend=resolve_for_backend,
            apply_reasoning=apply_reasoning_rules,
            probe_reasoning=probe_reasoning,
@@ -3996,7 +4058,7 @@ async def health():
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
-                **_comfy_watch_info(b),
+                **_comfy_watch_info(b), **_meshy_info(b),
             }
             for b in backends
         },

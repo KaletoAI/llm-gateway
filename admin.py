@@ -30,11 +30,16 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 
 import adapters
 import jobs
+import meshy
 import reasoning
 import stats
 import store
 
 logger = logging.getLogger(__name__)
+
+# Meshy is one fixed cloud endpoint — the form pre-fills it and backend_save
+# accepts a blank url for that type.
+_MESHY_URL = "https://api.meshy.ai"
 
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", "controlnet")
@@ -92,6 +97,7 @@ def _num(s: str):
 # catalog of bindable names; bind(**overrides) rebinds them by keyword (`foo=` sets
 # `_foo`). No triple bookkeeping (signature + global stmt + assignments) to keep in sync.
 _comfy_backends: Callable[[], list] = lambda: []
+_gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI + Meshy)
 _gateway_info: Callable[[], dict] = lambda: {}
 _cancel_generation = None
 _drain_backend = None
@@ -783,6 +789,8 @@ def _type_badge(t: str) -> str:
     t = (t or "openai").lower()
     if t == "comfyui":
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
+    if t == "meshy":
+        return _badge("☁ meshy", "img", "Meshy.ai cloud mesh generation (paid, per task)")
     if t == "anthropic":
         # plain glyph on purpose: the enclosed-A (🅐) renders as a blank box in the
         # console's system font stack
@@ -911,7 +919,14 @@ async def _multipart(request: Request) -> dict:
         head_s = head.decode("utf-8", "replace")
         nm = re.search(r'name="([^"]*)"', head_s)
         if nm:
-            out[nm.group(1)] = content if 'filename="' in head_s else content.decode("utf-8", "replace")
+            fn = re.search(r'filename="([^"]*)"', head_s)
+            out[nm.group(1)] = content if fn else content.decode("utf-8", "replace")
+            if fn:
+                # The upload's own name, under a companion key (callers read fields by
+                # name, and the prefix loops all filter by their own prefix). A mesh
+                # upload needs it: the extension is what tells the API the file type —
+                # the bytes of a .fbx and a .glb are both "some binary".
+                out[nm.group(1) + "__filename"] = os.path.basename(fn.group(1).replace("\\", "/"))
     return out
 
 
@@ -1073,15 +1088,20 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + "<p class='hint' style='margin:-4px 0 10px'><b>openai</b> = every OpenAI-compatible server "
               "(llama.cpp / llama-swap / vLLM / LocalAI / cloud) — including <b>TTS/voice</b> and whisper "
               "models, which are discovered and routed like any other model. <b>comfyui</b> = workflow-based "
-              "media generation. <b>anthropic</b> = api.anthropic.com for Claude Code, reachable through "
-              "<code>/v1/messages</code> only.</p>"
+              "media generation. <b>meshy</b> = Meshy.ai cloud mesh generation (image / multi-image → 3D), "
+              "billed per task in credits — always <b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
+              "Claude Code, reachable through <code>/v1/messages</code> only.</p>"
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
             + _field("host", host_inp)
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
               "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
               "host/IP, which groups correctly for most setups.</p>"
-            + _field("cost tier", _checkbox("paid", gb("paid"),
-                     "paid — used only when no unpaid backend is free"))
+            # Meshy bills per task, so `paid` is not a choice there: shown checked +
+            # disabled (a disabled box is NOT submitted — backend_save forces it too).
+            + _field("cost tier", ('<label class="ckbox"><input type="checkbox" name="paid" value="1" '
+                                   'checked disabled> paid — always, Meshy bills per task</label>')
+                     if g("type", "openai") == "meshy" else
+                     _checkbox("paid", gb("paid"), "paid — used only when no unpaid backend is free"))
             + "<p class='hint' style='margin:-4px 0 10px'><b>paid</b>: this backend bills per request "
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
               "and reaches for a paid one only when no unpaid backend is free.</p>"
@@ -1128,6 +1148,24 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "fault mid-job retries the <b>same</b> backend this many times (after waiting for "
               "<code>/system_stats</code>) before failing over — for hosts with sporadic driver "
               "faults. Blank/0 = fail over immediately; content errors are never retried.</p>"
+            + "</div>"
+            # Meshy-only options — a cloud task API: no dirs, no watchdog, no self-retry.
+            # The fields are named meshy_* because #comfyopts already renders max_wait /
+            # poll_interval, and one form may carry each name only once.
+            + f'<div id="meshyopts" style="{"" if g("type", "openai") == "meshy" else "display:none"}">'
+            + '<div class="grouphdr">Meshy</div>'
+            + _field("max wait s", _inp("meshy_max_wait", g("max_wait"), placeholder="900", typ="number"))
+            + _field("poll interval s", _inp("meshy_poll_interval", g("poll_interval"),
+                     placeholder="5", typ="number", step="0.5"))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>api key</b> (above) is the Meshy key "
+              "(<code>msy_…</code>, Meshy dashboard → API). <b>max_concurrent</b> should stay at or below "
+              "your Meshy tier's concurrent-task limit — this account is on <b>Pro (10)</b> "
+              "(Studio 20 · Premium 30 · Ultra 100; the limit is shared by every key of the account) — "
+              "beyond it Meshy answers 429 and the job fails over. "
+              "<b>max wait s</b> caps one task incl. Meshy's own queue (blank = 900); <b>poll interval s</b> "
+              "is the gap between task polls (blank = 5). Credits: 20 (no texture) / 30 (textured) / "
+              "35 (8K) per Meshy-6/7 task, +5 ultra; refunded when a task fails. The current balance shows "
+              "in the backend list after the next health poll.</p>"
             + "</div>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
@@ -1204,15 +1242,24 @@ def _sampling_text(d) -> str:
 
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
-    (LLM / ComfyUI / Anthropic — the form renders all, only one is ever visible)."""
+    (LLM / ComfyUI / Meshy / Anthropic — the form renders all, only one is ever visible).
+    Meshy also pre-fills the fixed cloud URL and forces `paid` (it bills per task); the
+    disabled box is not submitted, so `backend_save` sets it server-side too."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
-                   for t in ("comfyui", "openai", "anthropic"))
+                   for t in ("comfyui", "meshy", "openai", "anthropic"))
     return ('<select name="type" onchange="var t=this.value,'
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
-            "a=document.getElementById('anthopts');"
+            "m=document.getElementById('meshyopts'),a=document.getElementById('anthopts'),"
+            "u=document.querySelector('input[name=url]'),p=document.querySelector('input[name=paid]');"
             "if(l)l.style.display=t==='openai'?'':'none';"
             "if(c)c.style.display=t==='comfyui'?'':'none';"
-            "if(a)a.style.display=t==='anthropic'?'':'none'\">" + opts + "</select>")
+            "if(m)m.style.display=t==='meshy'?'':'none';"
+            "if(a)a.style.display=t==='anthropic'?'':'none';"
+            "if(t==='meshy'){if(u&&!u.value)u.value='" + _MESHY_URL + "';"
+            "if(p){if(p.dataset.was===undefined)p.dataset.was=p.checked?'1':'';"
+            "p.checked=true;p.disabled=true}}"
+            "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
+            "p.checked=p.dataset.was==='1';delete p.dataset.was}}\">" + opts + "</select>")
 
 
 def _bid(b: dict) -> str:
@@ -1279,13 +1326,21 @@ async def backends_page(request: Request):
               if b.get("fail_rate") is not None else "")
         smp = (f" · sampling {_sampling_text(b['sampling_defaults'])}"
                if b.get("sampling_defaults") else "")
-        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{rst}{src}"
+        # Meshy credit balance WITH its age: the number is a snapshot from the last
+        # successful discovery, and a stale one is worth spotting before a job fails.
+        cr = ""
+        if b.get("credits") is not None:
+            cr = f" · credits {b['credits']}"
+            if b.get("credits_at"):
+                cr += f" ({_age(b['credits_at'])} ago)"
+        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{cr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
-    # group by kind: LLM (openai-compatible) vs Media (comfyui), alphabetical within each
+    # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
+    # Meshy, …), alphabetical within each
     binfo = sorted(binfo, key=lambda b: b["name"].lower())
-    llm = [b for b in binfo if b.get("type", "openai") != "comfyui"]
-    img = [b for b in binfo if b.get("type") == "comfyui"]
+    llm = [b for b in binfo if b.get("type", "openai") not in adapters.GEN_TYPES]
+    img = [b for b in binfo if b.get("type") in adapters.GEN_TYPES]
     items = ""
     for label, group in (("LLM", llm), ("Media", img)):
         if group:
@@ -1504,10 +1559,12 @@ async def backend_save(request: Request):
     f = await _form(request)
     name = (f.get("name", "") or "").strip()
     url = (f.get("url", "") or "").strip().rstrip("/")
+    new_type = (f.get("type", "openai") or "openai").strip()
+    if not url and new_type == "meshy":
+        url = _MESHY_URL                   # one fixed cloud endpoint — nothing to type
     if not name or not url:
         return HTMLResponse(_page("Backends", '<p class="bad">name and url are required</p>'
             f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
-    new_type = (f.get("type", "openai") or "openai").strip()
     orig = (f.get("orig", "") or "").strip()
     oname, otype = _parse_bid(orig) if orig else (name, new_type)
     # start from the existing store backend (by old identity) so fields we don't render
@@ -1559,6 +1616,26 @@ async def backend_save(request: Request):
         b["poll_interval"] = pi_val
     else:
         b.pop("poll_interval", None)           # blank/0/garbage = the 1.0 s default
+    # Meshy: a cloud task API — bills per task, so `paid` is not the operator's choice
+    # (the form's box is disabled and therefore NOT submitted; it is forced here).
+    # Its max_wait/poll_interval arrive under meshy_* names because #comfyopts already
+    # renders those two names, and none of the ComfyUI-only keys apply.
+    if new_type == "meshy":
+        b["paid"] = True                       # bills per task — never an unpaid candidate
+        for src, dst, cast in (("meshy_max_wait", "max_wait", int),
+                               ("meshy_poll_interval", "poll_interval", float)):
+            v = (f.get(src, "") or "").strip()
+            try:
+                val = cast(float(v))
+            except ValueError:
+                val = 0
+            if val > 0:
+                b[dst] = val
+            else:
+                b.pop(dst, None)               # blank = defaults (900 / 5)
+        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+                  "stuck_after_s", "self_retries"):
+            b.pop(k, None)
     # Anthropic: how the credential is sent, plus the fallback model list used when
     # a subscription token isn't allowed on GET /v1/models.
     if new_type == "anthropic":
@@ -1882,7 +1959,8 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
         entries = sorted(per_backend.get(sel, []), key=lambda e: e[0].lower())
         rows = ""
         for alias, c, cands in entries:
-            mapped = ", ".join((c.get("mapping") or {}).keys()) or "auto"
+            mapped = (f"meshy · {meshy.endpoint_of(c)}" if c.get("meshy") is not None
+                      else ", ".join((c.get("mapping") or {}).keys()) or "auto")
             pins = len([b for b in (c.get("fixed") or []) if b.get("node")])
             byp = len(c.get("bypass") or [])
             # pins + bypass are the per-backend half of a workflow — the reason this
@@ -1957,12 +2035,13 @@ async def routing_page(request: Request):
     LoRAs (?sub=, first child = default)."""
     sub = request.query_params.get("sub") or SUBTABS["routing"][0][0]
     info = _gateway_info()
-    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") == "comfyui"}
+    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") in adapters.GEN_TYPES}
     if sub == "chat":
         title, body = "Chat aliases", _routing_chat_body(_routing_snapshot())
     elif sub == "llm":
         snap = _routing_snapshot()
-        on_llm = [m for m in snap.get("models", []) if any(h.get("type") != "comfyui" for h in m["hosts"])]
+        on_llm = [m for m in snap.get("models", [])
+                  if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])]
         title, body = "LLM models", (
             "<h2>LLM models → backends</h2>"
             "<p class='hint'>A bare model id goes to the fastest free <b>unpaid</b> backend of "
@@ -1976,9 +2055,11 @@ async def routing_page(request: Request):
             bmeta, (request.query_params.get("backend") or "").strip() or None)
     elif sub == "image":
         snap = _routing_snapshot()
-        img_models = [m for m in snap.get("models", []) if any(h.get("type") == "comfyui" for h in m["hosts"])]
+        img_models = [m for m in snap.get("models", [])
+                      if any(h.get("type") in adapters.GEN_TYPES for h in m["hosts"])]
         img_on_llm = [m for m in snap.get("models", [])
-                      if any(h.get("type") != "comfyui" for h in m["hosts"]) and _is_image_model(m["model"])]
+                      if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])
+                      and _is_image_model(m["model"])]
         title, body = "Image models", (
             "<h2>Image models → backends</h2>"
             "<p class='hint'>ComfyUI checkpoints/models, plus image models served by LLM "
@@ -2434,12 +2515,13 @@ async def chatplay_send(request: Request):
 # ── Tab: Mapping ────────────────────────────────────────────────────────────────
 
 def _register_form() -> str:
-    backend_opts = [b["name"] for b in _comfy_backends()] or [("", "(no comfyui backends)")]
+    backend_opts = [b["name"] for b in _gen_backends()] or [("", "(no generation backends)")]
     return ('<form action="/ui/mapping/register" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Register Workflow</h2>{_btn("Register", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}</div>'
             "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
-            "later ComfyUI-GUI edits. You'll map fields after registering.</p>"
+            "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>meshy</b> backend "
+            "no JSON is needed — the alias is created with Meshy defaults and edited next.</p>"
             + _field("alias", _inp("alias", placeholder="flux"))
             + _field("backend", _select("backend", backend_opts))
             + _field("task", _task_select())
@@ -2506,7 +2588,8 @@ def _mapping_list_media(iedit: str) -> str:
                  f'<span class="muted" style="font-weight:normal">{len(entries)}</span></div>')
         for alias, cands in entries:
             c = cands[0]
-            mapped = ", ".join((c.get("mapping") or {}).keys()) or "auto"
+            mapped = (f"meshy · {meshy.endpoint_of(c)}" if c.get("meshy") is not None
+                      else ", ".join((c.get("mapping") or {}).keys()) or "auto")
             backends = ", ".join(x.get("backend", "") for x in cands)
             acts = _icon_acts(
                 ("✎", f"/ui/mapping?edit={_esc(alias)}", "secondary", "Edit"),
@@ -2566,7 +2649,8 @@ async def register_post(request: Request):
     f = await _multipart(request)
     alias = str(f.get("alias", "")).strip()
     backend = str(f.get("backend", "")).strip()
-    task = (str(f.get("task", "")).strip() or "text2img")
+    picked_task = str(f.get("task", "")).strip()      # "" = field absent (API caller)
+    task = picked_task or "text2img"
     upload = f.get("workflow_file")
     path = str(f.get("workflow_path", "")).strip()
 
@@ -2575,6 +2659,23 @@ async def register_post(request: Request):
                             f'<div class="actions" style="padding-left:0">{_btn("← Back", "/ui/mapping?sub=media", "secondary")}</div>', "mapping"))
     if not alias or not backend:
         return err("alias and backend are required")
+    # A Meshy alias has no workflow at all: its request fields are the fixed label
+    # table in meshy.py, its per-backend half is a set of admin options. Registering
+    # creates the default candidate; everything else is edited in _meshy_editor.
+    # The KIND comes from the picked backend, and a name is unique only per type (a
+    # ComfyUI and a Meshy backend may both be called "gpu") — so match on (name, type)
+    # instead of trusting whichever same-named backend comes first.
+    if any(b["name"] == backend and b.get("type") == "meshy" for b in _gen_backends()):
+        cand = meshy.default_candidate(backend)
+        # The task dropdown defaults to `text2img`, which Meshy cannot do at all (it
+        # only turns images into 3D). So the form's untouched default — like a missing
+        # field — keeps default_candidate's `img2mesh`; only a task the user actually
+        # PICKED overrides it. Without this the alias landed in the text2img group.
+        if picked_task and picked_task != "text2img":
+            cand["task"] = picked_task
+        store.upsert(alias, [cand])
+        logger.info(f"ui: registered '{alias}' -> {backend} (meshy, no workflow)")
+        return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
     try:
         if isinstance(upload, (bytes, bytearray)) and upload.strip():
             wf = json.loads(upload.decode("utf-8"))
@@ -2674,6 +2775,17 @@ def _reorder_js(alias: str) -> str:
             "});})();</script>")
 
 
+def _same_kind(cands: list, backend_name: str) -> bool:
+    """An alias is homogeneous: ComfyUI candidates only or Meshy candidates only (the
+    editor, schema and playground read the FIRST candidate as the alias's shape).
+
+    Backends are keyed (name, type), so a bare-name lookup could answer about the
+    same-named backend of the OTHER kind — match on the wanted kind directly."""
+    want_meshy = bool(cands) and cands[0].get("meshy") is not None
+    return any(x["name"] == backend_name and (x.get("type") == "meshy") == want_meshy
+               for x in _gen_backends())
+
+
 def _backends_section(alias: str, cands: list) -> str:
     """Allowed backends for an alias — a flat list (no primary/fallback). A job takes
     the fastest free unpaid one of them; on error the job runner moves to the next.
@@ -2685,7 +2797,8 @@ def _backends_section(alias: str, cands: list) -> str:
                    "danger", sm=True, icon=True, title="Remove this backend")
               if len(used) > 1 else "<span class='muted' title='an alias needs ≥1 backend'>—</span>")
         rows += f"<tr><td>{_esc(bn)}</td><td class='acts'>{rm}</td></tr>"
-    add_opts = [b["name"] for b in _comfy_backends() if b["name"] not in used]
+    add_opts = [b["name"] for b in _gen_backends()
+                if b["name"] not in used and _same_kind(cands, b["name"])]
     add_sel = ""
     if add_opts:
         opts = "".join(f"<option>{_esc(o)}</option>" for o in add_opts)
@@ -3031,6 +3144,77 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             f"{body}{add_sel}")
 
 
+def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
+    """Editor for a Meshy alias: endpoint, model and the admin option defaults — no
+    workflow, no mapping, no pins (the public fields are a fixed table, see meshy.py)."""
+    cand = cands[0]
+    ep = meshy.endpoint_of(cand)
+    opts = meshy.options_of(cand)
+    model = cand.get("model") if cand.get("model") in meshy.AI_MODELS else "latest"
+    retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
+    cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "img2mesh"
+    fmts = "".join(f'<label style="margin-right:10px"><input type="checkbox" name="fmt__{_esc(f)}"'
+                   f'{" checked" if f in opts["target_formats"] else ""}> {_esc(f)}</label>'
+                   for f in meshy.FORMATS)
+    cb = lambda k, txt: _checkbox(f"opt__{k}", bool(opts.get(k)), txt)
+    remesh = {None: "", True: "true", False: "false"}.get(opts.get("should_remesh"), "")
+    params, images = meshy.public_fields(cand)
+    fields = "".join(f"<tr><td><code>{_esc(i['name'])}</code></td><td>image · {_esc(i['on_empty'])}</td></tr>"
+                     for i in images)
+    fields += "".join(f"<tr><td><code>{_esc(p['name'])}</code></td><td>{_esc(p['type'])}"
+                      f"{' · default ' + _esc(str(p['default'])) if p.get('default') not in (None, '') else ''}"
+                      f"{' · ' + '/'.join(_esc(c or 'none') for c in p['choices']) if p.get('choices') else ''}"
+                      "</td></tr>" for p in params)
+    return (f'<form action="/ui/mapping/meshy-update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
+            f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
+            + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "") + "</div>"
+            + _field("alias name", _inp("new_alias", alias), short=True)
+            + _field("task", _task_select(cur_task), short=True)
+            + '<h2 style="margin-top:18px">Meshy</h2>'
+            + _field("endpoint", _select("meshy_endpoint", list(meshy.ENDPOINTS), ep))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>image-to-3d</b> takes <code>input_image</code>; "
+              "<b>multi-image-to-3d</b> takes <code>input_image_front</code> (required) plus optional "
+              "<code>_back/_left/_right</code> — the same slot names as the Trellis2 multiview alias.</p>"
+            + _field("ai model", _select("meshy_model", list(meshy.AI_MODELS), model))
+            + _field("texture", cb("should_texture", "should_texture") + cb("enable_pbr", "enable_pbr (PBR maps)"))
+            + _field("texture resolution", _select("opt__texture_resolution", list(meshy.TEXTURE_RES),
+                                                   opts["texture_resolution"]))
+            + "<p class='hint' style='margin:-4px 0 10px'>Default when the client sends no "
+              "<code>input_texture_resolution</code> (≤2048 → 2k, ≤4096 → 4k, else 8k). 4k/8k need Meshy-6+.</p>"
+            + _field("topology", _select("opt__topology", list(meshy.TOPOLOGIES), opts["topology"]))
+            + _field("remesh", _select("opt__should_remesh",
+                                       [("", "model default"), ("true", "always"), ("false", "never")], remesh))
+            + "<p class='hint' style='margin:-4px 0 10px'>A client <code>input_face_num</code> always turns "
+              "remesh on for that request (a polycount needs the remesh pass).</p>"
+            + _field("pose", _select("opt__pose_mode", [(p, p or "none") for p in meshy.POSES],
+                                     opts.get("pose_mode") or ""))
+            + _field("input", cb("image_enhancement", "image_enhancement") + cb("remove_lighting", "remove_lighting")
+                     + cb("moderation", "moderation"))
+            + _field("ultra", cb("ultra_mode", "ultra_mode (+5 credits, Meshy-7 only)"))
+            + _field("deliver formats", fmts)
+            + _field("thumbnail", cb("thumbnail", "deliver Meshy's preview.png as an extra image artifact"))
+            + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
+                                     typ="number"), short=True)
+            + '<h2 style="margin-top:18px">Request fields</h2>'
+            + "<p class='hint'>Fixed for Meshy aliases — what <code>GET /v1/generations/{alias}/schema</code> "
+              "advertises. <code>input_remove_background</code> / <code>input_no_fingers</code> are accepted "
+              "and ignored.</p>"
+            + f"<table class='pins'><tr><th>name</th><th>type</th></tr>{fields}</table>"
+            + "</form>"
+            + '<h2 style="margin-top:18px">Backends</h2>'
+            + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free one; on a "
+              "connection error the next one is used. Only Meshy backends can be added to a Meshy alias.</p>"
+            + _backends_section(alias, cands))
+
+
+# The editor's third column ("Available fields") is a workflow view — a Meshy alias
+# has no workflow, so it carries the reason instead of rendering empty.
+_MESHY_SIDE = ("<h2>Available fields</h2><p class='hint'>A Meshy alias has no workflow: its request "
+               "fields are the fixed table in the editor, and everything else is an admin option "
+               "set on the left.</p>")
+
+
 async def _alias_editor(alias: str, saved: bool = False) -> str:
     """The alias editor as a single-column fragment for the master-detail right
     side (request fields + pinned values in one form, available fields below).
@@ -3040,6 +3224,8 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     if not cands:
         return f'<p class="bad">alias \'{_esc(alias)}\' not found</p>'
     cand = cands[0]
+    if cand.get("meshy") is not None:            # no workflow, no mapping, no /object_info
+        return _meshy_editor(alias, cands, saved), _MESHY_SIDE
     wf = cand.get("workflow_json")
     if wf is None and cand.get("workflow"):
         try:
@@ -3295,7 +3481,7 @@ async def cand_add(request: Request):
     workflow+mapping on that backend (deduped by backend name)."""
     alias, backend = _qp(request, "alias"), _qp(request, "backend")
     cands = store.get(alias)
-    valid = {b["name"] for b in _comfy_backends()}
+    valid = {b["name"] for b in _gen_backends() if _same_kind(cands or [], b["name"])}
     if cands and backend in valid and backend not in [c.get("backend") for c in cands]:
         new = json.loads(json.dumps(cands[0]))     # snapshot workflow+mapping (+retries)
         new["backend"] = backend
@@ -3520,6 +3706,49 @@ async def update(request: Request):
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
+async def meshy_update(request: Request):
+    """Save a Meshy alias: endpoint + ai model + the admin options, on EVERY candidate
+    (they are the alias's shape, not per-backend). Refuses a ComfyUI alias — its
+    fields live in /ui/mapping/update."""
+    f = await _form(request)
+    alias = (f.get("alias", "") or "").strip()
+    cands = store.get(alias)
+    if not alias or not cands or cands[0].get("meshy") is None:
+        raise HTTPException(404, "meshy alias not found")
+    ep = (f.get("meshy_endpoint", "") or "").strip()
+    model = (f.get("meshy_model", "") or "").strip()
+    opts = dict(meshy.OPTION_DEFAULTS)
+    for k in ("should_texture", "enable_pbr", "ultra_mode", "image_enhancement",
+              "remove_lighting", "moderation", "thumbnail"):
+        opts[k] = bool(f.get(f"opt__{k}"))
+    tr = (f.get("opt__texture_resolution", "") or "").strip()
+    opts["texture_resolution"] = tr if tr in meshy.TEXTURE_RES else "2k"
+    tp = (f.get("opt__topology", "") or "").strip()
+    opts["topology"] = tp if tp in meshy.TOPOLOGIES else "triangle"
+    opts["should_remesh"] = {"true": True, "false": False}.get((f.get("opt__should_remesh", "") or "").strip())
+    pm = (f.get("opt__pose_mode", "") or "").strip()
+    opts["pose_mode"] = pm if pm in meshy.POSES else ""
+    opts["target_formats"] = [x for x in meshy.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
+    task = (f.get("task", "") or "").strip()
+    retries = (f.get("retries", "") or "").strip()
+    for c in cands:
+        # a fresh options dict per candidate — one shared object would let a later
+        # in-place edit of one candidate rewrite the others
+        c["meshy"] = {"endpoint": ep if ep in meshy.ENDPOINTS else meshy.ENDPOINTS[0],
+                      "options": json.loads(json.dumps(opts))}
+        c["model"] = model if model in meshy.AI_MODELS else "latest"
+        c["retries"] = retries
+        if task:
+            c["task"] = task
+    new_alias = (f.get("new_alias", "") or "").strip()
+    if new_alias and new_alias != alias and not store.get(new_alias):
+        store.delete(alias)            # rename: move under the new name
+        alias = new_alias
+    store.upsert(alias, cands)
+    logger.info(f"ui: updated meshy alias '{alias}' ({cands[0]['meshy']['endpoint']}, {cands[0]['model']})")
+    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
+
+
 async def delete(request: Request):
     alias = request.query_params.get("alias", "").strip()
     if alias:
@@ -3543,12 +3772,74 @@ async def copy(request: Request):
 
 # ── Tab: Playground ─────────────────────────────────────────────────────────────
 
-# Reference images stick across generations: stashed in memory PER USER (keyed by
-# slot name) so the file-input (which the browser can't pre-fill) doesn't have to be
-# re-picked each time — and so switching the model keeps them: same-named slots
-# carry over to the new alias (generate() filters to the alias's actual image
-# slots). A new upload replaces; the "clear" checkbox drops it. Lost on restart.
+# Uploaded inputs stick across generations: stashed in memory PER USER as
+# {param: (filename, bytes)} so the file-input (which the browser can't pre-fill)
+# doesn't have to be re-picked each time — and so switching the model keeps them:
+# same-named slots carry over to the new alias (generate() filters to the alias's
+# actual slots). A new upload replaces; the "clear" checkbox drops it. Lost on
+# restart. The filename rides along because a MESH's type lives in its extension
+# alone (a .fbx and a .glb are both "some binary"); images carry theirs in the bytes.
 _pg_images: dict = {}
+
+# Mesh uploads the file picker offers, and what a stashed extension means on the
+# wire. Deliberately NOT adapters._mime_and_kind: that maps .fbx/.ply to
+# application/octet-stream (right for storage, wrong here — the API recovers the
+# file's extension from the data-URI MIME, and octet-stream would lose it).
+_PG_FILE_ACCEPT = ".glb,.gltf,.obj,.fbx,.stl,.ply"
+_PG_FILE_MIME = {"glb": "model/gltf-binary", "gltf": "model/gltf+json", "obj": "model/obj",
+                 "stl": "model/stl", "ply": "model/ply", "fbx": "model/fbx"}
+
+
+def _pg_file_mime(name: str) -> str:
+    """The data-URI MIME for a stashed mesh, derived from its filename extension —
+    that MIME is the ONLY thing the API has to rebuild the extension with (see
+    main._EXT_BY_MIME), so an unknown one costs the file its type."""
+    return _PG_FILE_MIME.get(os.path.splitext(name or "")[1].lstrip(".").lower(),
+                             "application/octet-stream")
+
+
+def _pg_history_opts() -> dict:
+    """{"image": [(value, label)…], "file": […]} — every artifact of the recent jobs,
+    newest first, as picker options. `value` is "<job>:r:<n>" (a result) or
+    "<job>:i:<n>" (a stored input image); generate() resolves it back to bytes.
+
+    An image slot may take any earlier image — a result OR another job's reference
+    input (re-running the same picture against a second alias is the common case);
+    a mesh param takes result FILES (glb/fbx/…), which is what a mesh stage produces."""
+    out = {"image": [], "file": []}
+    for j in jobs.recent_artifacts(limit=60):
+        when = time.strftime("%H:%M", time.localtime(int(j.get("created") or 0)))
+        head = f"{when} {j.get('alias') or '?'}"
+        for r in j["results"]:
+            kind = r.get("kind")
+            if kind in out:
+                out[kind].append((f"{j['id']}:r:{r['n']}", f"{head} · #{r['n']} {r.get('name') or ''}"))
+        for i in j["inputs"]:
+            out["image"].append((f"{j['id']}:i:{i['n']}",
+                                 f"{head} · in#{i['n']} {i.get('slot') or i.get('filename') or ''}"))
+    return out
+
+
+def _pg_history_blob(ref: str):
+    """A picked "<job>:r|i:<n>" → (filename, bytes), or None when the artifact is gone
+    (TTL pruning deletes a job's files while the row still lists them)."""
+    jid, _, rest = (ref or "").partition(":")
+    which, _, ns = rest.partition(":")
+    if which not in ("r", "i") or not ns.isdigit():
+        return None
+    n = int(ns)
+    p = jobs.result_path(jid, n) if which == "r" else jobs.input_path(jid, n)
+    if not p:
+        return None
+    try:
+        with open(p[0], "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    # a result's original name (mesh.glb) if it has one, else the on-disk name —
+    # either way the EXTENSION is what the upload's mime is derived from
+    name = (p[2] if which == "r" and len(p) > 2 and p[2] else os.path.basename(p[0]))
+    return name, data
 
 
 def _alias_defaults(cand: dict) -> dict:
@@ -3563,8 +3854,26 @@ def _alias_defaults(cand: dict) -> dict:
 
 
 def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
-                     kept: Optional[set] = None) -> str:
+                     kept: Optional[dict] = None) -> str:
+    """`kept` is the user's upload stash ({param: (filename, bytes)}) — membership drives
+    the '✓ kept' badge, the name is shown for mesh uploads (which one is loaded?)."""
     v = lambda k: str(vals.get(k) if vals.get(k) is not None else "")
+    # Job-artifact picker options, loaded AT MOST ONCE per render (one SELECT) and only
+    # when a row actually needs them — a text-only alias must not pay for the query.
+    hist_cache: list = []
+
+    def hist(param: str, kind: str) -> str:
+        if not hist_cache:
+            hist_cache.append(_pg_history_opts())
+        return _select(f"hist__{param}", [("", "(from a job…)")] + hist_cache[0][kind])
+
+    def kept_badge(param: str, show_name: bool = False) -> str:
+        name = (kept or {}).get(param)
+        name = name[0] if isinstance(name, tuple) else ""
+        return (' <span class="badge ok">✓ kept</span>'
+                + (f' <span class="muted">{_esc(name)}</span>' if show_name and name else "")
+                + ' <label class="muted" style="font-weight:normal">'
+                  f'<input type="checkbox" name="clear__{_esc(param)}"> clear</label>')
     # selecting an alias reloads with its workflow defaults pre-filled
     opts = "".join(f'<option value="{_esc(a)}"{" selected" if a == vals.get("model") else ""}>{_esc(a)}</option>'
                    for a in aliases)
@@ -3581,20 +3890,56 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     imgset = set(adapters.image_params(wf, mapping))
     defaults = _alias_defaults(cand) if cand else {}
     rows = ""
+    # A Meshy alias has no workflow to read fields off — its public fields are the
+    # fixed label table (same source the schema endpoint uses), so they are rendered
+    # from adapters.public_fields and the workflow-driven loop below is skipped.
+    if cand and cand.get("meshy") is not None:
+        params, images = adapters.public_fields(cand)
+        for i in images:
+            extra = (kept_badge(i["name"])
+                     if kept and i["name"] in kept else
+                     ' <span class="muted">required</span>' if i["required"] else
+                     ' <span class="muted">optional · empty → not sent</span>')
+            rows += _field(i["name"], f'<input type="file" name="img__{_esc(i["name"])}" '
+                                      f'accept="image/png,image/jpeg"> {hist(i["name"], "image")}{extra}')
+        for p in params:
+            cur = v(p["name"]) or ("" if p.get("default") in (None, "") else str(p["default"]))
+            if p.get("choices"):
+                rows += _field(p["name"], _select(f"p__{p['name']}",
+                                                  [(c, c or "none") for c in p["choices"]], cur))
+            elif p["type"] == "bool":
+                rows += _field(p["name"], _checkbox(f"p__{p['name']}",
+                                                    cur.lower() in ("true", "1", "on"), p["name"]))
+            else:
+                rows += _field(p["name"], _inp(f"p__{p['name']}", cur,
+                                               typ="number" if p["type"] in ("int", "float") else "text"))
+        mapping = {}                       # skip the workflow-driven loop below
     for p, m in mapping.items():
         label = (m or {}).get("label") or p
         if p in imgset:
             emode = adapters.slot_empty_mode(m)
             if kept and p in kept:
-                extra = (' <span class="badge ok">✓ kept</span> <label class="muted" '
-                         f'style="font-weight:normal"><input type="checkbox" name="clear__{_esc(p)}"> clear</label>')
+                extra = kept_badge(p)
             elif emode == "required":
                 extra = ' <span class="muted">required — no placeholder</span>'
             elif emode == "disable":
                 extra = ' <span class="muted">empty → loader node disabled</span>'
             else:
                 extra = ' <span class="muted">empty → 8×8 placeholder</span>'
-            rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*">{extra}')
+            rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*"> '
+                                  f'{hist(p, "image")}{extra}')
+        elif adapters.is_file_param(p, m):
+            # A mesh param takes a real file (uploaded, or an earlier job's result) —
+            # sent as the API's `files`. The old text field stays as the second way in:
+            # a path that already exists ON THE BACKEND needs no upload at all. Upload
+            # wins over path when both are set (generate() drops the path then).
+            extra = kept_badge(p, show_name=True) if kept and p in kept else ""
+            rows += _field(label,
+                           f'<input type="file" name="file__{_esc(p)}" accept="{_PG_FILE_ACCEPT}"> '
+                           f'{hist(p, "file")}{extra}'
+                           f'<div style="margin-top:4px">'
+                           + _inp(f"p__{p}", v(p), placeholder="…or a path on the backend")
+                           + '</div>')
         else:
             dv = defaults.get(p)
             node, field = (m or {}).get("node"), (m or {}).get("field")
@@ -3635,7 +3980,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
 
 
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None, kept: Optional[set] = None) -> str:
+                     oi: Optional[dict] = None, kept: Optional[dict] = None) -> str:
     # model-viewer loads with the page and stays loaded: _LIVE_JS never re-inserts a
     # <script>, so a viewer arriving through a live update upgrades against the
     # definition that is already there.
@@ -3720,7 +4065,13 @@ async def playground_page(request: Request):
     # alias's workflow default. Params are dynamic — whatever Mapping configured.
     vals = {"model": model, "backend": qp.get("backend", "")}
     defaults = _alias_defaults(cand) if cand else {}
-    for p in ((cand.get("mapping") if cand else {}) or {}):
+    # the alias's public param names: a mapping for a ComfyUI alias, the fixed label
+    # table for a Meshy one — without this a p__<field> from the URL (Send to
+    # Playground, or the post-Generate redirect) would never reach the form
+    pnames = ([x["name"] for x in adapters.public_fields(cand)[0]]
+              if cand and cand.get("meshy") is not None
+              else list((cand.get("mapping") if cand else {}) or {}))
+    for p in pnames:
         q = qp.get(f"p__{p}", "")
         vals[p] = q if q != "" else ("" if defaults.get(p) is None else str(defaults[p]))
     job_id = qp.get("job", "")
@@ -3731,7 +4082,7 @@ async def playground_page(request: Request):
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the result here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping")) if cand else {}
-    kept = set(_pg_images.get(_session_user(request) or "default", {}).keys())
+    kept = dict(_pg_images.get(_session_user(request) or "default", {}))
     return HTMLResponse(_page("Media Playground",
                               _playground_body(aliases, vals, cand, result_html, oi, kept),
                               "playground", refresh=refresh,
@@ -3756,32 +4107,80 @@ async def generate(request: Request):
             body[p] = raw
         else:
             body["params"][p] = _num(raw)
-    # per-field image uploads (img__<param>); empty inputs fall back to the 8×8
-    # placeholder downstream, so they're simply omitted here.
-    # reference images persist across generations AND model switches (one stash per
-    # user, keyed by slot name — same-named slots carry over to another alias); a new
-    # upload replaces, a checked clear__<param> drops the kept one.
+    # per-field uploads: images (img__<param>, empty → the 8×8 placeholder downstream,
+    # so simply omitted here) and mesh files (file__<param>). Both persist across
+    # generations AND model switches (one stash per user, keyed by slot/param name —
+    # same-named slots carry over to another alias); a new upload replaces, a checked
+    # clear__<param> drops the kept one, and hist__<param> takes an earlier job's
+    # artifact instead of a fresh upload.
     user = _session_user(request) or "default"
     stash = _pg_images.setdefault(user, {})
-    for k in f:
-        if k.startswith("img__"):
-            val = f.get(k)
-            if isinstance(val, (bytes, bytearray)) and val.strip():
-                stash[k[len("img__"):]] = bytes(val)
-        elif k.startswith("clear__"):
-            stash.pop(k[len("clear__"):], None)
     cand = (store.get(model) or [None])[0]
-    # only the slots this alias actually has ride along (the stash may carry other
-    # aliases' images); no mapping info → send everything, downstream ignores extras.
     wf_i = (cand.get("workflow_json") if cand else {}) or {}
     map_i = (cand.get("mapping") if cand else {}) or {}
-    slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
-    images = {p: v for p, v in stash.items() if p in slots} if slots else dict(stash)
     vals = {"model": model, "backend": force_bk, **submitted}
+
+    def _err(msg: str, status: int = 404):
+        aliases = list(store.list_aliases().keys())
+        result_html = f'<h2>Result</h2><p class="bad">Error {status}: {_esc(msg)}</p>'
+        return HTMLResponse(_page("Media Playground",
+                                  _playground_body(aliases, vals, cand, result_html, kept=dict(stash)),
+                                  "playground", subnav=_subnav("playground", "media")))
+
+    # One pass PER PARAM, so the three ways an input arrives have a defined precedence:
+    # clear drops what was kept, a fresh upload beats it, a history pick fills what is
+    # then still empty. (`__filename` companions are skipped — they are not params.)
+    for p in sorted({k.split("__", 1)[1] for k in f
+                     if k.startswith(("img__", "file__", "hist__", "clear__"))
+                     and not k.endswith("__filename")}):
+        if f.get(f"clear__{p}") is not None:          # checkbox present ⇒ checked
+            stash.pop(p, None)
+        up = next((k for k in (f"file__{p}", f"img__{p}")
+                   if isinstance(f.get(k), (bytes, bytearray)) and f[k].strip()), None)
+        if up:
+            # the browser's filename, because a mesh's type lives in its extension —
+            # and a fallback that HAS one: a name without a suffix would go out as
+            # application/octet-stream and the API could not name the file's kind.
+            stash[p] = (str(f.get(f"{up}__filename") or "")
+                        or (f"{p}.glb" if up.startswith("file__") else f"{p}.png"), bytes(f[up]))
+            continue
+        ref = str(f.get(f"hist__{p}", "") or "").strip()
+        if ref:
+            got = _pg_history_blob(ref)
+            if not got:                               # never silently generate without it
+                jid, _, rest = ref.partition(":")
+                return _err(f"job {jid} #{rest.partition(':')[2]} is no longer available — "
+                            f"its files were deleted (job TTL)")
+            stash[p] = got
+    # only the slots/params this alias actually has ride along — the stash may carry
+    # another alias's inputs (that is the point of it surviving a model switch).
+    if cand and cand.get("meshy") is not None:
+        slots, fset = {i["name"] for i in adapters.public_fields(cand)[1]}, set()
+    else:                                             # Meshy takes no `files` (the API 400s)
+        slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
+        fset = set(adapters.file_params(wf_i, map_i))
+    if slots or fset:
+        images = {p: v for p, v in stash.items() if p in slots}
+        files = {p: v for p, v in stash.items() if p in fset}
+    else:
+        # An alias the store knows nothing about (no mapping at all): send the stash
+        # as images and let downstream ignore extras — EXCEPT a file-ish param. A mesh
+        # left in the stash by another alias must never ride as an image; the alias
+        # cannot consume it either way, and `images` means images.
+        images = {p: v for p, v in stash.items() if not adapters.is_file_param(p, None)}
+        files = {}
     # A REAL API call through POST /v1/generations (reference images as the API's
-    # per-field base64 `images` dict) — the playground tests the API, bypassing nothing.
+    # per-field base64 `images` dict, meshes as `files` data-URIs) — the playground
+    # tests the API, bypassing nothing.
     if images:
-        body["images"] = {p: base64.b64encode(v).decode() for p, v in images.items()}
+        body["images"] = {p: base64.b64encode(d).decode() for p, (_, d) in images.items()}
+    if files:
+        body["files"] = {p: f"data:{_pg_file_mime(n)};base64,{base64.b64encode(d).decode()}"
+                         for p, (n, d) in files.items()}
+        for p in files:
+            # an upload beats the typed backend path — sending both would bind the
+            # same node twice, and the API would reject the pair
+            body["params"].pop(p, None)
     try:
         try:
             r = await _self_api(request, "POST", "/v1/generations", json=body)
@@ -3795,11 +4194,7 @@ async def generate(request: Request):
             raise HTTPException(r.status_code, detail)
         view = r.json()
     except HTTPException as e:
-        aliases = list(store.list_aliases().keys())
-        result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
-        return HTMLResponse(_page("Media Playground",
-                                  _playground_body(aliases, vals, cand, result_html, kept=set(stash.keys())),
-                                  "playground", subnav=_subnav("playground", "media")))
+        return _err(str(e.detail), e.status_code)
     # Redirect to the GET view (form re-populated + live-updating) — instant feedback.
     q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
@@ -4515,6 +4910,20 @@ async def job_detail_page(job_id: str, request: Request):
     elif meta.get("chain") or cand.get("successor"):
         inbox += ("<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2</span></h3>"
                   "<p class='muted'>Hand-off params not recorded (job predates this feature).</p>")
+    # Meshy: the body actually sent (image data replaced by its size) plus the task id
+    # — the id is what Meshy's own dashboard is searched by, and the body answers
+    # "which options did this run use?" without re-deriving them from today's config.
+    mrq = meta.get("request") if meta.get("meshy_task_id") else None
+    if mrq:
+        rows_m = "".join(
+            f"<tr><td><code>{_esc(str(k))}</code></td>"
+            f"<td>{_esc(json.dumps(v) if isinstance(v, (list, dict)) else str(v))}</td></tr>"
+            for k, v in mrq.items())
+        cr = meta.get("consumed_credits")
+        inbox += (f"<h3>Meshy <span class='muted' style='font-weight:normal'>· task "
+                  f"<code>{_esc(str(meta['meshy_task_id']))}</code> · {_esc(str(meta.get('endpoint') or ''))}"
+                  f"{' · ' + _esc(str(cr)) + ' credits' if cr is not None else ''}</span></h3>"
+                  f"<table>{rows_m}</table>")
     if st in ("queued", "running"):
         outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
     elif st == "failed":
@@ -4587,6 +4996,8 @@ async def job_to_playground(job_id: str, request: Request):
     # "remove background"), because a client sends them under the schema's label.
     # The playground reads p__<param>/img__<param>, so translate external→param;
     # else nothing lands (this was the "Send to Playground does nothing" for mesh).
+    # A Meshy alias has no mapping at all: its external names ARE its param names,
+    # so the empty table below leaves the .get(k, k) lookups as the identity.
     mapping = ((store.get(alias) or [{}])[0]).get("mapping") or {}
     ext2param = {}
     for p, m in mapping.items():
@@ -4609,7 +5020,9 @@ async def job_to_playground(job_id: str, request: Request):
         if ip:
             try:
                 with open(ip[0], "rb") as fh:
-                    stash[ext2param.get(r.get("slot"), r.get("slot"))] = fh.read()
+                    slot = ext2param.get(r.get("slot"), r.get("slot"))
+                    # (filename, bytes) — the stash's shape since mesh uploads joined it
+                    stash[slot] = (r.get("filename") or f"{slot}.png", fh.read())
             except OSError:
                 pass
     return RedirectResponse(f"/ui/playground?{urlencode(q)}", status_code=303)
@@ -5463,11 +5876,11 @@ def _user_form(u: Optional[dict]) -> str:
     allowed = set((u or {}).get("models") or [])
     chat_al = sorted(set(_gateway_info().get("virtual_models", [])))
     img_al = sorted(store.list_aliases().keys()) if store.is_active() else []
-    # Backend grants apply to LLM backends only (ComfyUI backends aren't in /v1/models;
-    # image access is granted via image aliases). Filtering them out also removes the
-    # confusing duplicate when an LLM and a ComfyUI backend share a name (e.g. gpu-3090).
+    # Backend grants apply to LLM backends only (generation backends aren't in
+    # /v1/models; image access is granted via image aliases). Filtering them out also
+    # removes the confusing duplicate when an LLM and a media backend share a name.
     bk_al = sorted({b["name"] for b in _gateway_info().get("backends", [])
-                    if b.get("name") and b.get("type", "openai") != "comfyui"})
+                    if b.get("name") and b.get("type", "openai") not in adapters.GEN_TYPES})
     # chat/image aliases granted by name; a backend grants ALL of its models (and filters
     # what this user's key sees in /v1/models). Each kind gets a "select all" header row.
     rows = ""
@@ -5865,6 +6278,7 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/bypass-del", bypass_del, methods=["GET"])
     app.add_api_route("/ui/mapping/field-order", field_order, methods=["GET"])
     app.add_api_route("/ui/mapping/update", update, methods=["POST"])
+    app.add_api_route("/ui/mapping/meshy-update", meshy_update, methods=["POST"])
     app.add_api_route("/ui/mapping/export", mapping_export, methods=["GET"])
     app.add_api_route("/ui/mapping/export-all", mapping_export_all, methods=["GET"])
     app.add_api_route("/ui/mapping/copy", copy, methods=["GET"])

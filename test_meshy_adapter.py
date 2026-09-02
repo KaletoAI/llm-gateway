@@ -1,0 +1,245 @@
+"""Adapter I/O tests for MeshyAdapter against a local HTTP stub.
+run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_meshy_adapter -v"""
+import asyncio
+import json
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import httpx
+
+import adapters
+import meshy
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+GLB = b"glTF" + b"\x00" * 60
+
+
+class _Stub(BaseHTTPRequestHandler):
+    """Scripted Meshy: POST → id; GET polls walk `script`; assets under /asset/<fmt>."""
+    script: list = []          # task objects returned by successive GETs (last one repeats)
+    poll_status = 200          # status a task poll answers with (non-200 → error body)
+    post_status = 202          # the real Meshy answers a task create with 202 Accepted
+    posted: list = []
+    balance = 120
+    seen_auth: list = []
+
+    def log_message(self, *a):  # silence
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        _Stub.seen_auth.append((self.path, self.headers.get("Authorization")))
+        if self.path == "/openapi/v1/balance":
+            return self._json(200, {"balance": _Stub.balance})
+        if self.path.startswith("/asset/"):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(GLB)))
+            self.end_headers()
+            return self.wfile.write(GLB)
+        if self.path.startswith("/openapi/v1/"):
+            if _Stub.poll_status != 200:
+                return self._json(_Stub.poll_status, {"message": "task not found"})
+            t = _Stub.script.pop(0) if len(_Stub.script) > 1 else _Stub.script[0]
+            return self._json(200, t)
+        self._json(404, {"message": "nope"})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        _Stub.posted.append((self.path, json.loads(self.rfile.read(n) or b"{}")))
+        if _Stub.post_status >= 400:
+            return self._json(_Stub.post_status, {"message": "NoMoreConcurrentTasks"
+                                                  if _Stub.post_status == 429 else "no credits"})
+        self._json(_Stub.post_status, {"result": "task-1"})
+
+
+def _ctx():
+    counts = {"inc": 0, "dec": 0}
+    return adapters.AdapterContext(
+        auth_headers=lambda b: {}, inflight_inc=lambda bid: counts.__setitem__("inc", counts["inc"] + 1),
+        inflight_dec=lambda bid: counts.__setitem__("dec", counts["dec"] + 1),
+        cost_usd=lambda *a: 0.0, source_of=lambda r: "test", record_call=lambda *a, **k: None,
+        log_enabled=lambda: False), counts
+
+
+def _task(status, **extra):
+    return {"id": "task-1", "status": status, "progress": 50, **extra}
+
+
+class TestMeshyAdapter(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), _Stub)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.srv.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        _Stub.script, _Stub.posted, _Stub.seen_auth = [], [], []
+        _Stub.post_status, _Stub.poll_status, _Stub.balance = 202, 200, 120
+        self.ctx, self.counts = _ctx()
+        self.backend = {"name": "meshy", "type": "meshy", "url": self.url, "api_key": "msy_test",
+                        "poll_interval": 0.01, "max_wait": 2}
+        self.ad = adapters.MeshyAdapter(self.backend, self.ctx)
+
+    def _req(self, images=None, values=None, endpoint="image-to-3d", formats=None):
+        cand = meshy.default_candidate("meshy")
+        cand["meshy"]["endpoint"] = endpoint
+        if formats:
+            cand["meshy"]["options"]["target_formats"] = list(formats)
+        return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest", task="img2mesh",
+                                          params=dict(values or {}), upload_images=dict(images or {}),
+                                          meshy=cand["meshy"], upload_prefix="gw_j1")
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _discover(self):
+        async def go():
+            async with httpx.AsyncClient() as client:
+                return await self.ad.discover(client)
+        return self._run(go())
+
+    def test_discover_reports_credits(self):
+        caps = self._discover()
+        self.assertIn("latest", caps.models)
+        self.assertEqual(self.ad.credits, 120)
+        self.assertEqual(_Stub.seen_auth[0][1], "Bearer msy_test")
+
+    def test_discover_zero_credits_is_down(self):
+        _Stub.balance = 0
+        with self.assertRaises(adapters.MeshyNoCredits):
+            self._discover()
+
+    def test_generate_success(self):
+        _Stub.script = [_task("PENDING"), _task("IN_PROGRESS"),
+                        _task("SUCCEEDED", progress=100, consumed_credits=30,
+                              model_urls={"glb": f"{self.url}/asset/glb"},
+                              thumbnail_url=f"{self.url}/asset/png")]
+        out = self._run(self.ad.generate(self._req({"input_image": PNG}, {"input_name": "hero"})))
+        self.assertEqual([b.name for b in out.blobs], ["model.glb", "preview.png"])
+        self.assertEqual(out.blobs[0].mime, "model/gltf-binary")
+        self.assertEqual(out.blobs[0].kind, "file")
+        self.assertEqual(out.blobs[1].kind, "image")
+        self.assertEqual(out.meta["meshy_task_id"], "task-1")
+        self.assertEqual(out.meta["consumed_credits"], 30)
+        self.assertEqual(out.meta["request"]["name"], "hero")
+        self.assertNotIn("data:", json.dumps(out.meta))
+        self.assertEqual(_Stub.posted[0][0], "/openapi/v1/image-to-3d")
+        self.assertEqual((self.counts["inc"], self.counts["dec"]), (1, 1))
+        # asset downloads carry NO bearer (signed URLs on another host)
+        self.assertTrue(all(a is None for p, a in _Stub.seen_auth if p.startswith("/asset/")))
+
+    def test_slot_held_does_not_double_count(self):
+        _Stub.script = [_task("SUCCEEDED", model_urls={"glb": f"{self.url}/asset/glb"})]
+        req = self._req({"input_image": PNG})
+        req.slot_held = True
+        self._run(self.ad.generate(req))
+        self.assertEqual((self.counts["inc"], self.counts["dec"]), (0, 0))
+
+    def test_failed_task_is_final_runtime_error(self):
+        _Stub.script = [_task("FAILED", task_error={"message": "bad input"})]
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIn("bad input", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+
+    def test_402_fails_over(self):
+        _Stub.post_status = 402
+        with self.assertRaises(adapters.MeshyNoCredits):
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+
+    def test_429_fails_over(self):
+        _Stub.post_status = 429
+        with self.assertRaises(adapters.MeshyBusy):
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+
+    def test_timeout_names_task(self):
+        _Stub.script = [_task("IN_PROGRESS")]
+        self.backend["max_wait"] = 0.05
+        with self.assertRaises(TimeoutError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIn("task-1", str(cm.exception))
+
+    def test_every_model_format_is_a_file_blob(self):
+        urls = {f: f"{self.url}/asset/{f}" for f in ("glb", "usdz", "3mf")}
+        _Stub.script = [_task("SUCCEEDED", model_urls=urls)]
+        out = self._run(self.ad.generate(
+            self._req({"input_image": PNG}, formats=["glb", "usdz", "3mf"])))
+        self.assertEqual([b.name for b in out.blobs], ["model.glb", "model.usdz", "model.3mf"])
+        self.assertEqual({b.kind for b in out.blobs}, {"file"})
+        self.assertNotIn("image", [b.mime.split("/")[0] for b in out.blobs])
+
+    def test_persistent_4xx_poll_is_final_and_fast(self):
+        _Stub.script = [_task("IN_PROGRESS")]
+        _Stub.poll_status = 404
+        self.backend["max_wait"] = 5
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertLess(time.monotonic() - started, 1.0)      # not polled out to max_wait
+        self.assertIn("404", str(cm.exception))
+        self.assertIn("task-1", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+
+    def test_persistent_5xx_poll_fails_over_after_grace(self):
+        _Stub.script = [_task("IN_PROGRESS")]
+        _Stub.poll_status = 503
+        self.backend["disconnect_grace"] = 0.05
+        with self.assertRaises(ConnectionError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIn("task-1", str(cm.exception))
+
+    def test_persistent_429_poll_is_service_side(self):
+        # A poll-rate limit is not a verdict on the task (which is running and paid for):
+        # it must reach the grace branch, never the final 4xx one.
+        _Stub.script = [_task("IN_PROGRESS")]
+        _Stub.poll_status = 429
+        self.backend["disconnect_grace"] = 0.05
+        with self.assertRaises(ConnectionError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIn("task-1", str(cm.exception))
+
+    def test_missing_image_is_input_error_before_post(self):
+        with self.assertRaises(meshy.MeshyInput):
+            self._run(self.ad.generate(self._req({})))
+        self.assertEqual(_Stub.posted, [])
+
+
+class TestGenTypesAndFields(unittest.TestCase):
+    def test_registry(self):
+        self.assertIs(adapters.ADAPTERS["meshy"], adapters.MeshyAdapter)
+        self.assertEqual(adapters.GEN_TYPES, frozenset({"comfyui", "meshy"}))
+        self.assertFalse(adapters.OpenAIAdapter.serves_generation)
+
+    def test_public_fields_meshy(self):
+        params, images = adapters.public_fields(meshy.default_candidate("m"))
+        self.assertEqual([i["name"] for i in images], ["input_image"])
+        self.assertTrue(any(p["name"] == "input_face_num" for p in params))
+
+    def test_public_fields_comfy(self):
+        wf = {"1": {"class_type": "LoadImage", "inputs": {"image": "x.png"}},
+              "2": {"class_type": "KSampler", "inputs": {"steps": 20, "seed": 1}}}
+        mapping = {"image": {"node": "1", "field": "image", "label": "input_image", "on_empty": "required"},
+                   "steps": {"node": "2", "field": "steps"},
+                   "seed": {"node": "2", "field": "seed"}}
+        params, images = adapters.public_fields({"workflow_json": wf, "mapping": mapping})
+        self.assertEqual(images, [{"name": "input_image", "on_empty": "required", "required": True}])
+        self.assertEqual(params[0], {"name": "steps", "type": "int", "default": 20})
+        self.assertEqual(params[1]["auto"], "random unless sent")
+
+
+if __name__ == "__main__":
+    unittest.main()

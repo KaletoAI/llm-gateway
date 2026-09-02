@@ -145,6 +145,17 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Trellis2-Generic-Low`, `Trellis2-Humanoid-Low`, `Trellis2-Object-Low` | 20000 | 1024 | schnellere Pipeline |
 | `Pixal3D-Generic`, `Pixal3D-Humanoid`, `Pixal3D-Object` | 50000 | 2048 | höchste Auflösung |
 | `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. `-Object` liefert zusätzlich frei wählbare LOD-Stufen, siehe unten. |
+| `Meshy-Object`, `Meshy-Multiview` | Meshy-Default (30000 bei Remesh) | 2048 | Cloud (Meshy.ai, bezahlt pro Task, nur als Fallback oder gezielt). `-Multiview` nimmt `input_image_front` (Pflicht) + optional `input_image_back` / `_left` / `_right`. Zusätzlich `input_texture_prompt` (string) und `input_pose` (`a-pose`/`t-pose`). `input_remove_background`/`input_no_fingers` werden angenommen, wirken nicht. Kein `files`-Upload (`400` — Bilder gehören unter `images`). Liefert `model.glb` (Texturen eingebettet) + `preview.png`. |
+
+**`input_face_num` bei den Meshy-Aliasen.** Hier gibt es — anders als bei den
+ComfyUI-Familien — keinen vom Gateway gesetzten Default: Bleibt der Parameter weg,
+entscheidet Meshys eigener Modell-Default über die Dreieckszahl. Wird er gesendet,
+geht er als `target_polycount` (100 … 300000) an Meshy **und schaltet für diese
+Anfrage den Remesh-Durchlauf ein** — die Zahl wirkt also nur zusammen mit einer
+Neuvernetzung. Texturen, PBR, Topologie, Ausgabeformate und das Vorschaubild sind
+Alias-Defaults des Betreibers, keine Client-Parameter. Ein fehlgeschlagener
+Meshy-Task ist endgültig (Meshy erstattet die Credits); `/v1/jobs/{id}/cancel`
+beendet nur den Gateway-Job — Meshy rechnet den Task trotzdem ab.
 
 #### LOD-Stufen bei `Hunyuan3D-Object`
 

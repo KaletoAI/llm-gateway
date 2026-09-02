@@ -42,8 +42,8 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Eleven self-contained Python files hold everything. `main.py` owns app state; the
-others (`adapters`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
+Twelve self-contained Python files hold everything. `main.py` owns app state; the
+others (`adapters`, `meshy`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
 `responses_bridge`, `anthropic_bridge`, `openai_image_bridge`, `previewanim`) never
 import `main` — they receive what they need via injected callables, staying
 hot-reload-safe.
@@ -173,6 +173,35 @@ hot-reload-safe.
   shared CONSTANT. `_cleanup_uploads` overwrites the job's inputs with that 72-byte
   placeholder after a CLEAN success only (a timed-out prompt may still read them);
   it never raises.
+- **`meshy.py`** — the PURE half of the Meshy.ai backend (`type: meshy`; the HTTP half
+  is `adapters.MeshyAdapter`): the fixed `input_*` label table → Meshy request body
+  (`build_request`), the recorded request (`request_summary`, image data → byte size),
+  task-object parsing (`parse_task` — a SUCCEEDED task missing a requested format
+  raises, never a silently smaller delivery), the advertised schema (`public_fields`)
+  and `default_candidate`/`options_of` (admin option defaults, deep-copied — a shallow
+  copy would hand every alias the same `target_formats` list). No `main`/`adapters`
+  imports; covered by `test_meshy.py` + `test_meshy_adapter.py` (HTTP stub). A Meshy
+  alias candidate has no workflow — `cand["meshy"] = {endpoint, options}`; the client
+  may set only what the label table names (`input_name`, `input_face_num` →
+  `target_polycount` + `should_remesh`, `input_texture_resolution` px → 2k/4k/8k,
+  `input_texture_prompt`, `input_pose`; `input_remove_background`/`input_no_fingers`
+  are accepted and inert), the rest are admin options — the counterpart of a ComfyUI
+  `fixed` pin. `input_face_num` is advertised WITHOUT a default: `build_request` only
+  sets a polycount when the client sends one, and that also forces the remesh pass.
+  `adapters.public_fields(cand)` is the ONE seam schema/playground/shims read for both
+  candidate kinds, and `adapters.GEN_TYPES` (types whose adapter sets
+  `serves_generation`) replaces `type == "comfyui"` in `main` wherever "generation
+  backend" is meant; the GPU-host sites (`/free`, `/interrupt` via `adapter.cancel()`,
+  restart, watchdog) stay ComfyUI — a cloud task has nothing to interrupt, Meshy
+  finishes and bills it. A Meshy backend is always `paid` (it bills per task);
+  discovery = `GET /openapi/v1/balance` (0 → DOWN "no credits", balance + its age and
+  the rolling gen fail-rate in `/health` + the Backends tab); 402/429 raise
+  `MeshyNoCredits`/`MeshyBusy` (ConnectionError subclasses → failover, named by
+  `_fault_label`). A FAILED task is final. While polling, a 4xx is a verdict about the
+  TASK (3 in a row → final `RuntimeError` naming the status) while transport errors,
+  5xx and 429 are about the SERVICE and get `disconnect_grace` seconds (default 30,
+  same key as ComfyUI) of CONTINUOUS failure before the failover-class error — a
+  poll-rate 429 must not end a task that is running and already paid for.
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
