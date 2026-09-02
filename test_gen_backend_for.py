@@ -13,6 +13,8 @@ import tempfile
 import unittest
 
 # `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd.
+# The dir is needed ONLY for that import, so it is removed in the same finally that
+# restores the cwd; leaving it to the finalizer raises a ResourceWarning under -W error.
 _here = os.path.dirname(os.path.abspath(__file__))
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
@@ -25,6 +27,8 @@ try:
     import admin
 finally:
     os.chdir(_prev)
+    _tmp.cleanup()
+    del _tmp
 
 
 COMFY = {"name": "gpu", "type": "comfyui"}
