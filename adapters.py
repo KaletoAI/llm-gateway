@@ -3009,9 +3009,11 @@ class MeshyAdapter(BackendAdapter):
         # task that is gone (404) would otherwise be reported as a max_wait TimeoutError —
         # the wrong cause, AND only after holding the in-flight slot for the full wait.
         # So: a 4xx is a verdict about the TASK (three in a row, so one edge hiccup does
-        # not end a job) → final RuntimeError; transport errors and 5xx are about the
-        # SERVICE and get `disconnect_grace` seconds of CONTINUOUS failure before the
+        # not end a job) → final RuntimeError; transport errors, 5xx and a 429 are about
+        # the SERVICE and get `disconnect_grace` seconds of CONTINUOUS failure before the
         # failover-class ConnectionError — same key and default as ComfyUIAdapter._poll.
+        # 429 sits on the service side deliberately: a poll-rate limit says nothing about
+        # the task, which is running and already paid for — ending it would burn credits.
         # Any 200 resets both counters: only an unbroken run of failures means anything.
         grace = float(self.backend.get("disconnect_grace", 30))
         deadline = time.monotonic() + max_wait
@@ -3027,13 +3029,13 @@ class MeshyAdapter(BackendAdapter):
                         f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
                         f": {type(e).__name__}: {e}")
                 continue
-            if 400 <= r.status_code < 500:
+            if 400 <= r.status_code < 500 and r.status_code != 429:
                 client_errs += 1
                 if client_errs >= 3:
                     raise RuntimeError(f"Meshy task {task_id}: poll answered "
                                        f"{r.status_code} — {_meshy_msg(r)}")
                 continue
-            if r.status_code != 200:                # 5xx — the service, not this task
+            if r.status_code != 200:                # 5xx / 429 — the service, not this task
                 gone_since = gone_since or time.monotonic()
                 if time.monotonic() - gone_since > grace:
                     raise ConnectionError(

@@ -202,6 +202,16 @@ class TestMeshyAdapter(unittest.TestCase):
             self._run(self.ad.generate(self._req({"input_image": PNG})))
         self.assertIn("task-1", str(cm.exception))
 
+    def test_persistent_429_poll_is_service_side(self):
+        # A poll-rate limit is not a verdict on the task (which is running and paid for):
+        # it must reach the grace branch, never the final 4xx one.
+        _Stub.script = [_task("IN_PROGRESS")]
+        _Stub.poll_status = 429
+        self.backend["disconnect_grace"] = 0.05
+        with self.assertRaises(ConnectionError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIn("task-1", str(cm.exception))
+
     def test_missing_image_is_input_error_before_post(self):
         with self.assertRaises(meshy.MeshyInput):
             self._run(self.ad.generate(self._req({})))
