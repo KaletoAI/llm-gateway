@@ -1,8 +1,8 @@
 """Meshy.ai (https://docs.meshy.ai) as a generation backend — the PURE half.
 
 Everything here is a function of dicts and bytes: the public `input_*` label table
-(spec 2026-09-02 §5), the request body Meshy's image-to-3d / multi-image-to-3d
-endpoints take, the task object they hand back, and the schema the gateway
+(spec 2026-09-02 §5), the request body Meshy's image-to-3d / multi-image-to-3d /
+rigging endpoints take, the task object they hand back, and the schema the gateway
 advertises for a Meshy alias. No `main`/`adapters` imports, no I/O — the adapter in
 `adapters.py` does the HTTP, this module decides WHAT to send and what came back.
 Covered by test_meshy.py (stdlib unittest).
@@ -14,9 +14,10 @@ import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
-ENDPOINTS = ("image-to-3d", "multi-image-to-3d")
+ENDPOINTS = ("image-to-3d", "multi-image-to-3d", "rigging")
 AI_MODELS = ("latest", "meshy-7", "meshy-6", "meshy-5")
 FORMATS = ("glb", "obj", "fbx", "stl", "usdz", "3mf")
+RIG_FORMATS = ("glb", "fbx")            # the only two the rigging endpoint delivers
 TOPOLOGIES = ("triangle", "quad")
 TEXTURE_RES = ("2k", "4k", "8k")
 POSES = ("", "a-pose", "t-pose")
@@ -30,6 +31,7 @@ OPTION_DEFAULTS: dict = {
     "ultra_mode": False, "pose_mode": "", "image_enhancement": True,
     "remove_lighting": True, "moderation": False,
     "target_formats": ["glb"], "thumbnail": True,
+    "animations": False,            # rigging: also deliver Meshy's walking/running clips
 }
 # Options that are copied into the request body verbatim (None = leave it out).
 _PASSTHROUGH = ("should_texture", "enable_pbr", "topology", "should_remesh", "ultra_mode",
@@ -39,10 +41,16 @@ SLOTS: dict[str, list[str]] = {
     "image-to-3d": ["input_image"],
     "multi-image-to-3d": ["input_image_front", "input_image_back",
                           "input_image_left", "input_image_right"],
+    "rigging": [],                  # takes a MESH, not images — see FILES
 }
+# File inputs per endpoint — the `files` half of the public fields. A file is NOT an
+# image slot: no placeholder, no empty-mode; it is sent or the request is refused.
+FILES: dict[str, list[str]] = {"image-to-3d": [], "multi-image-to-3d": [],
+                               "rigging": ["input_mesh_path"]}
 IGNORED_PARAMS = ("input_remove_background", "input_no_fingers")   # accepted, no effect
 
 _POLY_MIN, _POLY_MAX = 100, 300_000
+_HEIGHT_DEFAULT = 1.7               # Meshy's own default for `height_meters`
 _NAME_MAX, _TEXTURE_PROMPT_MAX = 100, 800
 _RES_PX = {"2k": 2048, "4k": 4096, "8k": 8192}
 
@@ -67,6 +75,8 @@ def options_of(cand: dict) -> dict:
     if not isinstance(out["target_formats"], list) or not out["target_formats"]:
         out["target_formats"] = ["glb"]
     out["target_formats"] = [f for f in out["target_formats"] if f in FORMATS] or ["glb"]
+    if endpoint_of(cand) == "rigging":       # rigging answers with glb/fbx and nothing else
+        out["target_formats"] = [f for f in out["target_formats"] if f in RIG_FORMATS] or ["glb"]
     if out["texture_resolution"] not in TEXTURE_RES:
         out["texture_resolution"] = "2k"
     return out
@@ -113,7 +123,36 @@ def _slot_images(endpoint: str, images: dict) -> list[str]:
     return [data_uri(b) for _, b in present]
 
 
-def build_request(cand: dict, values: dict, images: dict) -> dict:
+def glb_data_uri(data: bytes) -> str:
+    """Mesh bytes → base64 data URI for `model_url`. A binary glTF is the only container
+    the rigging endpoint takes, sniffed by magic — so a mislabelled .glb (an OBJ someone
+    renamed) is refused HERE, not after 5 credits are spent."""
+    if data[:4] != b"glTF":
+        raise MeshyInput("Meshy rigging takes a binary glTF (.glb) mesh")
+    return f"data:model/gltf-binary;base64,{base64.b64encode(data).decode()}"
+
+
+def _build_rigging(cand: dict, values: dict, files: dict) -> dict:
+    """POST /openapi/v1/rigging: the mesh, a height and an optional name. NONE of the
+    image-to-3d options apply — no ai_model, no texturing, no target_formats (the
+    formats are picked at DOWNLOAD time off the finished task)."""
+    f = (files or {}).get("input_mesh_path")
+    data = f[1] if isinstance(f, tuple) else f
+    if not data:
+        raise MeshyInput("`files.input_mesh_path` is required")
+    body: dict = {"model_url": glb_data_uri(data)}
+    h = values.get("input_height_m")
+    try:
+        body["height_meters"] = float(h) if h not in (None, "") else _HEIGHT_DEFAULT
+    except (TypeError, ValueError):
+        body["height_meters"] = _HEIGHT_DEFAULT
+    name = values.get("input_name")
+    if name not in (None, ""):
+        body["name"] = str(name)[:_NAME_MAX]
+    return body
+
+
+def build_request(cand: dict, values: dict, images: dict, files: Optional[dict] = None) -> dict:
     """The JSON body for POST /openapi/v1/<endpoint>.
 
     `values` is the flattened request (params + inputs, public labels as keys);
@@ -121,6 +160,8 @@ def build_request(cand: dict, values: dict, images: dict) -> dict:
     set only what the label table below names. Unknown params are ignored, as on
     every generation alias."""
     ep = endpoint_of(cand)
+    if ep == "rigging":                 # a different request entirely: mesh in, rig out
+        return _build_rigging(cand, values, files or {})
     opts = options_of(cand)
     m = cand.get("model")
     body: dict = {"ai_model": m if m in AI_MODELS else "latest"}
@@ -173,16 +214,27 @@ def request_summary(body: dict) -> dict:
         out["image_url"] = _sz(out["image_url"])
     if "image_urls" in out:
         out["image_urls"] = [_sz(u) for u in out["image_urls"]]
+    if "model_url" in out:              # rigging: the whole mesh rides in the body
+        out["model_url"] = _sz(out["model_url"])
     return out
 
 
-def public_fields(cand: dict) -> tuple[list, list]:
-    """(params, images) in the shape GET /v1/generations/{alias}/schema advertises.
-    Image entries: {name, on_empty, required}; params: {name, type, default?, choices?}."""
+def public_fields(cand: dict) -> tuple[list, list, list]:
+    """(params, images, files) in the shape GET /v1/generations/{alias}/schema advertises.
+    Image entries: {name, on_empty, required}; file entries: {name, required, accept};
+    params: {name, type, default?, choices?}."""
     ep = endpoint_of(cand)
     opts = options_of(cand)
     images = [{"name": s, "on_empty": "required" if i == 0 else "skip", "required": i == 0}
               for i, s in enumerate(SLOTS[ep])]
+    files = [{"name": n, "required": True, "accept": ["glb"]} for n in FILES[ep]]
+    if ep == "rigging":
+        # A rigging job is the mesh plus two knobs. None of the image-to-3d labels exist
+        # here, and advertising them would promise settings the request builder drops.
+        return ([{"name": "input_name", "type": "string", "default": ""},
+                 {"name": "input_height_m", "type": "float", "default": _HEIGHT_DEFAULT},
+                 {"name": "input_no_fingers", "type": "bool", "default": False}],
+                images, files)
     params = [
         {"name": "input_name", "type": "string", "default": ""},
         # No `default`: build_request sets target_polycount ONLY when the client sends
@@ -197,7 +249,7 @@ def public_fields(cand: dict) -> tuple[list, list]:
         {"name": "input_remove_background", "type": "bool", "default": True},
         {"name": "input_no_fingers", "type": "bool", "default": False},
     ]
-    return params, images
+    return params, images, files
 
 
 @dataclass
@@ -205,7 +257,7 @@ class TaskState:
     status: str
     progress: int = 0
     error: Optional[str] = None
-    downloads: list = field(default_factory=list)      # [(fmt, url)] in requested order
+    downloads: list = field(default_factory=list)      # [(filename, url)] in requested order
     thumbnail: Optional[str] = None
     credits: Optional[int] = None
 
@@ -213,9 +265,14 @@ class TaskState:
 TASK_STATUSES = ("PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED", "CANCELED")
 
 
-def parse_task(task: dict, formats: list) -> TaskState:
+def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
+               animations: bool = False) -> TaskState:
     """Read a task object (GET …/{id}). On SUCCEEDED every requested format must have
     a URL — a missing one raises, never a silently smaller delivery.
+
+    `endpoint` decides WHERE the urls sit (image-to-3d: `model_urls`; rigging: the
+    `result` object's `rigged_character_<fmt>_url`) and what the delivered files are
+    called (`model.glb` vs `rigged.glb`).
 
     TOTAL over what the API may answer: `progress` that is not an integer counts as 0
     (a poll must not die on a cosmetic field), and any status outside TASK_STATUSES is
@@ -237,9 +294,24 @@ def parse_task(task: dict, formats: list) -> TaskState:
         st.error = ((task.get("task_error") or {}).get("message") or status.lower())
         return st
     if status == "SUCCEEDED":
-        urls = task.get("model_urls") or {}
+        anim: dict = {}
+        if endpoint == "rigging":           # the rigged character lives under `result`
+            res = task.get("result") or {}
+            urls = {f: res.get(f"rigged_character_{f}_url") for f in formats}
+            anim = res.get("basic_animations") or {}
+        else:
+            urls = task.get("model_urls") or {}
         missing = [f for f in formats if not urls.get(f)]
         if missing:
             raise MeshyInput(f"Meshy task succeeded but has no url for {', '.join(missing)}")
-        st.downloads = [(f, urls[f]) for f in formats]
+        stem = "rigged" if endpoint == "rigging" else "model"
+        st.downloads = [(f"{stem}.{f}", urls[f]) for f in formats]
+        if endpoint == "rigging" and animations:
+            # A courtesy, not the delivery: a clip Meshy did not produce is skipped —
+            # unlike a missing FORMAT above, which IS the result and must not shrink.
+            for f in formats:
+                for clip in ("walking", "running"):
+                    u = anim.get(f"{clip}_{f}_url")
+                    if u:
+                        st.downloads.append((f"{clip}.{f}", u))
     return st

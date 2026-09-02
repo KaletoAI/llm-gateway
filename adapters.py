@@ -1540,16 +1540,22 @@ def slot_empty_mode(m: dict) -> str:
     return "required" if (m or {}).get("no_placeholder") else "placeholder"
 
 
-def public_fields(cand: dict) -> tuple[list, list]:
+def public_fields(cand: dict) -> tuple[list, list, list]:
     """The public request fields of a generation alias candidate — what the schema
     endpoint advertises, the playground renders and the OpenAI shims map reference
     images onto. ONE seam for both candidate kinds: a ComfyUI candidate derives them
     from workflow + mapping (labels are the external names), a Meshy candidate from
-    its fixed label table (meshy.public_fields)."""
+    its fixed label table (meshy.public_fields).
+
+    Three lists: params (scalars), images (loader slots) and files (uploads that are
+    not images — a mesh). A ComfyUI file param ALSO stays in `params`: there it is the
+    backend-side path, which is the second, upload-free way to name the same input."""
     if cand.get("meshy") is not None:
         return meshy.public_fields(cand)
     wf = cand.get("workflow_json") or {}
     mapping = cand.get("mapping") or {}
+    files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p, "required": False}
+             for p in file_params(wf, mapping)]
     params, images = [], []
     for p, m in mapping.items():
         m = m or {}
@@ -1575,7 +1581,7 @@ def public_fields(cand: dict) -> tuple[list, list]:
         if name == "seed" or (p == "seed" and name == p):
             entry["auto"] = "random unless sent"
         params.append(entry)
-    return params, images
+    return params, images, files
 
 
 def slot_empty_bypass(m: dict) -> list:
@@ -3046,7 +3052,8 @@ class MeshyAdapter(BackendAdapter):
         cand = {"model": req.real_model, "meshy": req.meshy or {}}
         endpoint = meshy.endpoint_of(cand)
         opts = meshy.options_of(cand)
-        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {})   # MeshyInput → final
+        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {},
+                                   req.upload_files or {})            # MeshyInput → final
         poll_interval = float(b.get("poll_interval", 5.0))
         max_wait = float(b.get("max_wait", 900))
         if not req.slot_held:
@@ -3073,13 +3080,14 @@ class MeshyAdapter(BackendAdapter):
                 if log_on:
                     logger.info(f"→ [{self.name}] meshy {endpoint} task {task_id}")
                 state = await self._poll(client, endpoint, task_id, opts["target_formats"],
-                                         poll_interval, max_wait)
+                                         poll_interval, max_wait, bool(opts.get("animations")))
                 blobs = []
-                for fmt, url in state.downloads:
+                for name, url in state.downloads:      # meshy.parse_task named them
                     data = await self._download(client, url)
-                    mime, kind = _mime_and_kind(f"model.{fmt}")
-                    blobs.append(GenBlob(data=data, mime=mime, kind=kind, name=f"model.{fmt}"))
-                if opts.get("thumbnail") and state.thumbnail:
+                    mime, kind = _mime_and_kind(name)
+                    blobs.append(GenBlob(data=data, mime=mime, kind=kind, name=name))
+                # rigging has no thumbnail_url — its input already had a preview
+                if endpoint != "rigging" and opts.get("thumbnail") and state.thumbnail:
                     try:
                         thumb = await self._download(client, state.thumbnail)
                         blobs.append(GenBlob(data=thumb, mime="image/png", kind="image", name="preview.png"))
@@ -3098,7 +3106,8 @@ class MeshyAdapter(BackendAdapter):
             "consumed_credits": state.credits, "elapsed_ms": elapsed_ms,
         })
 
-    async def _poll(self, client, endpoint, task_id, formats, poll_interval, max_wait) -> "meshy.TaskState":
+    async def _poll(self, client, endpoint, task_id, formats, poll_interval, max_wait,
+                    animations: bool = False) -> "meshy.TaskState":
         # A poll that answers is not proof the task is running. A revoked key (401) or a
         # task that is gone (404) would otherwise be reported as a max_wait TimeoutError —
         # the wrong cause, AND only after holding the in-flight slot for the full wait.
@@ -3137,7 +3146,8 @@ class MeshyAdapter(BackendAdapter):
                         f": HTTP {r.status_code}")
                 continue
             client_errs, gone_since = 0, None
-            state = meshy.parse_task(r.json() or {}, formats)     # MeshyInput → final
+            state = meshy.parse_task(r.json() or {}, formats,      # MeshyInput → final
+                                     endpoint, animations)
             if state.error:            # FAILED/CANCELED — or a status this gateway does not know
                 raise RuntimeError(f"Meshy task {task_id} {state.status.lower()}: {state.error}")
             if state.status == "SUCCEEDED":

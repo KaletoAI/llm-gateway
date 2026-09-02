@@ -7,6 +7,7 @@ import meshy
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 JPG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
 WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 16
+GLB = b"glTF" + b"\x00" * 60
 
 
 def _cand(endpoint="image-to-3d", **opts):
@@ -125,7 +126,8 @@ class TestBuildRequestMulti(unittest.TestCase):
 
 class TestPublicFields(unittest.TestCase):
     def test_single(self):
-        params, images = meshy.public_fields(_cand())
+        params, images, files = meshy.public_fields(_cand())
+        self.assertEqual(files, [])
         self.assertEqual([i["name"] for i in images], ["input_image"])
         self.assertEqual(images[0]["on_empty"], "required")
         self.assertTrue(images[0]["required"])
@@ -144,13 +146,13 @@ class TestPublicFields(unittest.TestCase):
         self.assertNotIn("default", face)
 
     def test_multi(self):
-        _, images = meshy.public_fields(_cand("multi-image-to-3d"))
+        _, images, _ = meshy.public_fields(_cand("multi-image-to-3d"))
         self.assertEqual([i["name"] for i in images],
                          ["input_image_front", "input_image_back", "input_image_left", "input_image_right"])
         self.assertEqual([i["on_empty"] for i in images], ["required", "skip", "skip", "skip"])
 
     def test_default_from_admin_option(self):
-        params, _ = meshy.public_fields(_cand(texture_resolution="4k"))
+        params, _, _ = meshy.public_fields(_cand(texture_resolution="4k"))
         tex = next(p for p in params if p["name"] == "input_texture_resolution")
         self.assertEqual(tex["default"], 4096)
 
@@ -163,7 +165,7 @@ class TestParseTask(unittest.TestCase):
     def test_succeeded(self):
         st = meshy.parse_task(self.OK, ["glb"])
         self.assertEqual(st.status, "SUCCEEDED")
-        self.assertEqual(st.downloads, [("glb", "https://a/x.glb?e=1")])
+        self.assertEqual(st.downloads, [("model.glb", "https://a/x.glb?e=1")])
         self.assertEqual(st.thumbnail, "https://a/p.png")
         self.assertEqual(st.credits, 30)
         self.assertIsNone(st.error)
@@ -213,6 +215,67 @@ class TestRequestSummary(unittest.TestCase):
         self.assertEqual(s["name"], "n")
         self.assertEqual(s["image_urls"], [f"<{len(PNG)} bytes>", f"<{len(JPG)} bytes>"])
         self.assertNotIn("data:", str(s))
+
+
+class TestRigging(unittest.TestCase):
+    C = {"backend": "meshy", "task": "mesh2rig", "model": "latest",
+         "meshy": {"endpoint": "rigging", "options": {"target_formats": ["glb"]}}}
+
+    def test_build_request(self):
+        body = meshy.build_request(self.C, {"input_name": "Kai", "input_height_m": 1.8},
+                                   {}, {"input_mesh_path": ("hero.glb", GLB)})
+        self.assertTrue(body["model_url"].startswith("data:model/gltf-binary;base64,"))
+        self.assertEqual(body["height_meters"], 1.8)
+        self.assertEqual(body["name"], "Kai")
+        for k in ("ai_model", "image_url", "should_texture", "target_formats"):
+            self.assertNotIn(k, body)
+
+    def test_default_height(self):
+        body = meshy.build_request(self.C, {}, {}, {"input_mesh_path": ("h.glb", GLB)})
+        self.assertEqual(body["height_meters"], 1.7)
+
+    def test_missing_mesh_and_non_glb(self):
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.build_request(self.C, {}, {}, {})
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.build_request(self.C, {}, {}, {"input_mesh_path": ("h.obj", b"v 0 0 0")})
+
+    def test_public_fields_triple(self):
+        params, images, files = meshy.public_fields(self.C)
+        self.assertEqual(images, [])
+        self.assertEqual(files, [{"name": "input_mesh_path", "required": True, "accept": ["glb"]}])
+        names = [p["name"] for p in params]
+        self.assertEqual(names, ["input_name", "input_height_m", "input_no_fingers"])
+        p2, i2, f2 = meshy.public_fields(_cand())
+        self.assertEqual(f2, [])
+        self.assertEqual([i["name"] for i in i2], ["input_image"])
+
+    def test_parse_rigging_result(self):
+        task = {"status": "SUCCEEDED", "progress": 100, "consumed_credits": 5,
+                "result": {"rigged_character_glb_url": "https://a/r.glb", "rigged_character_fbx_url": "https://a/r.fbx",
+                           "basic_animations": {"walking_glb_url": "https://a/w.glb", "running_glb_url": "https://a/x.glb",
+                                                "walking_fbx_url": "https://a/w.fbx", "running_fbx_url": "https://a/x.fbx"}}}
+        st = meshy.parse_task(task, ["glb"], "rigging")
+        self.assertEqual(st.downloads, [("rigged.glb", "https://a/r.glb")])
+        st = meshy.parse_task(task, ["glb", "fbx"], "rigging", animations=True)
+        self.assertEqual([n for n, _ in st.downloads],
+                         ["rigged.glb", "rigged.fbx", "walking.glb", "running.glb", "walking.fbx", "running.fbx"])
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.parse_task({"status": "SUCCEEDED", "result": {}}, ["glb"], "rigging")
+
+    def test_image_endpoint_downloads_are_named(self):
+        st = meshy.parse_task({"status": "SUCCEEDED", "model_urls": {"glb": "https://a/m.glb"}}, ["glb"])
+        self.assertEqual(st.downloads, [("model.glb", "https://a/m.glb")])
+
+    def test_request_summary_hides_mesh(self):
+        body = meshy.build_request(self.C, {}, {}, {"input_mesh_path": ("h.glb", GLB)})
+        self.assertEqual(meshy.request_summary(body)["model_url"], f"<{len(GLB)} bytes>")
+
+    def test_formats_restricted_to_glb_fbx(self):
+        c = {"meshy": {"endpoint": "rigging", "options": {"target_formats": ["obj", "usdz"]}}}
+        self.assertEqual(meshy.options_of(c)["target_formats"], ["glb"])
+        c["meshy"]["options"]["target_formats"] = ["fbx", "obj"]
+        self.assertEqual(meshy.options_of(c)["target_formats"], ["fbx"])
 
 
 class TestDefaultCandidate(unittest.TestCase):

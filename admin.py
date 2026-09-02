@@ -2976,19 +2976,29 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
     cand = cands[0]
     s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
     keep = [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]
+    rig_cur = (s.get("rig") or "").strip()
+    rig_opts: list = [("", "blank — trust the successor"), "mixamo", "generic", "meshy"]
+    if rig_cur and rig_cur not in rig_opts:      # keep an unknown stored value visible
+        rig_opts.append((rig_cur, f"{rig_cur} — (unknown)"))   # …a Save would clear it otherwise
     ep = meshy.endpoint_of(cand)
     opts = meshy.options_of(cand)
     model = cand.get("model") if cand.get("model") in meshy.AI_MODELS else "latest"
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "img2mesh"
+    # rigging answers with glb/fbx only (meshy.options_of filters server-side either way,
+    # so a stored alias that is switched TO rigging cannot keep an impossible format)
     fmts = "".join(f'<label style="margin-right:10px"><input type="checkbox" name="fmt__{_esc(f)}"'
                    f'{" checked" if f in opts["target_formats"] else ""}> {_esc(f)}</label>'
-                   for f in meshy.FORMATS)
+                   for f in (meshy.RIG_FORMATS if ep == "rigging" else meshy.FORMATS))
     cb = lambda k, txt: _checkbox(f"opt__{k}", bool(opts.get(k)), txt)
     remesh = {None: "", True: "true", False: "false"}.get(opts.get("should_remesh"), "")
-    params, images = meshy.public_fields(cand)
+    params, images, files = meshy.public_fields(cand)
     fields = "".join(f"<tr><td><code>{_esc(i['name'])}</code></td><td>image · {_esc(i['on_empty'])}</td></tr>"
                      for i in images)
+    fields += "".join(f"<tr><td><code>{_esc(x['name'])}</code></td><td>file · "
+                      f"{'required' if x.get('required') else 'optional'}"
+                      f"{' · ' + '/'.join(_esc(a) for a in x['accept']) if x.get('accept') else ''}"
+                      "</td></tr>" for x in files)
     fields += "".join(f"<tr><td><code>{_esc(p['name'])}</code></td><td>{_esc(p['type'])}"
                       f"{' · default ' + _esc(str(p['default'])) if p.get('default') not in (None, '') else ''}"
                       f"{' · ' + '/'.join(_esc(c or 'none') for c in p['choices']) if p.get('choices') else ''}"
@@ -3003,7 +3013,10 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
             + _field("endpoint", _select("meshy_endpoint", list(meshy.ENDPOINTS), ep))
             + "<p class='hint' style='margin:-4px 0 10px'><b>image-to-3d</b> takes <code>input_image</code>; "
               "<b>multi-image-to-3d</b> takes <code>input_image_front</code> (required) plus optional "
-              "<code>_back/_left/_right</code> — the same slot names as the Trellis2 multiview alias.</p>"
+              "<code>_back/_left/_right</code> — the same slot names as the Trellis2 multiview alias. "
+              "<b>rigging</b> takes no image at all: it rigs an uploaded <code>input_mesh_path</code> "
+              "(a <code>.glb</code> biped, 5 credits) and ignores every option below except "
+              "<b>deliver formats</b> (glb/fbx) and <b>animations</b>.</p>"
             + _field("ai model", _select("meshy_model", list(meshy.AI_MODELS), model))
             + _field("texture", cb("should_texture", "should_texture") + cb("enable_pbr", "enable_pbr (PBR maps)"))
             + _field("texture resolution", _select("opt__texture_resolution", list(meshy.TEXTURE_RES),
@@ -3021,6 +3034,7 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                      + cb("moderation", "moderation"))
             + _field("ultra", cb("ultra_mode", "ultra_mode (+5 credits, Meshy-7 only)"))
             + _field("deliver formats", fmts)
+            + _field("animations", cb("animations", "rigging only: also deliver walking/running clips"))
             + _field("thumbnail", cb("thumbnail", "deliver Meshy's preview.png as an extra image artifact"))
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
@@ -3033,9 +3047,7 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                      placeholder="input_mesh_path"), short=True)
             + _field("keep from this stage", _inp("chain_keep", ", ".join(keep),
                      placeholder="e.g. preview.png"), short=True)
-            + _field("delivered rig type", _select("chain_rig",
-                     [("", "blank — trust the successor"), "mixamo", "generic", "meshy"],
-                     s.get("rig", "")), short=True)
+            + _field("delivered rig type", _select("chain_rig", rig_opts, rig_cur), short=True)
             + "<p class='hint'>The mesh (glb) is relayed as <b>bytes</b> to the successor's backend — no "
               "export node, no hand-off choice (a Meshy stage shares no disk with anything). It arrives "
               "under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh workflows "
@@ -3570,7 +3582,7 @@ async def meshy_update(request: Request):
     model = (f.get("meshy_model", "") or "").strip()
     opts = dict(meshy.OPTION_DEFAULTS)
     for k in ("should_texture", "enable_pbr", "ultra_mode", "image_enhancement",
-              "remove_lighting", "moderation", "thumbnail"):
+              "remove_lighting", "moderation", "thumbnail", "animations"):
         opts[k] = bool(f.get(f"opt__{k}"))
     tr = (f.get("opt__texture_resolution", "") or "").strip()
     opts["texture_resolution"] = tr if tr in meshy.TEXTURE_RES else "2k"
@@ -3760,7 +3772,16 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     # fixed label table (same source the schema endpoint uses), so they are rendered
     # from adapters.public_fields and the workflow-driven loop below is skipped.
     if cand and cand.get("meshy") is not None:
-        params, images = adapters.public_fields(cand)
+        params, images, mfiles = adapters.public_fields(cand)
+        for x in mfiles:
+            # Same row as a ComfyUI mesh param (upload or an earlier job's artifact) —
+            # WITHOUT the "path on the backend" field: Meshy reads the bytes out of the
+            # request, there is no backend disk a path could point into.
+            acc = ",".join("." + a for a in (x.get("accept") or [])) or _PG_FILE_ACCEPT
+            extra = (kept_badge(x["name"], show_name=True) if kept and x["name"] in kept else
+                     ' <span class="muted">required</span>' if x.get("required") else "")
+            rows += _field(x["name"], f'<input type="file" name="file__{_esc(x["name"])}" '
+                                      f'accept="{_esc(acc)}"> {hist(x["name"], "file")}{extra}')
         for i in images:
             extra = (kept_badge(i["name"])
                      if kept and i["name"] in kept else
@@ -3934,9 +3955,11 @@ async def playground_page(request: Request):
     # the alias's public param names: a mapping for a ComfyUI alias, the fixed label
     # table for a Meshy one — without this a p__<field> from the URL (Send to
     # Playground, or the post-Generate redirect) would never reach the form
-    pnames = ([x["name"] for x in adapters.public_fields(cand)[0]]
-              if cand and cand.get("meshy") is not None
-              else list((cand.get("mapping") if cand else {}) or {}))
+    if cand and cand.get("meshy") is not None:
+        _pf, _, _ff = adapters.public_fields(cand)
+        pnames = [x["name"] for x in _pf] + [x["name"] for x in _ff]
+    else:
+        pnames = list((cand.get("mapping") if cand else {}) or {})
     for p in pnames:
         q = qp.get(f"p__{p}", "")
         vals[p] = q if q != "" else ("" if defaults.get(p) is None else str(defaults[p]))
@@ -4021,8 +4044,10 @@ async def generate(request: Request):
     # only the slots/params this alias actually has ride along — the stash may carry
     # another alias's inputs (that is the point of it surviving a model switch).
     if cand and cand.get("meshy") is not None:
-        slots, fset = {i["name"] for i in adapters.public_fields(cand)[1]}, set()
-    else:                                             # Meshy takes no `files` (the API 400s)
+        _, m_imgs, m_files = adapters.public_fields(cand)
+        slots = {i["name"] for i in m_imgs}
+        fset = {x["name"] for x in m_files}           # rigging: input_mesh_path
+    else:
         slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
         fset = set(adapters.file_params(wf_i, map_i))
     if slots or fset:

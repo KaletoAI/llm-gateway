@@ -58,6 +58,8 @@ class _Stub(BaseHTTPRequestHandler):
         if _Stub.post_status >= 400:
             return self._json(_Stub.post_status, {"message": "NoMoreConcurrentTasks"
                                                   if _Stub.post_status == 429 else "no credits"})
+        if self.path.endswith("/rigging"):          # the real Meshy answers rigging with 200
+            return self._json(200, {"result": "rig-1"})
         self._json(_Stub.post_status, {"result": "task-1"})
 
 
@@ -94,13 +96,16 @@ class TestMeshyAdapter(unittest.TestCase):
                         "poll_interval": 0.01, "max_wait": 2}
         self.ad = adapters.MeshyAdapter(self.backend, self.ctx)
 
-    def _req(self, images=None, values=None, endpoint="image-to-3d", formats=None):
+    def _req(self, images=None, values=None, endpoint="image-to-3d", formats=None,
+             files=None, **opts):
         cand = meshy.default_candidate("meshy")
         cand["meshy"]["endpoint"] = endpoint
         if formats:
             cand["meshy"]["options"]["target_formats"] = list(formats)
+        cand["meshy"]["options"].update(opts)
         return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest", task="img2mesh",
                                           params=dict(values or {}), upload_images=dict(images or {}),
+                                          upload_files=dict(files or {}),
                                           meshy=cand["meshy"], upload_prefix="gw_j1")
 
     def _run(self, coro):
@@ -217,6 +222,37 @@ class TestMeshyAdapter(unittest.TestCase):
             self._run(self.ad.generate(self._req({})))
         self.assertEqual(_Stub.posted, [])
 
+    def test_rigging_flow(self):
+        _Stub.script = [{"status": "SUCCEEDED", "progress": 100, "consumed_credits": 5,
+                         "result": {"rigged_character_glb_url": f"{self.url}/asset/glb"}}]
+        out = self._run(self.ad.generate(self._req(
+            endpoint="rigging", files={"input_mesh_path": ("h.glb", GLB)},
+            values={"input_height_m": 1.8})))
+        self.assertEqual([b.name for b in out.blobs], ["rigged.glb"])
+        self.assertEqual(out.blobs[0].mime, "model/gltf-binary")
+        self.assertEqual(out.blobs[0].kind, "file")
+        self.assertEqual(_Stub.posted[0][0], "/openapi/v1/rigging")
+        self.assertEqual(_Stub.posted[0][1]["height_meters"], 1.8)
+        self.assertEqual(out.meta["endpoint"], "rigging")
+        self.assertEqual(out.meta["meshy_task_id"], "rig-1")
+        self.assertEqual(out.meta["consumed_credits"], 5)
+        self.assertTrue(out.meta["request"]["model_url"].startswith("<"))
+        self.assertNotIn("data:", json.dumps(out.meta))
+
+    def test_rigging_animations_option(self):
+        _Stub.script = [{"status": "SUCCEEDED", "progress": 100, "consumed_credits": 5,
+                         "result": {"rigged_character_glb_url": f"{self.url}/asset/glb",
+                                    "basic_animations": {"walking_glb_url": f"{self.url}/asset/glb",
+                                                         "running_glb_url": f"{self.url}/asset/glb"}}}]
+        out = self._run(self.ad.generate(self._req(
+            endpoint="rigging", files={"input_mesh_path": ("h.glb", GLB)}, animations=True)))
+        self.assertEqual([b.name for b in out.blobs], ["rigged.glb", "walking.glb", "running.glb"])
+
+    def test_rigging_missing_mesh_is_input_error(self):
+        with self.assertRaises(meshy.MeshyInput):
+            self._run(self.ad.generate(self._req(endpoint="rigging")))
+        self.assertEqual(_Stub.posted, [])
+
 
 class TestGenTypesAndFields(unittest.TestCase):
     def test_registry(self):
@@ -225,9 +261,19 @@ class TestGenTypesAndFields(unittest.TestCase):
         self.assertFalse(adapters.OpenAIAdapter.serves_generation)
 
     def test_public_fields_meshy(self):
-        params, images = adapters.public_fields(meshy.default_candidate("m"))
+        params, images, files = adapters.public_fields(meshy.default_candidate("m"))
         self.assertEqual([i["name"] for i in images], ["input_image"])
+        self.assertEqual(files, [])
         self.assertTrue(any(p["name"] == "input_face_num" for p in params))
+
+    def test_public_fields_meshy_rigging(self):
+        cand = meshy.default_candidate("m")
+        cand["meshy"]["endpoint"] = "rigging"
+        params, images, files = adapters.public_fields(cand)
+        self.assertEqual(images, [])
+        self.assertEqual(files, [{"name": "input_mesh_path", "required": True, "accept": ["glb"]}])
+        self.assertEqual([p["name"] for p in params],
+                         ["input_name", "input_height_m", "input_no_fingers"])
 
     def test_public_fields_comfy(self):
         wf = {"1": {"class_type": "LoadImage", "inputs": {"image": "x.png"}},
@@ -235,10 +281,20 @@ class TestGenTypesAndFields(unittest.TestCase):
         mapping = {"image": {"node": "1", "field": "image", "label": "input_image", "on_empty": "required"},
                    "steps": {"node": "2", "field": "steps"},
                    "seed": {"node": "2", "field": "seed"}}
-        params, images = adapters.public_fields({"workflow_json": wf, "mapping": mapping})
+        params, images, files = adapters.public_fields({"workflow_json": wf, "mapping": mapping})
         self.assertEqual(images, [{"name": "input_image", "on_empty": "required", "required": True}])
+        self.assertEqual(files, [])
         self.assertEqual(params[0], {"name": "steps", "type": "int", "default": 20})
         self.assertEqual(params[1]["auto"], "random unless sent")
+
+    def test_public_fields_comfy_files(self):
+        """A mesh param is advertised under `files` (by its LABEL), never as an image
+        slot and never as a scalar param — that is what a client uploads it as."""
+        wf = {"1": {"class_type": "LoadMesh", "inputs": {"mesh": "a.glb"}}}
+        mapping = {"mesh_path": {"node": "1", "field": "mesh", "label": "input_mesh_path"}}
+        params, images, files = adapters.public_fields({"workflow_json": wf, "mapping": mapping})
+        self.assertEqual(files, [{"name": "input_mesh_path", "required": False}])
+        self.assertEqual(images, [])
 
 
 if __name__ == "__main__":

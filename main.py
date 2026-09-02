@@ -3416,6 +3416,22 @@ def _file_param(wf: dict, mapping: dict, key: str) -> str:
     return hit
 
 
+async def _decode_one_file(key: str, param: str, val) -> tuple:
+    """One `files` entry → (slot name, bytes). The name is a HINT (display + extension);
+    a ComfyUI upload is renamed under the job's prefix, a Meshy one is embedded as a
+    data-URI — neither ever writes the raw client name."""
+    got = await _decode_ref_blob(val)
+    if not got or not got[0]:
+        raise HTTPException(400, f"`files.{key}` could not be read — expected base64, "
+                                 f"a data-URI or an http(s) URL")
+    data, ext = got
+    if len(data) > _UPLOAD_MAX_BYTES:
+        raise HTTPException(413, f"`files.{key}` is {len(data) / (1024 * 1024):.1f} MB — "
+                                 f"the limit is {_UPLOAD_MAX_BYTES // (1024 * 1024)} MB")
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", param)[:40] or "file"
+    return f"gwup_{slug}.{ext}", data
+
+
 async def _decode_upload_files(alias: str, files: dict) -> dict:
     """`files: {param|label: base64|data-URI|URL}` → {param: (slot name, bytes)}.
 
@@ -3425,29 +3441,31 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     wf, mapping = await asyncio.to_thread(_gen_alias_mapping, alias)
     # Same lookup as every other alias read (_gen_routes, gen_alias_schema): store first,
     # config `image_models` for aliases the store doesn't hold — a config-defined Meshy
-    # alias must hit the 400 below too, not fall through and drop the files silently.
+    # alias must hit the branch below too, not fall through and drop the files silently.
     cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
         or image_models.get(alias)
     if cands and cands[0].get("meshy") is not None:
-        raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and accepts no `files`"
-                                 f" — send images under `images`")
+        # A Meshy alias has no mapping — its file inputs are the endpoint's fixed table
+        # (rigging: input_mesh_path; the image endpoints: none), so the keys are checked
+        # against public_fields instead, and are their OWN param names.
+        allowed = {f["name"] for f in adapters.public_fields(cands[0])[2]}
+        if not allowed:
+            raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and accepts no `files`"
+                                     f" — send images under `images`")
+        out = {}
+        for key, val in files.items():
+            if key not in allowed:
+                raise HTTPException(400, f"unknown `files` key '{key}' — this alias takes "
+                                         f"{', '.join(sorted(allowed))} (see GET "
+                                         f"/v1/generations/<alias>/schema)")
+            out[key] = await _decode_one_file(key, key, val)
+        return out
     if not mapping:
         return {}                       # no candidate at all → run_generation 503s in a moment
     out = {}
     for key, val in files.items():
         param = _file_param(wf, mapping, key)
-        got = await _decode_ref_blob(val)
-        if not got or not got[0]:
-            raise HTTPException(400, f"`files.{key}` could not be read — expected base64, "
-                                     f"a data-URI or an http(s) URL")
-        data, ext = got
-        if len(data) > _UPLOAD_MAX_BYTES:
-            raise HTTPException(413, f"`files.{key}` is {len(data) / (1024 * 1024):.1f} MB — "
-                                     f"the limit is {_UPLOAD_MAX_BYTES // (1024 * 1024)} MB")
-        slug = re.sub(r"[^A-Za-z0-9]+", "_", param)[:40] or "file"
-        # The name is a HINT (display + extension); the adapter rebuilds it under the
-        # job's upload prefix, so no two jobs ever write the same backend input file.
-        out[param] = (f"gwup_{slug}.{ext}", data)
+        out[param] = await _decode_one_file(key, param, val)
     return out
 
 
@@ -3497,8 +3515,9 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     """Self-description of a generation alias — enough for a client (or an agent)
     to build a valid request without out-of-band docs: params under their EXTERNAL
     names (label, else param; both are accepted on requests) with type + default
-    from the workflow, image slots with their empty behaviour, fps/frames raster,
-    and where to list valid LoRAs."""
+    from the workflow, image slots with their empty behaviour, `files` (uploads that
+    are not images — a mesh a rig/shrink alias works on), fps/frames raster, and
+    where to list valid LoRAs."""
     await gate_request(authorization, request, alias)                # auth + allow-list
     cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
         or image_models.get(alias)
@@ -3507,13 +3526,13 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     cand = cands[0]
     # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; Meshy:
     # the endpoint's fixed label table) — see adapters.public_fields.
-    params, images = adapters.public_fields(cand)
+    params, images, files = adapters.public_fields(cand)
     wf = cand.get("workflow_json") or {}
     mapping = cand.get("mapping") or {}
     kinds = sorted(k for _, k in lora_groups(wf, mapping) if k)
     out: dict = {"object": "generation.schema", "alias": alias,
                  "backends": [c.get("backend") for c in cands],
-                 "params": params, "images": images,
+                 "params": params, "images": images, "files": files,
                  "modes": ["sync", "async"],
                  "loras_url": f"/v1/generations/{alias}/loras",
                  "loras": {"list_url": f"/v1/generations/{alias}/loras",
@@ -3601,6 +3620,8 @@ def _gen_image_slots(alias: str) -> list:
         return []
     _, cand = routes[0]
     if cand.get("meshy") is not None:
+        # [1] = the IMAGE slots only: a `files` entry (a rigging mesh) is not something
+        # a positional reference image may ever land on.
         return [i["name"] for i in adapters.public_fields(cand)[1]]   # labels ARE the params
     return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
 
