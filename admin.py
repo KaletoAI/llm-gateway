@@ -3959,9 +3959,11 @@ async def generate(request: Request):
         up = next((k for k in (f"file__{p}", f"img__{p}")
                    if isinstance(f.get(k), (bytes, bytearray)) and f[k].strip()), None)
         if up:
-            # the browser's filename, because a mesh's type lives in its extension
+            # the browser's filename, because a mesh's type lives in its extension —
+            # and a fallback that HAS one: a name without a suffix would go out as
+            # application/octet-stream and the API could not name the file's kind.
             stash[p] = (str(f.get(f"{up}__filename") or "")
-                        or (p if up.startswith("file__") else f"{p}.png"), bytes(f[up]))
+                        or (f"{p}.glb" if up.startswith("file__") else f"{p}.png"), bytes(f[up]))
             continue
         ref = str(f.get(f"hist__{p}", "") or "").strip()
         if ref:
@@ -3971,9 +3973,8 @@ async def generate(request: Request):
                 return _err(f"job {jid} #{rest.partition(':')[2]} is no longer available — "
                             f"its files were deleted (job TTL)")
             stash[p] = got
-    # only the slots/params this alias actually has ride along (the stash may carry
-    # another alias's inputs); no mapping info at all → send everything as images,
-    # downstream ignores extras.
+    # only the slots/params this alias actually has ride along — the stash may carry
+    # another alias's inputs (that is the point of it surviving a model switch).
     if cand and cand.get("meshy") is not None:
         slots, fset = {i["name"] for i in adapters.public_fields(cand)[1]}, set()
     else:                                             # Meshy takes no `files` (the API 400s)
@@ -3983,7 +3984,12 @@ async def generate(request: Request):
         images = {p: v for p, v in stash.items() if p in slots}
         files = {p: v for p, v in stash.items() if p in fset}
     else:
-        images, files = dict(stash), {}
+        # An alias the store knows nothing about (no mapping at all): send the stash
+        # as images and let downstream ignore extras — EXCEPT a file-ish param. A mesh
+        # left in the stash by another alias must never ride as an image; the alias
+        # cannot consume it either way, and `images` means images.
+        images = {p: v for p, v in stash.items() if not adapters.is_file_param(p, None)}
+        files = {}
     # A REAL API call through POST /v1/generations (reference images as the API's
     # per-field base64 `images` dict, meshes as `files` data-URIs) — the playground
     # tests the API, bypassing nothing.

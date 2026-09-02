@@ -121,6 +121,104 @@ class FakeRequest:
         return self._body
 
 
+
+# ── generate(): what the playground actually POSTs ──────────────────────────────
+# The stash survives a model switch on purpose (same-named slots carry over), which
+# makes "an alias that cannot consume this input" the interesting case: a mesh left
+# behind by a rig alias must not be handed to a text2img alias as a reference IMAGE.
+# Reproduced before the fix: body carried images={"input_mesh_path": <glb bytes>}.
+
+MESH_ALIAS = [{"backend": "comfy-a", "task": "mesh2rig",
+               "workflow_json": {"9": {"class_type": "PrimitiveString",
+                                       "inputs": {"value": "/mnt/m.glb"}}},
+               "mapping": {"input_mesh_path": {"node": "9", "field": "value",
+                                               "label": "input_mesh_path"}}}]
+TXT_ALIAS = [{"backend": "comfy-a", "task": "text2img",
+              "workflow_json": {"6": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+                                "3": {"class_type": "KSampler", "inputs": {"steps": 20}}},
+              "mapping": {"prompt": {"node": "6", "field": "text"},
+                          "steps": {"node": "3", "field": "steps"}}}]
+
+
+class FakeGenRequest:
+    """Just enough Request for admin.generate (multipart body, no session cookie)."""
+    base_url = "http://gw/"
+    cookies: dict = {}
+
+    def __init__(self, parts):
+        b = "----gwtest"
+        raw = b""
+        for name, val, *fn in parts:
+            disp = f'; filename="{fn[0]}"' if fn else ""
+            raw += (f'--{b}\r\nContent-Disposition: form-data; name="{name}"{disp}\r\n\r\n'
+                    ).encode() + (val if isinstance(val, bytes) else val.encode()) + b"\r\n"
+        self._body = raw + f"--{b}--\r\n".encode()
+        self.headers = {"content-type": f"multipart/form-data; boundary={b}"}
+
+    async def body(self):
+        return self._body
+
+
+class GenerateBody(unittest.TestCase):
+    def setUp(self):
+        import store
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        store.init(os.path.join(self.tmp.name, "store.db"))
+        jobs.init(os.path.join(self.tmp.name, "jobs.db"),
+                  os.path.join(self.tmp.name, "blobs"), 3600)
+        store.upsert("mesh-rig", MESH_ALIAS)
+        store.upsert("sdxl", TXT_ALIAS)
+        self.sent = {}
+
+        class Resp:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"job_id": "job-1"}
+
+        async def fake_self_api(request, method, path, **kw):
+            self.sent.clear()
+            self.sent.update(kw.get("json") or {})
+            return Resp()
+
+        real = admin._self_api
+        admin._self_api = fake_self_api
+        self.addCleanup(lambda: setattr(admin, "_self_api", real))
+        admin._pg_images.clear()
+        self.addCleanup(admin._pg_images.clear)
+
+    def _post(self, parts):
+        self.sent.clear()                       # so "no API call" stays observable
+        return asyncio.run(admin.generate(FakeGenRequest(parts)))
+
+    def test_mesh_upload_rides_as_a_file_not_an_image(self):
+        self._post([("model", "mesh-rig"), ("p__input_mesh_path", "/backend/old.glb"),
+                    ("file__input_mesh_path", b"GLBBYTES", "hero.glb")])
+        self.assertTrue(self.sent["files"]["input_mesh_path"]
+                        .startswith("data:model/gltf-binary;base64,"))
+        self.assertNotIn("images", self.sent)
+        # the upload wins over the typed path — binding the node twice would 400
+        self.assertNotIn("input_mesh_path", self.sent.get("params", {}))
+
+    def test_stashed_mesh_never_leaks_into_an_alias_without_upload_fields(self):
+        self._post([("model", "mesh-rig"),
+                    ("file__input_mesh_path", b"GLBBYTES", "hero.glb")])
+        self._post([("model", "sdxl"), ("p__prompt", "a cat"), ("p__steps", "25")])
+        self.assertNotIn("images", self.sent)   # ← the bug: images={"input_mesh_path": glb}
+        self.assertNotIn("files", self.sent)
+        self.assertEqual(self.sent["prompt"], "a cat")
+        self.assertEqual(self.sent["params"]["steps"], 25)
+
+    def test_unnamed_mesh_upload_still_carries_its_type(self):
+        # a client may send a file part with an EMPTY filename (a part with no
+        # filename at all is not a file part for _multipart — it arrives as text)
+        self._post([("model", "mesh-rig"), ("file__input_mesh_path", b"GLBBYTES", "")])
+        self.assertTrue(self.sent["files"]["input_mesh_path"]
+                        .startswith("data:model/gltf-binary;base64,"))
+
+
 class MultipartFilename(unittest.TestCase):
     def test_file_part_carries_its_name(self):
         b = "----gwtest"
