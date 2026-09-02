@@ -948,6 +948,10 @@ def _is_model_field(options, current) -> bool:
 
 _OI_CACHE: dict = {}              # (backend, class) → (monotonic_ts, fields|None)
 _OI_TTL = 300.0                   # node defs change rarely; 5 min keeps edits snappy
+_OI_TTL_ERR = 60.0                # a FAILED fetch (backend down / class not installed) expires
+                                  # fast: cached as None it silently turns every model dropdown in
+                                  # the editor into a text box, so a RETURNING backend must not
+                                  # stay invisible for the full TTL. Cost: one probe per minute.
 
 
 async def _fetch_oi_class(client, url: str, cls: str):
@@ -996,7 +1000,7 @@ async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = No
     missing = []
     for cls in classes:
         hit = _OI_CACHE.get((backend_name, cls))
-        if hit and now - hit[0] < _OI_TTL:
+        if hit and now - hit[0] < (_OI_TTL if hit[1] is not None else _OI_TTL_ERR):
             if hit[1] is not None:
                 out[cls] = hit[1]
         else:
@@ -1009,6 +1013,32 @@ async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = No
             if fields is not None:
                 out[cls] = fields
     return out
+
+
+async def _editor_object_info(cands: list, wf: dict, mapping: Optional[dict]) -> tuple:
+    """The node defs the mapping editor renders its widgets from, with a **fallback
+    across the alias's own backends**.
+
+    Every widget in the editor — the model dropdowns under Pinned values, the numeric
+    bounds, the `▾ n` hints in Available fields — comes from `/object_info`, and the
+    editor used to ask ONLY the first candidate. A first backend that is merely DOWN
+    therefore degraded every one of those to a free-text box, silently: no error, just
+    a text field where a model list belongs (measured 2026-09-02 on `Qwen BL` — its
+    primary `dx10-02` was unreachable, so the two model pins, UNETLoader/LoaderGGUF,
+    lost their dropdowns while the alias's healthy `k12-gpu` had the very same classes).
+    The extra-backend tabs already borrow the primary's defs when they cannot answer
+    (`oi_bn or oi`); this is the same courtesy in the other direction.
+
+    All candidates are probed CONCURRENTLY, so a dead backend costs one timeout for the
+    page, not one per backend, and the results warm `_OI_CACHE` for `_pinned_block`'s
+    per-backend tabs. Returns `(oi, borrowed_from)` — `borrowed_from` names the backend
+    whose defs stood in, and is None when the primary answered (the normal case)."""
+    names = [str(c.get("backend") or "") for c in cands]
+    ois = await asyncio.gather(*[_object_info(n, wf, mapping) for n in names])
+    for i, (name, oi) in enumerate(zip(names, ois)):
+        if oi:
+            return oi, (None if i == 0 else name)
+    return {}, None
 
 
 def _detect_model_bindings(wf: dict, oi: dict) -> list:
@@ -3088,9 +3118,17 @@ def _chain_rig_warning(wf: dict, s: dict) -> str:
     return f"<p class='hint'><span class='bad'>⚠ generic rig: {why}.</span></p>"
 
 
-async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict) -> str:
-    """Pinned values as per-backend tabs (primary edits; extras override values)."""
+async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict,
+                        oi_from: Optional[str] = None) -> str:
+    """Pinned values as per-backend tabs (primary edits; extras override values).
+    `oi_from` names the sibling backend whose node defs stood in because the primary
+    could not answer — said out loud, because the choices then list what is installed
+    THERE (see `_editor_object_info`)."""
     primary_rows = _pin_tab_rows(alias, cands[0], True, fixed, wf, oi)
+    if oi_from:
+        primary_rows = (f"<p class='hint'>Primary <b>{_esc(str(cands[0].get('backend')))}</b> is not "
+                        f"answering — the choices below list what is installed on "
+                        f"<b>{_esc(oi_from)}</b>.</p>") + primary_rows
     if len(cands) == 1:
         return f"<h2>Pinned values</h2><div class='ppanel'>{primary_rows}</div>"
     bn0 = str(cands[0].get("backend"))
@@ -3303,14 +3341,14 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
         except Exception:
             wf = {}
     wf = wf or {}
-    oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping"))
+    oi, oi_from = await _editor_object_info(cands, wf, cand.get("mapping"))
     mapping = cand.get("mapping") or {}
     fixed = cand.get("fixed") or []
     mapped = ({(m["node"], m["field"]) for m in mapping.values()}
               | {(b["node"], b["field"]) for b in fixed})
 
     req_rows = _req_fields_rows(alias, wf, mapping, oi)
-    pinned_block = await _pinned_block(alias, cands, fixed, wf, oi)
+    pinned_block = await _pinned_block(alias, cands, fixed, wf, oi, oi_from)
     pin_extra = _PIN_CSS_JS
 
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
