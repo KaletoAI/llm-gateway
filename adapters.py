@@ -3044,7 +3044,7 @@ class MeshyAdapter(BackendAdapter):
                 continue
             client_errs, gone_since = 0, None
             state = meshy.parse_task(r.json() or {}, formats)     # MeshyInput → final
-            if state.status in ("FAILED", "CANCELED"):
+            if state.error:            # FAILED/CANCELED — or a status this gateway does not know
                 raise RuntimeError(f"Meshy task {task_id} {state.status.lower()}: {state.error}")
             if state.status == "SUCCEEDED":
                 return state

@@ -185,6 +185,25 @@ class TestParseTask(unittest.TestCase):
         self.assertEqual(st.downloads, [])
         self.assertIsNone(st.error)
 
+    def test_unknown_status_is_terminal_failed(self):
+        # Not falling through as "still running": an unknown state would be polled until
+        # max_wait, holding the backend slot for the whole wait to learn nothing.
+        st = meshy.parse_task({"status": "EXPIRED", "progress": 10,
+                               "model_urls": {"glb": "https://a/x.glb"}}, ["glb"])
+        self.assertEqual(st.status, "EXPIRED")
+        self.assertEqual(st.error, "unknown task status 'EXPIRED'")
+        self.assertEqual(st.downloads, [])
+
+    def test_missing_status_is_terminal_failed(self):
+        st = meshy.parse_task({"progress": 0}, ["glb"])
+        self.assertIsNotNone(st.error)
+        self.assertEqual(st.downloads, [])
+
+    def test_non_integer_progress_is_zero(self):
+        st = meshy.parse_task({"status": "IN_PROGRESS", "progress": "abc"}, ["glb"])
+        self.assertEqual(st.progress, 0)
+        self.assertIsNone(st.error)
+
 
 class TestRequestSummary(unittest.TestCase):
     def test_images_replaced(self):

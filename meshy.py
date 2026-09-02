@@ -210,13 +210,29 @@ class TaskState:
     credits: Optional[int] = None
 
 
+TASK_STATUSES = ("PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED", "CANCELED")
+
+
 def parse_task(task: dict, formats: list) -> TaskState:
     """Read a task object (GET …/{id}). On SUCCEEDED every requested format must have
-    a URL — a missing one raises, never a silently smaller delivery."""
+    a URL — a missing one raises, never a silently smaller delivery.
+
+    TOTAL over what the API may answer: `progress` that is not an integer counts as 0
+    (a poll must not die on a cosmetic field), and any status outside TASK_STATUSES is
+    terminal-FAILED with an explaining error. Falling through as "not finished yet"
+    would poll an unknown state until `max_wait` — holding the backend slot for the
+    full wait to learn nothing."""
     status = str(task.get("status") or "").upper()
-    st = TaskState(status=status, progress=int(task.get("progress") or 0),
+    try:
+        progress = int(task.get("progress") or 0)
+    except (TypeError, ValueError):
+        progress = 0
+    st = TaskState(status=status, progress=progress,
                    credits=task.get("consumed_credits"),
                    thumbnail=task.get("thumbnail_url") or None)
+    if status not in TASK_STATUSES:
+        st.error = f"unknown task status {status!r}"
+        return st
     if status in ("FAILED", "CANCELED"):
         st.error = ((task.get("task_error") or {}).get("message") or status.lower())
         return st
