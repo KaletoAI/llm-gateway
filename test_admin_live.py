@@ -58,27 +58,32 @@ class EmbeddedScriptsParse(unittest.TestCase):
         html = admin._page("T", "<p>x</p>", "dashboard", refresh=4)
         blocks = re.findall(r"<script>(.*?)</script>", html, re.S)
         self.assertTrue(blocks, "expected at least one inline script in the page")
-        for i, src in enumerate(blocks):
-            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-                fh.write(src)
-                path = fh.name
-            p = subprocess.run(["node", "--check", path],
-                               capture_output=True, text=True)
-            self.assertEqual(p.returncode, 0,
-                             f"inline script #{i} is not valid JS:\n{p.stderr}")
+        # One scratch dir for the whole loop: the files exist only for `node --check`
+        # and are gone when it returns. Written with delete=False before, they piled
+        # up in /tmp — a dozen per run, more with every constant added.
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, src in enumerate(blocks):
+                path = os.path.join(tmp, f"inline{i}.js")
+                with open(path, "w") as fh:
+                    fh.write(src)
+                p = subprocess.run(["node", "--check", path],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0,
+                                 f"inline script #{i} is not valid JS:\n{p.stderr}")
 
     def test_page_level_script_constants_are_valid(self):
         if not shutil.which("node"):
             self.skipTest("node not installed")
-        for name in ("_SCROLL_JS", "_SORT_JS", "_LIVE_JS", "_FILTER_JS", "_JOB_TICK"):
-            blob = getattr(admin, name)
-            for src in re.findall(r"<script>(.*?)</script>", blob, re.S):
-                with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
-                    fh.write(src)
-                    path = fh.name
-                p = subprocess.run(["node", "--check", path],
-                                   capture_output=True, text=True)
-                self.assertEqual(p.returncode, 0, f"{name} is not valid JS:\n{p.stderr}")
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("_SCROLL_JS", "_SORT_JS", "_LIVE_JS", "_FILTER_JS", "_JOB_TICK"):
+                blob = getattr(admin, name)
+                for i, src in enumerate(re.findall(r"<script>(.*?)</script>", blob, re.S)):
+                    path = os.path.join(tmp, f"{name}{i}.js")
+                    with open(path, "w") as fh:
+                        fh.write(src)
+                    p = subprocess.run(["node", "--check", path],
+                                       capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 0, f"{name} is not valid JS:\n{p.stderr}")
 
     def test_fbx_viewer_module_is_valid(self):
         # A `type="module"` block, so it is checked as .mjs — `node --check` rejects
@@ -352,6 +357,72 @@ class PlaygroundScriptInvariant(unittest.TestCase):
         # Written as an assertion so the day that changes, this says what to add.
         self.assertNotIn("fbxview", admin._media_tag("/x.fbx", "application/octet-stream", "file"))
         self.assertNotIn("fbxview", admin._playground_body([], {"model": ""}, None, "<p>x</p>"))
+
+
+class VoiceUploadProgressIsConsumed(unittest.TestCase):
+    """The upload verdict must be shown once and then gone.
+
+    `_voice_upload_prog` lives for the whole process and nothing clears it, so a
+    branch that renders it whenever it exists makes the LAST upload's checklist the
+    permanent content of the Voice tab — for the 303 landings from ship/delete (where
+    it can describe a reference that no longer exists), for a fresh tab hours later,
+    for the rest of the session. The old `vu=done` reload made the entry moot by
+    navigating away from it; the live morph does not, so the branch has to.
+    """
+
+    class _Q(dict):
+        def get(self, k, d=None):
+            return dict.get(self, k, d)
+
+    class _Req:
+        cookies: dict = {}
+
+        def __init__(self, qp):
+            self.query_params = qp
+
+    def setUp(self):
+        self._body = admin._voiceplay_body
+        # Stubbed: the real one renders the voice-library panel out of the store, which
+        # this test has nothing to say about. What it asserts is the branch's own logic.
+        admin._voiceplay_body = lambda vals, result, status="": result
+        admin._voice_upload_prog.clear()
+
+    def tearDown(self):
+        admin._voiceplay_body = self._body
+        admin._voice_upload_prog.clear()
+
+    def _render(self):
+        req = self._Req(self._Q(sub="voice"))
+        return asyncio.run(admin.playground_page(req)).body.decode()
+
+    def test_running_upload_is_live_and_shows_the_checklist(self):
+        admin._voice_upload_prog["default"] = {"name": "kai", "steps": [("run", "storing")],
+                                               "done": False, "ok": False}
+        html = self._render()
+        self.assertIn('<main data-live="1">', html)
+        self.assertIn("lib:kai", html)
+
+    def test_finished_upload_shows_the_verdict_once_then_the_hint(self):
+        admin._voice_upload_prog["default"] = {"name": "kai", "steps": [("ok", "stored")],
+                                               "done": True, "ok": True}
+        first = self._render()
+        self.assertIn("shipped to all hosts", first)
+        self.assertNotIn("<main data-live", first)   # nothing left to poll for
+        second = self._render()
+        self.assertNotIn("shipped to all hosts", second)
+        self.assertIn("Synthesize to hear the result here.", second)
+        self.assertNotIn("default", admin._voice_upload_prog)
+        # …and it stays gone, rather than resurfacing on the visit after that.
+        self.assertNotIn("shipped to all hosts", self._render())
+
+    def test_a_new_upload_is_not_consumed_by_the_old_entry(self):
+        admin._voice_upload_prog["default"] = {"name": "old", "steps": [], "done": True, "ok": True}
+        self._render()                                   # marks the old one seen
+        admin._voice_upload_prog["default"] = {"name": "new", "steps": [("run", "storing")],
+                                               "done": False, "ok": False}
+        html = self._render()
+        self.assertIn('<main data-live="1">', html)
+        self.assertIn("lib:new", html)
 
 
 if __name__ == "__main__":

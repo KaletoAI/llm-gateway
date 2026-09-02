@@ -323,11 +323,17 @@ _SCROLL_JS = ("<script>(function(){"
 # on the live DOM, so without the hook a clicked sort is undone on every tick.
 # The hook re-reads sessionStorage rather than closing over the state — that
 # store is the source of truth and stays it. For the same reason no call site
-# captures the storage key: the morph reuses an unkeyed table node for a
+# captures the storage KEY STRING: the morph reuses an unkeyed table node for a
 # different logical table when a dashboard panel appears or disappears, which
 # rewrites its data-sk while the header cells keep their old handlers. Every
-# read and write therefore derives 'sort:'+key(tbl,i) at the moment it acts, so
-# writer and reader always agree on the node's LIVE data-sk. Tables with `data-sk` get a stable key; others key off path+index.
+# read and write therefore derives 'sort:'+key(tbl,i) at the moment it acts, so a
+# data-sk table's writer and reader always agree on the node's LIVE data-sk.
+# That guarantee stops at data-sk: the `i` fallback (path+index) IS captured —
+# wire()'s click handler closes over the load-time index while the post-morph hook
+# passes a freshly recomputed one — so a table without data-sk that changes position
+# can read under one key and write under another. Latent only: every current
+# `table.sortable` carries a data-sk, which is why the fallback is a fallback.
+# Tables with `data-sk` get a stable key; others key off path+index.
 # The hook also calls `wire()` on every sortable table, not just `applySort()`: a
 # table the morph INSERTS mid-session (a dashboard panel appearing) never went
 # through the load-time loop and would show a restored sort while silently ignoring
@@ -464,7 +470,9 @@ _LIVE_JS = ("<script>(function(){"
             "if(k)pool['#'+k]=c;else unkeyed.push(c);}"
             "var out=[],ui=0,m;"
             "for(c=n.firstChild;c;c=c.nextSibling){k=keyOf(c);m=null;"
-            "if(k){m=pool['#'+k]||null;if(m)pool['#'+k]=null;}"
+            "if(k){m=pool['#'+k]||null;"
+            "if(m&&m.tagName!==c.tagName)m=null;"
+            "else if(m)pool['#'+k]=null;}"
             "else{while(ui<unkeyed.length&&!same(unkeyed[ui],c))ui++;"
             "if(ui<unkeyed.length){m=unkeyed[ui];ui++;}}"
             "if(m){morph(m,c);out.push(m);}"
@@ -494,7 +502,9 @@ _LIVE_JS = ("<script>(function(){"
             "var nm=doc.querySelector('main');"
             "if(!nm){stop();return;}"
             "try{morph(main,nm);}"
-            "catch(e){main.replaceChildren.apply(main,[].slice.call(nm.childNodes).map(adopt));}"
+            "catch(e){main.replaceChildren.apply(main,[].slice.call(nm.childNodes).map(adopt));"
+            "if(nm.hasAttribute('data-live'))main.setAttribute('data-live',nm.getAttribute('data-live'));"
+            "else main.removeAttribute('data-live');}"
             "for(var i=0;i<window.gwLiveHooks.length;i++){"
             "try{window.gwLiveHooks[i]();}catch(e){}}"
             "var next=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
@@ -3674,11 +3684,24 @@ async def playground_page(request: Request):
                                   subnav=_subnav("playground", "chat")))
     if sub == "voice":
         vals = {k: qp.get(k, "") for k in _VOICEPLAY_KEYS}
-        prog = _voice_upload_prog.get(_session_user(request) or "default")
+        vu_user = _session_user(request) or "default"
+        prog = _voice_upload_prog.get(vu_user)
         # A running upload makes the page live at 1s; the final tick renders the
         # finished checklist AND the library table with the new entry, then drops
         # data-live to stop the poller — which is all the old reload ever did.
+        # Consumed once it has been SHOWN in its terminal state: _voice_upload_prog
+        # lives for the whole process and nothing else clears it, so without this the
+        # last upload's verdict is what every later visit to the tab renders instead of
+        # the hint — a 303 landing from ship/delete included, where it can describe a
+        # reference that no longer exists. `seen` is set on the render that shows the
+        # finished checklist (the final live tick still gets it); the NEXT GET drops the
+        # entry. A new upload installs a fresh dict, so it is never popped early.
+        if prog is not None and prog.get("seen"):
+            _voice_upload_prog.pop(vu_user, None)
+            prog = None
         vu_refresh = 1 if (prog and not prog.get("done")) else None
+        if prog is not None and prog.get("done"):
+            prog["seen"] = True
         result_html = (_vu_fragment(prog) if prog else
                        "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>")
         return HTMLResponse(_page("Voice", _voiceplay_body(vals, result_html), "playground",
@@ -4685,10 +4708,14 @@ def _dash_backends(bes: list, offline: list) -> str:
         inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
         r1h = b.get("reqs_1h", 0)
         r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
-        # data-k: the backend name is this row's identity, and the panel re-sorts
+        # data-k: _bid (type:name) is this row's identity, and the panel re-sorts
         # itself (ready → busy → off), so a backend changing state moves its row —
-        # positional matching would rewrite the neighbours it stepped over.
-        brows += (f"<tr data-k=\"bk-{_esc(b['name'])}\"><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
+        # positional matching would rewrite the neighbours it stepped over. The bare
+        # name is NOT unique: _bid exists because an LLM and a ComfyUI backend may
+        # share one (main.rebuild_backends keys on (name, type)), and two rows with the
+        # same key collapse into one pool entry — each tick would then rewrite one row
+        # from the other's content, the exact per-tick full-row rewrite keys prevent.
+        brows += (f"<tr data-k=\"bk-{_esc(_bid(b))}\"><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td>"
                   f"<td>{b.get('models', 0)}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
