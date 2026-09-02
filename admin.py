@@ -346,6 +346,116 @@ _SORT_JS = ("<script>(function(){"
             "})();</script>")
 
 
+# One auto-update mechanism for the whole console. `_page(refresh=N)` marks <main>
+# with data-live=N; this poller re-fetches the SAME url and morphs the response's
+# <main> into the live one instead of reloading the page. Nodes are matched by id or
+# data-k (falling back to position+tag), so a table that gains a row keeps every
+# other row's identity — which is what preserves scroll, sort order, a focused
+# filter input, an open form, playing media and the model-viewer's camera.
+# Five things are deliberately never touched: <script> (a re-inserted _JOB_TICK
+# would double its setInterval), [data-live-skip] subtrees, form controls that are
+# focused or dirty, media whose src is unchanged, and <details open> (user state the
+# server knows nothing about). A response without data-live stops the poller — the
+# same signal the meta tag's absence used to carry.
+_LIVE_JS = ("<script>(function(){"
+            "var main=document.querySelector('main');"
+            "if(!main)return;"
+            "window.gwLiveHooks=window.gwLiveHooks||[];"
+            "var base=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
+            "if(!(base>0))return;"
+            "var MEDIA={IMG:1,VIDEO:1,AUDIO:1,IFRAME:1,SOURCE:1,'MODEL-VIEWER':1};"
+            "var FORM={INPUT:1,TEXTAREA:1,SELECT:1};"
+            "var seq=0;"
+            "function keyOf(n){if(n.nodeType!==1)return null;"
+            "return n.id||n.getAttribute('data-k')||null;}"
+            "function dirty(e){if(!FORM[e.tagName])return false;"
+            "if(document.activeElement===e)return true;"
+            "if(e.tagName==='SELECT'){var sel=e.querySelector('option[selected]');"
+            "var def=sel?sel.value:(e.options[0]?e.options[0].value:'');"
+            "return e.value!==def;}"
+            "if(e.type==='checkbox'||e.type==='radio')return e.checked!==e.defaultChecked;"
+            "return e.value!==e.defaultValue;}"
+            "function frozen(e){return e.tagName==='SCRIPT'||e.hasAttribute('data-live-skip')||dirty(e);}"
+            "function adopt(n){var c=document.importNode(n,true);"
+            "if(c.nodeType===1){var s=c.querySelectorAll?c.querySelectorAll('script'):[];"
+            "for(var i=0;i<s.length;i++)s[i].parentNode.removeChild(s[i]);"
+            "if(c.tagName==='SCRIPT')return document.createComment('gw-script-skipped');}"
+            "return c;}"
+            "function syncAttrs(o,n){"
+            "if(MEDIA[o.tagName]&&o.getAttribute('src')===n.getAttribute('src'))return;"
+            "var i,a;"
+            "for(i=n.attributes.length-1;i>=0;i--){a=n.attributes[i];"
+            "if(o.tagName==='DETAILS'&&a.name==='open')continue;"
+            "if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value);}"
+            "for(i=o.attributes.length-1;i>=0;i--){a=o.attributes[i];"
+            "if(o.tagName==='DETAILS'&&a.name==='open')continue;"
+            "if(!n.hasAttribute(a.name))o.removeAttribute(a.name);}"
+            "if(o.tagName==='INPUT'){"
+            "if(o.type==='checkbox'||o.type==='radio')o.checked=n.hasAttribute('checked');"
+            "else o.value=n.getAttribute('value')||'';}"
+            "else if(o.tagName==='TEXTAREA'){o.value=n.textContent;}}"
+            "function same(o,n){if(o.nodeType!==n.nodeType)return false;"
+            "if(o.nodeType!==1)return true;"
+            "if(o.tagName!==n.tagName)return false;"
+            "var ko=keyOf(o),kn=keyOf(n);"
+            "if(ko||kn)return ko===kn;"
+            "return true;}"
+            "function morph(o,n){"
+            "if(o.nodeType===3||o.nodeType===8){if(o.data!==n.data)o.data=n.data;return;}"
+            "if(o.nodeType!==1)return;"
+            "if(frozen(o))return;"
+            "syncAttrs(o,n);"
+            "if(MEDIA[o.tagName])return;"
+            "reconcile(o,n);}"
+            "function reconcile(o,n){var pool={},unkeyed=[],c,k,i;"
+            "for(c=o.firstChild;c;c=c.nextSibling){k=keyOf(c);"
+            "if(k)pool['#'+k]=c;else unkeyed.push(c);}"
+            "var out=[],ui=0,m;"
+            "for(c=n.firstChild;c;c=c.nextSibling){k=keyOf(c);m=null;"
+            "if(k){m=pool['#'+k]||null;if(m)pool['#'+k]=null;}"
+            "else{while(ui<unkeyed.length&&!same(unkeyed[ui],c))ui++;"
+            "if(ui<unkeyed.length){m=unkeyed[ui];ui++;}}"
+            "if(m){morph(m,c);out.push(m);}"
+            "else out.push(adopt(c));}"
+            "var stamp=++seq,nx;"
+            "for(i=0;i<out.length;i++)out[i].__gwLive=stamp;"
+            "c=o.firstChild;"
+            "while(c){nx=c.nextSibling;"
+            "if(c.__gwLive!==stamp)o.removeChild(c);"
+            "c=nx;}"
+            "var cur=o.firstChild;"
+            "for(i=0;i<out.length;i++){if(cur===out[i])cur=cur.nextSibling;"
+            "else o.insertBefore(out[i],cur);}}"
+            "var wait=base,timer=null,catchUp=false;"
+            "function schedule(ms){if(timer)clearTimeout(timer);timer=setTimeout(tick,ms);}"
+            "function stop(){if(timer)clearTimeout(timer);timer=null;}"
+            "function tick(){if(document.hidden){catchUp=true;schedule(wait);return;}"
+            "fetch(location.href,{cache:'no-store',credentials:'same-origin'})"
+            ".then(function(r){"
+            "if(r.redirected&&new URL(r.url).pathname!==location.pathname){"
+            "stop();location.href=r.url;return null;}"
+            "if(!r.ok){wait=Math.min(wait*2,30000);schedule(wait);return null;}"
+            "return r.text();})"
+            ".then(function(html){"
+            "if(html===null||html===undefined)return;"
+            "var doc=new DOMParser().parseFromString(html,'text/html');"
+            "var nm=doc.querySelector('main');"
+            "if(!nm){stop();return;}"
+            "try{morph(main,nm);}"
+            "catch(e){main.replaceChildren.apply(main,[].slice.call(nm.childNodes).map(adopt));}"
+            "for(var i=0;i<window.gwLiveHooks.length;i++){"
+            "try{window.gwLiveHooks[i]();}catch(e){}}"
+            "var next=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
+            "if(!(next>0)){stop();return;}"
+            "wait=base=next;"
+            "schedule(wait);})"
+            ".catch(function(){wait=Math.min(wait*2,30000);schedule(wait);});}"
+            "document.addEventListener('visibilitychange',function(){"
+            "if(!document.hidden&&catchUp&&timer){catchUp=false;schedule(0);}});"
+            "schedule(wait);"
+            "})();</script>")
+
+
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
           nologin: bool = False, subnav: str = "") -> str:
     # `refresh` no longer reloads the page. It marks <main> as live and _LIVE_JS
@@ -360,7 +470,7 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
     # never scrolls and sits flush under the tabs.
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · Gateway</title>'
             f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
-            f"{_SCROLL_JS}{_SORT_JS}</body></html>")
+            f"{_SCROLL_JS}{_SORT_JS}{_LIVE_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:

@@ -62,5 +62,19 @@ class EmbeddedScriptsParse(unittest.TestCase):
                              f"inline script #{i} is not valid JS:\n{p.stderr}")
 
 
+class LiveScriptPresence(unittest.TestCase):
+    def test_live_js_is_always_embedded(self):
+        # Embedded unconditionally, like _SORT_JS: the script disables itself when
+        # <main> carries no data-live, so a static page pays nothing for it.
+        # Compared against the constant itself rather than a keyword — _SORT_JS also
+        # mentions gwLiveHooks, so a keyword check would pass with _LIVE_JS missing.
+        for kwargs in ({"refresh": 4}, {}):
+            html = admin._page("T", "<p>x</p>", "dashboard", **kwargs)
+            self.assertIn(admin._LIVE_JS, html, f"_LIVE_JS missing for {kwargs}")
+
+    def test_live_js_declares_the_hook_array(self):
+        self.assertIn("window.gwLiveHooks", admin._LIVE_JS)
+
+
 if __name__ == "__main__":
     unittest.main()
