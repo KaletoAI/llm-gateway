@@ -92,6 +92,7 @@ def _num(s: str):
 # catalog of bindable names; bind(**overrides) rebinds them by keyword (`foo=` sets
 # `_foo`). No triple bookkeeping (signature + global stmt + assignments) to keep in sync.
 _comfy_backends: Callable[[], list] = lambda: []
+_gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI + Meshy)
 _gateway_info: Callable[[], dict] = lambda: {}
 _cancel_generation = None
 _drain_backend = None
