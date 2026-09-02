@@ -318,6 +318,16 @@ _SCROLL_JS = ("<script>(function(){"
 # rewrites its data-sk while the header cells keep their old handlers. Every
 # read and write therefore derives 'sort:'+key(tbl,i) at the moment it acts, so
 # writer and reader always agree on the node's LIVE data-sk. Tables with `data-sk` get a stable key; others key off path+index.
+# The hook also calls `wire()` on every sortable table, not just `applySort()`: a
+# table the morph INSERTS mid-session (a dashboard panel appearing) never went
+# through the load-time loop and would show a restored sort while silently ignoring
+# clicks until the next real reload — a regression the morph introduces, since before
+# it every refresh was a reload that re-bound everything. `wire()` is additive and
+# marks the node with the JS property `__gwWired` (a property, not an attribute:
+# syncAttrs would otherwise strip or re-add it on every tick, and it must vanish with
+# the node). That marker only short-circuits the BINDING; the hook still re-applies
+# the sort to already-wired tables, which is the whole point — the reconciler puts
+# the server's insertion order back on every morph.
 # Grouped tables (a `tr.grp` header row followed by its member rows — the routing
 # views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
 # key for column 0 (it is the alias name), later columns key off the first member row.
@@ -344,30 +354,38 @@ _SORT_JS = ("<script>(function(){"
             "bs.forEach(function(b){b.rows.forEach(function(r){tb.appendChild(r);});});"
             "var hs=hdr.cells;for(var i=0;i<hs.length;i++)ind(hs[i],i===idx?(dir<0?'\\u25bc':'\\u25b2'):'');}"
             "function key(tbl,i){return tbl.getAttribute('data-sk')||(location.pathname+'#'+i);}"
-            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
-            "var hdr=tbl.rows[0];if(!hdr)return;"
+            "function applySort(tbl,i){var hdr=tbl.rows[0];if(!hdr)return;var s={};"
+            "try{s=JSON.parse(sessionStorage.getItem('sort:'+key(tbl,i))||'{}');}catch(e){}"
+            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);}"
+            "function wire(tbl,i){var hdr=tbl.rows[0];if(!hdr)return;"
+            "if(tbl.__gwWired)return;tbl.__gwWired=true;"
             "[].forEach.call(hdr.cells,function(th,idx){th.addEventListener('click',function(){"
             "var k='sort:'+key(tbl,i),c={};"
             "try{c=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
             "var dir=(c.idx===idx&&c.dir>0)?-1:1;sortIt(tbl,idx,dir);"
             "try{sessionStorage.setItem(k,JSON.stringify({idx:idx,dir:dir}));}catch(e){}});});"
-            "var s={};try{s=JSON.parse(sessionStorage.getItem('sort:'+key(tbl,i))||'{}');}catch(e){}"
-            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});"
+            "applySort(tbl,i);}"
+            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
+            "wire(tbl,i);});"
             "window.gwLiveHooks=window.gwLiveHooks||[];"
             "window.gwLiveHooks.push(function(){"
             "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
-            "var hdr=tbl.rows[0];if(!hdr)return;var s={};"
-            "try{s=JSON.parse(sessionStorage.getItem('sort:'+key(tbl,i))||'{}');}catch(e){}"
-            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});});"
+            "wire(tbl,i);applySort(tbl,i);});});"
             "})();</script>")
 
 
 # One auto-update mechanism for the whole console. `_page(refresh=N)` marks <main>
 # with data-live=N; this poller re-fetches the SAME url and morphs the response's
-# <main> into the live one instead of reloading the page. Nodes are matched by id or
-# data-k (falling back to position+tag), so a table that gains a row keeps every
-# other row's identity — which is what preserves scroll, sort order, a focused
+# <main> into the live one instead of reloading the page. Nodes are matched by id,
+# data-k or data-sk (falling back to position+tag), so a table that gains a row keeps
+# every other row's identity — which is what preserves scroll, sort order, a focused
 # filter input, an open form, playing media and the model-viewer's camera.
+# `data-sk` counts as a key because it is the stable, document-unique NAME of a
+# sortable table (dash-backends, dash-jobs, …). The dashboard renders three of its
+# four tables conditionally; without that key the morph would keep using table node N
+# for a DIFFERENT logical table when a panel appears or disappears — syncAttrs would
+# rewrite the data-sk while everything attached to the node (handlers, the sort
+# indicator, its wired marker) stayed behind from the table it used to be.
 # Five things are deliberately never touched: <script> (a re-inserted _JOB_TICK
 # would double its setInterval), [data-live-skip] subtrees, form controls that are
 # focused or dirty, media whose src is unchanged, and <details open> (user state the
@@ -383,7 +401,7 @@ _LIVE_JS = ("<script>(function(){"
             "var FORM={INPUT:1,TEXTAREA:1,SELECT:1};"
             "var seq=0;"
             "function keyOf(n){if(n.nodeType!==1)return null;"
-            "return n.id||n.getAttribute('data-k')||null;}"
+            "return n.id||n.getAttribute('data-k')||n.getAttribute('data-sk')||null;}"
             "function dirty(e){if(!FORM[e.tagName])return false;"
             "if(document.activeElement===e)return true;"
             "if(e.tagName==='SELECT'){var sel=e.querySelector('option[selected]');"
@@ -4129,7 +4147,10 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
                  if st in ('queued', 'running') else '')
                 + _btn('view', f'/ui/job/{jid}', 'secondary', sm=True))
         cells.append(f"<td style='text-align:right;white-space:nowrap'>{acts}</td>")
-    return "<tr>" + "".join(cells) + "</tr>"
+    # data-k keys this row for the live morph: the media job list is newest-first,
+    # so a new job shifts every row — without a key the reconciler would match
+    # positionally and rewrite every cell instead of inserting one row.
+    return f"<tr data-k=\"job-{_esc(jid)}\">" + "".join(cells) + "</tr>"
 
 
 def _call_kind(endpoint: str) -> str:
@@ -4655,7 +4676,10 @@ def _dash_backends(bes: list, offline: list) -> str:
         inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
         r1h = b.get("reqs_1h", 0)
         r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
-        brows += (f"<tr><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
+        # data-k: the backend name is this row's identity, and the panel re-sorts
+        # itself (ready → busy → off), so a backend changing state moves its row —
+        # positional matching would rewrite the neighbours it stepped over.
+        brows += (f"<tr data-k=\"bk-{_esc(b['name'])}\"><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td>"
                   f"<td>{b.get('models', 0)}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
@@ -4780,7 +4804,12 @@ def _call_row(r, aliases) -> str:
         view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
     else:
         view = "<span class='muted'>—</span>"
-    return (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
+    # data-k keys this row for the live morph — the call lists are newest-first, so a
+    # finished call shifts every row down and positional matching would rewrite the
+    # whole table instead of inserting one row. Prefixed to keep the key space apart
+    # from the job rows', in case the two ever share a parent node.
+    return (f"<tr data-k=\"call-{_esc(cid)}\">"
+            f"<td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
             f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
             f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
             f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"

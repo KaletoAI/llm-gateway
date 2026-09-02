@@ -96,5 +96,67 @@ class LiveScriptPresence(unittest.TestCase):
         self.assertIn("gwLiveHooks.push", admin._FILTER_JS)
 
 
+# Fixtures for the identity tests below. Built from what the three row templates
+# actually read — nothing invented: `_job_row` needs id/status plus the created/
+# updated pair `_job_dur_cell` measures, `_call_row` destructures a 15-column stats
+# tuple whose first element is the call id, and `_dash_parked` reads a dict with a
+# non-empty `parked_calls` list (it returns "" for an empty one, which would make the
+# assertion pass for the wrong reason).
+_JOB_FIXTURE = {
+    "id": "9f3c1ab27de44b0e",
+    "status": "done",
+    "task": "image",
+    "alias": "sdxl",
+    "backend": "comfy-a",
+    "created": 1_799_999_400,
+    "updated": 1_799_999_460,
+    "owner": "kai",
+    "result_count": 2,
+}
+
+# (cid, ts, dur, backend, source, alias, model, endpoint, status, in, out, cost,
+#  preview, has_body, reasoning)
+_CALL_FIXTURE = (4711, 1_799_999_400, 1234, "local-llama", "10.0.0.5", "chat",
+                 "gemma-4", "/v1/chat/completions", 200, 120, 45, 0.0012,
+                 "hello", 1, "off:prefill")
+
+_PARKED_FIXTURE = {"parked_calls": [
+    {"alias": "chat", "source": "10.0.0.5", "waited_s": 3.2, "remaining_s": 56.8},
+]}
+
+
+class LiveIdentity(unittest.TestCase):
+    """Stable identity for everything the morph reconciles.
+
+    Without keys the morph matches positionally, and all three of these fail
+    silently — the page still renders correctly, it just rewrites every cell,
+    reuses a table node for a different table, or shows a sort UI that ignores
+    clicks. Nothing but these assertions would notice.
+    """
+
+    def test_job_row_carries_the_job_id_as_key(self):
+        row = admin._job_row(_JOB_FIXTURE, 1_800_000_000)
+        self.assertIn('data-k="job-', row)
+        self.assertIn(_JOB_FIXTURE["id"], row)
+
+    def test_call_row_carries_the_call_id_as_key(self):
+        row = admin._call_row(_CALL_FIXTURE, {})
+        self.assertIn('data-k="call-', row)
+
+    def test_parked_rows_stay_unkeyed(self):
+        # Parked entries have no identity — only alias, source and two values
+        # that change every tick. An invented key would be worse than none.
+        self.assertNotIn("data-k", admin._dash_parked(_PARKED_FIXTURE))
+
+    def test_keyof_accepts_data_sk_so_sortable_tables_have_identity(self):
+        self.assertIn("data-sk", admin._LIVE_JS)
+
+    def test_sort_js_wires_tables_it_has_not_seen(self):
+        # A table the morph inserts mid-session gets no click handlers unless the
+        # post-morph hook wires it — before this branch a refresh was a reload and
+        # re-bound everything, so an unwired table is a regression, not a gap.
+        self.assertIn("__gwWired", admin._SORT_JS)
+
+
 if __name__ == "__main__":
     unittest.main()
