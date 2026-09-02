@@ -3667,14 +3667,14 @@ async def playground_page(request: Request):
     if sub == "voice":
         vals = {k: qp.get(k, "") for k in _VOICEPLAY_KEYS}
         prog = _voice_upload_prog.get(_session_user(request) or "default")
-        if qp.get("vu") == "done" and prog:              # post-upload reload: final checklist + fresh table
-            result_html = _vu_fragment(prog).replace("<span data-vudone hidden></span>", "")
-        elif prog and not prog.get("done"):              # reload during an upload → keep polling
-            result_html = _vu_fragment(prog) + _VU_POLL_JS
-        else:
-            result_html = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+        # A running upload makes the page live at 1s; the final tick renders the
+        # finished checklist AND the library table with the new entry, then drops
+        # data-live to stop the poller — which is all the old reload ever did.
+        vu_refresh = 1 if (prog and not prog.get("done")) else None
+        result_html = (_vu_fragment(prog) if prog else
+                       "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>")
         return HTMLResponse(_page("Voice", _voiceplay_body(vals, result_html), "playground",
-                                  subnav=_subnav("playground", "voice")))
+                                  refresh=vu_refresh, subnav=_subnav("playground", "voice")))
     if not store.is_active():
         return _inactive()
     aliases = list(store.list_aliases().keys())
@@ -3977,7 +3977,7 @@ _voice_upload_prog: dict = {}   # user → {name, steps: [(kind, text)], done, o
 
 
 def _vu_fragment(prog: dict) -> str:
-    """Progress checklist for the result column (polled): ✓/✗ per finished step,
+    """Progress checklist for the result column: ✓/✗ per finished step,
     ⏳ for the one currently running (superseded 'run' markers are dropped)."""
     icons = {"ok": "✓", "err": "✗"}
     steps = prog.get("steps") or []
@@ -3993,22 +3993,13 @@ def _vu_fragment(prog: dict) -> str:
         return head + rows
     tail = ("<p>✓ <b>done — shipped to all hosts</b></p>" if prog.get("ok") else
             "<p class='bad'>finished with problems — see the steps above (↻ retries the ship)</p>")
-    return head + rows + tail + "<span data-vudone hidden></span>"
-
-
-_VU_POLL_JS = ("<script>(function(){var t=setInterval(function(){"
-               "fetch('/ui/playground/voice-upload-status',{cache:'no-store'})"
-               ".then(function(r){return r.text();}).then(function(h){"
-               "var r=document.getElementById('vpresult');if(r)r.innerHTML=h;"
-               "if(h.indexOf('data-vudone')>=0){clearInterval(t);"
-               "setTimeout(function(){location.replace('/ui/playground?sub=voice&vu=done');},900);}"
-               "}).catch(function(){});},1000);})();</script>")
+    return head + rows + tail
 
 
 async def voice_upload(request: Request):
-    """Start the upload as a background task and show LIVE progress in the result
-    column (store → whisper transcription → scp per host); the poller refreshes
-    the page when done so the library table shows the new entry."""
+    """Start the upload as a background task and hand over to the GET view, which
+    shows LIVE progress in the result column (store → whisper transcription → scp
+    per host) while the live morph keeps the library table in step with it."""
     f = await _multipart(request)
     name = str(f.get("name", "")).strip()
     data = f.get("file")
@@ -4037,17 +4028,10 @@ async def voice_upload(request: Request):
             logger.info(f"ui: voice ref '{name}' uploaded (ok={prog['ok']})")
 
     asyncio.create_task(_run())
-    return HTMLResponse(_page("Voice", _voiceplay_body(vals, _vu_fragment(prog) + _VU_POLL_JS),
-                              "playground", subnav=_subnav("playground", "voice")))
-
-
-async def voice_upload_status(request: Request):
-    """Result-column fragment for the upload poller."""
-    prog = _voice_upload_prog.get(_session_user(request) or "default")
-    if not prog:
-        return HTMLResponse("<h2>Result</h2><p class='muted'>no upload running</p>"
-                            "<span data-vudone hidden></span>")
-    return HTMLResponse(_vu_fragment(prog))
+    # Redirect to the GET view like every other voice action: _LIVE_JS polls
+    # location.href, and this POST-only URL would answer a GET with 405 — the page
+    # would render the first checklist and then never move again.
+    return RedirectResponse("/ui/playground?sub=voice", status_code=303)
 
 
 async def voice_target(request: Request):
@@ -5819,7 +5803,6 @@ def register(app) -> None:
     app.add_api_route("/ui/playground/voice", voiceplay_send, methods=["POST"])
     app.add_api_route("/ui/playground/voice-audio", voice_audio, methods=["GET"])
     app.add_api_route("/ui/playground/voice-upload", voice_upload, methods=["POST"])
-    app.add_api_route("/ui/playground/voice-upload-status", voice_upload_status, methods=["GET"])
     app.add_api_route("/ui/playground/voice-target", voice_target, methods=["POST"])
     app.add_api_route("/ui/playground/voice-ship", voice_ship, methods=["GET"])
     app.add_api_route("/ui/playground/voice-del", voice_del, methods=["GET"])

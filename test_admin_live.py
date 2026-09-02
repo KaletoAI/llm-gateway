@@ -125,6 +125,14 @@ class LiveScriptPresence(unittest.TestCase):
         self.assertFalse(hasattr(admin, "playground_status"),
                          "the result-fragment route should be gone")
 
+    def test_voice_upload_uses_the_shared_live_mechanism(self):
+        # The old poller ended in location.replace(...&vu=done) purely so the library
+        # table would show the new entry. The morph updates that table in the same tick.
+        self.assertFalse(hasattr(admin, "_VU_POLL_JS"),
+                         "_VU_POLL_JS should be gone — the live morph replaces it")
+        self.assertFalse(hasattr(admin, "voice_upload_status"),
+                         "the upload-progress fragment route should be gone")
+
 
 # Fixtures for the identity tests below. Built from what the three row templates
 # actually read — nothing invented: `_job_row` needs id/status plus the created/
