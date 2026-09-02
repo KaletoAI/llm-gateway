@@ -3104,6 +3104,10 @@ class MeshyAdapter(BackendAdapter):
             "backend": self.name, "meshy_task_id": task_id, "endpoint": endpoint,
             "ai_model": body.get("ai_model"), "request": meshy.request_summary(body),
             "consumed_credits": state.credits, "elapsed_ms": elapsed_ms,
+            # A standalone rigging job is a rig delivery like a chain's stage 2 is —
+            # `main._job_view` reads meta["rig"], so name it here too or the job view
+            # shows no rig type at all for the one endpoint that always produces one.
+            **({"rig": "meshy"} if endpoint == "rigging" else {}),
         })
 
     async def _poll(self, client, endpoint, task_id, formats, poll_interval, max_wait,

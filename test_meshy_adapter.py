@@ -141,6 +141,7 @@ class TestMeshyAdapter(unittest.TestCase):
         self.assertEqual(out.meta["meshy_task_id"], "task-1")
         self.assertEqual(out.meta["consumed_credits"], 30)
         self.assertEqual(out.meta["request"]["name"], "hero")
+        self.assertNotIn("rig", out.meta)        # only the rigging endpoint delivers a rig
         self.assertNotIn("data:", json.dumps(out.meta))
         self.assertEqual(_Stub.posted[0][0], "/openapi/v1/image-to-3d")
         self.assertEqual((self.counts["inc"], self.counts["dec"]), (1, 1))
@@ -236,6 +237,7 @@ class TestMeshyAdapter(unittest.TestCase):
         self.assertEqual(out.meta["endpoint"], "rigging")
         self.assertEqual(out.meta["meshy_task_id"], "rig-1")
         self.assertEqual(out.meta["consumed_credits"], 5)
+        self.assertEqual(out.meta["rig"], "meshy")   # job view reads meta["rig"]
         self.assertTrue(out.meta["request"]["model_url"].startswith("<"))
         self.assertNotIn("data:", json.dumps(out.meta))
 

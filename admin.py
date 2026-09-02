@@ -2835,20 +2835,29 @@ def _chain_section(wf: dict, cands: list) -> str:
     if cur_exp and not listed:                       # keep a stale choice visible instead of silently clearing
         node_opts += f'<option value="{_esc(cur_exp)}" selected>{_esc(cur_exp)} — (stale: node missing)</option>'
     cur_relay = (s.get("relay") or "path").strip().lower()
-    relay_opts = "".join(
-        f'<option value="{v}"{" selected" if cur_relay == v else ""}>{lbl}</option>'
-        for v, lbl in (("path", "path — same backend, shared disk (default)"),
-                       ("upload", "upload — relay bytes to a stage-2 backend")))
+    # A Meshy successor never reads a shared disk — the mesh always travels as bytes.
+    # Offering a hand-off choice there would only let the user pick one that is ignored.
+    succ_meshy = (store.get(str(s.get("alias") or "").strip()) or [{}])[0].get("meshy") is not None
+    if succ_meshy:
+        relay_field = ('<input type="hidden" name="chain_relay" value="upload">'
+                       '<p class="hint" style="margin:0">upload — forced: the successor runs on Meshy</p>')
+    else:
+        relay_opts = "".join(
+            f'<option value="{v}"{" selected" if cur_relay == v else ""}>{lbl}</option>'
+            for v, lbl in (("path", "path — same backend, shared disk (default)"),
+                           ("upload", "upload — relay bytes to a stage-2 backend")))
+        relay_field = f'<select name="chain_relay">{relay_opts}</select>'
     return ("<h2 style='margin-top:18px'>Chain (successor)</h2>"
-            "<p class='hint'>Optional: run a second workflow after this one on the same backend and "
-            "deliver only its result — e.g. mesh here, rigging as the successor. Needs the backend's "
-            "<b>comfy output dir</b> set. Leave the successor blank for a normal single-stage alias.</p>"
+            "<p class='hint'>Optional: run a second alias after this one and deliver only its result — "
+            "e.g. mesh here, rigging as the successor (a ComfyUI rigger on the same or another backend, "
+            "or a Meshy rigging alias). The path hand-off needs the backend's <b>comfy output dir</b>; "
+            "the upload hand-off does not. Leave the successor blank for a normal single-stage alias.</p>"
             + _field("successor alias", _inp("successor", s.get("alias", ""),
                      placeholder="e.g. mesh-reg-mia"), short=True)
             + _field("mesh export node", f'<select name="chain_export_node">{node_opts}</select>')
             + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
                      placeholder="mesh_path (mesh workflows: input_mesh_path)"), short=True)
-            + _field("mesh hand-off", f'<select name="chain_relay">{relay_opts}</select>')
+            + _field("mesh hand-off", relay_field)
             + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh, and passes "
               "it to the successor under the <b>mesh param</b> (blank = <code>mesh_path</code>; the mesh "
               "workflows label their mesh input <code>input_mesh_path</code>) — must be a request field "
@@ -3552,9 +3561,14 @@ async def update(request: Request):
     succ_alias = (f.get("successor", "") or "").strip()
     keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
     relay = (f.get("chain_relay", "") or "path").strip().lower()
+    # A Meshy successor has exactly one file field and no mapping to rename it, so a
+    # blank mesh param must default to ITS name (`input_mesh_path`) — ComfyUI's
+    # `mesh_path` would be a param the Meshy stage cannot bind.
+    succ_meshy = (store.get(succ_alias) or [{}])[0].get("meshy") is not None
     succ = ({"alias": succ_alias,
              "export_node": (f.get("chain_export_node", "") or "").strip(),
-             "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "mesh_path",
+             "mesh_param": ((f.get("chain_mesh_param", "") or "").strip()
+                            or ("input_mesh_path" if succ_meshy else "mesh_path")),
              **({"relay": relay} if relay == "upload" else {}),
              **({"keep_from_mesh": keep} if keep else {}),
              **({"rig": (f.get("chain_rig", "") or "").strip()} if (f.get("chain_rig", "") or "").strip() else {})}
