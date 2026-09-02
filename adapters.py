@@ -3153,6 +3153,26 @@ class MeshyAdapter(BackendAdapter):
             raise RuntimeError(f"Meshy asset download failed ({r.status_code}) for {url.split('?')[0]}")
         return r.content
 
+    # ── the chain roles (main._run_chain calls these) ─────────────────────────
+    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
+        """Stage 1 on Meshy: nothing to pin — the mesh comes back as a RESULT BLOB, not
+        off a disk, so the name is ours to choose (it only labels the hand-off upload).
+        A task that does not deliver glb is refused here, before credits are spent: the
+        successor is fed a glb, and Meshy bills the task either way."""
+        opts = meshy.options_of({"meshy": cand.get("meshy") or {}})
+        if "glb" not in opts["target_formats"]:
+            return ChainExport("", error=f"chain: Meshy stage 1 must deliver glb — add it to "
+                                         f"target_formats (now {opts['target_formats']})")
+        return ChainExport(f"{prefix}.glb")             # no pins: the mesh is a result blob
+
+    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
+        """Stage 1's mesh is already in hand: the `model.glb` blob `generate()` downloaded
+        (b'' when only its existence is asked for — nothing to fetch either way)."""
+        blob = next((b for b in (out.blobs or []) if (b.name or "") == "model.glb"), None)
+        if blob is None:
+            return None
+        return blob.data if want_bytes else b""
+
 
 def _meshy_msg(r) -> str:
     try:

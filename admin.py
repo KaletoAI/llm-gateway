@@ -2860,16 +2860,18 @@ def _chain_section(wf: dict, cands: list) -> str:
               "hand-off — no special loader needed. Stage 2 runs on an <b>allowed</b> "
               "successor candidate, preferring the same backend as stage 1; so only list the successor on "
               "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
-              "threaded to the successor by matching param name.</p>"
+              "threaded to the successor by matching param name. A <b>Meshy successor</b> (cloud rig) always "
+              "receives the mesh as bytes — the hand-off setting is ignored then.</p>"
             + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
                      placeholder="e.g. *_basecolor*.png"), short=True)
             + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
-                     placeholder="blank · mixamo · generic"), short=True)
+                     placeholder="blank · mixamo · generic · meshy"), short=True)
             + "<p class='hint'><b>keep from this stage</b>: globs for files THIS (mesh) stage produces that "
               "must ship with the successor's result — e.g. the <code>*_basecolor*.png</code> the texturing "
               "bakes here (the UniRig fbx only references its texture). <b>delivered rig type</b>: set "
               "<code>generic</code>/<code>mixamo</code> to tag + validate the COMBINED delivery at the chain "
-              "level (generic needs fbx + basecolor). Blank = trust the successor's own output config.</p>"
+              "level (generic needs fbx + basecolor); <code>meshy</code> (a cloud rig) is only tagged, never "
+              "re-normalized or validated. Blank = trust the successor's own output config.</p>"
             + _chain_rig_warning(wf, s))
 
 
@@ -2967,8 +2969,13 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
 
 def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
     """Editor for a Meshy alias: endpoint, model and the admin option defaults — no
-    workflow, no mapping, no pins (the public fields are a fixed table, see meshy.py)."""
+    workflow, no mapping, no pins (the public fields are a fixed table, see meshy.py).
+    It DOES carry the chain successor: a Meshy alias can be stage 1 (mesh here, rigging
+    in the successor) — without an export node or a hand-off choice, because the mesh
+    comes back as a result blob and always travels to stage 2 as bytes."""
     cand = cands[0]
+    s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
+    keep = [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]
     ep = meshy.endpoint_of(cand)
     opts = meshy.options_of(cand)
     model = cand.get("model") if cand.get("model") in meshy.AI_MODELS else "latest"
@@ -3017,6 +3024,29 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
             + _field("thumbnail", cb("thumbnail", "deliver Meshy's preview.png as an extra image artifact"))
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
+            + '<h2 style="margin-top:18px">Chain (successor)</h2>'
+            + "<p class='hint'>Optional: run a second alias (a rigger) on this alias's mesh and deliver "
+              "ONLY its result. Leave blank for a normal single-stage alias.</p>"
+            + _field("successor alias", _inp("successor", s.get("alias", ""),
+                     placeholder="e.g. mesh-mia"), short=True)
+            + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
+                     placeholder="input_mesh_path"), short=True)
+            + _field("keep from this stage", _inp("chain_keep", ", ".join(keep),
+                     placeholder="e.g. preview.png"), short=True)
+            + _field("delivered rig type", _select("chain_rig",
+                     [("", "blank — trust the successor"), "mixamo", "generic", "meshy"],
+                     s.get("rig", "")), short=True)
+            + "<p class='hint'>The mesh (glb) is relayed as <b>bytes</b> to the successor's backend — no "
+              "export node, no hand-off choice (a Meshy stage shares no disk with anything). It arrives "
+              "under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh workflows "
+              "label their mesh input), which must be a request field (param or label) of "
+              "the successor. <b>keep from this stage</b>: globs for files THIS stage produces that must ship "
+              "with the successor's result (Meshy embeds its texture in the GLB, so this is usually empty — "
+              "<code>preview.png</code> is the one candidate). <b>delivered rig type</b> tags the delivery; "
+              "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
+              "level, <code>meshy</code> is only tagged (Meshy rigs to its own conventions). Requires "
+              "<code>glb</code> in <b>deliver formats</b> — the job is refused up front otherwise, before "
+              "credits are spent.</p>"
             + '<h2 style="margin-top:18px">Request fields</h2>'
             + "<p class='hint'>Fixed for Meshy aliases — what <code>GET /v1/generations/{alias}/schema</code> "
               "advertises. <code>input_remove_background</code> / <code>input_no_fingers</code> are accepted "
@@ -3552,6 +3582,17 @@ async def meshy_update(request: Request):
     opts["target_formats"] = [x for x in meshy.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
     task = (f.get("task", "") or "").strip()
     retries = (f.get("retries", "") or "").strip()
+    # chain successor (blank alias → not a chain). No export_node and no relay: a Meshy
+    # stage's mesh is a result blob and always travels to stage 2 as bytes (_run_chain
+    # forces `upload`), so those two ComfyUI fields would only be misleading here.
+    succ_alias = (f.get("successor", "") or "").strip()
+    keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
+    rig = (f.get("chain_rig", "") or "").strip()
+    succ = ({"alias": succ_alias,
+             "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "input_mesh_path",
+             **({"keep_from_mesh": keep} if keep else {}),
+             **({"rig": rig} if rig else {})}
+            if succ_alias else None)
     for c in cands:
         # a fresh options dict per candidate — one shared object would let a later
         # in-place edit of one candidate rewrite the others
@@ -3559,6 +3600,10 @@ async def meshy_update(request: Request):
                       "options": json.loads(json.dumps(opts))}
         c["model"] = model if model in meshy.AI_MODELS else "latest"
         c["retries"] = retries
+        if succ:
+            c["successor"] = json.loads(json.dumps(succ))    # own copy per candidate (see above)
+        else:
+            c.pop("successor", None)
         if task:
             c["task"] = task
     new_alias = (f.get("new_alias", "") or "").strip()
@@ -4573,6 +4618,25 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     return out + _FBX_VIEWER_JS if has_fbx else out
 
 
+def _meshy_table(title: str, m: dict) -> str:
+    """One Meshy run in the job view: the body actually sent (image data replaced by its
+    size) plus the task id — the id is what Meshy's own dashboard is searched by, and the
+    body answers "which options did this run use?" without re-deriving them from today's
+    config. '' when `m` is not a Meshy run (no task id), so a chain renders a table per
+    Meshy STAGE: the top-level meta is the last stage's, a stage-1 Meshy run is kept
+    beside it under `meta.chain_stage1`."""
+    if not m.get("meshy_task_id") or not m.get("request"):
+        return ""
+    rows = "".join(f"<tr><td><code>{_esc(str(k))}</code></td>"
+                   f"<td>{_esc(json.dumps(v) if isinstance(v, (list, dict)) else str(v))}</td></tr>"
+                   for k, v in (m.get("request") or {}).items())
+    cr = m.get("consumed_credits")
+    return (f"<h3>{_esc(title)} <span class='muted' style='font-weight:normal'>· task "
+            f"<code>{_esc(str(m['meshy_task_id']))}</code> · {_esc(str(m.get('endpoint') or ''))}"
+            f"{' · ' + _esc(str(cr)) + ' credits' if cr is not None else ''}</span></h3>"
+            f"<table>{rows}</table>")
+
+
 def _stage2_section(s2: dict) -> str:
     """The chain hand-off, for the job view: what stage 2 was actually HANDED and which
     of it the successor mapped. Stage-1 params are threaded to the successor by mapping
@@ -4730,20 +4794,11 @@ async def job_detail_page(job_id: str, request: Request):
     elif meta.get("chain") or cand.get("successor"):
         inbox += ("<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2</span></h3>"
                   "<p class='muted'>Hand-off params not recorded (job predates this feature).</p>")
-    # Meshy: the body actually sent (image data replaced by its size) plus the task id
-    # — the id is what Meshy's own dashboard is searched by, and the body answers
-    # "which options did this run use?" without re-deriving them from today's config.
-    mrq = meta.get("request") if meta.get("meshy_task_id") else None
-    if mrq:
-        rows_m = "".join(
-            f"<tr><td><code>{_esc(str(k))}</code></td>"
-            f"<td>{_esc(json.dumps(v) if isinstance(v, (list, dict)) else str(v))}</td></tr>"
-            for k, v in mrq.items())
-        cr = meta.get("consumed_credits")
-        inbox += (f"<h3>Meshy <span class='muted' style='font-weight:normal'>· task "
-                  f"<code>{_esc(str(meta['meshy_task_id']))}</code> · {_esc(str(meta.get('endpoint') or ''))}"
-                  f"{' · ' + _esc(str(cr)) + ' credits' if cr is not None else ''}</span></h3>"
-                  f"<table>{rows_m}</table>")
+    # Meshy runs (task id + the body actually sent + credits — see _meshy_table): a
+    # chain's stage-1 Meshy run FIRST, then the top-level meta (stage 2's on a chain),
+    # so a Meshy→Meshy chain reads in the order it ran.
+    inbox += _meshy_table("Meshy · stage 1", meta.get("chain_stage1") or {})
+    inbox += _meshy_table("Meshy", meta)
     if st in ("queued", "running"):
         outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
     elif st == "failed":

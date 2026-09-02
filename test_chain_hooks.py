@@ -63,6 +63,52 @@ class ComfyChainFeed(unittest.TestCase):
         self.assertEqual(req2.upload_files, {})
 
 
+class ComfyChainFeedUpload(unittest.TestCase):
+    def test_upload_relay_returns_the_input_dir_path(self):
+        """The bytes go into the stage-2 backend's input dir; what stage 2 is handed is
+        that file's ABSOLUTE path there (a bare stored name only loads via a
+        load-from-input node)."""
+        ad = _comfy()
+        backend2 = {"comfy_input_dir": "/srv/comfy/input"}
+        seen = {}
+
+        async def fake_upload(data, name, content_type="application/octet-stream"):
+            seen["args"] = (data, name)
+            return "sub/gwchain_j1_00001_.glb"
+
+        ad.upload_input = fake_upload
+        req2 = NormalizedRequest(alias="rig")
+        ref = asyncio.run(ad.chain_feed_mesh(req2, backend2, "input_mesh_path",
+                                             "gwchain_j1_00001_.glb", b"glTFxxxx", "/srv/comfy/output"))
+        self.assertEqual(ref, adapters.input_path_ref(backend2, "sub/gwchain_j1_00001_.glb"))
+        self.assertEqual(seen["args"], (b"glTFxxxx", "gwchain_j1_00001_.glb"))
+
+
+class MeshyChainStage1(unittest.TestCase):
+    def _ad(self):
+        return adapters.MeshyAdapter({"name": "meshy", "type": "meshy", "url": "http://127.0.0.1:1"}, _ctx())
+
+    def test_export_names_glb_without_pins(self):
+        cand = {"meshy": {"endpoint": "image-to-3d", "options": {"target_formats": ["glb"]}}}
+        ex = self._ad().chain_export(cand, {"alias": "mesh-mia"}, {}, "gwchain_j1")
+        self.assertIsNone(ex.error)
+        self.assertEqual(ex.mesh_name, "gwchain_j1.glb")
+        self.assertEqual(ex.extra_fixed, [])
+
+    def test_export_requires_glb_format(self):
+        cand = {"meshy": {"endpoint": "image-to-3d", "options": {"target_formats": ["fbx"]}}}
+        ex = self._ad().chain_export(cand, {"alias": "mesh-mia"}, {}, "gwchain_j1")
+        self.assertIn("glb", ex.error)
+
+    def test_take_mesh_from_blobs(self):
+        out = GenOutput(blobs=[GenBlob(b"glTFxxxx", "model/gltf-binary", "file", "model.glb"),
+                               GenBlob(b"png", "image/png", "image", "preview.png")])
+        ex = adapters.ChainExport("gwchain_j1.glb")
+        self.assertEqual(asyncio.run(self._ad().chain_take_mesh(out, ex, True)), b"glTFxxxx")
+        self.assertEqual(asyncio.run(self._ad().chain_take_mesh(out, ex, False)), b"")
+        self.assertIsNone(asyncio.run(self._ad().chain_take_mesh(GenOutput(blobs=[]), ex, True)))
+
+
 class BaseDefaults(unittest.TestCase):
     def test_base_adapter_refuses_chain_roles(self):
         base = adapters.OpenAIAdapter({"name": "llm", "type": "openai", "url": "http://x"}, _ctx())

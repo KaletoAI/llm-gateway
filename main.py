@@ -2686,6 +2686,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         backend (e.g. mesh on dx10-02, rig on a UniRig box). The stage-1 slot is
         released (and its ComfyUI VRAM freed) once its mesh is in hand, then the
         stage-2 slot is claimed — different backends, so they need not be atomic.
+        A Meshy stage (either side) shares no disk with anything, so it FORCES this
+        mode regardless of what the alias stored.
 
     successor config: {alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}."""
     succ_alias = (succ.get("alias") or "").strip()
@@ -2694,6 +2696,16 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     keep_globs = [g.strip() for g in (succ.get("keep_from_mesh") or []) if g.strip()]
     chain_rig = (succ.get("rig") or "").strip() or None
     relay = (succ.get("relay") or "path").strip().lower()      # "path" (shared disk) | "upload" (relay bytes)
+
+    # A Meshy stage has no shared disk: with Meshy on EITHER side the mesh travels as
+    # bytes, whatever the stored relay says (the editor hides the field for such aliases).
+    def _kind_meshy(alias_name: str) -> bool:
+        c = (store.get(alias_name) if store.is_active() else None) or image_models.get(alias_name) or []
+        return bool(c) and c[0].get("meshy") is not None
+    s1_meshy = await asyncio.to_thread(_kind_meshy, alias)
+    s2_meshy = await asyncio.to_thread(_kind_meshy, succ_alias)
+    if s1_meshy or s2_meshy:
+        relay = "upload"
     # inputs/params come pre-computed from the endpoint (one _gen_inputs_params +
     # _apply_seconds pass, which also raised any 400); the per-attempt _apply_seconds
     # below then re-derives for failover freshness (a no-op once seconds is resolved).
@@ -2891,6 +2903,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             held = bid
             active = backend
             s1_done = False                             # mesh in hand → stage-2 errors are final
+            s1_meta = None                              # a paid stage-1 cloud task (Meshy), for the job view
             s2_info = None                              # what stage 2 was actually handed (job view)
             await asyncio.to_thread(jobs.set_status, job_id, "running")
             await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
@@ -2948,6 +2961,14 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                        "check the export node / file_format")
                 mesh_bytes = mesh if need_bytes else None
                 s1_done = True
+                # A Meshy stage 1 is a PAID cloud task: its task id (what Meshy's own
+                # dashboard is searched by), endpoint, request and credits are knowable
+                # only from THIS run — and stage 2's meta would overwrite every one of
+                # those keys in the merge below, so they are kept under their own key.
+                s1_meta = ({k: out1.meta.get(k) for k in
+                            ("backend", "meshy_task_id", "endpoint", "consumed_credits", "request")
+                            if out1.meta.get(k) is not None}
+                           if out1.meta.get("meshy_task_id") else None)
 
                 # Stage 2's request is built BEFORE the hand-off: the feed is the
                 # stage-2 adapter's business and may have to put the mesh ON the request
@@ -3030,6 +3051,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # successor actually mapped) is filled in from out2 below.
                 s2_info = {"alias": succ_alias, "backend": backend2["name"], "relay": relay,
                            "mesh_param": mesh_param, "mesh_ref": mesh_ref, "params": s2_params}
+                # This REPLACES req2.params, so a stage-2 feed hook must put the mesh on
+                # `req2.upload_files` (or the request body) — never into `req2.params`.
                 req2.params = s2_params                  # built before the hand-off (see above)
                 await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
                 await _unload_host_llms(backend2)
@@ -3044,19 +3067,25 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # param as applied-or-dropped without guessing which stage it came from.
                 s2_info["applied"] = list(out2.meta.get("applied") or [])
                 meta = {**out2.meta, "backend": backend2["name"], "chain": [alias, succ_alias],
-                        "chain_stage2": s2_info}
+                        "chain_stage2": s2_info,
+                        **({"chain_stage1": s1_meta} if s1_meta else {})}
                 if gen_attempts > 2:             # a clean chain is exactly 2 generate() calls
                     meta["attempts"] = gen_attempts
                 if cross:
                     meta["chain_backends"] = [backend["name"], backend2["name"]]
-                if chain_rig:                                # validate the COMBINED delivery at chain level
+                if chain_rig:
+                    meta["rig"] = chain_rig              # the client-facing rig tag, whatever its kind
+                    # `generic`/`mixamo` name deliveries the GATEWAY shapes and checks:
                     # V-flip (+ optional jpeg) textures — normalize-once flagged; the knob
-                    # lives on the CLIENT-FACING (stage-1) alias, covering kept stage-1 files too
-                    normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
-                    warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
-                    meta["rig"] = chain_rig
-                    if warnings:
-                        meta["warnings"] = warnings
+                    # lives on the CLIENT-FACING (stage-1) alias, covering kept stage-1 files
+                    # too — then validate the COMBINED delivery at chain level. `meshy` is a
+                    # rig the cloud built to its own conventions: tag it, never re-flip it or
+                    # fail it against ComfyUI-shaped rules.
+                    if chain_rig in ("generic", "mixamo"):
+                        normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
+                        warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
+                        if warnings:
+                            meta["warnings"] = warnings
                 await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
                 if log_per_call:
                     route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
@@ -3304,14 +3333,6 @@ async def run_generation(body: dict, request: Request,
         )
 
     first, cand0 = routes[0]
-    # Chains are a ComfyUI mechanism (export node → mesh path/upload hand-off): a Meshy
-    # stage 1 reaches ComfyUIAdapter-only hooks inside _run_chain and dies with an
-    # AttributeError in the spawned task. Refuse it here, NAMED — and before jobs.create,
-    # so a misconfigured alias leaves no orphan queued row.
-    _succ0 = cand0.get("successor") or {}
-    if cand0.get("meshy") is not None and (_succ0.get("alias") or "").strip():
-        raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and cannot be a "
-                                 f"chain stage (successor configured)")
     task = cand0.get("task", body.get("task", "text2img"))
     owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
