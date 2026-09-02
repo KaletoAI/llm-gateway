@@ -295,6 +295,16 @@ details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129
 # `saved=1` is stripped from that query: it is a transient banner flag the Save redirect
 # appends, and keying on it made every Save read as a fresh URL — the whole point of
 # Save being the ONE action that must not move the pane you were working in.
+# `<main>` is tracked as a pane too, and stays tracked under the live morph. It is the
+# page's scroll container, not the window: `body{overflow:hidden}` + `main{overflow-y:
+# auto}` mean `<main>.scrollTop` IS the page scroll. What this block preserves is that
+# position across REAL navigation — F5, a nav link back to a long list (Media Jobs, LLM
+# Calls, the LoRA list), a form POST's 303 — none of which the morph covers. It does
+# NOT exist for the live update any more: the morph patches `<main>`'s children and
+# never replaces the container, so the position is simply never lost there and the
+# restore, which runs once at load, is inert from the first tick onward. The browser's
+# own scroll restoration is no substitute: it applies to history navigation (Back /
+# Forward), not to F5 or to re-clicking the same nav link.
 _SCROLL_JS = ("<script>(function(){"
               "var q=location.search.replace(/([?&])saved=[^&]*&?/,'$1').replace(/[?&]$/,'');"
               "var b='scr:'+location.pathname;"
@@ -314,7 +324,32 @@ _SCROLL_JS = ("<script>(function(){"
 # Click-a-header to sort any `table.sortable` (numeric-aware: a cell that is a plain
 # number sorts numerically, otherwise lexically). The choice persists per table in
 # sessionStorage and is re-applied on load — so it survives the dashboard's 4s
-# auto-refresh. Tables with `data-sk` get a stable key; others key off path+index.
+# auto-refresh. A gwLiveHooks entry re-applies it after every live morph too:
+# the server renders rows in insertion order and the morph re-imposes that order
+# on the live DOM, so without the hook a clicked sort is undone on every tick.
+# The hook re-reads sessionStorage rather than closing over the state — that
+# store is the source of truth and stays it. For the same reason no call site
+# captures the storage KEY STRING: the morph reuses an unkeyed table node for a
+# different logical table when a dashboard panel appears or disappears, which
+# rewrites its data-sk while the header cells keep their old handlers. Every
+# read and write therefore derives 'sort:'+key(tbl,i) at the moment it acts, so a
+# data-sk table's writer and reader always agree on the node's LIVE data-sk.
+# That guarantee stops at data-sk: the `i` fallback (path+index) IS captured —
+# wire()'s click handler closes over the load-time index while the post-morph hook
+# passes a freshly recomputed one — so a table without data-sk that changes position
+# can read under one key and write under another. Latent only: every current
+# `table.sortable` carries a data-sk, which is why the fallback is a fallback.
+# Tables with `data-sk` get a stable key; others key off path+index.
+# The hook also calls `wire()` on every sortable table, not just `applySort()`: a
+# table the morph INSERTS mid-session (a dashboard panel appearing) never went
+# through the load-time loop and would show a restored sort while silently ignoring
+# clicks until the next real reload — a regression the morph introduces, since before
+# it every refresh was a reload that re-bound everything. `wire()` is additive and
+# marks the node with the JS property `__gwWired` (a property, not an attribute:
+# syncAttrs would otherwise strip or re-add it on every tick, and it must vanish with
+# the node). That marker only short-circuits the BINDING; the hook still re-applies
+# the sort to already-wired tables, which is the whole point — the reconciler puts
+# the server's insertion order back on every morph.
 # Grouped tables (a `tr.grp` header row followed by its member rows — the routing
 # views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
 # key for column 0 (it is the alias name), later columns key off the first member row.
@@ -341,25 +376,169 @@ _SORT_JS = ("<script>(function(){"
             "bs.forEach(function(b){b.rows.forEach(function(r){tb.appendChild(r);});});"
             "var hs=hdr.cells;for(var i=0;i<hs.length;i++)ind(hs[i],i===idx?(dir<0?'\\u25bc':'\\u25b2'):'');}"
             "function key(tbl,i){return tbl.getAttribute('data-sk')||(location.pathname+'#'+i);}"
-            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
-            "var hdr=tbl.rows[0];if(!hdr)return;var k='sort:'+key(tbl,i);"
-            "[].forEach.call(hdr.cells,function(th,idx){th.addEventListener('click',function(){var c={};"
+            "function applySort(tbl,i){var hdr=tbl.rows[0];if(!hdr)return;var s={};"
+            "try{s=JSON.parse(sessionStorage.getItem('sort:'+key(tbl,i))||'{}');}catch(e){}"
+            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);}"
+            "function wire(tbl,i){var hdr=tbl.rows[0];if(!hdr)return;"
+            "if(tbl.__gwWired)return;tbl.__gwWired=true;"
+            "[].forEach.call(hdr.cells,function(th,idx){th.addEventListener('click',function(){"
+            "var k='sort:'+key(tbl,i),c={};"
             "try{c=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
             "var dir=(c.idx===idx&&c.dir>0)?-1:1;sortIt(tbl,idx,dir);"
             "try{sessionStorage.setItem(k,JSON.stringify({idx:idx,dir:dir}));}catch(e){}});});"
-            "var s={};try{s=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
-            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});"
+            "applySort(tbl,i);}"
+            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
+            "wire(tbl,i);});"
+            "window.gwLiveHooks=window.gwLiveHooks||[];"
+            "window.gwLiveHooks.push(function(){"
+            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
+            "wire(tbl,i);applySort(tbl,i);});});"
+            "})();</script>")
+
+
+# One auto-update mechanism for the whole console. `_page(refresh=N)` marks <main>
+# with data-live=N; this poller re-fetches the SAME url and morphs the response's
+# <main> into the live one instead of reloading the page. Nodes are matched by id,
+# data-k or data-sk (falling back to position+tag), so a table that gains a row keeps
+# every other row's identity — which is what preserves scroll, sort order, a focused
+# filter input, an open form, playing media and the model-viewer's camera.
+# `data-sk` counts as a key because it is the stable, document-unique NAME of a
+# sortable table (dash-backends, dash-jobs, …). The dashboard renders three of its
+# four tables conditionally; without that key the morph would keep using table node N
+# for a DIFFERENT logical table when a panel appears or disappears — syncAttrs would
+# rewrite the data-sk while everything attached to the node (handlers, the sort
+# indicator, its wired marker) stayed behind from the table it used to be.
+# Five things are deliberately never touched: <script> (a re-inserted _JOB_TICK
+# would double its setInterval), [data-live-skip] subtrees, form controls that are
+# focused or dirty, media whose src is unchanged, and <details open> (user state the
+# server knows nothing about). A response without data-live stops the poller — the
+# same signal the meta tag's absence used to carry.
+# The <script> rule cuts BOTH ways, and the second way bites: `adopt()` also drops a
+# script it would otherwise INSERT, so markup that only appears in a LATER state of a
+# live page arrives without its script and silently never initialises (a <model-viewer>
+# that never upgrades, a viewer div that stays black), and data-live is usually gone in
+# that same response, so the poller stops and it cannot self-heal. Hence the invariant
+# every live page owes: it must ALREADY contain every <script> any later state of it
+# can render — hoist them (see job_detail_page, _playground_body) and, where the script
+# has to act on nodes that arrive later, register the action in window.gwLiveHooks.
+_LIVE_JS = ("<script>(function(){"
+            "var main=document.querySelector('main');"
+            "if(!main)return;"
+            "window.gwLiveHooks=window.gwLiveHooks||[];"
+            "var base=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
+            "if(!(base>0))return;"
+            "var MEDIA={IMG:1,VIDEO:1,AUDIO:1,IFRAME:1,SOURCE:1,'MODEL-VIEWER':1};"
+            "var FORM={INPUT:1,TEXTAREA:1,SELECT:1};"
+            "var seq=0;"
+            "function keyOf(n){if(n.nodeType!==1)return null;"
+            "return n.id||n.getAttribute('data-k')||n.getAttribute('data-sk')||null;}"
+            "function dirty(e){if(!FORM[e.tagName])return false;"
+            "if(document.activeElement===e)return true;"
+            "if(e.tagName==='SELECT'){var sel=e.querySelector('option[selected]');"
+            "var def=sel?sel.value:(e.options[0]?e.options[0].value:'');"
+            "return e.value!==def;}"
+            "if(e.type==='checkbox'||e.type==='radio')return e.checked!==e.defaultChecked;"
+            "return e.value!==e.defaultValue;}"
+            "function frozen(e){return e.tagName==='SCRIPT'||e.hasAttribute('data-live-skip')||dirty(e);}"
+            "function adopt(n){var c=document.importNode(n,true);"
+            "if(c.nodeType===1){var s=c.querySelectorAll?c.querySelectorAll('script'):[];"
+            "for(var i=0;i<s.length;i++)s[i].parentNode.removeChild(s[i]);"
+            "if(c.tagName==='SCRIPT')return document.createComment('gw-script-skipped');}"
+            "return c;}"
+            "function syncAttrs(o,n){"
+            "if(MEDIA[o.tagName]&&o.getAttribute('src')===n.getAttribute('src'))return;"
+            "var i,a;"
+            "for(i=n.attributes.length-1;i>=0;i--){a=n.attributes[i];"
+            "if(o.tagName==='DETAILS'&&a.name==='open')continue;"
+            "if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value);}"
+            "for(i=o.attributes.length-1;i>=0;i--){a=o.attributes[i];"
+            "if(o.tagName==='DETAILS'&&a.name==='open')continue;"
+            "if(!n.hasAttribute(a.name))o.removeAttribute(a.name);}"
+            "if(o.tagName==='INPUT'){"
+            "if(o.type==='checkbox'||o.type==='radio')o.checked=n.hasAttribute('checked');"
+            "else o.value=n.getAttribute('value')||'';}"
+            "else if(o.tagName==='TEXTAREA'){o.value=n.textContent;}}"
+            "function same(o,n){if(o.nodeType!==n.nodeType)return false;"
+            "if(o.nodeType!==1)return true;"
+            "if(o.tagName!==n.tagName)return false;"
+            "var ko=keyOf(o),kn=keyOf(n);"
+            "if(ko||kn)return ko===kn;"
+            "return true;}"
+            "function morph(o,n){"
+            "if(o.nodeType===3||o.nodeType===8){if(o.data!==n.data)o.data=n.data;return;}"
+            "if(o.nodeType!==1)return;"
+            "if(frozen(o))return;"
+            "syncAttrs(o,n);"
+            "if(MEDIA[o.tagName])return;"
+            "reconcile(o,n);}"
+            "function reconcile(o,n){var pool={},unkeyed=[],c,k,i;"
+            "for(c=o.firstChild;c;c=c.nextSibling){k=keyOf(c);"
+            "if(k)pool['#'+k]=c;else unkeyed.push(c);}"
+            "var out=[],ui=0,m;"
+            "for(c=n.firstChild;c;c=c.nextSibling){k=keyOf(c);m=null;"
+            "if(k){m=pool['#'+k]||null;"
+            "if(m&&m.tagName!==c.tagName)m=null;"
+            "else if(m)pool['#'+k]=null;}"
+            "else{while(ui<unkeyed.length&&!same(unkeyed[ui],c))ui++;"
+            "if(ui<unkeyed.length){m=unkeyed[ui];ui++;}}"
+            "if(m){morph(m,c);out.push(m);}"
+            "else out.push(adopt(c));}"
+            "var stamp=++seq,nx;"
+            "for(i=0;i<out.length;i++)out[i].__gwLive=stamp;"
+            "c=o.firstChild;"
+            "while(c){nx=c.nextSibling;"
+            "if(c.__gwLive!==stamp)o.removeChild(c);"
+            "c=nx;}"
+            "var cur=o.firstChild;"
+            "for(i=0;i<out.length;i++){if(cur===out[i])cur=cur.nextSibling;"
+            "else o.insertBefore(out[i],cur);}}"
+            "var wait=base,timer=null,catchUp=false;"
+            "function schedule(ms){if(timer)clearTimeout(timer);timer=setTimeout(tick,ms);}"
+            "function stop(){if(timer)clearTimeout(timer);timer=null;}"
+            "function tick(){if(document.hidden){catchUp=true;schedule(wait);return;}"
+            "fetch(location.href,{cache:'no-store',credentials:'same-origin'})"
+            ".then(function(r){"
+            "if(r.redirected&&new URL(r.url).pathname!==location.pathname){"
+            "stop();location.href=r.url;return null;}"
+            "if(!r.ok){wait=Math.min(wait*2,30000);schedule(wait);return null;}"
+            "return r.text();})"
+            ".then(function(html){"
+            "if(html===null||html===undefined)return;"
+            "var doc=new DOMParser().parseFromString(html,'text/html');"
+            "var nm=doc.querySelector('main');"
+            "if(!nm){stop();return;}"
+            "try{morph(main,nm);}"
+            "catch(e){main.replaceChildren.apply(main,[].slice.call(nm.childNodes).map(adopt));"
+            "if(nm.hasAttribute('data-live'))main.setAttribute('data-live',nm.getAttribute('data-live'));"
+            "else main.removeAttribute('data-live');}"
+            "for(var i=0;i<window.gwLiveHooks.length;i++){"
+            "try{window.gwLiveHooks[i]();}catch(e){}}"
+            "var next=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
+            "if(!(next>0)){stop();return;}"
+            "wait=base=next;"
+            "schedule(wait);})"
+            ".catch(function(){wait=Math.min(wait*2,30000);schedule(wait);});}"
+            "document.addEventListener('visibilitychange',function(){"
+            "if(!document.hidden&&catchUp&&timer){catchUp=false;schedule(0);}});"
+            "schedule(wait);"
             "})();</script>")
 
 
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
           nologin: bool = False, subnav: str = "") -> str:
-    meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
+    # `refresh` no longer reloads the page. It marks <main> as live and _LIVE_JS
+    # polls this same URL and MORPHS the new <main> into the old one — the container
+    # is never replaced, so scroll position, sort order, a half-typed filter, an
+    # open form, playing video and the model-viewer's camera all survive an update.
+    # A response without data-live stops the poller, which is exactly what dropping
+    # the meta tag used to mean.
+    live = f' data-live="{int(refresh)}"' if refresh else ""
     head = "" if nologin else _nav(active)        # login page renders without the nav
     # subnav (see SUBTABS) renders as a second header row — outside <main>, so it
     # never scrolls and sits flush under the tabs.
-    return (f'<!doctype html><html><head><meta charset="utf-8">{meta}<title>{_esc(title)} · Gateway</title>'
-            f"<style>{_CSS}</style></head><body>{head}{subnav}<main>{body}</main>{_SCROLL_JS}{_SORT_JS}</body></html>")
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · Gateway</title>'
+            f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
+            f"{_SCROLL_JS}{_SORT_JS}{_LIVE_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
@@ -3888,27 +4067,14 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             + pg_switch_js)
 
 
-# Polls ONLY the result column (not a full-page meta-refresh), so the form stays
-# editable while a job runs — pick new params and Generate again without losing them.
-_PG_POLL_JS = ("<script>(function(){var rc=document.getElementById('resultcol');"
-               "if(!rc)return;var job=rc.getAttribute('data-poll-job');if(!job)return;"
-               "var t=setInterval(function(){"
-               "fetch('/ui/playground/status/'+encodeURIComponent(job),{cache:'no-store'})"
-               ".then(function(r){return r.text();}).then(function(h){rc.innerHTML=h;"
-               "if(h.indexOf('data-jobdone')>=0){clearInterval(t);}}).catch(function(){});"
-               "},2000);})();</script>")
-
-
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None, kept: Optional[dict] = None, poll_job: str = "") -> str:
-    pa = f' data-poll-job="{_esc(poll_job)}"' if poll_job else ""
-    # model-viewer must load with the PAGE: the poller swaps #resultcol via
-    # innerHTML, and innerHTML-inserted <script> tags never execute — a GLB result
-    # arriving through the poll would otherwise sit in an undefined custom element
-    # (an empty dark box). Loaded up front, swapped-in tags upgrade automatically.
+                     oi: Optional[dict] = None, kept: Optional[dict] = None) -> str:
+    # model-viewer loads with the page and stays loaded: _LIVE_JS never re-inserts a
+    # <script>, so a viewer arriving through a live update upgrades against the
+    # definition that is already there.
     return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
             f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
-            f'<div class="col"><div id="resultcol"{pa}>{result_html}</div></div></div>{_PG_POLL_JS}')
+            f'<div class="col"><div id="resultcol">{result_html}</div></div></div>')
 
 
 def _job_result_html(job_id: str, job: Optional[dict]):
@@ -3951,15 +4117,28 @@ async def playground_page(request: Request):
                                   subnav=_subnav("playground", "chat")))
     if sub == "voice":
         vals = {k: qp.get(k, "") for k in _VOICEPLAY_KEYS}
-        prog = _voice_upload_prog.get(_session_user(request) or "default")
-        if qp.get("vu") == "done" and prog:              # post-upload reload: final checklist + fresh table
-            result_html = _vu_fragment(prog).replace("<span data-vudone hidden></span>", "")
-        elif prog and not prog.get("done"):              # reload during an upload → keep polling
-            result_html = _vu_fragment(prog) + _VU_POLL_JS
-        else:
-            result_html = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+        vu_user = _session_user(request) or "default"
+        prog = _voice_upload_prog.get(vu_user)
+        # A running upload makes the page live at 1s; the final tick renders the
+        # finished checklist AND the library table with the new entry, then drops
+        # data-live to stop the poller — which is all the old reload ever did.
+        # Consumed once it has been SHOWN in its terminal state: _voice_upload_prog
+        # lives for the whole process and nothing else clears it, so without this the
+        # last upload's verdict is what every later visit to the tab renders instead of
+        # the hint — a 303 landing from ship/delete included, where it can describe a
+        # reference that no longer exists. `seen` is set on the render that shows the
+        # finished checklist (the final live tick still gets it); the NEXT GET drops the
+        # entry. A new upload installs a fresh dict, so it is never popped early.
+        if prog is not None and prog.get("seen"):
+            _voice_upload_prog.pop(vu_user, None)
+            prog = None
+        vu_refresh = 1 if (prog and not prog.get("done")) else None
+        if prog is not None and prog.get("done"):
+            prog["seen"] = True
+        result_html = (_vu_fragment(prog) if prog else
+                       "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>")
         return HTMLResponse(_page("Voice", _voiceplay_body(vals, result_html), "playground",
-                                  subnav=_subnav("playground", "voice")))
+                                  refresh=vu_refresh, subnav=_subnav("playground", "voice")))
     if not store.is_active():
         return _inactive()
     aliases = list(store.list_aliases().keys())
@@ -3994,10 +4173,10 @@ async def playground_page(request: Request):
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping")) if cand else {}
     kept = dict(_pg_images.get(_session_user(request) or "default", {}))
-    poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
     return HTMLResponse(_page("Media Playground",
-                              _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
-                              "playground", subnav=_subnav("playground", "media")))
+                              _playground_body(aliases, vals, cand, result_html, oi, kept),
+                              "playground", refresh=refresh,
+                              subnav=_subnav("playground", "media")))
 
 
 async def generate(request: Request):
@@ -4108,7 +4287,7 @@ async def generate(request: Request):
         view = r.json()
     except HTTPException as e:
         return _err(str(e.detail), e.status_code)
-    # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
+    # Redirect to the GET view (form re-populated + live-updating) — instant feedback.
     q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
@@ -4148,14 +4327,6 @@ async def result(job_id: str, n: int, anim: str = ""):
     if name:
         headers = {"Content-Disposition": jobs.content_disposition(name)}
     return FileResponse(path, media_type=mime, headers=headers)
-
-
-async def playground_status(job_id: str):
-    """Result-column fragment for the JS poller (so the form isn't reloaded mid-edit)."""
-    html, refresh = _job_result_html(job_id, jobs.get(job_id))
-    if not refresh:                              # done/failed → marker tells the poller to stop
-        html += "<span data-jobdone hidden></span>"
-    return HTMLResponse(html)
 
 
 # ── Playground sub-tab: Voice (direct /v1/audio/speech, synchronous) ─────────────
@@ -4324,7 +4495,7 @@ _voice_upload_prog: dict = {}   # user → {name, steps: [(kind, text)], done, o
 
 
 def _vu_fragment(prog: dict) -> str:
-    """Progress checklist for the result column (polled): ✓/✗ per finished step,
+    """Progress checklist for the result column: ✓/✗ per finished step,
     ⏳ for the one currently running (superseded 'run' markers are dropped)."""
     icons = {"ok": "✓", "err": "✗"}
     steps = prog.get("steps") or []
@@ -4340,22 +4511,13 @@ def _vu_fragment(prog: dict) -> str:
         return head + rows
     tail = ("<p>✓ <b>done — shipped to all hosts</b></p>" if prog.get("ok") else
             "<p class='bad'>finished with problems — see the steps above (↻ retries the ship)</p>")
-    return head + rows + tail + "<span data-vudone hidden></span>"
-
-
-_VU_POLL_JS = ("<script>(function(){var t=setInterval(function(){"
-               "fetch('/ui/playground/voice-upload-status',{cache:'no-store'})"
-               ".then(function(r){return r.text();}).then(function(h){"
-               "var r=document.getElementById('vpresult');if(r)r.innerHTML=h;"
-               "if(h.indexOf('data-vudone')>=0){clearInterval(t);"
-               "setTimeout(function(){location.replace('/ui/playground?sub=voice&vu=done');},900);}"
-               "}).catch(function(){});},1000);})();</script>")
+    return head + rows + tail
 
 
 async def voice_upload(request: Request):
-    """Start the upload as a background task and show LIVE progress in the result
-    column (store → whisper transcription → scp per host); the poller refreshes
-    the page when done so the library table shows the new entry."""
+    """Start the upload as a background task and hand over to the GET view, which
+    shows LIVE progress in the result column (store → whisper transcription → scp
+    per host) while the live morph keeps the library table in step with it."""
     f = await _multipart(request)
     name = str(f.get("name", "")).strip()
     data = f.get("file")
@@ -4384,17 +4546,10 @@ async def voice_upload(request: Request):
             logger.info(f"ui: voice ref '{name}' uploaded (ok={prog['ok']})")
 
     asyncio.create_task(_run())
-    return HTMLResponse(_page("Voice", _voiceplay_body(vals, _vu_fragment(prog) + _VU_POLL_JS),
-                              "playground", subnav=_subnav("playground", "voice")))
-
-
-async def voice_upload_status(request: Request):
-    """Result-column fragment for the upload poller."""
-    prog = _voice_upload_prog.get(_session_user(request) or "default")
-    if not prog:
-        return HTMLResponse("<h2>Result</h2><p class='muted'>no upload running</p>"
-                            "<span data-vudone hidden></span>")
-    return HTMLResponse(_vu_fragment(prog))
+    # Redirect to the GET view like every other voice action: _LIVE_JS polls
+    # location.href, and this POST-only URL would answer a GET with 405 — the page
+    # would render the first checklist and then never move again.
+    return RedirectResponse("/ui/playground?sub=voice", status_code=303)
 
 
 async def voice_target(request: Request):
@@ -4483,7 +4638,10 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
                  if st in ('queued', 'running') else '')
                 + _btn('view', f'/ui/job/{jid}', 'secondary', sm=True))
         cells.append(f"<td style='text-align:right;white-space:nowrap'>{acts}</td>")
-    return "<tr>" + "".join(cells) + "</tr>"
+    # data-k keys this row for the live morph: the media job list is newest-first,
+    # so a new job shifts every row — without a key the reconciler would match
+    # positionally and rewrite every cell instead of inserting one row.
+    return f"<tr data-k=\"job-{_esc(jid)}\">" + "".join(cells) + "</tr>"
 
 
 def _call_kind(endpoint: str) -> str:
@@ -4587,14 +4745,22 @@ async def jobs_page(request: Request):
 
 # three.js FBX preview: the generic (UniRig) result is an FBX whose texture is only
 # a dead temp-path reference, so the sibling basecolor PNG is applied as the material
-# map. Import map + module init emitted ONCE per page (see _job_thumbs). All bundled
-# locally under /ui/static/three (no CDN).
+# map. Import map + module init emitted ONCE per page, HOISTED by the page that can
+# ever show an FBX (job_detail_page) rather than appended next to the viewer div:
+# _LIVE_JS strips every <script> out of a subtree it morphs in, so a block that only
+# arrives WITH the finished artifact never executes (see the invariant in _page).
+# All bundled locally under /ui/static/three (no CDN).
+# The scan is a named global and a post-morph hook, because hoisting alone only gets
+# the code onto the page: the module body runs once at load, when a still-running job
+# has no `.fbxview` at all. Each morph that brings one in re-runs gwFbxScan, which
+# picks up exactly the ones not yet initialised.
 _FBX_VIEWER_JS = (
     '<script type="importmap">{"imports":{"three":"/ui/static/three/three.module.min.js"}}</script>'
     '<script type="module">'
     "import * as THREE from 'three';"
     "import { FBXLoader } from '/ui/static/three/jsm/loaders/FBXLoader.js';"
     "import { OrbitControls } from '/ui/static/three/jsm/controls/OrbitControls.js';"
+    "window.gwFbxScan = function(){"
     "document.querySelectorAll('.fbxview:not([data-init])').forEach(function(el){"
     " el.dataset.init='1';"
     " var W=el.clientWidth||480,H=el.clientHeight||420;"
@@ -4616,13 +4782,25 @@ _FBX_VIEWER_JS = (
     " },undefined,function(e){ el.innerHTML='<p style=\"padding:14px;color:#e89\">FBX-Vorschau fehlgeschlagen</p>'; });"
     " (function loop(){ requestAnimationFrame(loop); ct.update(); rn.render(sc,cam); })();"
     "});"
+    "};"
+    "window.gwFbxScan();"
+    "window.gwLiveHooks = window.gwLiveHooks || [];"
+    "window.gwLiveHooks.push(window.gwFbxScan);"
     '</script>')
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     """Gallery of artifact thumbnails (kind = 'input'|'result'). Images link to the
     full file; video/audio play inline; GLB → <model-viewer>; FBX → a three.js 3D
-    viewer textured with the sibling basecolor PNG; other files → a download card."""
+    viewer textured with the sibling basecolor PNG; other files → a download card.
+
+    Emits no import map and no viewer INIT of its own: the three.js module and its
+    import map (_FBX_VIEWER_JS) and the model-viewer module are hoisted by the calling
+    page, because this gallery is exactly the markup a live morph inserts mid-session
+    and the morph drops every <script> it would insert. A GLB cell still carries
+    _media_tag's own <script type="module" src=...> for model-viewer — byte-identical
+    to the hoisted one and turned into a comment by adopt(), so it is inert either
+    way."""
     base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
     style = "max-width:260px;max-height:260px;border:1px solid #313a46;border-radius:8px"
     box3d = "width:720px;max-width:100%;height:640px"
@@ -4635,7 +4813,7 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
                 tex_url = u
                 break
             tex_url = tex_url or u
-    cells, has_fbx = "", False
+    cells = ""
     for r in entries:
         src = f"{base}{r['n']}"
         m, mk = (r.get("mime") or "").lower(), (r.get("kind") or "").lower()
@@ -4652,17 +4830,19 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}{stats}"
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
-            has_fbx = True
             tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
-            cells += (f'<div><div class="fbxview" data-src="{_esc(src)}"{tex_attr} '
+            # data-live-skip: the server renders this div EMPTY and gwFbxScan fills it
+            # client-side (data-init + a three.js canvas). A morph would strip both back
+            # out — the attribute is not in the server's markup and the canvas is not in
+            # its children — and the viewer would go black with nothing in any log.
+            cells += (f'<div><div class="fbxview" data-live-skip data-src="{_esc(src)}"{tex_attr} '
                       f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif mk == "file":                                # other file artifacts → download card
             cells += _dl_card(src, label, dl=dl, mime=(r.get("mime") or "file"))
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
-    out = f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
-    return out + _FBX_VIEWER_JS if has_fbx else out
+    return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
 
 
 def _meshy_table(title: str, m: dict) -> str:
@@ -4881,7 +5061,25 @@ async def job_detail_page(job_id: str, request: Request):
     newer, older = jobs.neighbors(job_id)
     nav = ((_btn("‹ Prev", f"/ui/job/{_esc(newer)}", "secondary", title="Newer job") if newer else "")
            + (_btn("Next ›", f"/ui/job/{_esc(older)}", "secondary", title="Older job") if older else ""))
-    page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
+    # Both 3D viewers are hoisted UNCONDITIONALLY, exactly as _playground_body hoists
+    # model-viewer: this page is live while the job runs, and _LIVE_JS strips every
+    # <script> out of the subtree it morphs in. A GLB or FBX that only appears when the
+    # job finishes would otherwise arrive without its viewer — an un-upgraded custom
+    # element or an uninitialised div, i.e. a permanently black box, and `data-live`
+    # vanishes in that same response so the poller stops and it never self-heals.
+    # Custom elements upgrade on their own once model-viewer is defined; the FBX side
+    # needs the gwFbxScan hook on top (the module body runs when there is nothing to
+    # scan yet). Both files are local static and browser-cached.
+    # ORDER IS LOAD-BEARING: _FBX_VIEWER_JS carries the import map, and an import map
+    # inserted after a module script's load has been triggered is REJECTED outright by
+    # every engine without the "multiple import maps" support (Chrome < 133, older
+    # Firefox/Safari) — the model-viewer <script type="module" src> starts loading the
+    # moment it is parsed. The FBX module would then die on "Failed to resolve module
+    # specifier 'three'", gwFbxScan would never exist and the viewer stays a black box
+    # with nothing in any log. So the import map goes FIRST. Pinned by
+    # test_admin_live.LiveScriptInvariant.test_import_map_precedes_any_module_script.
+    page = (f'{_FBX_VIEWER_JS}<script type="module" src="{_MODELVIEWER_SRC}"></script>'
+            f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
             f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(job))}</span></h2>"
             f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
@@ -5051,7 +5249,14 @@ def _dash_backends(bes: list, offline: list) -> str:
         inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
         r1h = b.get("reqs_1h", 0)
         r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
-        brows += (f"<tr><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
+        # data-k: _bid (type:name) is this row's identity, and the panel re-sorts
+        # itself (ready → busy → off), so a backend changing state moves its row —
+        # positional matching would rewrite the neighbours it stepped over. The bare
+        # name is NOT unique: _bid exists because an LLM and a ComfyUI backend may
+        # share one (main.rebuild_backends keys on (name, type)), and two rows with the
+        # same key collapse into one pool entry — each tick would then rewrite one row
+        # from the other's content, the exact per-tick full-row rewrite keys prevent.
+        brows += (f"<tr data-k=\"bk-{_esc(_bid(b))}\"><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td>"
                   f"<td>{b.get('models', 0)}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
@@ -5176,7 +5381,12 @@ def _call_row(r, aliases) -> str:
         view = f"<span class='muted' title='{_esc(prev)}'>{_esc(prev[:30])}…</span>"
     else:
         view = "<span class='muted'>—</span>"
-    return (f"<tr><td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
+    # data-k keys this row for the live morph — the call lists are newest-first, so a
+    # finished call shifts every row down and positional matching would rewrite the
+    # whole table instead of inserting one row. Prefixed to keep the key space apart
+    # from the job rows', in case the two ever share a parent node.
+    return (f"<tr data-k=\"call-{_esc(cid)}\">"
+            f"<td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
             f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
             f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
             f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
@@ -5203,16 +5413,22 @@ def _recent_calls_table(rows, aliases, src: str = "llm") -> str:
 _BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
 # Row filter for `table.filterable`, driven by the ONE `#sf` input a view renders.
 # The typed text is persisted in sessionStorage per view and re-applied on load — like
-# the sort order above, and for the same reason: Media Jobs auto-refreshes every 5 s
-# while a job runs, and a full-page reload otherwise wipes the search you just typed
-# (reported from the Media Jobs list). Focus + caret come back too, but ONLY when the
-# save is seconds old: that means the reload pulled the page out from under someone who
-# was typing, whereas re-opening the tab later must not steal focus.
+# the sort order above, and for the same reason: it must survive REAL navigation (a tab
+# switch, a form POST, F5), which the live morph does not cover.
+# Focus and caret are deliberately NOT saved any more. That was pure compensation for
+# the old full-page auto-refresh, which yanked the page out from under someone typing;
+# the morph never replaces a focused or dirty control (see _LIVE_JS), so the input the
+# caret sits in is exactly the node it was, and the 15-second "was someone typing"
+# window it needed had itself been made meaningless by the hook below re-saving on
+# every tick. Every write is now just the text, so a tick rewriting it is a no-op.
+# A gwLiveHooks entry re-runs the filter after every live morph, because rows the
+# morph brings in fresh carry no display style and would otherwise ignore it.
+# The hook is registered outside the `if(i)` guard and no-ops when the view has no
+# #sf input, so it is harmless on a page that never renders one.
 _FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.search;"
               "function el(){return document.getElementById('sf');}"
               "function save(){var i=el();if(!i)return;try{sessionStorage.setItem(K,"
-              "JSON.stringify({v:i.value,c:i.selectionStart,f:document.activeElement===i,"
-              "t:Date.now()}));}catch(e){}}"
+              "JSON.stringify({v:i.value}));}catch(e){}}"
               "window.sfRun=function(){var i=el();if(!i)return;"
               "var q=(i.value||'').toLowerCase();"
               "document.querySelectorAll('.filterable tr').forEach(function(r){"
@@ -5220,10 +5436,9 @@ _FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.searc
               "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});save();};"
               "var i=el();if(i){var s=null;"
               "try{s=JSON.parse(sessionStorage.getItem(K)||'null');}catch(e){}"
-              "if(s&&s.v){i.value=s.v;window.sfRun();"
-              "if(s.f&&Date.now()-(s.t||0)<15000){i.focus();"
-              "try{i.setSelectionRange(s.c,s.c);}catch(e){}}}"
-              "i.addEventListener('blur',save);window.addEventListener('beforeunload',save);}"
+              "if(s&&s.v){i.value=s.v;window.sfRun();}}"
+              "window.gwLiveHooks=window.gwLiveHooks||[];"
+              "window.gwLiveHooks.push(function(){if(window.sfRun)window.sfRun();});"
               "})();</script>")
 
 
@@ -6193,14 +6408,12 @@ def register(app) -> None:
     app.add_api_route("/ui/playground/voice", voiceplay_send, methods=["POST"])
     app.add_api_route("/ui/playground/voice-audio", voice_audio, methods=["GET"])
     app.add_api_route("/ui/playground/voice-upload", voice_upload, methods=["POST"])
-    app.add_api_route("/ui/playground/voice-upload-status", voice_upload_status, methods=["GET"])
     app.add_api_route("/ui/playground/voice-target", voice_target, methods=["POST"])
     app.add_api_route("/ui/playground/voice-ship", voice_ship, methods=["GET"])
     app.add_api_route("/ui/playground/voice-del", voice_del, methods=["GET"])
     app.add_api_route("/ui/playground/voice-lib/{name}", voice_lib_play, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
-    app.add_api_route("/ui/playground/status/{job_id}", playground_status, methods=["GET"])
     app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])

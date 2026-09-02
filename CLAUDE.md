@@ -28,10 +28,12 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 - `config.yaml` is gitignored and **hot-reloaded** on save (watchfiles) — no
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
-- **No test suite, linter, or build step.** Verify by running the server and
-  hitting endpoints with `curl` (README "Try it"), `curl localhost:4000/health`
-  for a routing snapshot, or compile-gating (`venv/bin/python -m py_compile *.py`)
-  before deploy.
+- **No linter or build step, and no blanket test suite** — only targeted stdlib
+  `unittest` files for the mechanisms that fail SILENTLY (see the six listed under
+  `anthropic_bridge.py`): `venv/bin/python -m unittest discover -p 'test_*.py'`.
+  Everything else is verified by running the server and hitting endpoints with
+  `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
+  compile-gating (`venv/bin/python -m py_compile *.py`) before deploy.
 - `requirements.txt` omits `watchfiles`; it ships with `uvicorn[standard]`. Keep it.
 - Deploy with `DEPLOY_HOST=root@host ./deploy.sh` (rsync/tar over SSH, remote venv
   install, systemd sync, restart). rsync IS present on both dev and the prod box
@@ -249,7 +251,64 @@ hot-reload-safe.
   existing action links keep working unchanged and still land in the right tab.
   The Media list groups by `task` in `_TASK_OPTIONS` order (unknown tasks trail
   alphabetically, so a typo stays visible) with a per-group count; the task is the
-  header, so the row shows what differs WITHIN a group (backends · mapped params). POST bodies parsed by
+  header, so the row shows what differs WITHIN a group (backends · mapped params).
+  **Auto-update is one mechanism, not six** (`_LIVE_JS`): `_page(refresh=N)` marks
+  `<main data-live="N">` and a global poller re-fetches the SAME url and MORPHS the
+  response's `<main>` into the live one — nodes matched by `id`, `data-k` or `data-sk`
+  (`keyOf`), falling back to position+tag. An UPDATE never reloads, so scroll, sort
+  order, a focused filter, an open form, playing media and the model-viewer camera
+  survive it; a response without `data-live` stops the poller (what the meta tag's
+  absence used to mean). The one deliberate real navigation is the escape hatch:
+  a re-fetch that REDIRECTS to a different path does `location.href = r.url`, which
+  is how an expired session lands on `/ui/login` instead of having a login form
+  morphed into `<main>` — do not "simplify" it away. The three live row templates
+  carry a key themselves — `_job_row` → `job-<job id>`, `_call_row` → `call-<call
+  id>`, `_dash_backends`' row → `bk-<_bid>` (`type:name`, because an LLM and a
+  ComfyUI backend may share a name) — because those lists are newest-first (and the
+  backends panel re-sorts ready→busy→off): without a key the reconciler matches
+  POSITIONALLY and a list that gains one row rewrites EVERY row, which is the one
+  thing the mechanism exists to avoid. `data-sk` counts as a key for the same reason
+  one level up — the dashboard renders three of its four tables conditionally, and an
+  unkeyed table node would be reused for a DIFFERENT logical table when a panel comes
+  or goes. Never touched: `<script>`, `[data-live-skip]` subtrees (the `.fbxview`
+  container, which the server renders EMPTY and the client fills), focused/dirty form
+  controls, media with an unchanged `src`, and `<details open>`.
+  **The `<script>` rule cuts both ways, and the second way is the trap**: `adopt()`
+  drops a script it would otherwise INSERT, not just leave existing ones alone. So
+  markup that appears only in a LATER state of a live page arrives without its script
+  and silently never initialises — and `data-live` is typically gone in that same
+  response, so the poller stops and it cannot self-heal (measured: a finishing job's
+  `<model-viewer>`/`.fbxview` preview, a permanently black box until F5). Hence the
+  invariant every live page owes: **it must already contain every `<script>` any later
+  state of it can render** — hoist them (`job_detail_page`, `_playground_body`) and,
+  where the script must act on nodes arriving later, register the action in
+  `window.gwLiveHooks` (`gwFbxScan`). `test_admin_live.py` pins this, plus `data-live`
+  on `<main>` and the ES5 validity of every JS constant — all three fail silently.
+  Post-morph hooks in `window.gwLiveHooks`: the SORT hook because the server always
+  renders insertion order and the morph re-imposes it (a clicked sort would be undone
+  every tick), the FILTER hook because rows the morph brings in FRESH carry no
+  `display` style and would ignore an active filter; the sort hook also `wire()`s
+  every sortable table, since a table the morph INSERTS mid-session never went through
+  the load-time binding and would otherwise ignore header clicks until a
+  real reload. This replaced four `<meta http-equiv="refresh">` pages (Dashboard,
+  Media Jobs, Job detail, Backends while draining) and both hand-rolled fragment
+  pollers: `_PG_POLL_JS` + `/ui/playground/status/{job_id}` (the media playground's
+  result column — the dirty-input rule is what keeps the form editable now) and
+  `_VU_POLL_JS` + `/ui/playground/voice-upload-status`, whose terminating
+  `location.replace(…&vu=done)` reload, the `vu=done` parameter and its branch left
+  with it (one tick now refreshes the progress column AND the voice-library table).
+  `voice_upload` therefore 303-redirects to the GET view: the poller re-fetches
+  `location.href`, and a POST-only URL answers a GET with 405; the per-user progress
+  entry is CONSUMED once its terminal state has been rendered (`prog["seen"]` → popped
+  on the next GET), because `_voice_upload_prog` lives for the whole process and the
+  `vu=done` reload that used to make it moot is gone. Of the state-restore
+  hacks the reload needed, only `_FILTER_JS`'s focus/caret save+restore and the
+  `blur`+`beforeunload` listeners that saved them are gone; `_SCROLL_JS`'s `<main>`
+  restore STAYS, because
+  `<main>` is the page's scroll container (`body{overflow:hidden}` +
+  `main{overflow-y:auto}`) and that restore serves REAL navigation (F5, a nav link
+  back to a long list, a POST's 303), which the morph does not cover — it is merely
+  inert from the first tick onward. POST bodies parsed by
   hand (`parse_qs`) to stay `python-multipart`-free.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
@@ -282,9 +341,13 @@ hot-reload-safe.
   server-side tools), raise `UnsupportedContent` → 400 where dropping would
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
-  silently rather than crashing). The repo's only other test file is
-  `test_prune_branch.py`, for the same reason: a dead-branch prune that cascades one
-  node too far or too few surfaces as an aborted generation, not an exception.
+  silently rather than crashing). There are **six** test files, and each exists for
+  that same reason — the mechanism it guards fails SILENTLY, so it is named next to
+  that mechanism above: `test_anthropic_bridge.py`, `test_prune_branch.py` (a
+  dead-branch prune that cascades one node too far or too few surfaces as an aborted
+  generation, not an exception), `test_chain_export_node.py`,
+  `test_ratelimit_headers.py`, `test_scheduler.py` and `test_admin_live.py`. Run them
+  all with `python -m unittest discover -p 'test_*.py'` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
   slot mapping, `images_response`); imports only the leaf `jobs`. `main.py`
