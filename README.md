@@ -771,6 +771,13 @@ which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`.
 
+**Playground.** In the console's **Media** playground a mesh parameter takes a real
+file (glb/gltf/obj/fbx/stl/ply — sent as `files`) or, as before, a path that already
+exists on the backend; when both are filled the upload wins. Every upload field —
+image slot or mesh param — can alternatively take an **artifact of an earlier job**
+from a dropdown (results and stored reference images of the 60 most recent media
+jobs), so rigging the mesh a previous job produced needs no download/upload detour.
+
 **Input isolation (guarantee).** Every file the gateway uploads into a backend
 (`images`, `files`, chain hand-off meshes) is named per job —
 `gw_<job id>_<param>.<ext>` — so **no two jobs ever share input state**, not
@@ -807,7 +814,7 @@ locked). Tabs:
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a Meshy alias needs no workflow — endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
-| **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
+| **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL), plus the media requests that were refused before they became a job |
 | **LLM Calls** | per-call history with stored request/response bodies (LLM endpoints only — voice and media have their own sub-tabs) |
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
