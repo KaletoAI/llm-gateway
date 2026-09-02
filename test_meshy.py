@@ -1,0 +1,206 @@
+"""Unit tests for meshy.py — run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_meshy -v"""
+import base64
+import unittest
+
+import meshy
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+JPG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 16
+
+
+def _cand(endpoint="image-to-3d", **opts):
+    return {"backend": "meshy", "task": "img2mesh", "model": "latest",
+            "meshy": {"endpoint": endpoint, "options": opts}}
+
+
+class TestTextureRes(unittest.TestCase):
+    def test_buckets(self):
+        self.assertEqual(meshy.texture_res(1024), "2k")
+        self.assertEqual(meshy.texture_res(2048), "2k")
+        self.assertEqual(meshy.texture_res(4096), "4k")
+        self.assertEqual(meshy.texture_res(8192), "8k")
+        self.assertEqual(meshy.texture_res("4k"), "4k")      # already a bucket → verbatim
+        self.assertEqual(meshy.texture_res("garbage"), "2k")  # unknown → default
+
+
+class TestDataUri(unittest.TestCase):
+    def test_png_and_jpeg(self):
+        self.assertTrue(meshy.data_uri(PNG).startswith("data:image/png;base64,"))
+        self.assertTrue(meshy.data_uri(JPG).startswith("data:image/jpeg;base64,"))
+        self.assertEqual(base64.b64decode(meshy.data_uri(PNG).split(",", 1)[1]), PNG)
+
+    def test_webp_rejected(self):
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.data_uri(WEBP)
+
+
+class TestBuildRequestSingle(unittest.TestCase):
+    def test_minimal(self):
+        body = meshy.build_request(_cand(), {}, {"input_image": PNG})
+        self.assertTrue(body["image_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(body["ai_model"], "latest")
+        self.assertTrue(body["should_texture"])
+        self.assertEqual(body["texture_resolution"], "2k")
+        self.assertEqual(body["target_formats"], ["glb"])
+        self.assertNotIn("image_urls", body)
+        self.assertNotIn("should_remesh", body)        # untouched → Meshy's model default
+
+    def test_missing_image_is_input_error(self):
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.build_request(_cand(), {}, {})
+
+    def test_face_num_sets_polycount_and_remesh(self):
+        body = meshy.build_request(_cand(), {"input_face_num": 20000}, {"input_image": PNG})
+        self.assertEqual(body["target_polycount"], 20000)
+        self.assertTrue(body["should_remesh"])
+
+    def test_face_num_clamped(self):
+        lo = meshy.build_request(_cand(), {"input_face_num": 5}, {"input_image": PNG})
+        hi = meshy.build_request(_cand(), {"input_face_num": "999999"}, {"input_image": PNG})
+        self.assertEqual(lo["target_polycount"], 100)
+        self.assertEqual(hi["target_polycount"], 300000)
+
+    def test_client_params_and_ignored(self):
+        body = meshy.build_request(_cand(), {
+            "input_name": "x" * 150, "input_texture_resolution": 4096,
+            "input_texture_prompt": "rusty metal", "input_pose": "t-pose",
+            "input_remove_background": False, "input_no_fingers": True,
+            "input_bogus": 1, "prompt": ""}, {"input_image": JPG})
+        self.assertEqual(len(body["name"]), 100)
+        self.assertEqual(body["texture_resolution"], "4k")
+        self.assertEqual(body["texture_prompt"], "rusty metal")
+        self.assertEqual(body["pose_mode"], "t-pose")
+        for k in ("input_bogus", "input_remove_background", "input_no_fingers", "prompt"):
+            self.assertNotIn(k, body)
+
+    def test_bad_pose_is_input_error(self):
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.build_request(_cand(), {"input_pose": "sitting"}, {"input_image": PNG})
+
+    def test_admin_options_and_model(self):
+        c = _cand(enable_pbr=True, topology="quad", ultra_mode=True, target_formats=["glb", "fbx"],
+                  texture_resolution="8k")
+        c["model"] = "meshy-7"
+        body = meshy.build_request(c, {}, {"input_image": PNG})
+        self.assertEqual(body["ai_model"], "meshy-7")
+        self.assertTrue(body["enable_pbr"])
+        self.assertEqual(body["topology"], "quad")
+        self.assertTrue(body["ultra_mode"])
+        self.assertEqual(body["target_formats"], ["glb", "fbx"])
+        self.assertEqual(body["texture_resolution"], "8k")          # admin default …
+        body2 = meshy.build_request(c, {"input_texture_resolution": 1024}, {"input_image": PNG})
+        self.assertEqual(body2["texture_resolution"], "2k")         # … the client may override
+
+    def test_thumbnail_option_not_sent(self):
+        body = meshy.build_request(_cand(thumbnail=False), {}, {"input_image": PNG})
+        self.assertNotIn("thumbnail", body)
+
+
+class TestBuildRequestMulti(unittest.TestCase):
+    C = _cand("multi-image-to-3d")
+
+    def test_front_first_optional_dropped(self):
+        body = meshy.build_request(self.C, {}, {"input_image_left": JPG, "input_image_front": PNG})
+        self.assertEqual(len(body["image_urls"]), 2)
+        self.assertTrue(body["image_urls"][0].startswith("data:image/png"))
+        self.assertTrue(body["image_urls"][1].startswith("data:image/jpeg"))
+        self.assertNotIn("image_url", body)
+
+    def test_all_four_in_order(self):
+        imgs = {"input_image_right": PNG, "input_image_back": PNG,
+                "input_image_left": PNG, "input_image_front": JPG}
+        body = meshy.build_request(self.C, {}, imgs)
+        self.assertEqual(len(body["image_urls"]), 4)
+        self.assertTrue(body["image_urls"][0].startswith("data:image/jpeg"))
+
+    def test_missing_front_is_input_error(self):
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.build_request(self.C, {}, {"input_image_back": PNG})
+
+    def test_empty_bytes_count_as_absent(self):
+        body = meshy.build_request(self.C, {}, {"input_image_front": PNG, "input_image_back": b""})
+        self.assertEqual(len(body["image_urls"]), 1)
+
+
+class TestPublicFields(unittest.TestCase):
+    def test_single(self):
+        params, images = meshy.public_fields(_cand())
+        self.assertEqual([i["name"] for i in images], ["input_image"])
+        self.assertEqual(images[0]["on_empty"], "required")
+        self.assertTrue(images[0]["required"])
+        names = [p["name"] for p in params]
+        for n in ("input_name", "input_face_num", "input_texture_resolution",
+                  "input_texture_prompt", "input_pose", "input_remove_background", "input_no_fingers"):
+            self.assertIn(n, names)
+        pose = next(p for p in params if p["name"] == "input_pose")
+        self.assertEqual(pose["choices"], ["", "a-pose", "t-pose"])
+        tex = next(p for p in params if p["name"] == "input_texture_resolution")
+        self.assertEqual(tex["default"], 2048)
+        self.assertEqual(tex["type"], "int")
+
+    def test_multi(self):
+        _, images = meshy.public_fields(_cand("multi-image-to-3d"))
+        self.assertEqual([i["name"] for i in images],
+                         ["input_image_front", "input_image_back", "input_image_left", "input_image_right"])
+        self.assertEqual([i["on_empty"] for i in images], ["required", "skip", "skip", "skip"])
+
+    def test_default_from_admin_option(self):
+        params, _ = meshy.public_fields(_cand(texture_resolution="4k"))
+        tex = next(p for p in params if p["name"] == "input_texture_resolution")
+        self.assertEqual(tex["default"], 4096)
+
+
+class TestParseTask(unittest.TestCase):
+    OK = {"id": "t1", "status": "SUCCEEDED", "progress": 100, "consumed_credits": 30,
+          "model_urls": {"glb": "https://a/x.glb?e=1", "fbx": "https://a/x.fbx"},
+          "thumbnail_url": "https://a/p.png", "task_error": {"message": ""}}
+
+    def test_succeeded(self):
+        st = meshy.parse_task(self.OK, ["glb"])
+        self.assertEqual(st.status, "SUCCEEDED")
+        self.assertEqual(st.downloads, [("glb", "https://a/x.glb?e=1")])
+        self.assertEqual(st.thumbnail, "https://a/p.png")
+        self.assertEqual(st.credits, 30)
+        self.assertIsNone(st.error)
+
+    def test_succeeded_missing_format_is_error(self):
+        with self.assertRaises(meshy.MeshyInput):
+            meshy.parse_task(self.OK, ["glb", "usdz"])
+
+    def test_failed(self):
+        st = meshy.parse_task({"status": "FAILED", "progress": 30,
+                               "task_error": {"message": "bad image"}}, ["glb"])
+        self.assertEqual(st.status, "FAILED")
+        self.assertEqual(st.error, "bad image")
+        self.assertEqual(st.downloads, [])
+
+    def test_pending(self):
+        st = meshy.parse_task({"status": "PENDING", "progress": 0, "preceding_tasks": 3}, ["glb"])
+        self.assertEqual(st.status, "PENDING")
+        self.assertEqual(st.downloads, [])
+        self.assertIsNone(st.error)
+
+
+class TestRequestSummary(unittest.TestCase):
+    def test_images_replaced(self):
+        body = meshy.build_request(_cand("multi-image-to-3d"), {"input_name": "n"},
+                                   {"input_image_front": PNG, "input_image_back": JPG})
+        s = meshy.request_summary(body)
+        self.assertEqual(s["name"], "n")
+        self.assertEqual(s["image_urls"], [f"<{len(PNG)} bytes>", f"<{len(JPG)} bytes>"])
+        self.assertNotIn("data:", str(s))
+
+
+class TestDefaultCandidate(unittest.TestCase):
+    def test_shape(self):
+        c = meshy.default_candidate("meshy-cloud")
+        self.assertEqual(c["backend"], "meshy-cloud")
+        self.assertEqual(c["task"], "img2mesh")
+        self.assertEqual(c["model"], "latest")
+        self.assertEqual(c["meshy"]["endpoint"], "image-to-3d")
+        self.assertEqual(c["meshy"]["options"], meshy.OPTION_DEFAULTS)
+
+
+if __name__ == "__main__":
+    unittest.main()
