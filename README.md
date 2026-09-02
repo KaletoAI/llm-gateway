@@ -23,7 +23,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
-- [Media generation](#media-generation) — ComfyUI image/video/audio, aliases, mapping, LoRA, jobs
+- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai cloud meshes, aliases, mapping, LoRA, jobs
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
 - [Endpoint reference](#endpoint-reference)
@@ -565,7 +565,9 @@ respect.
 
 ## Media generation
 
-A ComfyUI backend speaks a different protocol, so it declares `type: comfyui`.
+Generation runs on two backend types: **`type: comfyui`** — a ComfyUI server on
+your own GPU — and **`type: meshy`**, the Meshy.ai cloud (further down). A ComfyUI
+backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
 dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
 artifacts it produced — **image, video (e.g. SaveVideo), or audio** — with each
@@ -608,6 +610,51 @@ restarts the service via the **ComfyUI-Manager** reboot endpoint (requires the
 Manager extension and a systemd unit with `Restart=always`); auto-restart fires
 at most once per `restart_cooldown_s` (default 600 s). A GPU that fell off the
 bus needs a host reboot instead — the backend then simply stays down.
+
+### Meshy.ai (cloud mesh generation)
+
+A Meshy backend (`type: meshy`, <https://docs.meshy.ai>) serves **image → 3D** and
+**multi-image → 3D** through the same `POST /v1/generations` API as a ComfyUI mesh
+alias — same `input_*` labels, same image slots, same job endpoints. It is always a
+**paid** backend: the scheduler reaches for it only when no unpaid backend is free.
+
+```yaml
+backends:
+  - name: meshy
+    type: meshy
+    url: https://api.meshy.ai
+    api_key: msy_…              # Meshy dashboard → API
+    max_concurrent: 4           # keep it ≤ your tier's concurrent-task limit (Pro: 10)
+    # poll_interval: 5          # seconds between task polls
+    # max_wait: 900             # cap for one task incl. Meshy's own queue
+    # disconnect_grace: 30      # unreachability tolerated while polling a task
+```
+
+Register an alias on the Meshy backend in **Mapping › Media** (no workflow JSON) and
+pick the endpoint: `image-to-3d` takes `images.input_image`; `multi-image-to-3d` takes
+`images.input_image_front` (required) plus optional `input_image_back`,
+`input_image_left`, `input_image_right` — the slot names of the Trellis2 multiview
+alias, so a client can switch by changing `model` only. Mesh uploads under `files` are
+refused with a `400` (there is no workflow to bind them to).
+
+Client params: `input_name`, `input_face_num`, `input_texture_resolution` (pixels →
+2k/4k/8k), `input_texture_prompt`, `input_pose` (`a-pose`/`t-pose`);
+`input_remove_background` and `input_no_fingers` are accepted and ignored.
+`input_face_num` carries **no default** — sent, it becomes Meshy's `target_polycount`
+**and turns the remesh pass on** for that request; left out, Meshy's own per-model
+default decides the face count. Textures, PBR, texture resolution, topology, ultra
+mode, delivered formats and the preview thumbnail are alias defaults set by the admin.
+
+The job records what was sent (`meta.request`), the Meshy task id and
+`consumed_credits`; `/health` and the Backends tab show the credit balance together
+with the age of that reading (`credits 120 (3m ago)`) and the same rolling fail-rate
+the ComfyUI backends carry — a balance of 0 takes the backend **down** with that
+reason. A failed Meshy task is final (Meshy refunds the credits); `402` (out of
+credits) and `429` (tier's concurrent-task limit) fail over to the next candidate.
+While a task is polled, a persistent `4xx` (three in a row, `429` excepted) fails the
+job with that status named, while transport errors, `5xx` and `429` are tolerated for
+`disconnect_grace` seconds (default 30) and then fail over. Cancelling stops the
+gateway's job only — Meshy finishes the task and bills it.
 
 ### Generation aliases + mapping
 
@@ -755,10 +802,10 @@ locked). Tabs:
 |---|---|
 | **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
 | **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
-| **Backends** | add/edit/remove backends (LLM + ComfyUI), incl. the `paid` cost tier |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy), incl. the `paid` cost tier |
 | **Input** | what clients can call — chat aliases, generation models, endpoints |
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
-| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values; chat-alias editor (per-alias `park_s` + reasoning default) |
+| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a Meshy alias needs no workflow — endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL), plus the media requests that were refused before they became a job |
@@ -874,7 +921,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 | `GET` | `/v1/jobs/{id}` | job status + results |
 | `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |
 | `GET` | `/v1/jobs/{id}/input/{n}` | a stored reference image (owner-gated) |
-| `POST` | `/v1/jobs/{id}/cancel` | cancel a queued/running job (interrupts ComfyUI) |
+| `POST` | `/v1/jobs/{id}/cancel` | cancel a queued/running job (interrupts ComfyUI; a Meshy task keeps running and is billed) |
 
 ### Other
 

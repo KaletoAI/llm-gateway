@@ -170,6 +170,35 @@ virtual_models:
 #     max_concurrent: 1               # one generation at a time on this GPU
 #     poll_interval: 1.0
 #     max_wait: 600
+#
+# Meshy.ai is the second generation backend type: a cloud task API (image → 3D and
+# multi-image → 3D), billed per task in credits, so it is ALWAYS paid — the scheduler
+# reaches for it only when no unpaid backend is free. Its knobs:
+#   poll_interval     → seconds between task polls (default 5)
+#   max_wait          → cap for ONE task incl. Meshy's own queue (default 900)
+#   disconnect_grace  → seconds of continuous unreachability / 5xx / 429 tolerated
+#                       while polling before failing over (default 30). A persistent
+#                       4xx (three in a row, 429 excepted) fails the job outright.
+#
+#   - name: meshy
+#     type: meshy
+#     url: https://api.meshy.ai
+#     api_key: msy_...
+#     max_concurrent: 4               # keep it <= your Meshy tier's concurrent-task
+#                                     # limit (Pro: 10) — beyond it Meshy answers 429
+#     poll_interval: 5
+#     max_wait: 900
+#
+# A Meshy alias carries no workflow — endpoint + admin option defaults instead
+# (edit them in the console; the option keys are meshy.OPTION_DEFAULTS):
+#   "Meshy-Multiview":
+#     - backend: meshy
+#       task: img2mesh
+#       model: latest                 # ai_model: latest | meshy-7 | meshy-6 | meshy-5
+#       meshy:
+#         endpoint: multi-image-to-3d # or image-to-3d (images.input_image)
+#         options: {should_texture: true, enable_pbr: false, texture_resolution: "2k",
+#                   topology: triangle, target_formats: [glb], thumbnail: true}
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
 # maps to a list of candidates (the fastest free unpaid one is used;
