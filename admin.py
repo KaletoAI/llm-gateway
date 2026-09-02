@@ -3073,7 +3073,9 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
               "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
               "level, <code>meshy</code> is only tagged (Meshy rigs to its own conventions). Requires "
               "<code>glb</code> in <b>deliver formats</b> — the job is refused up front otherwise, before "
-              "credits are spent.</p>"
+              "credits are spent. Any OTHER format in <b>deliver formats</b> is wasted on a chained "
+              "alias: Meshy bills every one of them, but only the successor's result (plus what "
+              "<b>keep from this stage</b> matches) is delivered — the rest is discarded.</p>"
             + '<h2 style="margin-top:18px">Request fields</h2>'
             + "<p class='hint'>Fixed for Meshy aliases — what <code>GET /v1/generations/{alias}/schema</code> "
               "advertises. <code>input_remove_background</code> / <code>input_no_fingers</code> are accepted "

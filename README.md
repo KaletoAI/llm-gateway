@@ -835,7 +835,8 @@ which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
   other file input (a mesh to shrink/rig). A `files` entry is uploaded into the
   input dir of whichever backend runs the job — after parking and across
   failover — and the param gets that file's absolute path, so a client never
-  needs a path on a backend. The bytes are not kept as a job input.
+  needs a path on a backend; on a cloud backend (Meshy) it rides in the request
+  instead (embedded as a `model_url` data URI), so no path exists. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`.
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:

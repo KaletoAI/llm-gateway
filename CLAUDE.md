@@ -216,7 +216,11 @@ hot-reload-safe.
   TASK (3 in a row → final `RuntimeError` naming the status) while transport errors,
   5xx and 429 are about the SERVICE and get `disconnect_grace` seconds (default 30,
   same key as ComfyUI) of CONTINUOUS failure before the failover-class error — a
-  poll-rate 429 must not end a task that is running and already paid for.
+  poll-rate 429 must not end a task that is running and already paid for. A
+  standalone rigging job tags its own meta `rig: "meshy"` (a CHAIN's `rig` comes from
+  the successor config instead), so a rigged delivery is recognisable by that field on
+  either path; `normalize_delivery`/`validate_delivery` never run for `meshy` — the
+  cloud rigs to its own conventions, so the files ship exactly as they arrive.
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**

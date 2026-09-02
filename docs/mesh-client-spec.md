@@ -60,7 +60,7 @@ Eingangs-Mesh alternativ als Backend-Pfad in `params` genannt werden kann (siehe
 {
   "job_id": "…", "status": "queued|running|done|failed",
   "alias": "…", "backend": "…", "error": null,
-  "rig": "generic|mixamo|meshy",        // nur bei Rigging-Ketten (siehe 3.1)
+  "rig": "generic|mixamo|meshy",        // bei Rigging-Ketten und bei Meshy-Rig (siehe 3.1)
   "warnings": ["x.glb is 41 MB (> 30 MB guideline)"],
   "results": [
     {"n": 0, "name": "Held_articulationxl.fbx",   "mime": "application/octet-stream", "kind": "file",  "sha256": "…", "url": "…/result/0"},
@@ -158,9 +158,9 @@ und validiert sie nicht — kein V-Flip, keine JPEG-Umkodierung, keine Paar-Prü
 Meshy riggt nach eigenen Konventionen; die Dateien so speichern, wie sie kommen. Die
 Clips sind eine Zugabe, kein garantierter Bestandteil: liefert Meshy einen Clip nicht,
 fehlt er kommentarlos (das Rig-Mesh selbst fehlt nie — dafür scheitert der Job).
-`rig` setzt das Gateway bei **Ketten**-Ergebnissen (und bei Aliasen, die ihre
-Rig-Variante selbst melden); ein Direktaufruf von `Meshy-Rig` (3.5) liefert dieselben
-Dateien, aber kein `rig`-Feld — dort ist `rigged.glb` das Erkennungsmerkmal.
+`rig` setzt das Gateway bei **Ketten**-Ergebnissen (dort nennt es die Rig-Variante
+der Kette) **und** bei einem direkten `Meshy-Rig`-Job (3.5) — dort immer `meshy`. Ein
+Rigging-Ergebnis ist also am `rig`-Feld erkennbar, egal auf welchem Weg es entstand.
 
 ### 3.2 `img2mesh`-Familien
 
