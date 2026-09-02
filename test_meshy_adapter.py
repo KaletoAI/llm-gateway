@@ -3,6 +3,7 @@ run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_meshy_adapt
 import asyncio
 import json
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -18,6 +19,7 @@ GLB = b"glTF" + b"\x00" * 60
 class _Stub(BaseHTTPRequestHandler):
     """Scripted Meshy: POST → id; GET polls walk `script`; assets under /asset/<fmt>."""
     script: list = []          # task objects returned by successive GETs (last one repeats)
+    poll_status = 200          # status a task poll answers with (non-200 → error body)
     post_status = 200
     posted: list = []
     balance = 120
@@ -44,6 +46,8 @@ class _Stub(BaseHTTPRequestHandler):
             self.end_headers()
             return self.wfile.write(GLB)
         if self.path.startswith("/openapi/v1/"):
+            if _Stub.poll_status != 200:
+                return self._json(_Stub.poll_status, {"message": "task not found"})
             t = _Stub.script.pop(0) if len(_Stub.script) > 1 else _Stub.script[0]
             return self._json(200, t)
         self._json(404, {"message": "nope"})
@@ -80,18 +84,21 @@ class TestMeshyAdapter(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()
 
     def setUp(self):
         _Stub.script, _Stub.posted, _Stub.seen_auth = [], [], []
-        _Stub.post_status, _Stub.balance = 200, 120
+        _Stub.post_status, _Stub.poll_status, _Stub.balance = 200, 200, 120
         self.ctx, self.counts = _ctx()
         self.backend = {"name": "meshy", "type": "meshy", "url": self.url, "api_key": "msy_test",
                         "poll_interval": 0.01, "max_wait": 2}
         self.ad = adapters.MeshyAdapter(self.backend, self.ctx)
 
-    def _req(self, images=None, values=None, endpoint="image-to-3d"):
+    def _req(self, images=None, values=None, endpoint="image-to-3d", formats=None):
         cand = meshy.default_candidate("meshy")
         cand["meshy"]["endpoint"] = endpoint
+        if formats:
+            cand["meshy"]["options"]["target_formats"] = list(formats)
         return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest", task="img2mesh",
                                           params=dict(values or {}), upload_images=dict(images or {}),
                                           meshy=cand["meshy"], upload_prefix="gw_j1")
@@ -163,6 +170,35 @@ class TestMeshyAdapter(unittest.TestCase):
         _Stub.script = [_task("IN_PROGRESS")]
         self.backend["max_wait"] = 0.05
         with self.assertRaises(TimeoutError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIn("task-1", str(cm.exception))
+
+    def test_every_model_format_is_a_file_blob(self):
+        urls = {f: f"{self.url}/asset/{f}" for f in ("glb", "usdz", "3mf")}
+        _Stub.script = [_task("SUCCEEDED", model_urls=urls)]
+        out = self._run(self.ad.generate(
+            self._req({"input_image": PNG}, formats=["glb", "usdz", "3mf"])))
+        self.assertEqual([b.name for b in out.blobs], ["model.glb", "model.usdz", "model.3mf"])
+        self.assertEqual({b.kind for b in out.blobs}, {"file"})
+        self.assertNotIn("image", [b.mime.split("/")[0] for b in out.blobs])
+
+    def test_persistent_4xx_poll_is_final_and_fast(self):
+        _Stub.script = [_task("IN_PROGRESS")]
+        _Stub.poll_status = 404
+        self.backend["max_wait"] = 5
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertLess(time.monotonic() - started, 1.0)      # not polled out to max_wait
+        self.assertIn("404", str(cm.exception))
+        self.assertIn("task-1", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+
+    def test_persistent_5xx_poll_fails_over_after_grace(self):
+        _Stub.script = [_task("IN_PROGRESS")]
+        _Stub.poll_status = 503
+        self.backend["disconnect_grace"] = 0.05
+        with self.assertRaises(ConnectionError) as cm:
             self._run(self.ad.generate(self._req({"input_image": PNG})))
         self.assertIn("task-1", str(cm.exception))
 

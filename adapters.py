@@ -1065,6 +1065,10 @@ _MIME_BY_EXT = {
     ".glb": ("model/gltf-binary", "file"), ".gltf": ("model/gltf+json", "file"),
     ".obj": ("model/obj", "file"), ".fbx": ("application/octet-stream", "file"),
     ".ply": ("application/octet-stream", "file"), ".stl": ("model/stl", "file"),
+    # Meshy target formats beyond the ComfyUI set — without them a delivered mesh
+    # falls through to the ("application/octet-stream", "image") default and would be
+    # stored/rendered as an IMAGE.
+    ".usdz": ("model/vnd.usdz+zip", "file"), ".3mf": ("model/3mf", "file"),
 }
 
 
@@ -3001,15 +3005,42 @@ class MeshyAdapter(BackendAdapter):
         })
 
     async def _poll(self, client, endpoint, task_id, formats, poll_interval, max_wait) -> "meshy.TaskState":
+        # A poll that answers is not proof the task is running. A revoked key (401) or a
+        # task that is gone (404) would otherwise be reported as a max_wait TimeoutError —
+        # the wrong cause, AND only after holding the in-flight slot for the full wait.
+        # So: a 4xx is a verdict about the TASK (three in a row, so one edge hiccup does
+        # not end a job) → final RuntimeError; transport errors and 5xx are about the
+        # SERVICE and get `disconnect_grace` seconds of CONTINUOUS failure before the
+        # failover-class ConnectionError — same key and default as ComfyUIAdapter._poll.
+        # Any 200 resets both counters: only an unbroken run of failures means anything.
+        grace = float(self.backend.get("disconnect_grace", 30))
         deadline = time.monotonic() + max_wait
+        client_errs, gone_since = 0, None
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
             try:
                 r = await client.get(self._api(f"/{endpoint}/{task_id}"), headers=self._headers())
-            except httpx.HTTPError:
-                continue                            # one failed poll is not a verdict
-            if r.status_code != 200:
+            except httpx.HTTPError as e:            # one failed poll is not a verdict
+                gone_since = gone_since or time.monotonic()
+                if time.monotonic() - gone_since > grace:
+                    raise ConnectionError(
+                        f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
+                        f": {type(e).__name__}: {e}")
                 continue
+            if 400 <= r.status_code < 500:
+                client_errs += 1
+                if client_errs >= 3:
+                    raise RuntimeError(f"Meshy task {task_id}: poll answered "
+                                       f"{r.status_code} — {_meshy_msg(r)}")
+                continue
+            if r.status_code != 200:                # 5xx — the service, not this task
+                gone_since = gone_since or time.monotonic()
+                if time.monotonic() - gone_since > grace:
+                    raise ConnectionError(
+                        f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
+                        f": HTTP {r.status_code}")
+                continue
+            client_errs, gone_since = 0, None
             state = meshy.parse_task(r.json() or {}, formats)     # MeshyInput → final
             if state.status in ("FAILED", "CANCELED"):
                 raise RuntimeError(f"Meshy task {task_id} {state.status.lower()}: {state.error}")
