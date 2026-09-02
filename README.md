@@ -642,10 +642,15 @@ is the endpoint that takes a file, see below.
 Client params: `input_name`, `input_face_num`, `input_texture_resolution` (pixels →
 2k/4k/8k), `input_texture_prompt`, `input_pose` (`a-pose`/`t-pose`);
 `input_remove_background` and `input_no_fingers` are accepted and ignored.
-`input_face_num` carries **no default** — sent, it becomes Meshy's `target_polycount`
-**and turns the remesh pass on** for that request; left out, Meshy's own per-model
-default decides the face count. Textures, PBR, texture resolution, topology, ultra
-mode, delivered formats and the preview thumbnail are alias defaults set by the admin.
+`input_face_num` becomes Meshy's `target_polycount` **and turns the remesh pass on**
+for that request. Its default is the alias's **target polycount** option (100–300000,
+blank = none): set, it is applied to every request that omits the label (and shows up
+as the param's `default` in the schema); blank, Meshy's own per-model default decides
+the face count. Set it on any alias that **chains into a rigger** — Meshy's rigging
+endpoint refuses a mesh above 300k faces, and a no-remesh humanoid came back at 70 MB
+(measured 2026-09-02), which the hand-off then has to push through as base64. Textures,
+PBR, texture resolution, topology, ultra mode, delivered formats and the preview
+thumbnail are alias defaults set by the admin too.
 
 The job records what was sent (`meta.request`), the Meshy task id and
 `consumed_credits`; `/health` and the Backends tab show the credit balance together

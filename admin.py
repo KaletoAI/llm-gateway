@@ -3219,6 +3219,16 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                                        [("", "model default"), ("true", "always"), ("false", "never")], remesh))
             + "<p class='hint' style='margin:-4px 0 10px'>A client <code>input_face_num</code> always turns "
               "remesh on for that request (a polycount needs the remesh pass).</p>"
+            + _field("target polycount", _inp("opt__target_polycount",
+                                              "" if opts.get("target_polycount") is None
+                                              else str(opts["target_polycount"]),
+                                              placeholder="blank = Meshy default / no remesh",
+                                              typ="number"), short=True)
+            + "<p class='hint' style='margin:-4px 0 10px'>Face budget applied when the client sends no "
+              "<code>input_face_num</code> (100–300000; turns remesh on). A client value still wins. "
+              "An alias that <b>chains into a rigger</b> should stay ≤ 300000: Meshy's rigging endpoint "
+              "refuses more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02), "
+              "which is a mesh the hand-off then has to push through as base64.</p>"
             + _field("pose", _select("opt__pose_mode", [(p, p or "none") for p in meshy.POSES],
                                      opts.get("pose_mode") or ""))
             + _field("input", cb("image_enhancement", "image_enhancement") + cb("remove_lighting", "remove_lighting")
@@ -3792,6 +3802,9 @@ async def meshy_update(request: Request):
     opts["should_remesh"] = {"true": True, "false": False}.get((f.get("opt__should_remesh", "") or "").strip())
     pm = (f.get("opt__pose_mode", "") or "").strip()
     opts["pose_mode"] = pm if pm in meshy.POSES else ""
+    # blank or garbage → None (Meshy's default, no remesh); meshy.opt_polycount owns
+    # the range check, so the editor and the request builder cannot drift apart.
+    opts["target_polycount"] = meshy.opt_polycount((f.get("opt__target_polycount", "") or "").strip())
     opts["target_formats"] = [x for x in meshy.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
     task = (f.get("task", "") or "").strip()
     retries = (f.get("retries", "") or "").strip()

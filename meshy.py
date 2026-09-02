@@ -30,6 +30,12 @@ OPTION_DEFAULTS: dict = {
     "topology": "triangle", "should_remesh": None,          # None = Meshy's per-model default
     "ultra_mode": False, "pose_mode": "", "image_enhancement": True,
     "remove_lighting": True, "moderation": False,
+    # Admin face budget: None = don't ask for one (Meshy's per-model default, i.e. no
+    # remesh). Measured 2026-09-02 on prod: a humanoid generated WITHOUT a polycount
+    # came back at 70 MB, which then blew up the chain's rigging hand-off — and Meshy's
+    # rigging endpoint refuses more than 300k faces anyway. So a chained alias needs a
+    # cap even when the client sends no `input_face_num`. Set → also forces should_remesh.
+    "target_polycount": None,
     "target_formats": ["glb"], "thumbnail": True,
     "animations": False,            # rigging: also deliver Meshy's walking/running clips
 }
@@ -79,7 +85,24 @@ def options_of(cand: dict) -> dict:
         out["target_formats"] = [f for f in out["target_formats"] if f in RIG_FORMATS] or ["glb"]
     if out["texture_resolution"] not in TEXTURE_RES:
         out["texture_resolution"] = "2k"
+    out["target_polycount"] = opt_polycount(out.get("target_polycount"))
     return out
+
+
+def opt_polycount(v) -> Optional[int]:
+    """The admin `target_polycount` option, validated: an int in [100, 300000] or None.
+
+    Deliberately NOT clamped the way the client's `input_face_num` is: a stored option
+    is admin input that Save already vetted, so a value outside the range here means the
+    stored candidate is broken — ignoring it (falling back to Meshy's default) is honest,
+    silently rewriting an admin's number to 300000 is not."""
+    if v is None or v == "":
+        return None
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return None
+    return n if _POLY_MIN <= n <= _POLY_MAX else None
 
 
 def default_candidate(backend: str) -> dict:
@@ -176,6 +199,13 @@ def build_request(cand: dict, values: dict, images: dict, files: Optional[dict] 
     body["texture_resolution"] = opts["texture_resolution"]
     if opts.get("pose_mode"):
         body["pose_mode"] = opts["pose_mode"]
+    if opts.get("target_polycount") is not None:
+        # Admin face budget — applied BEFORE the client block on purpose: a client
+        # `input_face_num` below overwrites both keys, so the option is a DEFAULT, not a
+        # pin. Forces the remesh pass, same as the client label (a polycount without one
+        # is silently ignored by Meshy).
+        body["target_polycount"] = opts["target_polycount"]
+        body["should_remesh"] = True
     # ── client-settable labels ──
     name = values.get("input_name")
     if name not in (None, ""):
@@ -237,11 +267,13 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
                 images, files)
     params = [
         {"name": "input_name", "type": "string", "default": ""},
-        # No `default`: build_request sets target_polycount ONLY when the client sends
-        # this label, and doing so also forces should_remesh — advertising a default
-        # would promise a value the request builder never applies. Left out, Meshy's
-        # own per-model default decides.
-        {"name": "input_face_num", "type": "int"},
+        # A `default` ONLY when the admin option is set: build_request then really does
+        # apply that polycount (plus should_remesh) to a request that omits the label, so
+        # the schema may say so. With the option blank nothing is applied — Meshy's own
+        # per-model default decides — and advertising any number would be a promise the
+        # request builder never keeps.
+        {"name": "input_face_num", "type": "int",
+         **({"default": opts["target_polycount"]} if opts.get("target_polycount") is not None else {})},
         {"name": "input_texture_resolution", "type": "int", "default": _RES_PX[opts["texture_resolution"]]},
         {"name": "input_texture_prompt", "type": "string", "default": ""},
         {"name": "input_pose", "type": "string", "default": opts.get("pose_mode") or "",

@@ -62,6 +62,32 @@ class TestBuildRequestSingle(unittest.TestCase):
         self.assertEqual(lo["target_polycount"], 100)
         self.assertEqual(hi["target_polycount"], 300000)
 
+    def test_admin_target_polycount_applies_without_a_client_value(self):
+        """The admin face budget is what keeps a CHAINED alias shippable: measured
+        2026-09-02, a no-remesh humanoid came back at 70 MB and the rigging hand-off
+        died on it (and Meshy's rigger refuses >300k faces anyway)."""
+        body = meshy.build_request(_cand(target_polycount=150000), {}, {"input_image": PNG})
+        self.assertEqual(body["target_polycount"], 150000)
+        self.assertTrue(body["should_remesh"])      # a polycount is inert without the pass
+
+    def test_client_face_num_beats_the_admin_option(self):
+        body = meshy.build_request(_cand(target_polycount=150000),
+                                   {"input_face_num": 20000}, {"input_image": PNG})
+        self.assertEqual(body["target_polycount"], 20000)
+        self.assertTrue(body["should_remesh"])
+
+    def test_out_of_range_admin_option_is_ignored(self):
+        for bad in (5, 400000, "abc", "", None):
+            body = meshy.build_request(_cand(target_polycount=bad), {}, {"input_image": PNG})
+            self.assertNotIn("target_polycount", body, f"option {bad!r} leaked")
+
+    def test_options_of_coerces_target_polycount(self):
+        self.assertEqual(meshy.options_of(_cand(target_polycount="20000"))["target_polycount"], 20000)
+        self.assertIsNone(meshy.options_of(_cand())["target_polycount"])
+        self.assertIsNone(meshy.options_of(_cand(target_polycount=99))["target_polycount"])
+        self.assertIsNone(meshy.options_of(_cand(target_polycount=300001))["target_polycount"])
+        self.assertEqual(meshy.options_of(_cand(target_polycount=300000))["target_polycount"], 300000)
+
     def test_client_params_and_ignored(self):
         body = meshy.build_request(_cand(), {
             "input_name": "x" * 150, "input_texture_resolution": 4096,
@@ -155,6 +181,16 @@ class TestPublicFields(unittest.TestCase):
         params, _, _ = meshy.public_fields(_cand(texture_resolution="4k"))
         tex = next(p for p in params if p["name"] == "input_texture_resolution")
         self.assertEqual(tex["default"], 4096)
+
+    def test_face_num_default_iff_the_admin_option_is_set(self):
+        """With the option set the schema MAY promise a default — build_request really
+        applies it now. With it blank there is still nothing to promise."""
+        params, _, _ = meshy.public_fields(_cand(target_polycount=150000))
+        face = next(p for p in params if p["name"] == "input_face_num")
+        self.assertEqual(face["default"], 150000)
+        params, _, _ = meshy.public_fields(_cand(target_polycount=400000))   # invalid → ignored
+        face = next(p for p in params if p["name"] == "input_face_num")
+        self.assertNotIn("default", face)
 
 
 class TestParseTask(unittest.TestCase):
