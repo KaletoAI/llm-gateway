@@ -348,12 +348,19 @@ _SORT_JS = ("<script>(function(){"
 
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
           nologin: bool = False, subnav: str = "") -> str:
-    meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
+    # `refresh` no longer reloads the page. It marks <main> as live and _LIVE_JS
+    # polls this same URL and MORPHS the new <main> into the old one — the container
+    # is never replaced, so scroll position, sort order, a half-typed filter, an
+    # open form, playing video and the model-viewer's camera all survive an update.
+    # A response without data-live stops the poller, which is exactly what dropping
+    # the meta tag used to mean.
+    live = f' data-live="{int(refresh)}"' if refresh else ""
     head = "" if nologin else _nav(active)        # login page renders without the nav
     # subnav (see SUBTABS) renders as a second header row — outside <main>, so it
     # never scrolls and sits flush under the tabs.
-    return (f'<!doctype html><html><head><meta charset="utf-8">{meta}<title>{_esc(title)} · Gateway</title>'
-            f"<style>{_CSS}</style></head><body>{head}{subnav}<main>{body}</main>{_SCROLL_JS}{_SORT_JS}</body></html>")
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · Gateway</title>'
+            f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
+            f"{_SCROLL_JS}{_SORT_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
