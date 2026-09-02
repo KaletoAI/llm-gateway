@@ -2463,7 +2463,8 @@ async def register_post(request: Request):
     f = await _multipart(request)
     alias = str(f.get("alias", "")).strip()
     backend = str(f.get("backend", "")).strip()
-    task = (str(f.get("task", "")).strip() or "text2img")
+    picked_task = str(f.get("task", "")).strip()      # "" = field absent (API caller)
+    task = picked_task or "text2img"
     upload = f.get("workflow_file")
     path = str(f.get("workflow_path", "")).strip()
 
@@ -2478,7 +2479,12 @@ async def register_post(request: Request):
     bk = next((b for b in _gen_backends() if b["name"] == backend), None)
     if bk is not None and bk.get("type") == "meshy":
         cand = meshy.default_candidate(backend)
-        cand["task"] = task or "img2mesh"
+        # The task dropdown defaults to `text2img`, which Meshy cannot do at all (it
+        # only turns images into 3D). So the form's untouched default — like a missing
+        # field — keeps default_candidate's `img2mesh`; only a task the user actually
+        # PICKED overrides it. Without this the alias landed in the text2img group.
+        if picked_task and picked_task != "text2img":
+            cand["task"] = picked_task
         store.upsert(alias, [cand])
         logger.info(f"ui: registered '{alias}' -> {backend} (meshy, no workflow)")
         return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
