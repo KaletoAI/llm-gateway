@@ -10,6 +10,7 @@ Covered by test_meshy.py (stdlib unittest).
 from __future__ import annotations
 
 import base64
+import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -73,8 +74,11 @@ def options_of(cand: dict) -> dict:
 
 def default_candidate(backend: str) -> dict:
     """The candidate the console creates when registering an alias on a Meshy backend."""
+    # deepcopy, not dict(): a shallow copy hands every candidate the SAME
+    # `target_formats` list object as the module constant, so one in-place edit on a
+    # stored candidate would rewrite the default for every future alias.
     return {"backend": backend, "task": "img2mesh", "model": "latest",
-            "meshy": {"endpoint": ENDPOINTS[0], "options": dict(OPTION_DEFAULTS)}}
+            "meshy": {"endpoint": ENDPOINTS[0], "options": copy.deepcopy(OPTION_DEFAULTS)}}
 
 
 def texture_res(px) -> str:
@@ -181,7 +185,11 @@ def public_fields(cand: dict) -> tuple[list, list]:
               for i, s in enumerate(SLOTS[ep])]
     params = [
         {"name": "input_name", "type": "string", "default": ""},
-        {"name": "input_face_num", "type": "int", "default": 30000},
+        # No `default`: build_request sets target_polycount ONLY when the client sends
+        # this label, and doing so also forces should_remesh — advertising a default
+        # would promise a value the request builder never applies. Left out, Meshy's
+        # own per-model default decides.
+        {"name": "input_face_num", "type": "int"},
         {"name": "input_texture_resolution", "type": "int", "default": _RES_PX[opts["texture_resolution"]]},
         {"name": "input_texture_prompt", "type": "string", "default": ""},
         {"name": "input_pose", "type": "string", "default": opts.get("pose_mode") or "",

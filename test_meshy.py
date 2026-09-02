@@ -138,6 +138,10 @@ class TestPublicFields(unittest.TestCase):
         tex = next(p for p in params if p["name"] == "input_texture_resolution")
         self.assertEqual(tex["default"], 2048)
         self.assertEqual(tex["type"], "int")
+        # no advertised default — build_request never applies one, and sending it
+        # would force should_remesh (see meshy.public_fields)
+        face = next(p for p in params if p["name"] == "input_face_num")
+        self.assertNotIn("default", face)
 
     def test_multi(self):
         _, images = meshy.public_fields(_cand("multi-image-to-3d"))
@@ -200,6 +204,18 @@ class TestDefaultCandidate(unittest.TestCase):
         self.assertEqual(c["model"], "latest")
         self.assertEqual(c["meshy"]["endpoint"], "image-to-3d")
         self.assertEqual(c["meshy"]["options"], meshy.OPTION_DEFAULTS)
+
+    def test_options_are_a_deep_copy(self):
+        """A stored candidate must not share the module constant's nested list —
+        one in-place edit would otherwise rewrite the default for every alias."""
+        c = meshy.default_candidate("meshy-cloud")
+        c["meshy"]["options"]["target_formats"].append("fbx")
+        c["meshy"]["options"]["texture_resolution"] = "8k"
+        self.assertEqual(meshy.OPTION_DEFAULTS["target_formats"], ["glb"])
+        self.assertEqual(meshy.OPTION_DEFAULTS["texture_resolution"], "2k")
+        fresh = meshy.default_candidate("meshy-cloud")
+        self.assertEqual(fresh["meshy"]["options"]["target_formats"], ["glb"])
+        self.assertEqual(fresh["meshy"]["options"], meshy.OPTION_DEFAULTS)
 
 
 if __name__ == "__main__":
