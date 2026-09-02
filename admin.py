@@ -401,6 +401,14 @@ _SORT_JS = ("<script>(function(){"
 # focused or dirty, media whose src is unchanged, and <details open> (user state the
 # server knows nothing about). A response without data-live stops the poller — the
 # same signal the meta tag's absence used to carry.
+# The <script> rule cuts BOTH ways, and the second way bites: `adopt()` also drops a
+# script it would otherwise INSERT, so markup that only appears in a LATER state of a
+# live page arrives without its script and silently never initialises (a <model-viewer>
+# that never upgrades, a viewer div that stays black), and data-live is usually gone in
+# that same response, so the poller stops and it cannot self-heal. Hence the invariant
+# every live page owes: it must ALREADY contain every <script> any later state of it
+# can render — hoist them (see job_detail_page, _playground_body) and, where the script
+# has to act on nodes that arrive later, register the action in window.gwLiveHooks.
 _LIVE_JS = ("<script>(function(){"
             "var main=document.querySelector('main');"
             "if(!main)return;"
@@ -4227,14 +4235,22 @@ async def jobs_page(request: Request):
 
 # three.js FBX preview: the generic (UniRig) result is an FBX whose texture is only
 # a dead temp-path reference, so the sibling basecolor PNG is applied as the material
-# map. Import map + module init emitted ONCE per page (see _job_thumbs). All bundled
-# locally under /ui/static/three (no CDN).
+# map. Import map + module init emitted ONCE per page, HOISTED by the page that can
+# ever show an FBX (job_detail_page) rather than appended next to the viewer div:
+# _LIVE_JS strips every <script> out of a subtree it morphs in, so a block that only
+# arrives WITH the finished artifact never executes (see the invariant in _page).
+# All bundled locally under /ui/static/three (no CDN).
+# The scan is a named global and a post-morph hook, because hoisting alone only gets
+# the code onto the page: the module body runs once at load, when a still-running job
+# has no `.fbxview` at all. Each morph that brings one in re-runs gwFbxScan, which
+# picks up exactly the ones not yet initialised.
 _FBX_VIEWER_JS = (
     '<script type="importmap">{"imports":{"three":"/ui/static/three/three.module.min.js"}}</script>'
     '<script type="module">'
     "import * as THREE from 'three';"
     "import { FBXLoader } from '/ui/static/three/jsm/loaders/FBXLoader.js';"
     "import { OrbitControls } from '/ui/static/three/jsm/controls/OrbitControls.js';"
+    "window.gwFbxScan = function(){"
     "document.querySelectorAll('.fbxview:not([data-init])').forEach(function(el){"
     " el.dataset.init='1';"
     " var W=el.clientWidth||480,H=el.clientHeight||420;"
@@ -4256,13 +4272,21 @@ _FBX_VIEWER_JS = (
     " },undefined,function(e){ el.innerHTML='<p style=\"padding:14px;color:#e89\">FBX-Vorschau fehlgeschlagen</p>'; });"
     " (function loop(){ requestAnimationFrame(loop); ct.update(); rn.render(sc,cam); })();"
     "});"
+    "};"
+    "window.gwFbxScan();"
+    "window.gwLiveHooks = window.gwLiveHooks || [];"
+    "window.gwLiveHooks.push(window.gwFbxScan);"
     '</script>')
 
 
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     """Gallery of artifact thumbnails (kind = 'input'|'result'). Images link to the
     full file; video/audio play inline; GLB → <model-viewer>; FBX → a three.js 3D
-    viewer textured with the sibling basecolor PNG; other files → a download card."""
+    viewer textured with the sibling basecolor PNG; other files → a download card.
+
+    Emits no <script> of its own: both viewers (model-viewer, _FBX_VIEWER_JS) are
+    hoisted by the calling page, because this gallery is exactly the markup a live
+    morph inserts mid-session, and the morph drops scripts it would insert."""
     base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
     style = "max-width:260px;max-height:260px;border:1px solid #313a46;border-radius:8px"
     box3d = "width:720px;max-width:100%;height:640px"
@@ -4275,7 +4299,7 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
                 tex_url = u
                 break
             tex_url = tex_url or u
-    cells, has_fbx = "", False
+    cells = ""
     for r in entries:
         src = f"{base}{r['n']}"
         m, mk = (r.get("mime") or "").lower(), (r.get("kind") or "").lower()
@@ -4292,17 +4316,19 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}{stats}"
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
-            has_fbx = True
             tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
-            cells += (f'<div><div class="fbxview" data-src="{_esc(src)}"{tex_attr} '
+            # data-live-skip: the server renders this div EMPTY and gwFbxScan fills it
+            # client-side (data-init + a three.js canvas). A morph would strip both back
+            # out — the attribute is not in the server's markup and the canvas is not in
+            # its children — and the viewer would go black with nothing in any log.
+            cells += (f'<div><div class="fbxview" data-live-skip data-src="{_esc(src)}"{tex_attr} '
                       f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif mk == "file":                                # other file artifacts → download card
             cells += _dl_card(src, label, dl=dl, mime=(r.get("mime") or "file"))
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
-    out = f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
-    return out + _FBX_VIEWER_JS if has_fbx else out
+    return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
 
 
 def _stage2_section(s2: dict) -> str:
@@ -4483,7 +4509,17 @@ async def job_detail_page(job_id: str, request: Request):
     newer, older = jobs.neighbors(job_id)
     nav = ((_btn("‹ Prev", f"/ui/job/{_esc(newer)}", "secondary", title="Newer job") if newer else "")
            + (_btn("Next ›", f"/ui/job/{_esc(older)}", "secondary", title="Older job") if older else ""))
-    page = (f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
+    # Both 3D viewers are hoisted UNCONDITIONALLY, exactly as _playground_body hoists
+    # model-viewer: this page is live while the job runs, and _LIVE_JS strips every
+    # <script> out of the subtree it morphs in. A GLB or FBX that only appears when the
+    # job finishes would otherwise arrive without its viewer — an un-upgraded custom
+    # element or an uninitialised div, i.e. a permanently black box, and `data-live`
+    # vanishes in that same response so the poller stops and it never self-heals.
+    # Custom elements upgrade on their own once model-viewer is defined; the FBX side
+    # needs the gwFbxScan hook on top (the module body runs when there is nothing to
+    # scan yet). Both files are local static and browser-cached.
+    page = (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>{_FBX_VIEWER_JS}'
+            f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
             f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(job))}</span></h2>"
             f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"

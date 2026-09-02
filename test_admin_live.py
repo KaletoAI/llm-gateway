@@ -1,11 +1,17 @@
 """The console's live-update contract.
 
-Two failure modes are silent, which is why they are tested here rather than
+Three failure modes are silent, which is why they are tested here rather than
 eyeballed: a `_page()` that stops emitting `data-live` leaves every auto-updating
-view frozen with no error anywhere, and a syntax error inside one of the JS blobs
+view frozen with no error anywhere; a syntax error inside one of the JS blobs
 embedded as a Python string simply means the script never runs — the page renders
-fine and nothing in the log says otherwise.
+fine and nothing in the log says otherwise; and a live page whose LATER state
+introduces a `<script>` loses it to the morph (`adopt()` strips scripts out of
+everything it inserts), so the markup that script was to animate arrives inert —
+an un-upgraded custom element, an empty viewer div — while `data-live` disappears
+in the same response, stopping the poller so it never self-heals.
 """
+import asyncio
+import os
 import re
 import shutil
 import subprocess
@@ -73,6 +79,24 @@ class EmbeddedScriptsParse(unittest.TestCase):
                 p = subprocess.run(["node", "--check", path],
                                    capture_output=True, text=True)
                 self.assertEqual(p.returncode, 0, f"{name} is not valid JS:\n{p.stderr}")
+
+    def test_fbx_viewer_module_is_valid(self):
+        # A `type="module"` block, so it is checked as .mjs — `node --check` rejects
+        # `import` in a plain .js file for reasons that say nothing about our code.
+        # Checked at all because this blob grew a named function and a hook push, and a
+        # broken module fails exactly like a missing one: an empty black viewer box.
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        blocks = re.findall(r'<script type="module">(.*?)</script>',
+                            admin._FBX_VIEWER_JS, re.S)
+        self.assertEqual(len(blocks), 1, "expected one module block in _FBX_VIEWER_JS")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fbx.mjs")
+            with open(path, "w") as fh:
+                fh.write(blocks[0])
+            p = subprocess.run(["node", "--check", path], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0,
+                             f"_FBX_VIEWER_JS is not valid JS:\n{p.stderr}")
 
 
 class LiveScriptPresence(unittest.TestCase):
@@ -194,6 +218,140 @@ class LiveIdentity(unittest.TestCase):
         # post-morph hook wires it — before this branch a refresh was a reload and
         # re-bound everything, so an unwired table is a regression, not a gap.
         self.assertIn("__gwWired", admin._SORT_JS)
+
+
+_RUNNING_JOB = {
+    "id": "abc123def4567890", "status": "running", "task": "image", "alias": "mesh",
+    "backend": "comfy-a", "created": 1_799_999_400, "updated": 1_799_999_460,
+    "owner": "kai", "results": [], "meta": {},
+}
+# The state the running one becomes. Both artifact kinds that need a viewer are here,
+# because they fail differently: the GLB needs a DEFINED custom element (model-viewer),
+# the FBX needs code to RUN over a div the server renders empty.
+_DONE_JOB = dict(_RUNNING_JOB, status="done", results=[
+    {"n": 0, "mime": "model/gltf-binary", "kind": "file", "name": "mesh.glb"},
+    {"n": 1, "mime": "application/octet-stream", "kind": "file", "name": "rigged.fbx"},
+])
+
+
+class LiveScriptInvariant(unittest.TestCase):
+    """A page `_page()` marks live must ALREADY contain every <script> that any later
+    state of that page can render.
+
+    `adopt()` strips <script> from everything the morph inserts — deliberately, so a
+    re-inserted `_JOB_TICK` cannot double its setInterval — which means the rule cuts
+    both ways: a script that first appears in a later response never executes. It fails
+    silently and terminally. The Job detail page is the case that has one (it is live at
+    2 s while the job runs and grows a 3D preview when it finishes), and `data-live`
+    goes away in that same response, so the poller stops and no later tick can repair
+    it — only F5 does, which is precisely what nobody does while watching a job.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "jobs.is_active": admin.jobs.is_active, "jobs.get": admin.jobs.get,
+            "jobs.neighbors": admin.jobs.neighbors,
+            "jobs.result_path": admin.jobs.result_path,
+            "store.is_active": admin.store.is_active,
+        }
+        admin.jobs.is_active = lambda: True
+        admin.jobs.neighbors = lambda jid: (None, None)
+        admin.jobs.result_path = lambda jid, n: None
+        admin.store.is_active = lambda: False   # no alias config → no mapping section
+
+    def tearDown(self):
+        admin.jobs.is_active = self._saved["jobs.is_active"]
+        admin.jobs.get = self._saved["jobs.get"]
+        admin.jobs.neighbors = self._saved["jobs.neighbors"]
+        admin.jobs.result_path = self._saved["jobs.result_path"]
+        admin.store.is_active = self._saved["store.is_active"]
+
+    def _render(self, job):
+        admin.jobs.get = lambda jid: job
+        resp = asyncio.run(admin.job_detail_page(job["id"], None))
+        return resp.body.decode()
+
+    @staticmethod
+    def _script_tags(html):
+        return re.findall(r"<script[^>]*>", html)
+
+    def test_running_job_page_is_live(self):
+        # The premise of everything below. If this ever stops holding, the invariant
+        # tests would pass for the wrong reason.
+        self.assertIn('<main data-live="2">', self._render(_RUNNING_JOB))
+
+    def test_finished_job_page_stops_the_poller(self):
+        # The other half of the trap: the response that brings the viewer markup is
+        # also the one that stops the poller, so a stripped script is never retried.
+        html = self._render(_DONE_JOB)
+        self.assertNotIn("<main data-live", html)
+
+    def test_live_page_already_has_every_script_its_later_state_renders(self):
+        # THE invariant, checked the general way: no <script> opening tag may be new in
+        # the finished page. Catches any future viewer/widget added to a job artifact
+        # without hoisting it, not just today's two.
+        live = self._script_tags(self._render(_RUNNING_JOB))
+        done = self._script_tags(self._render(_DONE_JOB))
+        new = [s for s in done if s not in live]
+        self.assertEqual(new, [], "scripts that only a finished job renders are dropped "
+                                  "by the morph and never run: " + repr(new))
+
+    def test_running_job_page_carries_the_model_viewer_module(self):
+        html = self._render(_RUNNING_JOB)
+        self.assertIn(f'<script type="module" src="{admin._MODELVIEWER_SRC}"></script>', html)
+
+    def test_running_job_page_carries_the_fbx_viewer(self):
+        # Hoisted whole (import map + module), because the module also has to REGISTER
+        # its post-morph hook before the first tick.
+        self.assertIn(admin._FBX_VIEWER_JS, self._render(_RUNNING_JOB))
+
+    def test_finished_job_actually_renders_the_two_viewers(self):
+        # Guards the fixture itself: if _media_tag/_job_thumbs stopped emitting a
+        # <model-viewer> or a .fbxview the invariant test above would go vacuously green.
+        html = self._render(_DONE_JOB)
+        self.assertIn("<model-viewer", html)
+        self.assertIn('class="fbxview"', html)
+
+    def test_fbx_scan_is_a_named_post_morph_hook(self):
+        # Hoisting alone is not enough: the module body runs at load, when a running
+        # job's page has no .fbxview at all. The hook is what initialises the one the
+        # morph brings in.
+        self.assertIn("window.gwFbxScan", admin._FBX_VIEWER_JS)
+        self.assertIn("gwLiveHooks.push", admin._FBX_VIEWER_JS)
+
+    def test_fbx_container_is_skipped_by_the_morph(self):
+        # The server renders this div EMPTY; data-init and the three.js canvas are
+        # client-only, so a later morph would strip both back out.
+        self.assertIn("data-live-skip", self._render(_DONE_JOB))
+
+    def test_job_thumbs_emits_no_script_of_its_own(self):
+        # The gallery IS the subtree the morph inserts. A <script> in here is dead code
+        # by definition — which is how the regression got in.
+        gal = admin._job_thumbs("abc", "result", _DONE_JOB["results"])
+        self.assertNotIn("<script type=\"importmap\"", gal)
+        self.assertNotIn("<script type='importmap'", gal)
+
+
+class PlaygroundScriptInvariant(unittest.TestCase):
+    """The Media Playground is the other live page whose column grows a 3D preview."""
+
+    def setUp(self):
+        self._get = admin.store.get
+        admin.store.get = lambda alias: None    # no store here; the form only needs a shape
+
+    def tearDown(self):
+        admin.store.get = self._get
+
+    def test_playground_hoists_the_model_viewer(self):
+        body = admin._playground_body([], {"model": ""}, None, "<p>x</p>")
+        self.assertIn(f'<script type="module" src="{admin._MODELVIEWER_SRC}"></script>', body)
+
+    def test_playground_never_renders_an_fbx_viewer(self):
+        # Why it needs no gwFbxScan: the playground's result column goes through
+        # _media_tag, which has no .fbxview branch — an FBX there is a download card.
+        # Written as an assertion so the day that changes, this says what to add.
+        self.assertNotIn("fbxview", admin._media_tag("/x.fbx", "application/octet-stream", "file"))
+        self.assertNotIn("fbxview", admin._playground_body([], {"model": ""}, None, "<p>x</p>"))
 
 
 if __name__ == "__main__":
