@@ -3728,15 +3728,22 @@ def _comfy_watch_info(b: dict) -> dict:
 
 
 def _meshy_info(b: dict) -> dict:
-    """Credit balance seen at the last discovery of a Meshy backend (merged into
-    /health + the UI snapshot); {} for every other type."""
+    """Credit balance seen at the last discovery of a Meshy backend, plus the same
+    rolling fail-rate the comfy backends carry (merged into /health + the UI
+    snapshot); {} for every other type. fail_rate is display-only — it never
+    reorders routing."""
     if b.get("type") != "meshy":
         return {}
+    info: dict = {}
+    fs = _gen_fail_stats(backend_id(b))      # same rolling fail-rate as comfy backends
+    if fs:
+        info.update(fs)
     ad = backend_adapters.get(backend_id(b))
     if ad is None:
-        return {}
-    return {"credits": getattr(ad, "credits", None),
-            "credits_at": int(getattr(ad, "credits_at", 0) or 0) or None}
+        return info
+    info.update({"credits": getattr(ad, "credits", None),
+                 "credits_at": int(getattr(ad, "credits_at", 0) or 0) or None})
+    return info
 
 
 def gateway_info() -> dict:

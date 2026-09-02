@@ -36,6 +36,10 @@ import store
 
 logger = logging.getLogger(__name__)
 
+# Meshy is one fixed cloud endpoint — the form pre-fills it and backend_save
+# accepts a blank url for that type.
+_MESHY_URL = "https://api.meshy.ai"
+
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", "controlnet")
 
@@ -605,6 +609,8 @@ def _type_badge(t: str) -> str:
     t = (t or "openai").lower()
     if t == "comfyui":
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
+    if t == "meshy":
+        return _badge("☁ meshy", "img", "Meshy.ai cloud mesh generation (paid, per task)")
     if t == "anthropic":
         # plain glyph on purpose: the enclosed-A (🅐) renders as a blank box in the
         # console's system font stack
@@ -895,15 +901,20 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
             + "<p class='hint' style='margin:-4px 0 10px'><b>openai</b> = every OpenAI-compatible server "
               "(llama.cpp / llama-swap / vLLM / LocalAI / cloud) — including <b>TTS/voice</b> and whisper "
               "models, which are discovered and routed like any other model. <b>comfyui</b> = workflow-based "
-              "media generation. <b>anthropic</b> = api.anthropic.com for Claude Code, reachable through "
-              "<code>/v1/messages</code> only.</p>"
+              "media generation. <b>meshy</b> = Meshy.ai cloud mesh generation (image / multi-image → 3D), "
+              "billed per task in credits — always <b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
+              "Claude Code, reachable through <code>/v1/messages</code> only.</p>"
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
             + _field("host", host_inp)
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
               "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
               "host/IP, which groups correctly for most setups.</p>"
-            + _field("cost tier", _checkbox("paid", gb("paid"),
-                     "paid — used only when no unpaid backend is free"))
+            # Meshy bills per task, so `paid` is not a choice there: shown checked +
+            # disabled (a disabled box is NOT submitted — backend_save forces it too).
+            + _field("cost tier", ('<label class="ckbox"><input type="checkbox" name="paid" value="1" '
+                                   'checked disabled> paid — always, Meshy bills per task</label>')
+                     if g("type", "openai") == "meshy" else
+                     _checkbox("paid", gb("paid"), "paid — used only when no unpaid backend is free"))
             + "<p class='hint' style='margin:-4px 0 10px'><b>paid</b>: this backend bills per request "
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
               "and reaches for a paid one only when no unpaid backend is free.</p>"
@@ -950,6 +961,24 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "fault mid-job retries the <b>same</b> backend this many times (after waiting for "
               "<code>/system_stats</code>) before failing over — for hosts with sporadic driver "
               "faults. Blank/0 = fail over immediately; content errors are never retried.</p>"
+            + "</div>"
+            # Meshy-only options — a cloud task API: no dirs, no watchdog, no self-retry.
+            # The fields are named meshy_* because #comfyopts already renders max_wait /
+            # poll_interval, and one form may carry each name only once.
+            + f'<div id="meshyopts" style="{"" if g("type", "openai") == "meshy" else "display:none"}">'
+            + '<div class="grouphdr">Meshy</div>'
+            + _field("max wait s", _inp("meshy_max_wait", g("max_wait"), placeholder="900", typ="number"))
+            + _field("poll interval s", _inp("meshy_poll_interval", g("poll_interval"),
+                     placeholder="5", typ="number", step="0.5"))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>api key</b> (above) is the Meshy key "
+              "(<code>msy_…</code>, Meshy dashboard → API). <b>max_concurrent</b> should stay at or below "
+              "your Meshy tier's concurrent-task limit — this account is on <b>Pro (10)</b> "
+              "(Studio 20 · Premium 30 · Ultra 100; the limit is shared by every key of the account) — "
+              "beyond it Meshy answers 429 and the job fails over. "
+              "<b>max wait s</b> caps one task incl. Meshy's own queue (blank = 900); <b>poll interval s</b> "
+              "is the gap between task polls (blank = 5). Credits: 20 (no texture) / 30 (textured) / "
+              "35 (8K) per Meshy-6/7 task, +5 ultra; refunded when a task fails. The current balance shows "
+              "in the backend list after the next health poll.</p>"
             + "</div>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
@@ -1026,15 +1055,24 @@ def _sampling_text(d) -> str:
 
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
-    (LLM / ComfyUI / Anthropic — the form renders all, only one is ever visible)."""
+    (LLM / ComfyUI / Meshy / Anthropic — the form renders all, only one is ever visible).
+    Meshy also pre-fills the fixed cloud URL and forces `paid` (it bills per task); the
+    disabled box is not submitted, so `backend_save` sets it server-side too."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
-                   for t in ("comfyui", "openai", "anthropic"))
+                   for t in ("comfyui", "meshy", "openai", "anthropic"))
     return ('<select name="type" onchange="var t=this.value,'
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
-            "a=document.getElementById('anthopts');"
+            "m=document.getElementById('meshyopts'),a=document.getElementById('anthopts'),"
+            "u=document.querySelector('input[name=url]'),p=document.querySelector('input[name=paid]');"
             "if(l)l.style.display=t==='openai'?'':'none';"
             "if(c)c.style.display=t==='comfyui'?'':'none';"
-            "if(a)a.style.display=t==='anthropic'?'':'none'\">" + opts + "</select>")
+            "if(m)m.style.display=t==='meshy'?'':'none';"
+            "if(a)a.style.display=t==='anthropic'?'':'none';"
+            "if(t==='meshy'){if(u&&!u.value)u.value='" + _MESHY_URL + "';"
+            "if(p){if(p.dataset.was===undefined)p.dataset.was=p.checked?'1':'';"
+            "p.checked=true;p.disabled=true}}"
+            "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
+            "p.checked=p.dataset.was==='1';delete p.dataset.was}}\">" + opts + "</select>")
 
 
 def _bid(b: dict) -> str:
@@ -1101,13 +1139,21 @@ async def backends_page(request: Request):
               if b.get("fail_rate") is not None else "")
         smp = (f" · sampling {_sampling_text(b['sampling_defaults'])}"
                if b.get("sampling_defaults") else "")
-        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{rst}{src}"
+        # Meshy credit balance WITH its age: the number is a snapshot from the last
+        # successful discovery, and a stale one is worth spotting before a job fails.
+        cr = ""
+        if b.get("credits") is not None:
+            cr = f" · credits {b['credits']}"
+            if b.get("credits_at"):
+                cr += f" ({_age(b['credits_at'])} ago)"
+        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{cr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
-    # group by kind: LLM (openai-compatible) vs Media (comfyui), alphabetical within each
+    # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
+    # Meshy, …), alphabetical within each
     binfo = sorted(binfo, key=lambda b: b["name"].lower())
-    llm = [b for b in binfo if b.get("type", "openai") != "comfyui"]
-    img = [b for b in binfo if b.get("type") == "comfyui"]
+    llm = [b for b in binfo if b.get("type", "openai") not in adapters.GEN_TYPES]
+    img = [b for b in binfo if b.get("type") in adapters.GEN_TYPES]
     items = ""
     for label, group in (("LLM", llm), ("Media", img)):
         if group:
@@ -1326,10 +1372,12 @@ async def backend_save(request: Request):
     f = await _form(request)
     name = (f.get("name", "") or "").strip()
     url = (f.get("url", "") or "").strip().rstrip("/")
+    new_type = (f.get("type", "openai") or "openai").strip()
+    if not url and new_type == "meshy":
+        url = _MESHY_URL                   # one fixed cloud endpoint — nothing to type
     if not name or not url:
         return HTMLResponse(_page("Backends", '<p class="bad">name and url are required</p>'
             f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
-    new_type = (f.get("type", "openai") or "openai").strip()
     orig = (f.get("orig", "") or "").strip()
     oname, otype = _parse_bid(orig) if orig else (name, new_type)
     # start from the existing store backend (by old identity) so fields we don't render
@@ -1381,6 +1429,26 @@ async def backend_save(request: Request):
         b["poll_interval"] = pi_val
     else:
         b.pop("poll_interval", None)           # blank/0/garbage = the 1.0 s default
+    # Meshy: a cloud task API — bills per task, so `paid` is not the operator's choice
+    # (the form's box is disabled and therefore NOT submitted; it is forced here).
+    # Its max_wait/poll_interval arrive under meshy_* names because #comfyopts already
+    # renders those two names, and none of the ComfyUI-only keys apply.
+    if new_type == "meshy":
+        b["paid"] = True                       # bills per task — never an unpaid candidate
+        for src, dst, cast in (("meshy_max_wait", "max_wait", int),
+                               ("meshy_poll_interval", "poll_interval", float)):
+            v = (f.get(src, "") or "").strip()
+            try:
+                val = cast(float(v))
+            except ValueError:
+                val = 0
+            if val > 0:
+                b[dst] = val
+            else:
+                b.pop(dst, None)               # blank = defaults (900 / 5)
+        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+                  "stuck_after_s", "self_retries"):
+            b.pop(k, None)
     # Anthropic: how the credential is sent, plus the fallback model list used when
     # a subscription token isn't allowed on GET /v1/models.
     if new_type == "anthropic":
@@ -1779,12 +1847,13 @@ async def routing_page(request: Request):
     LoRAs (?sub=, first child = default)."""
     sub = request.query_params.get("sub") or SUBTABS["routing"][0][0]
     info = _gateway_info()
-    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") == "comfyui"}
+    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") in adapters.GEN_TYPES}
     if sub == "chat":
         title, body = "Chat aliases", _routing_chat_body(_routing_snapshot())
     elif sub == "llm":
         snap = _routing_snapshot()
-        on_llm = [m for m in snap.get("models", []) if any(h.get("type") != "comfyui" for h in m["hosts"])]
+        on_llm = [m for m in snap.get("models", [])
+                  if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])]
         title, body = "LLM models", (
             "<h2>LLM models → backends</h2>"
             "<p class='hint'>A bare model id goes to the fastest free <b>unpaid</b> backend of "
@@ -1798,9 +1867,11 @@ async def routing_page(request: Request):
             bmeta, (request.query_params.get("backend") or "").strip() or None)
     elif sub == "image":
         snap = _routing_snapshot()
-        img_models = [m for m in snap.get("models", []) if any(h.get("type") == "comfyui" for h in m["hosts"])]
+        img_models = [m for m in snap.get("models", [])
+                      if any(h.get("type") in adapters.GEN_TYPES for h in m["hosts"])]
         img_on_llm = [m for m in snap.get("models", [])
-                      if any(h.get("type") != "comfyui" for h in m["hosts"]) and _is_image_model(m["model"])]
+                      if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])
+                      and _is_image_model(m["model"])]
         title, body = "Image models", (
             "<h2>Image models → backends</h2>"
             "<p class='hint'>ComfyUI checkpoints/models, plus image models served by LLM "
@@ -5249,11 +5320,11 @@ def _user_form(u: Optional[dict]) -> str:
     allowed = set((u or {}).get("models") or [])
     chat_al = sorted(set(_gateway_info().get("virtual_models", [])))
     img_al = sorted(store.list_aliases().keys()) if store.is_active() else []
-    # Backend grants apply to LLM backends only (ComfyUI backends aren't in /v1/models;
-    # image access is granted via image aliases). Filtering them out also removes the
-    # confusing duplicate when an LLM and a ComfyUI backend share a name (e.g. gpu-3090).
+    # Backend grants apply to LLM backends only (generation backends aren't in
+    # /v1/models; image access is granted via image aliases). Filtering them out also
+    # removes the confusing duplicate when an LLM and a media backend share a name.
     bk_al = sorted({b["name"] for b in _gateway_info().get("backends", [])
-                    if b.get("name") and b.get("type", "openai") != "comfyui"})
+                    if b.get("name") and b.get("type", "openai") not in adapters.GEN_TYPES})
     # chat/image aliases granted by name; a backend grants ALL of its models (and filters
     # what this user's key sees in /v1/models). Each kind gets a "select all" header row.
     rows = ""
