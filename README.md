@@ -766,17 +766,22 @@ locked). Tabs:
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
-**Live views update in place — the page is never reloaded.** Anything that moves
-on its own (the Dashboard, Media Jobs, a running job's detail page, the Backends
-tab while a backend drains, the Media Playground while a job generates, the Voice
-sub-tab while a reference uploads) re-fetches its own URL every few seconds and
-patches only the parts of the page that actually changed. So an update never
-interrupts you: your scroll position, a sort order you clicked, half-typed text in
-a filter or a form field, an open `<details>`, playing audio/video and the 3D
-viewer's camera angle all stay exactly where they were, and you can keep editing
+**Live views update in place — an update never reloads the page.** Anything that
+moves on its own (the Dashboard, Media Jobs, a running job's detail page, the
+Backends tab while a backend drains, the Media Playground while a job generates,
+the Voice sub-tab while a reference uploads) re-fetches its own URL every few
+seconds and patches only the parts of the page that actually changed. So an update
+never interrupts you: your scroll position, a sort order you clicked, half-typed
+text in a filter or a form field, an open `<details>`, playing audio/video and the
+3D viewer's camera angle all stay exactly where they were, and you can keep editing
 the playground form while the job you just started renders into the column beside
-it. Updating stops on its own once there is nothing live left to watch (the job
-finished, the drain completed) — no timer keeps running in the background.
+it. The one case that does navigate for real is a redirect to a different page —
+that is how an expired session takes you to the login form instead of pasting it
+into the view you were on. Updating stops on its own once there is nothing live
+left to watch (the job finished, the drain completed) — no timer keeps running in
+the background, except that a server answering non-200 is retried with a doubling
+backoff up to every 30 s rather than given up on. Tabs in the background are
+skipped entirely and catch up the moment you switch back.
 
 ---
 

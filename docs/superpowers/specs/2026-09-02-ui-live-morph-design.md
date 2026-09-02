@@ -69,6 +69,11 @@ Ersparnis liegt im niedrigen einstelligen Kilobyte-Bereich und der Meta-Refresh
 rendert heute ohnehin die volle Seite. Die Serverlast ändert sich durch dieses Design
 nicht.
 
+> **Korrektur (2026-09-02, Review):** Die Zahl stimmt nicht — das `_page()`-Skelett
+> (Nav + `_CSS` + die drei JS-Konstanten) misst allein **16,8 KB** pro Tick, nicht
+> „niedrig einstellig". Die Entscheidung bleibt, aber wer sie später neu bewertet,
+> soll das gegen die richtige Größe tun.
+
 ### Clientseite: `_LIVE_JS`
 
 Poll-Schleife pro Takt:
