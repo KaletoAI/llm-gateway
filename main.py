@@ -2149,6 +2149,20 @@ async def audio_speech(request: Request, authorization: Optional[str] = Header(N
 # by id (TTL) — sync mode also returns them inline. No VRAM coordinator yet
 # (Phase 2): candidates are filtered by health + the existing busy cap only.
 
+def _gen_backend_for(name: str, cand: Optional[dict],
+                     pool: Optional[list] = None) -> Optional[dict]:
+    """The generation backend `name` of the SAME KIND as `cand` (Meshy candidate ↔ meshy
+    backend, workflow candidate ↔ comfyui backend). Backends are keyed (name, type), so a
+    ComfyUI and a Meshy backend may share a name; a bare-name match could route a Meshy
+    alias onto a GPU box (or a workflow alias onto the cloud API) and fail opaquely.
+    `pool` defaults to the enabled generation backends."""
+    want_meshy = cand is not None and cand.get("meshy") is not None
+    for b in (pool if pool is not None else _gen_backends):
+        if b.get("name") == name and (b.get("type") == "meshy") == want_meshy:
+            return b
+    return None
+
+
 def _gen_routes(alias: str) -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
     **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
@@ -2169,11 +2183,13 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     if candidates is None:
         candidates = image_models.get(alias, [])
     # generation routes only to generation backends (ComfyUI, Meshy), so a name shared
-    # with an LLM backend resolves to the right one.
+    # with an LLM backend resolves to the right one — and, since backends are keyed
+    # (name, type), the candidate's own KIND picks between a same-named ComfyUI and
+    # Meshy backend (see _gen_backend_for).
     gen = [b for b in _gen_backends if not is_draining(b)]
     allc = []
     for cand in candidates:
-        b = next((b for b in gen if b["name"] == cand.get("backend")), None)
+        b = _gen_backend_for(cand.get("backend"), cand, gen)
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
         allc.append((b, cand))
@@ -3101,7 +3117,17 @@ async def cancel_generation(job_id: str) -> bool:
     job = await asyncio.to_thread(jobs.get, job_id)
     if not job or job.get("status") not in ("queued", "running"):
         return False
-    b = next((x for x in backends if x.get("name") == job.get("backend") and _is_gen(x)), None)
+    # The job row names the backend by NAME, which is unique only per TYPE — so the
+    # alias's candidate for that name decides the kind, or an /interrupt would hit an
+    # unrelated same-named ComfyUI. A row whose alias is gone (legacy/deleted) falls
+    # back to the bare name match: cancelling the worker task still beats not cancelling.
+    job_alias = job.get("alias") or ""
+    cands = (await asyncio.to_thread(store.get, job_alias)
+             if store.is_active() else None) or image_models.get(job_alias) or []
+    cand = next((c for c in cands if c.get("backend") == job.get("backend")), None)
+    pool = [x for x in backends if _is_gen(x)]       # incl. disabled: cancel must still reach it
+    b = (_gen_backend_for(job.get("backend"), cand, pool) if cand is not None
+         else next((x for x in pool if x.get("name") == job.get("backend")), None))
     adapter = backend_adapters.get(backend_id(b)) if b else None
     if adapter is not None:
         await adapter.cancel()
@@ -3286,6 +3312,14 @@ async def run_generation(body: dict, request: Request,
         )
 
     first, cand0 = routes[0]
+    # Chains are a ComfyUI mechanism (export node → mesh path/upload hand-off): a Meshy
+    # stage 1 reaches ComfyUIAdapter-only hooks inside _run_chain and dies with an
+    # AttributeError in the spawned task. Refuse it here, NAMED — and before jobs.create,
+    # so a misconfigured alias leaves no orphan queued row.
+    _succ0 = cand0.get("successor") or {}
+    if cand0.get("meshy") is not None and (_succ0.get("alias") or "").strip():
+        raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and cannot be a "
+                                 f"chain stage (successor configured)")
     task = cand0.get("task", body.get("task", "text2img"))
     owner = _request_owner(request)
     job_id = await asyncio.to_thread(jobs.create, task, alias, first["name"], owner=owner, ttl_s=ttl_s)
@@ -3376,7 +3410,11 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     a dropped file would not degrade the job, it would run the workflow against its
     baked-in default and hand back a confidently wrong result."""
     wf, mapping = await asyncio.to_thread(_gen_alias_mapping, alias)
-    cands = (await asyncio.to_thread(store.get, alias)) if store.is_active() else None
+    # Same lookup as every other alias read (_gen_routes, gen_alias_schema): store first,
+    # config `image_models` for aliases the store doesn't hold — a config-defined Meshy
+    # alias must hit the 400 below too, not fall through and drop the files silently.
+    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
+        or image_models.get(alias)
     if cands and cands[0].get("meshy") is not None:
         raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and accepts no `files`"
                                  f" — send images under `images`")

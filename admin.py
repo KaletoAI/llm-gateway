@@ -2476,8 +2476,10 @@ async def register_post(request: Request):
     # A Meshy alias has no workflow at all: its request fields are the fixed label
     # table in meshy.py, its per-backend half is a set of admin options. Registering
     # creates the default candidate; everything else is edited in _meshy_editor.
-    bk = next((b for b in _gen_backends() if b["name"] == backend), None)
-    if bk is not None and bk.get("type") == "meshy":
+    # The KIND comes from the picked backend, and a name is unique only per type (a
+    # ComfyUI and a Meshy backend may both be called "gpu") — so match on (name, type)
+    # instead of trusting whichever same-named backend comes first.
+    if any(b["name"] == backend and b.get("type") == "meshy" for b in _gen_backends()):
         cand = meshy.default_candidate(backend)
         # The task dropdown defaults to `text2img`, which Meshy cannot do at all (it
         # only turns images into 3D). So the form's untouched default — like a missing
@@ -2589,10 +2591,13 @@ def _reorder_js(alias: str) -> str:
 
 def _same_kind(cands: list, backend_name: str) -> bool:
     """An alias is homogeneous: ComfyUI candidates only or Meshy candidates only (the
-    editor, schema and playground read the FIRST candidate as the alias's shape)."""
+    editor, schema and playground read the FIRST candidate as the alias's shape).
+
+    Backends are keyed (name, type), so a bare-name lookup could answer about the
+    same-named backend of the OTHER kind — match on the wanted kind directly."""
     want_meshy = bool(cands) and cands[0].get("meshy") is not None
-    b = next((x for x in _gen_backends() if x["name"] == backend_name), None)
-    return b is not None and ((b.get("type") == "meshy") == want_meshy)
+    return any(x["name"] == backend_name and (x.get("type") == "meshy") == want_meshy
+               for x in _gen_backends())
 
 
 def _backends_section(alias: str, cands: list) -> str:
