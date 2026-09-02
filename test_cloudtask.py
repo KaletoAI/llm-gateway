@@ -1,4 +1,5 @@
 """Unit tests for cloudtask.py — run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_cloudtask -v"""
+import asyncio
 import unittest
 
 import cloudtask
@@ -105,6 +106,49 @@ class AdapterHelpers(unittest.TestCase):
         self.assertIsInstance(e, ConnectionError)
         self.assertEqual(e.vendor, "Tripo")
         self.assertEqual(adapters.CloudBusy("y").vendor, "cloud")
+
+
+class RunResultEndpoint(unittest.TestCase):
+    """The job meta and the rig/thumbnail decisions describe the task that was actually
+    run — `RunResult.endpoint` — not the endpoint the alias is configured for. They are
+    the same thing for Meshy (one task per job), but a vendor whose `_run` chases several
+    tasks names the primary one there, and a meta that silently kept saying "image-to-3d"
+    would send you reading the wrong task's history."""
+
+    def _adapter(self, run_endpoint: str):
+        import adapters
+
+        class _Fake(adapters.CloudTaskAdapter):
+            mod = meshy
+            type = mod.KIND
+
+            async def _run(self, client, req, cand, opts, poll_interval, max_wait):
+                return adapters.RunResult(
+                    "task-9", run_endpoint, {"ai_model": "latest"},
+                    cloudtask.TaskState(status=meshy.SUCCESS_STATUS, credits=5))
+
+        ctx = adapters.AdapterContext(
+            auth_headers=lambda b: {}, inflight_inc=lambda bid: None, inflight_dec=lambda bid: None,
+            cost_usd=lambda *a: 0.0, source_of=lambda r: "test", record_call=lambda *a, **k: None,
+            log_enabled=lambda: False)
+        return _Fake({"name": "cloud", "type": "meshy", "url": "http://127.0.0.1:1"}, ctx)
+
+    def _meta(self, run_endpoint: str, alias_endpoint: str) -> dict:
+        import adapters
+        req = adapters.NormalizedRequest(alias="a", real_model="latest",
+                                         cloud={"endpoint": alias_endpoint, "options": {}})
+        return asyncio.run(self._adapter(run_endpoint).generate(req)).meta
+
+    def test_meta_and_rig_follow_the_run(self):
+        meta = self._meta(meshy.RIG_ENDPOINT, "image-to-3d")
+        self.assertEqual(meta["endpoint"], meshy.RIG_ENDPOINT)
+        self.assertEqual(meta["cloud_task_id"], "task-9")
+        self.assertEqual(meta["rig"], meshy.KIND)      # the rig branch reads the run too
+
+    def test_no_rig_when_the_run_was_not_one(self):
+        meta = self._meta("image-to-3d", meshy.RIG_ENDPOINT)
+        self.assertEqual(meta["endpoint"], "image-to-3d")
+        self.assertNotIn("rig", meta)
 
 
 if __name__ == "__main__":

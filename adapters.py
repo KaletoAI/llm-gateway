@@ -3171,7 +3171,6 @@ class CloudTaskAdapter(BackendAdapter):
     async def generate(self, req: NormalizedRequest) -> GenOutput:
         b, mod = self.backend, self.mod
         cand = {"model": req.real_model, mod.KIND: req.cloud or {}}
-        endpoint = mod.endpoint_of(cand)
         opts = mod.options_of(cand)
         poll_interval = float(b.get("poll_interval", mod.POLL_INTERVAL_DEFAULT))
         max_wait = float(b.get("max_wait", mod.MAX_WAIT_DEFAULT))
@@ -3185,7 +3184,10 @@ class CloudTaskAdapter(BackendAdapter):
             # The create POST carries the whole input and gets its own budget (_create).
             async with httpx.AsyncClient(timeout=_CLOUD_HTTP_TIMEOUT) as client:
                 run = await self._run(client, req, cand, opts, poll_interval, max_wait)
-                state = run.state
+                # `run.endpoint`, never the alias's: a vendor whose `_run` chases several
+                # tasks names the PRIMARY one there, and the rig/thumbnail decisions and
+                # the job meta must all describe the task that was actually run.
+                state, endpoint = run.state, run.endpoint
                 blobs = []
                 for name, url in state.downloads:      # the pure module named them
                     data = await self._download(client, url)
