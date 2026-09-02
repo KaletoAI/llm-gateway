@@ -2869,15 +2869,26 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                         f"'{backend2.get('name')}' has no adapter")
                 return
             # `mesh_param` must be a request field of the successor (accepted under param
-            # OR label, exactly like any incoming value) — _apply_mapping silently drops
-            # unknown params, so stage 2 would otherwise run on the workflow's baked-in
-            # mesh path and deliver a stale/WRONG mesh as a "done" job.
-            if not any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
-                       for p, m in (s2.get("mapping") or {}).items()):
-                await asyncio.to_thread(jobs.fail, job_id,
-                                        f"chain mesh param '{mesh_param}' is not a request field "
-                                        f"(param or label) of successor '{succ_alias}' — map the "
-                                        f"successor's mesh-load input or fix 'successor mesh param'")
+            # OR label, exactly like any incoming value) — both adapters silently drop an
+            # unknown param, so stage 2 would otherwise run on the workflow's baked-in
+            # mesh path (or, on Meshy, on no mesh at all) and deliver a stale/WRONG mesh
+            # as a "done" job. A Meshy successor carries no mapping: its request fields
+            # are the fixed label table, and the mesh is a FILE field (public_fields()[2]).
+            if s2.get("meshy") is not None:
+                s2_files = [f["name"] for f in adapters.public_fields(s2)[2]]
+                ok_param = mesh_param in s2_files
+                why = (f"chain mesh param '{mesh_param}' is not a file field of the Meshy "
+                       f"successor '{succ_alias}' — it takes "
+                       + (", ".join(f"'{n}'" for n in s2_files) if s2_files else
+                          "no file input at all (only a rigging alias does)"))
+            else:
+                ok_param = any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
+                               for p, m in (s2.get("mapping") or {}).items())
+                why = (f"chain mesh param '{mesh_param}' is not a request field "
+                       f"(param or label) of successor '{succ_alias}' — map the "
+                       f"successor's mesh-load input or fix 'successor mesh param'")
+            if not ok_param:
+                await asyncio.to_thread(jobs.fail, job_id, why)
                 return
             s1_wf = stage1_cand.get("workflow_json") or {}
             # Stage-1 export is backend-specific (ComfyUI pins an export node; Meshy

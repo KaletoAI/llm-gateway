@@ -288,8 +288,9 @@ class TestGenTypesAndFields(unittest.TestCase):
         self.assertEqual(params[1]["auto"], "random unless sent")
 
     def test_public_fields_comfy_files(self):
-        """A mesh param is advertised under `files` (by its LABEL), never as an image
-        slot and never as a scalar param — that is what a client uploads it as."""
+        """A ComfyUI mesh param is advertised under `files` (by its LABEL) — what a client
+        uploads it as — and never as an image slot. It ALSO stays a scalar param: there it
+        is the backend-side path, the second, upload-free way to name the same input."""
         wf = {"1": {"class_type": "LoadMesh", "inputs": {"mesh": "a.glb"}}}
         mapping = {"mesh_path": {"node": "1", "field": "mesh", "label": "input_mesh_path"}}
         params, images, files = adapters.public_fields({"workflow_json": wf, "mapping": mapping})

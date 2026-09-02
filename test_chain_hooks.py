@@ -100,6 +100,16 @@ class MeshyChainStage1(unittest.TestCase):
         ex = self._ad().chain_export(cand, {"alias": "mesh-mia"}, {}, "gwchain_j1")
         self.assertIn("glb", ex.error)
 
+    def test_rigging_cannot_be_stage_1(self):
+        """A rigging alias delivers `rigged.glb` — a stage-2 product, not a stage-1 mesh.
+        Refused by NAME up front: it would otherwise spend credits and then die on the
+        generic "stage-1 produced no mesh" (chain_take_mesh looks for `model.glb`)."""
+        cand = {"meshy": {"endpoint": "rigging", "options": {"target_formats": ["glb"]}}}
+        ex = self._ad().chain_export(cand, {"alias": "mesh-mia"}, {}, "gwchain_j1")
+        self.assertIsNotNone(ex.error)
+        self.assertIn("rigging", ex.error)
+        self.assertEqual(ex.mesh_name, "")
+
     def test_take_mesh_from_blobs(self):
         out = GenOutput(blobs=[GenBlob(b"glTFxxxx", "model/gltf-binary", "file", "model.glb"),
                                GenBlob(b"png", "image/png", "image", "preview.png")])
@@ -107,6 +117,29 @@ class MeshyChainStage1(unittest.TestCase):
         self.assertEqual(asyncio.run(self._ad().chain_take_mesh(out, ex, True)), b"glTFxxxx")
         self.assertEqual(asyncio.run(self._ad().chain_take_mesh(out, ex, False)), b"")
         self.assertIsNone(asyncio.run(self._ad().chain_take_mesh(GenOutput(blobs=[]), ex, True)))
+
+
+class MeshyChainStage2(unittest.TestCase):
+    """A Meshy successor reads the mesh off the REQUEST (embedded as a model_url data
+    URI by meshy.build_request) — there is no backend disk to upload it to."""
+
+    def _ad(self):
+        return adapters.MeshyAdapter({"name": "meshy", "type": "meshy", "url": "http://127.0.0.1:1"}, _ctx())
+
+    def test_feed_embeds_upload(self):
+        req2 = NormalizedRequest(alias="Meshy-Rig", meshy={"endpoint": "rigging", "options": {}})
+        ref = asyncio.run(self._ad().chain_feed_mesh(req2, {"name": "meshy"}, "input_mesh_path",
+                                                     "gwchain_j1.glb", b"glTF" + b"\0" * 1_048_576, ""))
+        self.assertEqual(req2.upload_files["input_mesh_path"][0], "gwchain_j1.glb")
+        self.assertEqual(len(req2.upload_files["input_mesh_path"][1]), 1_048_580)
+        self.assertEqual(ref, "<upload:gwchain_j1.glb (1.0 MB)>")
+
+    def test_feed_needs_bytes(self):
+        """No path relay to a cloud backend: without the bytes there is nothing to send,
+        and a path from someone else's disk would silently mean nothing to Meshy."""
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self._ad().chain_feed_mesh(NormalizedRequest(), {}, "input_mesh_path",
+                                                   "n", None, "/out"))
 
 
 class BaseDefaults(unittest.TestCase):

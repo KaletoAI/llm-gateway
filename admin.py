@@ -2860,8 +2860,11 @@ def _chain_section(wf: dict, cands: list) -> str:
               "hand-off — no special loader needed. Stage 2 runs on an <b>allowed</b> "
               "successor candidate, preferring the same backend as stage 1; so only list the successor on "
               "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
-              "threaded to the successor by matching param name. A <b>Meshy successor</b> (cloud rig) always "
-              "receives the mesh as bytes — the hand-off setting is ignored then.</p>"
+              "threaded to the successor by matching param name. The successor may also be a "
+              "<b>Meshy alias</b> (e.g. <code>Meshy-Rig</code>, endpoint <code>rigging</code>) — the mesh then "
+              "travels to Meshy as bytes (the hand-off setting is ignored), the <b>mesh param</b> must be one "
+              "of that alias's file fields (<code>input_mesh_path</code>) and the <b>delivered rig type</b> is "
+              "<code>meshy</code>.</p>"
             + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
                      placeholder="e.g. *_basecolor*.png"), short=True)
             + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
@@ -3052,7 +3055,10 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
               "export node, no hand-off choice (a Meshy stage shares no disk with anything). It arrives "
               "under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh workflows "
               "label their mesh input), which must be a request field (param or label) of "
-              "the successor. <b>keep from this stage</b>: globs for files THIS stage produces that must ship "
+              "the successor. The successor may itself be a <b>Meshy alias</b> (e.g. "
+              "<code>Meshy-Rig</code>, endpoint <code>rigging</code>) — it then takes the mesh as its file "
+              "field <code>input_mesh_path</code>, and the <b>delivered rig type</b> is <code>meshy</code>. "
+              "<b>keep from this stage</b>: globs for files THIS stage produces that must ship "
               "with the successor's result (Meshy embeds its texture in the GLB, so this is usually empty — "
               "<code>preview.png</code> is the one candidate). <b>delivered rig type</b> tags the delivery; "
               "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
@@ -4672,16 +4678,22 @@ def _stage2_section(s2: dict) -> str:
     `s2` is recorded at run time by `_run_chain` (meta.chain_stage2); only the node/field
     DETAIL is looked up in the alias config live, and marked as such — the mapping may
     have changed since the run. `applied` is absent when stage 2 never reported back
-    (a failed hand-off); the rows then say what the CURRENT config would bind, and say so."""
+    (a failed hand-off); the rows then say what the CURRENT config would bind, and say so.
+
+    A **Meshy** successor has no mapping at all — its request fields are a fixed label
+    table (meshy.public_fields) and it reports no `applied` set. Its rows therefore say
+    "handed", never "dropped": claiming a loss nobody measured would send you hunting a
+    mapping that does not exist."""
     alias2, b2 = s2.get("alias") or "?", s2.get("backend") or "?"
     params = s2.get("params") or {}
     mesh_param = s2.get("mesh_param") or ""
     applied = s2.get("applied")               # None → stage 2 never got that far
-    mapping2 = {}
+    mapping2, meshy2 = {}, False
     if store.is_active():
         cs = store.get(alias2) or []
         c2 = next((x for x in cs if x.get("backend") == b2), cs[0] if cs else None) or {}
         mapping2 = c2.get("mapping") or {}
+        meshy2 = c2.get("meshy") is not None
 
     def target(k):                            # (node, field) the successor binds `k` to, per CURRENT config
         for p, m in mapping2.items():
@@ -4695,7 +4707,11 @@ def _stage2_section(s2: dict) -> str:
         if k == mesh_param:                   # the mesh itself gets its own line below
             continue
         node, field = target(k)
-        if applied is None:                   # unverified: describe the binding, don't claim it ran
+        if meshy2:                            # no mapping to look up — and none to miss
+            hit = True
+            tag = "<span class='muted' title='Meshy binds a fixed label table; a name it " \
+                  "does not know is ignored'>handed · Meshy fixed table</span>"
+        elif applied is None:                 # unverified: describe the binding, don't claim it ran
             hit = node is not None
             tag = (f"<span class='muted' title='from the successor alias config as it "
                    f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if hit else
@@ -4718,6 +4734,10 @@ def _stage2_section(s2: dict) -> str:
     warn = ("" if applied is not None else
             " <span class='bad'>· stage 2 did not report back — bindings shown are from "
             "the current alias config</span>")
+    if meshy2:                                # nothing to tally against: no mapping, no `applied`
+        tally = (f"{len(rows)} param(s) handed · Meshy takes its fixed label table and "
+                 f"ignores the rest" if rows else "no params handed besides the mesh")
+        warn = "" if applied is not None else " <span class='bad'>· stage 2 did not report back</span>"
     mesh = (f"<p style='margin:6px 0'><code>{_esc(mesh_param)}</code> "
             f"<span class='muted'>← the relayed mesh</span><br>"
             f"<code style='font-size:12px'>{_esc(str(s2.get('mesh_ref') or ''))}</code></p>")

@@ -3169,6 +3169,13 @@ class MeshyAdapter(BackendAdapter):
         off a disk, so the name is ours to choose (it only labels the hand-off upload).
         A task that does not deliver glb is refused here, before credits are spent: the
         successor is fed a glb, and Meshy bills the task either way."""
+        if meshy.endpoint_of(cand) == "rigging":
+            # A rigging alias is a stage-2 product: it delivers `rigged.glb`, and its
+            # request needs a mesh it has no way to get here. Refused by name — the
+            # generic path would spend 5 credits and then fail on "produced no mesh"
+            # (chain_take_mesh looks for `model.glb`, which a rig task never returns).
+            return ChainExport("", error="chain: a Meshy rigging alias cannot be stage 1 — "
+                                         "it rigs an existing mesh; use an image-to-3d alias")
         opts = meshy.options_of({"meshy": cand.get("meshy") or {}})
         if "glb" not in opts["target_formats"]:
             return ChainExport("", error=f"chain: Meshy stage 1 must deliver glb — add it to "
@@ -3182,6 +3189,16 @@ class MeshyAdapter(BackendAdapter):
         if blob is None:
             return None
         return blob.data if want_bytes else b""
+
+    async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
+        """Stage 2 on Meshy reads the mesh off the REQUEST — `meshy.build_request` embeds
+        `upload_files[mesh_param]` as the `model_url` data URI. There is no disk to upload
+        to and no path Meshy could resolve, so the bytes are mandatory (a `path` relay is
+        forced to `upload` in _run_chain whenever either stage is Meshy)."""
+        if mesh_bytes is None:
+            raise RuntimeError("chain: a Meshy stage 2 needs the mesh bytes (upload relay)")
+        req2.upload_files[mesh_param] = (mesh_name, mesh_bytes)   # embedded as the model_url data URI
+        return f"<upload:{mesh_name} ({len(mesh_bytes) / (1024 * 1024):.1f} MB)>"
 
 
 def _meshy_msg(r) -> str:
