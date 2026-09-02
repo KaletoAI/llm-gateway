@@ -78,5 +78,34 @@ class MeshyFields(unittest.TestCase):
         self.assertEqual([n for n, _ in st.downloads], ["rigged.glb"])
 
 
+class AdapterHelpers(unittest.TestCase):
+    """The kind seam in adapters.py — pure enough to check without a server. main and
+    admin ask these four questions everywhere a candidate or backend has a kind."""
+
+    def test_kinds(self):
+        import adapters
+        self.assertEqual(adapters.cloud_kind({"meshy": {}}), "meshy")
+        self.assertEqual(adapters.cloud_kind({"tripo": {"endpoint": "rig"}}), "tripo")
+        self.assertIsNone(adapters.cloud_kind({"workflow_json": {}}))
+        self.assertEqual(adapters.cand_kind({}), "comfyui")
+        self.assertEqual(adapters.backend_kind({"type": "meshy"}), "meshy")
+        self.assertEqual(adapters.backend_kind({"type": "comfyui"}), "comfyui")
+        self.assertEqual(adapters.backend_kind({"type": "openai"}), "comfyui")
+        self.assertIn("meshy", adapters.CLOUD_TYPES)
+        self.assertTrue(adapters.CLOUD_TYPES <= adapters.GEN_TYPES)
+        self.assertIs(adapters.cloud_module("meshy"), meshy)
+        self.assertEqual(adapters.cloud_block({"tripo": {"endpoint": "rig"}}), {"endpoint": "rig"})
+        self.assertIsNone(adapters.cloud_block({}))
+
+    def test_exception_aliases_and_vendor(self):
+        import adapters
+        self.assertIs(adapters.MeshyNoCredits, adapters.CloudNoCredits)
+        self.assertIs(adapters.MeshyBusy, adapters.CloudBusy)
+        e = adapters.CloudNoCredits("x", vendor="Tripo")
+        self.assertIsInstance(e, ConnectionError)
+        self.assertEqual(e.vendor, "Tripo")
+        self.assertEqual(adapters.CloudBusy("y").vendor, "cloud")
+
+
 if __name__ == "__main__":
     unittest.main()

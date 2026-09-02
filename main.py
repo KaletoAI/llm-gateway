@@ -2967,7 +2967,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
                     node_mapping=stage1_cand.get("mapping") or {},
                     fixed=list(stage1_cand.get("fixed") or []) + list(export.extra_fixed),
-                    meshy=stage1_cand.get("meshy"),
+                    cloud=adapters.cloud_block(stage1_cand),
                     bypass=(stage1_cand.get("bypass") or []),
                     upload_images=dict(upload_images or {}), raw=request,
                     upload_files=dict(upload_files or {}),
@@ -3035,7 +3035,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     output_cases=(s2.get("output_cases") or None),
                     texture_format=(s2.get("texture_format") or None),
                     dummy_check=(s2.get("dummy_check") is not False),
-                    meshy=s2.get("meshy"),
+                    cloud=adapters.cloud_block(s2),
                     bypass=(s2.get("bypass") or []), slot_held=True)
 
                 # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
@@ -3383,7 +3383,7 @@ async def run_generation(body: dict, request: Request,
             texture_format=(cand.get("texture_format") or None),
             dummy_check=(cand.get("dummy_check") is not False),   # default on; alias opt-out
             bypass=(cand.get("bypass") or []),                    # per-backend node bypass
-            meshy=cand.get("meshy"),                              # Meshy candidate block (None on ComfyUI)
+            cloud=adapters.cloud_block(cand),                     # cloud candidate block (None on ComfyUI)
         )
 
     first, cand0 = routes[0]
