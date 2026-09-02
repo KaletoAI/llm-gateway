@@ -3420,6 +3420,226 @@ class MeshyAdapter(CloudTaskAdapter):
         return str(js.get("result") or "")
 
 
+# ── Tripo3D (cloud image → 3D, and its rigger) ────────────────────────────────
+
+
+class TripoAdapter(CloudTaskAdapter):
+    """Tripo3D V3: every input is uploaded to `/v3/files` FIRST (the API takes no inline
+    bytes — no data URI, no base64), then one task per endpoint under
+    `/v3/generation|animations|models`, all polled at `/v3/tasks/{id}`.
+
+    Where Meshy answers one job with one task, a Tripo job is SEVERAL: a rig runs
+    rig-check → rig → one convert per extra format → one retarget per clip. They share
+    the backend's `max_wait` (each poll gets the REMAINDER), their ids are recorded under
+    `meta.tasks` so the job view can name every billed task, and their credits are summed."""
+
+    mod = tripo
+    type = mod.KIND
+
+    # The endpoints an ALIAS can be configured on → the path that creates their task. The
+    # follow-up tasks (rig-check, convert, retarget) are created by _run itself.
+    _CREATE_PATH = {"image-to-model": "/generation/image-to-model",
+                    "multiview-to-model": "/generation/multiview-to-model",
+                    tripo.RIG_ENDPOINT: "/animations/rig"}
+
+    def _api(self, path: str) -> str:
+        return f"{self.backend['url'].rstrip('/')}{tripo.API}{path}"
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        r = await client.get(self._api("/account/balance"), headers=self._headers(),
+                             timeout=_CLOUD_DISCOVERY_TIMEOUT)
+        r.raise_for_status()                       # 401 → auth kind in main._classify_error
+        js = r.json() or {}
+        if js.get("code", 0) != 0:                 # a 200 that carries a refusal
+            raise RuntimeError(f"{self.vendor} balance: {js.get('message') or js.get('code')}")
+        bal = _to_float((js.get("data") or {}).get("balance"))
+        self.credits, self.credits_at = bal, time.time()
+        if bal <= 0:
+            raise CloudNoCredits("no credits left on the Tripo account", vendor=self.vendor)
+        return Capabilities(models=set(tripo.AI_MODELS), pricing={}, loras=set())
+
+    # ── the response envelope ────────────────────────────────────────────────
+    def _msg(self, r) -> str:
+        """Tripo's error body is `{code, message, suggestion}` — the suggestion is half
+        the answer ("Check whether the API Key is correct"), so it travels with it."""
+        try:
+            js = r.json() or {}
+            m = str(js.get("message") or "")
+            s = str(js.get("suggestion") or "")
+            return (m + (f" — {s}" if s else "")) or r.text[:200]
+        except Exception:
+            return r.text[:200]
+
+    @staticmethod
+    def _code_of(r):
+        try:
+            return (r.json() or {}).get("code")
+        except Exception:
+            return None
+
+    def _classify_create(self, r) -> Optional[str]:
+        code = self._code_of(r)
+        if r.status_code == 403 and code == 2010:  # Tripo has no 402: 403 + 2010 = broke
+            return "nocredits"
+        if r.status_code == 429:                   # 1007 request rate / 2000 concurrency
+            return "busy"
+        if r.status_code >= 500:
+            return "server"
+        # A non-zero `code` is a refusal even under HTTP 200 — the envelope is the truth.
+        if not 200 <= r.status_code < 300 or code not in (None, 0):
+            return "rejected"
+        return None
+
+    def _task_id_of(self, js: dict) -> str:
+        return str((js.get("data") or {}).get("task_id") or "")
+
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        # ONE poll url for every task kind — the endpoint is not part of it.
+        return await client.get(self._api(f"/tasks/{task_id}"), headers=self._headers())
+
+    def _task_body(self, r) -> dict:
+        js = r.json() or {}
+        if js.get("code", 0) != 0:
+            # HTTP 200 with a non-zero code says the task cannot be READ (gone, wrong
+            # key): a verdict, which _poll counts like a 4xx (three in a row = final).
+            raise _TaskVerdict(str(js.get("message") or f"code {js.get('code')}"))
+        return js.get("data") or {}
+
+    # ── uploads ──────────────────────────────────────────────────────────────
+    async def _upload(self, client, name: str, data: bytes) -> str:
+        """One `POST /v3/files` → file token. Every image and every mesh goes this way.
+
+        A transport error or a 5xx is re-raised as ConnectionError so the job FAILS OVER
+        to the next candidate: httpx's own transport exceptions are not ConnectionErrors,
+        and the message names the step — an upload failure and a create failure send you
+        looking in different places. A 4xx (or a non-zero envelope code) is Tripo's
+        verdict on the FILE and is final."""
+        try:
+            r = await client.post(self._api("/files"),
+                                  files={"file": (name, data, _mime_and_kind(name)[0])},
+                                  headers=self._headers(),
+                                  timeout=_upload_timeout_for(len(data)))
+        except httpx.HTTPError as e:
+            raise ConnectionError(f"{self.vendor} upload of {name} failed: "
+                                  f"{type(e).__name__}: {e}")
+        if r.status_code >= 500:
+            raise ConnectionError(f"{self.vendor} upload of {name} failed "
+                                  f"({r.status_code}): {self._msg(r)}")
+        if not 200 <= r.status_code < 300 or self._code_of(r) not in (None, 0):
+            raise RuntimeError(f"{self.vendor} refused upload {name}: {self._msg(r)}")
+        token = str(((r.json() or {}).get("data") or {}).get("file_token") or "")
+        if not token:
+            raise RuntimeError(f"{self.vendor} returned no file_token for {name}")
+        return token
+
+    def _collect_inputs(self, req: NormalizedRequest, endpoint: str) -> tuple[dict, dict]:
+        """({slot: (filename, bytes)}, {file field: (filename, bytes)}) for the endpoint —
+        and every reason to refuse the request, checked BEFORE the first upload.
+
+        The pure module refuses the same requests when it builds the body, but by then the
+        files are already in the Tripo account: an upload for a request that can never run
+        is litter nobody cleans up. So the slot count and the format sniff happen here."""
+        got = req.upload_images or {}
+        images = {s: got[s] for s in tripo.SLOTS[endpoint] if got.get(s)}
+        if endpoint == "multiview-to-model" and ("input_image_front" not in images
+                                                 or len(images) < 2):
+            raise tripo.TripoInput("Tripo multiview needs `input_image_front` plus at "
+                                   "least one more view")
+        if endpoint == "image-to-model" and "input_image" not in images:
+            raise tripo.TripoInput("`images.input_image` is required")
+        named = {s: (f"{s}.{tripo.image_ext(b)}", b) for s, b in images.items()}
+        files = {}
+        for fname in tripo.FILES[endpoint]:
+            f = (req.upload_files or {}).get(fname)
+            data = f[1] if isinstance(f, tuple) else f
+            if not data:
+                raise tripo.TripoInput(f"`files.{fname}` is required")
+            files[fname] = (f"{fname}.{tripo.mesh_ext(data)}", data)
+        return named, files
+
+    # ── the run ──────────────────────────────────────────────────────────────
+    async def _run(self, client, req: NormalizedRequest, cand: dict, opts: dict,
+                   poll_interval: float, max_wait: float) -> RunResult:
+        endpoint = tripo.endpoint_of(cand)
+        deadline = time.monotonic() + max_wait
+        tasks: list = []
+        credits = 0.0
+
+        def left() -> float:
+            """`max_wait` caps the WHOLE job, not one task: every follow-up poll gets
+            what is left of the budget (the backend form says so)."""
+            return max(0.0, deadline - time.monotonic())
+
+        def took(role: str, tid: str, st) -> None:
+            nonlocal credits
+            tasks.append({"role": role, "task_id": tid, "credits": st.credits})
+            credits += _to_float(st.credits)
+
+        # 1. inputs → file tokens (validated first, see _collect_inputs)
+        images, files = self._collect_inputs(req, endpoint)
+        tokens = {s: await self._upload(client, n, b) for s, (n, b) in images.items()}
+        ftokens = {f: await self._upload(client, n, b) for f, (n, b) in files.items()}
+        body = tripo.build_request(cand, _gen_values(req), tokens, ftokens)
+        # The format the primary task delivers ITSELF leads the list: generation is always
+        # GLB, a rig its `out_format`. parse_task names that download after formats[0], so
+        # an alias asking for obj alone would otherwise ship a GLB called `model.obj`;
+        # every OTHER requested format is a convert task below.
+        native = opts["target_formats"][0] if endpoint == tripo.RIG_ENDPOINT else tripo.NATIVE_FORMAT
+        formats = [native] + [f for f in opts["target_formats"] if f != native]
+        extra: dict = {}
+        # 2. the free rig-check: a verdict about the MESH, before the rig's 25 credits
+        if endpoint == tripo.RIG_ENDPOINT and opts.get("rig_check"):
+            cid = await self._create(client, self._api("/animations/rig-check"),
+                                     tripo.build_rig_check(body["input"]),
+                                     tripo.RIG_CHECK_ENDPOINT)
+            cst = await self._poll(client, tripo.RIG_CHECK_ENDPOINT, cid, formats, opts,
+                                   poll_interval, left())
+            took(tripo.RIG_CHECK_ENDPOINT, cid, cst)
+            if not cst.riggable:
+                raise RuntimeError(f"{self.vendor} rig-check: mesh is not riggable "
+                                   f"(detected rig_type={cst.rig_type or '?'})")
+            extra["rig_type"] = cst.rig_type or body.get("rig_type")
+        # 3. the primary task
+        task_id = await self._create(client, self._api(self._CREATE_PATH[endpoint]), body, endpoint)
+        state = await self._poll(client, endpoint, task_id, formats, opts, poll_interval, left())
+        took(endpoint, task_id, state)
+        stem = "rigged" if endpoint == tripo.RIG_ENDPOINT else "model"
+        # 4. extra formats — each its own paid convert task. A failed one FAILS the job:
+        #    a requested delivery must never silently shrink (same rule as Meshy's
+        #    missing url), and the caller asked for that format on purpose.
+        for fmt in formats[1:]:
+            cbody = tripo.build_convert(task_id, fmt, endpoint == tripo.RIG_ENDPOINT)
+            cid = await self._create(client, self._api("/models/convert"), cbody, f"convert:{fmt}")
+            try:
+                cst = await self._poll(client, "convert", cid, [fmt], opts, poll_interval, left())
+            except RuntimeError as e:                # names the format, not just the task
+                raise RuntimeError(f"{self.vendor} convert to {fmt} failed: {e}") from e
+            took(f"convert:{fmt}", cid, cst)
+            state.downloads.append((f"{stem}.{fmt}", cst.downloads[0][1]))
+        # 5. animation clips (rig only) — a courtesy, like Meshy's: a clip that fails is
+        #    skipped with a warning, never the rigged mesh the job is actually about.
+        if endpoint == tripo.RIG_ENDPOINT:
+            extra["rig_spec"] = body.get("spec")
+            extra.setdefault("rig_type", body.get("rig_type"))
+            for preset in opts.get("animations") or []:
+                rbody = tripo.build_retarget(task_id, preset, native)
+                try:
+                    cid = await self._create(client, self._api("/animations/retarget"),
+                                             rbody, f"clip:{preset}")
+                    cst = await self._poll(client, "retarget", cid, [native], opts,
+                                           poll_interval, left())
+                except (RuntimeError, ConnectionError, TimeoutError) as e:
+                    # TimeoutError too: the job's max_wait running out on a CLIP must not
+                    # throw away the rigged mesh, which is finished, paid for and in hand.
+                    logger.warning(f"[{self.name}] tripo clip {preset} skipped: {e}")
+                    continue
+                took(f"clip:{preset}", cid, cst)
+                state.downloads.append((f"{tripo.clip_name(preset)}.{native}",
+                                        cst.downloads[0][1]))
+        state.credits = credits
+        extra["tasks"] = tasks
+        return RunResult(task_id, endpoint, body, state, extra)
+
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -3428,6 +3648,7 @@ ADAPTERS: dict[str, type[BackendAdapter]] = {
     "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
     "meshy": MeshyAdapter,
+    "tripo": TripoAdapter,
 }
 
 # Backend types that take POST /v1/generations work (main routes generation to these

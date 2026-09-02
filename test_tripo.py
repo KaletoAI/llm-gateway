@@ -228,6 +228,18 @@ class ParseTask(unittest.TestCase):
         st = tripo.parse_task({"status": "success", "output": {"model_url": "u/r.fbx"}}, ["fbx"], "rig")
         self.assertEqual(st.downloads, [("rigged.fbx", "u/r.fbx")])
 
+    def test_rig_check_success_has_no_model_url(self):
+        """The rig-check task delivers a VERDICT, not a mesh — so `model_url` is not
+        required there, and its answer travels on the TaskState the adapter polls to."""
+        st = tripo.parse_task({"status": "success", "output": {"riggable": False,
+                                                               "rig_type": "avian"}},
+                              ["glb"], "rig-check")
+        self.assertEqual((st.riggable, st.rig_type, st.downloads), (False, "avian", []))
+        st = tripo.parse_task({"status": "success", "output": {"riggable": True,
+                                                               "rig_type": "biped"}},
+                              ["glb"], "rig-check")
+        self.assertIs(st.riggable, True)
+
     def test_success_without_model_url_raises(self):
         with self.assertRaises(tripo.TripoInput):
             tripo.parse_task({"status": "success", "output": {}}, ["glb"])

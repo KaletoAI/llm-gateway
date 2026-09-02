@@ -19,6 +19,9 @@ KIND, VENDOR, URL, API = "tripo", "Tripo", "https://openapi.tripo3d.ai", "/v3"
 POLL_INTERVAL_DEFAULT, MAX_WAIT_DEFAULT = 2.0, 900     # the docs' own poll recommendation
 ENDPOINTS = ("image-to-model", "multiview-to-model", "rig")
 RIG_ENDPOINT = "rig"
+# The free verdict task the docs ask for before every rig. Not in ENDPOINTS: no alias
+# can be configured on it — the adapter runs it as a step of the rig endpoint.
+RIG_CHECK_ENDPOINT = "rig-check"
 SUCCESS_STATUS = "success"              # the one `TaskState.status` that means delivered
 AI_MODELS = ("v3.1-20260211", "v3.0-20250812", "v2.5-20250123", "P1-20260311", "P2-20260801")
 RIG_MODELS = ("v1.0-20240301", "v2.5-20260210")        # the rig endpoint has its OWN series
@@ -348,7 +351,9 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-model",
     A generation task delivers exactly one file (`output.model_url`, always GLB); the
     extra formats and the animation clips are separate tasks the adapter appends. Hence
     `formats[0]` names the one download here — for the rig endpoint that is its
-    `out_format`, and the stem says which it is (`model.glb` vs `rigged.glb`).
+    `out_format`, and the stem says which it is (`model.glb` vs `rigged.glb`). The free
+    `rig-check` is the one task that succeeds with NO file: it answers `riggable` /
+    `rig_type` instead, and the adapter reads them off the same TaskState.
 
     TOTAL over what the API may answer: `progress` that is not an integer counts as 0 (a
     poll must not die on a cosmetic field), and any status outside TASK_STATUSES is
@@ -382,6 +387,12 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-model",
         st.error = "cancelled"
         return st
     # ── success: what the task delivered depends on WHICH task it was ──
+    if endpoint == RIG_CHECK_ENDPOINT:
+        # A verdict, not a delivery: the rig-check succeeds WITHOUT a model_url, and the
+        # answer the adapter needs (rig this mesh, yes/no, and as what) is the output.
+        st.riggable = bool(out.get("riggable"))
+        st.rig_type = out.get("rig_type") or None
+        return st
     url = out.get("model_url")
     if not url:
         raise TripoInput("Tripo task succeeded but has no model_url")
