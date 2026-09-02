@@ -61,6 +61,19 @@ class EmbeddedScriptsParse(unittest.TestCase):
             self.assertEqual(p.returncode, 0,
                              f"inline script #{i} is not valid JS:\n{p.stderr}")
 
+    def test_page_level_script_constants_are_valid(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        for name in ("_SCROLL_JS", "_SORT_JS", "_LIVE_JS", "_FILTER_JS", "_JOB_TICK"):
+            blob = getattr(admin, name)
+            for src in re.findall(r"<script>(.*?)</script>", blob, re.S):
+                with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+                    fh.write(src)
+                    path = fh.name
+                p = subprocess.run(["node", "--check", path],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, f"{name} is not valid JS:\n{p.stderr}")
+
 
 class LiveScriptPresence(unittest.TestCase):
     def test_live_js_is_always_embedded(self):
@@ -74,6 +87,13 @@ class LiveScriptPresence(unittest.TestCase):
 
     def test_live_js_declares_the_hook_array(self):
         self.assertIn("window.gwLiveHooks", admin._LIVE_JS)
+
+    def test_sort_and_filter_register_post_morph_hooks(self):
+        # The server always renders insertion order and the morph reuses nodes, so
+        # without these hooks a clicked sort order is undone on every tick and rows
+        # morphed in fresh ignore an active filter.
+        self.assertIn("gwLiveHooks.push", admin._SORT_JS)
+        self.assertIn("gwLiveHooks.push", admin._FILTER_JS)
 
 
 if __name__ == "__main__":

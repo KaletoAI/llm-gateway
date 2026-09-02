@@ -308,7 +308,11 @@ _SCROLL_JS = ("<script>(function(){"
 # Click-a-header to sort any `table.sortable` (numeric-aware: a cell that is a plain
 # number sorts numerically, otherwise lexically). The choice persists per table in
 # sessionStorage and is re-applied on load — so it survives the dashboard's 4s
-# auto-refresh. Tables with `data-sk` get a stable key; others key off path+index.
+# auto-refresh. A gwLiveHooks entry re-applies it after every live morph too:
+# the server renders rows in insertion order and the morph re-imposes that order
+# on the live DOM, so without the hook a clicked sort is undone on every tick.
+# The hook re-reads sessionStorage rather than closing over the state — that
+# store is the source of truth and stays it. Tables with `data-sk` get a stable key; others key off path+index.
 # Grouped tables (a `tr.grp` header row followed by its member rows — the routing
 # views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
 # key for column 0 (it is the alias name), later columns key off the first member row.
@@ -343,6 +347,12 @@ _SORT_JS = ("<script>(function(){"
             "try{sessionStorage.setItem(k,JSON.stringify({idx:idx,dir:dir}));}catch(e){}});});"
             "var s={};try{s=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
             "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});"
+            "window.gwLiveHooks=window.gwLiveHooks||[];"
+            "window.gwLiveHooks.push(function(){"
+            "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
+            "var hdr=tbl.rows[0];if(!hdr)return;var s={};"
+            "try{s=JSON.parse(sessionStorage.getItem('sort:'+key(tbl,i))||'{}');}catch(e){}"
+            "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});});"
             "})();</script>")
 
 
@@ -4796,6 +4806,10 @@ _BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;borde
 # (reported from the Media Jobs list). Focus + caret come back too, but ONLY when the
 # save is seconds old: that means the reload pulled the page out from under someone who
 # was typing, whereas re-opening the tab later must not steal focus.
+# A gwLiveHooks entry re-runs the filter after every live morph, because rows the
+# morph brings in fresh carry no display style and would otherwise ignore it.
+# The hook is registered outside the `if(i)` guard and no-ops when the view has no
+# #sf input, so it is harmless on a page that never renders one.
 _FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.search;"
               "function el(){return document.getElementById('sf');}"
               "function save(){var i=el();if(!i)return;try{sessionStorage.setItem(K,"
@@ -4812,6 +4826,8 @@ _FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.searc
               "if(s.f&&Date.now()-(s.t||0)<15000){i.focus();"
               "try{i.setSelectionRange(s.c,s.c);}catch(e){}}}"
               "i.addEventListener('blur',save);window.addEventListener('beforeunload',save);}"
+              "window.gwLiveHooks=window.gwLiveHooks||[];"
+              "window.gwLiveHooks.push(function(){if(window.sfRun)window.sfRun();});"
               "})();</script>")
 
 
