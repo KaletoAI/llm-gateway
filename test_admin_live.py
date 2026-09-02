@@ -277,8 +277,13 @@ class LiveScriptInvariant(unittest.TestCase):
         return resp.body.decode()
 
     @staticmethod
-    def _script_tags(html):
-        return re.findall(r"<script[^>]*>", html)
+    def _script_blocks(html):
+        # Whole elements — attributes AND body — not just the opening tag. A bare
+        # inline block added to the finished state opens with the very same
+        # `<script>` four already-hoisted blocks use, so an opening-tag comparison
+        # calls it "already there" and the invariant test goes green on a script the
+        # morph will strip. The body is what makes two inline blocks distinguishable.
+        return re.findall(r"<script[^>]*>.*?</script>", html, re.S)
 
     def test_running_job_page_is_live(self):
         # The premise of everything below. If this ever stops holding, the invariant
@@ -292,11 +297,13 @@ class LiveScriptInvariant(unittest.TestCase):
         self.assertNotIn("<main data-live", html)
 
     def test_live_page_already_has_every_script_its_later_state_renders(self):
-        # THE invariant, checked the general way: no <script> opening tag may be new in
-        # the finished page. Catches any future viewer/widget added to a job artifact
-        # without hoisting it, not just today's two.
-        live = self._script_tags(self._render(_RUNNING_JOB))
-        done = self._script_tags(self._render(_DONE_JOB))
+        # THE invariant, checked the general way: no <script> ELEMENT may be new in the
+        # finished page. Catches any future viewer/widget added to a job artifact
+        # without hoisting it, not just today's two — including a hand-rolled inline
+        # block, which an opening-tag comparison could not tell from the inline blocks
+        # already on the page.
+        live = self._script_blocks(self._render(_RUNNING_JOB))
+        done = self._script_blocks(self._render(_DONE_JOB))
         new = [s for s in done if s not in live]
         self.assertEqual(new, [], "scripts that only a finished job renders are dropped "
                                   "by the morph and never run: " + repr(new))
@@ -309,6 +316,23 @@ class LiveScriptInvariant(unittest.TestCase):
         # Hoisted whole (import map + module), because the module also has to REGISTER
         # its post-morph hook before the first tick.
         self.assertIn(admin._FBX_VIEWER_JS, self._render(_RUNNING_JOB))
+
+    def test_import_map_precedes_any_module_script(self):
+        # An import map added after a module script's load was triggered is rejected
+        # outright wherever "multiple import maps" is unsupported (Chrome < 133, older
+        # Firefox/Safari), and `import ... from 'three'` then fails to resolve — no
+        # gwFbxScan, a permanently black FBX box, nothing in any log. An external
+        # <script type="module" src> starts loading as soon as it is parsed, so the map
+        # has to come first. Invisible in review; only this test guards it.
+        for job in (_RUNNING_JOB, _DONE_JOB):
+            html = self._render(job)
+            imap = html.find('<script type="importmap"')
+            self.assertNotEqual(imap, -1, "no import map on the page")
+            mods = [m.start() for m in
+                    re.finditer(r'<script[^>]*\btype="module"[^>]*\bsrc=', html)]
+            self.assertTrue(mods, "no external module script on the page")
+            self.assertLess(imap, min(mods),
+                            "the import map must precede every external module script")
 
     def test_finished_job_actually_renders_the_two_viewers(self):
         # Guards the fixture itself: if _media_tag/_job_thumbs stopped emitting a
@@ -329,9 +353,12 @@ class LiveScriptInvariant(unittest.TestCase):
         # client-only, so a later morph would strip both back out.
         self.assertIn("data-live-skip", self._render(_DONE_JOB))
 
-    def test_job_thumbs_emits_no_script_of_its_own(self):
-        # The gallery IS the subtree the morph inserts. A <script> in here is dead code
-        # by definition — which is how the regression got in.
+    def test_job_thumbs_emits_no_import_map(self):
+        # The gallery IS the subtree the morph inserts, so a <script> in here is dead
+        # code by definition — which is how the regression got in. The gallery is not
+        # script-free (a GLB cell carries _media_tag's model-viewer module tag, inert
+        # because it is byte-identical to the hoisted one); what must never come back
+        # is the import map, whose absence up top kills the whole FBX module.
         gal = admin._job_thumbs("abc", "result", _DONE_JOB["results"])
         self.assertNotIn("<script type=\"importmap\"", gal)
         self.assertNotIn("<script type='importmap'", gal)

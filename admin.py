@@ -4307,9 +4307,13 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     full file; video/audio play inline; GLB → <model-viewer>; FBX → a three.js 3D
     viewer textured with the sibling basecolor PNG; other files → a download card.
 
-    Emits no <script> of its own: both viewers (model-viewer, _FBX_VIEWER_JS) are
-    hoisted by the calling page, because this gallery is exactly the markup a live
-    morph inserts mid-session, and the morph drops scripts it would insert."""
+    Emits no import map and no viewer INIT of its own: the three.js module and its
+    import map (_FBX_VIEWER_JS) and the model-viewer module are hoisted by the calling
+    page, because this gallery is exactly the markup a live morph inserts mid-session
+    and the morph drops every <script> it would insert. A GLB cell still carries
+    _media_tag's own <script type="module" src=...> for model-viewer — byte-identical
+    to the hoisted one and turned into a comment by adopt(), so it is inert either
+    way."""
     base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
     style = "max-width:260px;max-height:260px;border:1px solid #313a46;border-radius:8px"
     box3d = "width:720px;max-width:100%;height:640px"
@@ -4541,7 +4545,15 @@ async def job_detail_page(job_id: str, request: Request):
     # Custom elements upgrade on their own once model-viewer is defined; the FBX side
     # needs the gwFbxScan hook on top (the module body runs when there is nothing to
     # scan yet). Both files are local static and browser-cached.
-    page = (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>{_FBX_VIEWER_JS}'
+    # ORDER IS LOAD-BEARING: _FBX_VIEWER_JS carries the import map, and an import map
+    # inserted after a module script's load has been triggered is REJECTED outright by
+    # every engine without the "multiple import maps" support (Chrome < 133, older
+    # Firefox/Safari) — the model-viewer <script type="module" src> starts loading the
+    # moment it is parsed. The FBX module would then die on "Failed to resolve module
+    # specifier 'three'", gwFbxScan would never exist and the viewer stays a black box
+    # with nothing in any log. So the import map goes FIRST. Pinned by
+    # test_admin_live.LiveScriptInvariant.test_import_map_precedes_any_module_script.
+    page = (f'{_FBX_VIEWER_JS}<script type="module" src="{_MODELVIEWER_SRC}"></script>'
             f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
             f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(job))}</span></h2>"
             f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
