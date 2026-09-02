@@ -30,7 +30,7 @@ import scheduler
 import stats
 import store
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
-                      input_path_ref, is_image_field, lora_counterpart, lora_groups,
+                      is_image_field, lora_counterpart, lora_groups,
                       make_adapter, normalize_delivery, validate_delivery)
 from openai_image_bridge import (EDIT_KNOWN, OAI_IMG_KEYS, coerce_scalar, gen_done_or_502,
                                  images_response, images_uploads, multipart_list, parse_size)
@@ -2689,7 +2689,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
 
     successor config: {alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}."""
     succ_alias = (succ.get("alias") or "").strip()
-    export_node = str(succ.get("export_node") or "").strip()
+    # `export_node` is read by the stage-1 adapter (chain_export), not here.
     mesh_param = (succ.get("mesh_param") or "mesh_path").strip()
     keep_globs = [g.strip() for g in (succ.get("keep_from_mesh") or []) if g.strip()]
     chain_rig = (succ.get("rig") or "").strip() or None
@@ -2868,32 +2868,14 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                         f"successor's mesh-load input or fix 'successor mesh param'")
                 return
             s1_wf = stage1_cand.get("workflow_json") or {}
-            # The export node must EXIST and accept the filename pin — a node without a
-            # `filename_prefix` input drops it silently (_apply_fixed), so stage 1 would
-            # run to completion under its own name and only the /view fetch below would
-            # notice. Reject here, before the GPU-minutes are spent.
-            export_why = adapter.export_node_error(s1_wf, export_node)
-            if export_why:
-                await asyncio.to_thread(jobs.fail, job_id, export_why)
+            # Stage-1 export is backend-specific (ComfyUI pins an export node; Meshy
+            # delivers the mesh as a blob) — the adapter decides, and a candidate that
+            # cannot export as configured is refused HERE, before GPU-minutes/credits.
+            export = adapter.chain_export(stage1_cand, succ, params, prefix)
+            if export.error:
+                await asyncio.to_thread(jobs.fail, job_id, export.error)
                 return
-            # The mesh filename's extension is what ComfyUI will WRITE: the export node's
-            # file_format as the adapter effectively applies it — a mapped request param
-            # overrides the raw workflow value, an admin pin (per-backend `fixed`) beats
-            # both (mirrors _apply_mapping/_apply_fixed precedence).
-            ext = str(((s1_wf.get(export_node) or {}).get("inputs") or {}).get("file_format") or "glb")
-            for p, m in (stage1_cand.get("mapping") or {}).items():
-                m = m or {}
-                if str(m.get("node")) == export_node and m.get("field") == "file_format":
-                    v = params.get(p)
-                    if v in (None, "") and (m.get("label") or "").strip():
-                        v = params.get((m.get("label") or "").strip())
-                    if v not in (None, ""):
-                        ext = str(v)
-            for fx in (stage1_cand.get("fixed") or []):
-                if (str(fx.get("node")) == export_node and fx.get("field") == "file_format"
-                        and fx.get("value") not in (None, "")):
-                    ext = str(fx["value"])
-            mesh_name = adapter.pinned_output_name(prefix, ext)   # backend names the export file
+            mesh_name = export.mesh_name
             cross = relay == "upload" and bid2 != bid
 
             # Claim the stage-1 slot: the busy-check and inc run with no await between them
@@ -2922,8 +2904,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
                     workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
                     node_mapping=stage1_cand.get("mapping") or {},
-                    fixed=list(stage1_cand.get("fixed") or [])
-                         + [adapter.export_pin(export_node, prefix)],
+                    fixed=list(stage1_cand.get("fixed") or []) + list(export.extra_fixed),
+                    meshy=stage1_cand.get("meshy"),
                     bypass=(stage1_cand.get("bypass") or []),
                     upload_images=dict(upload_images or {}), raw=request,
                     upload_files=dict(upload_files or {}),
@@ -2957,15 +2939,34 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                                      for g in keep_globs)]
                 # The path relay only needs the mesh to EXIST on the shared disk (stage 2
                 # reads it by absolute path); only the upload relay needs the bytes. The
-                # adapter fetches (existence-only = cheap 1-byte Range GET; bytes otherwise),
-                # keeping ComfyUI's /view out of the router.
+                # adapter takes it (ComfyUI: existence-only = cheap 1-byte Range GET on
+                # /view; bytes otherwise), keeping backend conventions out of the router.
                 need_bytes = relay == "upload"
-                mesh = await adapter.fetch_output(mesh_name, want_bytes=need_bytes)
+                mesh = await adapter.chain_take_mesh(out1, export, need_bytes)
                 if mesh is None:
                     raise RuntimeError(f"stage-1 produced no mesh at '{mesh_name}' — "
                                        "check the export node / file_format")
                 mesh_bytes = mesh if need_bytes else None
                 s1_done = True
+
+                # Stage 2's request is built BEFORE the hand-off: the feed is the
+                # stage-2 adapter's business and may have to put the mesh ON the request
+                # (a cloud backend uploads/embeds it) instead of somewhere it can name by
+                # path. `params` is filled in after the feed, once the mesh_ref is known.
+                req2 = NormalizedRequest(
+                    alias=succ_alias, real_model=s2.get("model"),
+                    task=s2.get("task", "text2img"), inputs={}, params={}, output={},
+                    workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
+                    node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
+                    upload_files={},
+                    upload_prefix=_upload_prefix(job_id, "s2"),
+                    raw=request, output_node=(s2.get("output_node") or None),
+                    output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
+                    output_cases=(s2.get("output_cases") or None),
+                    texture_format=(s2.get("texture_format") or None),
+                    dummy_check=(s2.get("dummy_check") is not False),
+                    meshy=s2.get("meshy"),
+                    bypass=(s2.get("bypass") or []), slot_held=True)
 
                 # ── Hand-off: give stage 2 either a shared-disk path or an uploaded input name ──
                 if cross:
@@ -2999,14 +3000,16 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     active = backend2
                     backend_last_key[bid2] = succ_alias   # stage 2 is its own type key
                     await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
-                    mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
+                    mesh_ref = await adapter2.chain_feed_mesh(req2, backend2, mesh_param,
+                                                             mesh_name, mesh_bytes, outdir)
                     if log_per_call:
                         logger.info(f"chain job {job_id}: relayed mesh {mesh_name} "
                                     f"[{backend['name']}]→[{backend2['name']}] as '{mesh_ref}'")
-                elif relay == "upload":                         # same backend, still via input dir
-                    mesh_ref = input_path_ref(backend2, await adapter2.upload_input(mesh_bytes, mesh_name))
                 else:
-                    mesh_ref = f"{outdir}/{mesh_name}"          # shared-disk absolute path
+                    # same backend: the relayed bytes go through stage 2's own input path
+                    # (`upload`), else the mesh already lies on the shared disk (`path`).
+                    mesh_ref = await adapter2.chain_feed_mesh(req2, backend2, mesh_param,
+                                                             mesh_name, mesh_bytes, outdir)
 
                 # ── Stage 2: successor, fed the mesh + stage-1 params (name, no_fingers, …) ──
                 # Thread stage-1 params to the successor keyed by their mapping LABEL, never by
@@ -3027,18 +3030,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # successor actually mapped) is filled in from out2 below.
                 s2_info = {"alias": succ_alias, "backend": backend2["name"], "relay": relay,
                            "mesh_param": mesh_param, "mesh_ref": mesh_ref, "params": s2_params}
-                req2 = NormalizedRequest(
-                    alias=succ_alias, real_model=s2.get("model"),
-                    task=s2.get("task", "text2img"), inputs={}, params=s2_params, output={},
-                    workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
-                    node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
-                    upload_prefix=_upload_prefix(job_id, "s2"),
-                    raw=request, output_node=(s2.get("output_node") or None),
-                    output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
-                    output_cases=(s2.get("output_cases") or None),
-                    texture_format=(s2.get("texture_format") or None),
-                    dummy_check=(s2.get("dummy_check") is not False),
-                    bypass=(s2.get("bypass") or []), slot_held=True)
+                req2.params = s2_params                  # built before the hand-off (see above)
                 await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
                 await _unload_host_llms(backend2)
                 gen_attempts += 1

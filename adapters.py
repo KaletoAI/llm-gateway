@@ -239,6 +239,17 @@ class GenOutput:
 
 
 @dataclass
+class ChainExport:
+    """What a stage-1 adapter contributes before the chain runs: the name the mesh
+    will have (`mesh_name`), pins the stage-1 request needs (`extra_fixed`) and, when
+    the candidate cannot be a stage 1 as configured, a NAMED `error` — the chain fails
+    the job with it before any GPU-minutes or credits are spent."""
+    mesh_name: str
+    extra_fixed: list = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@dataclass
 class AdapterContext:
     """App services injected into every adapter. Keeps adapters import-cycle-free
     and hot-reload-safe: `log_enabled` is a callable so the live flag value is
@@ -325,6 +336,21 @@ class BackendAdapter(ABC):
         """Best-effort: stop whatever this backend is running for the gateway (a
         cancelled job). Default no-op — a cloud task API has nothing to interrupt."""
         return None
+
+    # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
+    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
+        """Stage 1: how this backend will name/export the mesh. Default: not a stage 1."""
+        return ChainExport("", error=f"a {self.type} backend cannot be a chain stage 1")
+
+    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
+        """Stage 1: the produced mesh (bytes; b'' when only existence is asked for), None if absent."""
+        return None
+
+    async def chain_feed_mesh(self, req2: NormalizedRequest, backend2: dict, mesh_param: str,
+                              mesh_name: str, mesh_bytes: Optional[bytes], outdir: str) -> str:
+        """Stage 2: put the mesh where THIS backend reads it and return the `mesh_ref`
+        recorded on the job (a path, or a marker for an embedded upload)."""
+        raise RuntimeError(f"a {self.type} backend cannot be a chain stage 2")
 
 
 # ── OpenAI-compatible adapter (the only one in Phase 0) ───────────────────────
@@ -2390,6 +2416,46 @@ class ComfyUIAdapter(BackendAdapter):
         if r.status_code == 404:
             return None
         raise RuntimeError(f"/view '{name}' → HTTP {r.status_code}")
+
+    # ── the chain roles, built from the primitives above (main._run_chain calls these) ──
+    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
+        """Stage 1 on ComfyUI: pin the export node's `filename_prefix` and predict the
+        name it writes. A node that cannot be pinned is refused HERE — `_apply_fixed`
+        drops such a binding silently, so stage 1 would run to completion (tens of
+        GPU-minutes) under its own name and only the /view fetch would notice."""
+        wf = cand.get("workflow_json") or {}
+        node = str(succ.get("export_node") or "").strip()
+        why = self.export_node_error(wf, node)
+        if why:
+            return ChainExport("", error=why)
+        # The extension is what ComfyUI will WRITE: the node's file_format as applied —
+        # a mapped request param overrides the workflow value, an admin pin beats both.
+        ext = str(((wf.get(node) or {}).get("inputs") or {}).get("file_format") or "glb")
+        for p, m in (cand.get("mapping") or {}).items():
+            m = m or {}
+            if str(m.get("node")) == node and m.get("field") == "file_format":
+                v = params.get(p)
+                if v in (None, "") and (m.get("label") or "").strip():
+                    v = params.get((m.get("label") or "").strip())
+                if v not in (None, ""):
+                    ext = str(v)
+        for fx in (cand.get("fixed") or []):
+            if (str(fx.get("node")) == node and fx.get("field") == "file_format"
+                    and fx.get("value") not in (None, "")):
+                ext = str(fx["value"])
+        return ChainExport(self.pinned_output_name(prefix, ext), [self.export_pin(node, prefix)])
+
+    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
+        """Stage 1's mesh comes off the backend's disk, not out of the response: the
+        export node wrote it under our pinned name (existence-only = cheap Range GET)."""
+        return await self.fetch_output(export.mesh_name, want_bytes=want_bytes)
+
+    async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
+        """Stage 2 on ComfyUI reads a FILE: either the shared-disk output path (path
+        relay, no bytes travelled) or the mesh uploaded into this backend's input dir."""
+        if mesh_bytes is None:                       # path relay: shared disk, absolute path
+            return f"{outdir}/{mesh_name}"
+        return input_path_ref(backend2, await self.upload_input(mesh_bytes, mesh_name))
 
     async def _resolve_image_sentinels(self, fixed: list, upload: Optional[bytes],
                                        prefix: str, used: list) -> list:
