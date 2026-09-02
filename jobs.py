@@ -142,6 +142,60 @@ def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = Non
     return [dict(r) for r in rows]
 
 
+def recent_artifacts(limit: int = 60, media_only: bool = True) -> list:
+    """Recent jobs WITH their artifact manifests, newest first — the source of the
+    playground's "pick from an earlier job" dropdowns (recent() returns column values
+    only, and one get() per job would be N queries per page render).
+
+    Per job: `results` (only for a done job — a queued/failed one has none) and
+    `inputs` (the stored reference images, any status). `name` is the manifest's
+    original artifact name, else its on-disk filename. Deliberately NO filesystem
+    check here: TTL pruning may have deleted the bytes, and the reader that opens
+    them is the one place that can report it — a listing that stats 60 jobs' files
+    on every render pays for a race it cannot win. `media_only` defaults to True
+    (unlike recent()): a chat/response row has no artifacts to pick."""
+    if not _active:
+        return []
+    flt, args = (_MEDIA_FLT, _NON_MEDIA_TASKS) if media_only else ("", ())
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT id, created, status, task, alias, results_json, meta_json "
+            f"FROM jobs{flt} ORDER BY created DESC LIMIT ?", (*args, limit)).fetchall()
+    out = []
+    for r in rows:
+        results = []
+        if r["status"] == "done":
+            for e in _json_list(r["results_json"]):
+                if isinstance(e, dict) and e.get("filename"):
+                    results.append({"n": e.get("n"), "kind": e.get("kind"), "mime": e.get("mime"),
+                                    "name": e.get("name") or e.get("filename")})
+        meta = {}
+        if r["meta_json"]:
+            try:
+                meta = json.loads(r["meta_json"]) or {}
+            except Exception:
+                meta = {}
+        inputs = [{"n": e.get("n"), "slot": e.get("slot"), "mime": e.get("mime"),
+                   "filename": e.get("filename")}
+                  for e in (meta.get("input_images") or []) if isinstance(e, dict)]
+        out.append({"id": r["id"], "created": r["created"], "status": r["status"],
+                    "task": r["task"], "alias": r["alias"],
+                    "results": results, "inputs": inputs})
+    return out
+
+
+def _json_list(raw) -> list:
+    """A stored JSON array column as a list — never raises (a corrupt row must not
+    take a whole listing down)."""
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+    except Exception:
+        return []
+    return v if isinstance(v, list) else []
+
+
 def owners(media_only: bool = True) -> list:
     """Distinct job owners, alphabetical — the Media Jobs user-picker options."""
     if not _active:

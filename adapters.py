@@ -1476,6 +1476,31 @@ def image_params(wf: dict, mapping: dict) -> list:
     return [p for p, m in (mapping or {}).items() if is_image_field(wf, (m or {}).get("node"))]
 
 
+# Workflow fields that take a path to a client file. A mapped node is a plain
+# Primitive/string node either way, so the workflow itself never says "this is a
+# file" — the NAME is the only signal there is.
+_FILE_FIELDS = ("file_path", "mesh_path", "path", "filename", "file")
+
+
+def is_file_param(param: str, m: Optional[dict]) -> bool:
+    """A mapped NON-image param that takes a client file (a mesh): its public name or the
+    workflow field says so. Heuristic on purpose — the mapping has no kind flag, and every
+    rig/shrink alias in the wild names it `input_mesh_path`. Never true for image loaders
+    (the caller checks is_image_field first)."""
+    names = {(param or "").lower(), ((m or {}).get("label") or "").lower()}
+    if any(("path" in n or "mesh" in n or n.endswith("_file")) for n in names if n):
+        return True
+    return ((m or {}).get("field") or "").lower() in _FILE_FIELDS
+
+
+def file_params(wf: dict, mapping: dict) -> list:
+    """Mapped params rendered as file uploads: not an image loader, and is_file_param.
+    Deliberately NOT part of public_fields' `images` list — that schema means images
+    (the API carries these under `files`, with no placeholder/empty-mode semantics)."""
+    return [p for p, m in (mapping or {}).items()
+            if not is_image_field(wf, (m or {}).get("node")) and is_file_param(p, m)]
+
+
 def slot_empty_mode(m: dict) -> str:
     """What a mapped image slot does when the request sends no image for it:
     'placeholder' (8×8 black, the default) · 'required' (no fallback → ComfyUI errors

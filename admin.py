@@ -740,7 +740,14 @@ async def _multipart(request: Request) -> dict:
         head_s = head.decode("utf-8", "replace")
         nm = re.search(r'name="([^"]*)"', head_s)
         if nm:
-            out[nm.group(1)] = content if 'filename="' in head_s else content.decode("utf-8", "replace")
+            fn = re.search(r'filename="([^"]*)"', head_s)
+            out[nm.group(1)] = content if fn else content.decode("utf-8", "replace")
+            if fn:
+                # The upload's own name, under a companion key (callers read fields by
+                # name, and the prefix loops all filter by their own prefix). A mesh
+                # upload needs it: the extension is what tells the API the file type —
+                # the bytes of a .fbx and a .glb are both "some binary".
+                out[nm.group(1) + "__filename"] = os.path.basename(fn.group(1).replace("\\", "/"))
     return out
 
 
@@ -3586,12 +3593,74 @@ async def copy(request: Request):
 
 # ── Tab: Playground ─────────────────────────────────────────────────────────────
 
-# Reference images stick across generations: stashed in memory PER USER (keyed by
-# slot name) so the file-input (which the browser can't pre-fill) doesn't have to be
-# re-picked each time — and so switching the model keeps them: same-named slots
-# carry over to the new alias (generate() filters to the alias's actual image
-# slots). A new upload replaces; the "clear" checkbox drops it. Lost on restart.
+# Uploaded inputs stick across generations: stashed in memory PER USER as
+# {param: (filename, bytes)} so the file-input (which the browser can't pre-fill)
+# doesn't have to be re-picked each time — and so switching the model keeps them:
+# same-named slots carry over to the new alias (generate() filters to the alias's
+# actual slots). A new upload replaces; the "clear" checkbox drops it. Lost on
+# restart. The filename rides along because a MESH's type lives in its extension
+# alone (a .fbx and a .glb are both "some binary"); images carry theirs in the bytes.
 _pg_images: dict = {}
+
+# Mesh uploads the file picker offers, and what a stashed extension means on the
+# wire. Deliberately NOT adapters._mime_and_kind: that maps .fbx/.ply to
+# application/octet-stream (right for storage, wrong here — the API recovers the
+# file's extension from the data-URI MIME, and octet-stream would lose it).
+_PG_FILE_ACCEPT = ".glb,.gltf,.obj,.fbx,.stl,.ply"
+_PG_FILE_MIME = {"glb": "model/gltf-binary", "gltf": "model/gltf+json", "obj": "model/obj",
+                 "stl": "model/stl", "ply": "model/ply", "fbx": "model/fbx"}
+
+
+def _pg_file_mime(name: str) -> str:
+    """The data-URI MIME for a stashed mesh, derived from its filename extension —
+    that MIME is the ONLY thing the API has to rebuild the extension with (see
+    main._EXT_BY_MIME), so an unknown one costs the file its type."""
+    return _PG_FILE_MIME.get(os.path.splitext(name or "")[1].lstrip(".").lower(),
+                             "application/octet-stream")
+
+
+def _pg_history_opts() -> dict:
+    """{"image": [(value, label)…], "file": […]} — every artifact of the recent jobs,
+    newest first, as picker options. `value` is "<job>:r:<n>" (a result) or
+    "<job>:i:<n>" (a stored input image); generate() resolves it back to bytes.
+
+    An image slot may take any earlier image — a result OR another job's reference
+    input (re-running the same picture against a second alias is the common case);
+    a mesh param takes result FILES (glb/fbx/…), which is what a mesh stage produces."""
+    out = {"image": [], "file": []}
+    for j in jobs.recent_artifacts(limit=60):
+        when = time.strftime("%H:%M", time.localtime(int(j.get("created") or 0)))
+        head = f"{when} {j.get('alias') or '?'}"
+        for r in j["results"]:
+            kind = r.get("kind")
+            if kind in out:
+                out[kind].append((f"{j['id']}:r:{r['n']}", f"{head} · #{r['n']} {r.get('name') or ''}"))
+        for i in j["inputs"]:
+            out["image"].append((f"{j['id']}:i:{i['n']}",
+                                 f"{head} · in#{i['n']} {i.get('slot') or i.get('filename') or ''}"))
+    return out
+
+
+def _pg_history_blob(ref: str):
+    """A picked "<job>:r|i:<n>" → (filename, bytes), or None when the artifact is gone
+    (TTL pruning deletes a job's files while the row still lists them)."""
+    jid, _, rest = (ref or "").partition(":")
+    which, _, ns = rest.partition(":")
+    if which not in ("r", "i") or not ns.isdigit():
+        return None
+    n = int(ns)
+    p = jobs.result_path(jid, n) if which == "r" else jobs.input_path(jid, n)
+    if not p:
+        return None
+    try:
+        with open(p[0], "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    # a result's original name (mesh.glb) if it has one, else the on-disk name —
+    # either way the EXTENSION is what the upload's mime is derived from
+    name = (p[2] if which == "r" and len(p) > 2 and p[2] else os.path.basename(p[0]))
+    return name, data
 
 
 def _alias_defaults(cand: dict) -> dict:
@@ -3606,8 +3675,26 @@ def _alias_defaults(cand: dict) -> dict:
 
 
 def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
-                     kept: Optional[set] = None) -> str:
+                     kept: Optional[dict] = None) -> str:
+    """`kept` is the user's upload stash ({param: (filename, bytes)}) — membership drives
+    the '✓ kept' badge, the name is shown for mesh uploads (which one is loaded?)."""
     v = lambda k: str(vals.get(k) if vals.get(k) is not None else "")
+    # Job-artifact picker options, loaded AT MOST ONCE per render (one SELECT) and only
+    # when a row actually needs them — a text-only alias must not pay for the query.
+    hist_cache: list = []
+
+    def hist(param: str, kind: str) -> str:
+        if not hist_cache:
+            hist_cache.append(_pg_history_opts())
+        return _select(f"hist__{param}", [("", "(from a job…)")] + hist_cache[0][kind])
+
+    def kept_badge(param: str, show_name: bool = False) -> str:
+        name = (kept or {}).get(param)
+        name = name[0] if isinstance(name, tuple) else ""
+        return (' <span class="badge ok">✓ kept</span>'
+                + (f' <span class="muted">{_esc(name)}</span>' if show_name and name else "")
+                + ' <label class="muted" style="font-weight:normal">'
+                  f'<input type="checkbox" name="clear__{_esc(param)}"> clear</label>')
     # selecting an alias reloads with its workflow defaults pre-filled
     opts = "".join(f'<option value="{_esc(a)}"{" selected" if a == vals.get("model") else ""}>{_esc(a)}</option>'
                    for a in aliases)
@@ -3630,13 +3717,12 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     if cand and cand.get("meshy") is not None:
         params, images = adapters.public_fields(cand)
         for i in images:
-            extra = (' <span class="badge ok">✓ kept</span> <label class="muted" style="font-weight:normal">'
-                     f'<input type="checkbox" name="clear__{_esc(i["name"])}"> clear</label>'
+            extra = (kept_badge(i["name"])
                      if kept and i["name"] in kept else
                      ' <span class="muted">required</span>' if i["required"] else
                      ' <span class="muted">optional · empty → not sent</span>')
             rows += _field(i["name"], f'<input type="file" name="img__{_esc(i["name"])}" '
-                                      f'accept="image/png,image/jpeg">{extra}')
+                                      f'accept="image/png,image/jpeg"> {hist(i["name"], "image")}{extra}')
         for p in params:
             cur = v(p["name"]) or ("" if p.get("default") in (None, "") else str(p["default"]))
             if p.get("choices"):
@@ -3654,15 +3740,27 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
         if p in imgset:
             emode = adapters.slot_empty_mode(m)
             if kept and p in kept:
-                extra = (' <span class="badge ok">✓ kept</span> <label class="muted" '
-                         f'style="font-weight:normal"><input type="checkbox" name="clear__{_esc(p)}"> clear</label>')
+                extra = kept_badge(p)
             elif emode == "required":
                 extra = ' <span class="muted">required — no placeholder</span>'
             elif emode == "disable":
                 extra = ' <span class="muted">empty → loader node disabled</span>'
             else:
                 extra = ' <span class="muted">empty → 8×8 placeholder</span>'
-            rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*">{extra}')
+            rows += _field(label, f'<input type="file" name="img__{_esc(p)}" accept="image/*"> '
+                                  f'{hist(p, "image")}{extra}')
+        elif adapters.is_file_param(p, m):
+            # A mesh param takes a real file (uploaded, or an earlier job's result) —
+            # sent as the API's `files`. The old text field stays as the second way in:
+            # a path that already exists ON THE BACKEND needs no upload at all. Upload
+            # wins over path when both are set (generate() drops the path then).
+            extra = kept_badge(p, show_name=True) if kept and p in kept else ""
+            rows += _field(label,
+                           f'<input type="file" name="file__{_esc(p)}" accept="{_PG_FILE_ACCEPT}"> '
+                           f'{hist(p, "file")}{extra}'
+                           f'<div style="margin-top:4px">'
+                           + _inp(f"p__{p}", v(p), placeholder="…or a path on the backend")
+                           + '</div>')
         else:
             dv = defaults.get(p)
             node, field = (m or {}).get("node"), (m or {}).get("field")
@@ -3714,7 +3812,7 @@ _PG_POLL_JS = ("<script>(function(){var rc=document.getElementById('resultcol');
 
 
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None, kept: Optional[set] = None, poll_job: str = "") -> str:
+                     oi: Optional[dict] = None, kept: Optional[dict] = None, poll_job: str = "") -> str:
     pa = f' data-poll-job="{_esc(poll_job)}"' if poll_job else ""
     # model-viewer must load with the PAGE: the poller swaps #resultcol via
     # innerHTML, and innerHTML-inserted <script> tags never execute — a GLB result
@@ -3805,7 +3903,7 @@ async def playground_page(request: Request):
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the result here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
     oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping")) if cand else {}
-    kept = set(_pg_images.get(_session_user(request) or "default", {}).keys())
+    kept = dict(_pg_images.get(_session_user(request) or "default", {}))
     poll_job = job_id if refresh else ""        # poll only the result column; form stays editable
     return HTMLResponse(_page("Media Playground",
                               _playground_body(aliases, vals, cand, result_html, oi, kept, poll_job),
@@ -3830,35 +3928,74 @@ async def generate(request: Request):
             body[p] = raw
         else:
             body["params"][p] = _num(raw)
-    # per-field image uploads (img__<param>); empty inputs fall back to the 8×8
-    # placeholder downstream, so they're simply omitted here.
-    # reference images persist across generations AND model switches (one stash per
-    # user, keyed by slot name — same-named slots carry over to another alias); a new
-    # upload replaces, a checked clear__<param> drops the kept one.
+    # per-field uploads: images (img__<param>, empty → the 8×8 placeholder downstream,
+    # so simply omitted here) and mesh files (file__<param>). Both persist across
+    # generations AND model switches (one stash per user, keyed by slot/param name —
+    # same-named slots carry over to another alias); a new upload replaces, a checked
+    # clear__<param> drops the kept one, and hist__<param> takes an earlier job's
+    # artifact instead of a fresh upload.
     user = _session_user(request) or "default"
     stash = _pg_images.setdefault(user, {})
-    for k in f:
-        if k.startswith("img__"):
-            val = f.get(k)
-            if isinstance(val, (bytes, bytearray)) and val.strip():
-                stash[k[len("img__"):]] = bytes(val)
-        elif k.startswith("clear__"):
-            stash.pop(k[len("clear__"):], None)
     cand = (store.get(model) or [None])[0]
-    # only the slots this alias actually has ride along (the stash may carry other
-    # aliases' images); no mapping info → send everything, downstream ignores extras.
     wf_i = (cand.get("workflow_json") if cand else {}) or {}
     map_i = (cand.get("mapping") if cand else {}) or {}
-    if cand and cand.get("meshy") is not None:
-        slots = {i["name"] for i in adapters.public_fields(cand)[1]}
-    else:
-        slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
-    images = {p: v for p, v in stash.items() if p in slots} if slots else dict(stash)
     vals = {"model": model, "backend": force_bk, **submitted}
+
+    def _err(msg: str, status: int = 404):
+        aliases = list(store.list_aliases().keys())
+        result_html = f'<h2>Result</h2><p class="bad">Error {status}: {_esc(msg)}</p>'
+        return HTMLResponse(_page("Media Playground",
+                                  _playground_body(aliases, vals, cand, result_html, kept=dict(stash)),
+                                  "playground", subnav=_subnav("playground", "media")))
+
+    # One pass PER PARAM, so the three ways an input arrives have a defined precedence:
+    # clear drops what was kept, a fresh upload beats it, a history pick fills what is
+    # then still empty. (`__filename` companions are skipped — they are not params.)
+    for p in sorted({k.split("__", 1)[1] for k in f
+                     if k.startswith(("img__", "file__", "hist__", "clear__"))
+                     and not k.endswith("__filename")}):
+        if f.get(f"clear__{p}") is not None:          # checkbox present ⇒ checked
+            stash.pop(p, None)
+        up = next((k for k in (f"file__{p}", f"img__{p}")
+                   if isinstance(f.get(k), (bytes, bytearray)) and f[k].strip()), None)
+        if up:
+            # the browser's filename, because a mesh's type lives in its extension
+            stash[p] = (str(f.get(f"{up}__filename") or "")
+                        or (p if up.startswith("file__") else f"{p}.png"), bytes(f[up]))
+            continue
+        ref = str(f.get(f"hist__{p}", "") or "").strip()
+        if ref:
+            got = _pg_history_blob(ref)
+            if not got:                               # never silently generate without it
+                jid, _, rest = ref.partition(":")
+                return _err(f"job {jid} #{rest.partition(':')[2]} is no longer available — "
+                            f"its files were deleted (job TTL)")
+            stash[p] = got
+    # only the slots/params this alias actually has ride along (the stash may carry
+    # another alias's inputs); no mapping info at all → send everything as images,
+    # downstream ignores extras.
+    if cand and cand.get("meshy") is not None:
+        slots, fset = {i["name"] for i in adapters.public_fields(cand)[1]}, set()
+    else:                                             # Meshy takes no `files` (the API 400s)
+        slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
+        fset = set(adapters.file_params(wf_i, map_i))
+    if slots or fset:
+        images = {p: v for p, v in stash.items() if p in slots}
+        files = {p: v for p, v in stash.items() if p in fset}
+    else:
+        images, files = dict(stash), {}
     # A REAL API call through POST /v1/generations (reference images as the API's
-    # per-field base64 `images` dict) — the playground tests the API, bypassing nothing.
+    # per-field base64 `images` dict, meshes as `files` data-URIs) — the playground
+    # tests the API, bypassing nothing.
     if images:
-        body["images"] = {p: base64.b64encode(v).decode() for p, v in images.items()}
+        body["images"] = {p: base64.b64encode(d).decode() for p, (_, d) in images.items()}
+    if files:
+        body["files"] = {p: f"data:{_pg_file_mime(n)};base64,{base64.b64encode(d).decode()}"
+                         for p, (n, d) in files.items()}
+        for p in files:
+            # an upload beats the typed backend path — sending both would bind the
+            # same node twice, and the API would reject the pair
+            body["params"].pop(p, None)
     try:
         try:
             r = await _self_api(request, "POST", "/v1/generations", json=body)
@@ -3872,11 +4009,7 @@ async def generate(request: Request):
             raise HTTPException(r.status_code, detail)
         view = r.json()
     except HTTPException as e:
-        aliases = list(store.list_aliases().keys())
-        result_html = f'<h2>Result</h2><p class="bad">Error {e.status_code}: {_esc(e.detail)}</p>'
-        return HTMLResponse(_page("Media Playground",
-                                  _playground_body(aliases, vals, cand, result_html, kept=set(stash.keys())),
-                                  "playground", subnav=_subnav("playground", "media")))
+        return _err(str(e.detail), e.status_code)
     # Redirect to the GET view (form re-populated + auto-polling) — instant feedback.
     q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
@@ -4683,7 +4816,9 @@ async def job_to_playground(job_id: str, request: Request):
         if ip:
             try:
                 with open(ip[0], "rb") as fh:
-                    stash[ext2param.get(r.get("slot"), r.get("slot"))] = fh.read()
+                    slot = ext2param.get(r.get("slot"), r.get("slot"))
+                    # (filename, bytes) — the stash's shape since mesh uploads joined it
+                    stash[slot] = (r.get("filename") or f"{slot}.png", fh.read())
             except OSError:
                 pass
     return RedirectResponse(f"/ui/playground?{urlencode(q)}", status_code=303)
