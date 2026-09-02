@@ -2636,6 +2636,30 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                             {"attempts": attempts} if attempts > 1 else None)
 
 
+def _chain_mesh_param_error(s2: dict, mesh_param: str, succ_alias: str) -> Optional[str]:
+    """Why `mesh_param` cannot carry the mesh into the successor candidate `s2` (None = it
+    can). `mesh_param` must be a request field of the successor (accepted under param OR
+    label, exactly like any incoming value) — both adapters silently drop an unknown
+    param, so stage 2 would otherwise run on the workflow's baked-in mesh path (or, on
+    Meshy, on no mesh at all) and deliver a stale/WRONG mesh as a "done" job. A Meshy
+    successor carries no mapping: its request fields are the fixed label table, and the
+    mesh is a FILE field (public_fields()[2]). Pure over `s2` — unit-tested."""
+    if s2.get("meshy") is not None:
+        s2_files = [f["name"] for f in adapters.public_fields(s2)[2]]
+        if mesh_param in s2_files:
+            return None
+        return (f"chain mesh param '{mesh_param}' is not a file field of the Meshy "
+                f"successor '{succ_alias}' — it takes "
+                + (", ".join(f"'{n}'" for n in s2_files) if s2_files else
+                   "no file input at all (only a rigging alias does)"))
+    if any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
+           for p, m in (s2.get("mapping") or {}).items()):
+        return None
+    return (f"chain mesh param '{mesh_param}' is not a request field "
+            f"(param or label) of successor '{succ_alias}' — map the "
+            f"successor's mesh-load input or fix 'successor mesh param'")
+
+
 async def _wait_and_hold(backend: dict, job_id: str, label: str) -> bool:
     """Wait until `backend` is free, then claim a slot (inflight_inc) atomically — the
     last busy-check and the inc run with no await between them (the dispatch invariant).
@@ -2741,9 +2765,12 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         hand-off matters most, so what stage 2 was handed is kept on the failed row too
         (`jobs.fail` merges; `complete`'s _mark_done rewrites, hence the explicit key
         there). `s2_info` is None until the hand-off, so a stage-1 failure carries only
-        the attempt count, as before."""
+        the attempt count, as before. `chain_stage1` rides along whenever stage 1 was a
+        PAID cloud task: a chain that dies after it must still name the Meshy task that
+        was billed, which `complete`'s meta would otherwise be the only record of."""
         m = {**({"attempts": gen_attempts} if gen_attempts > 2 else {}),
-             **({"chain_stage2": s2_info} if s2_info else {})}
+             **({"chain_stage2": s2_info} if s2_info else {}),
+             **({"chain_stage1": s1_meta} if s1_meta else {})}
         return m or None
 
     deadline = time.monotonic() + async_park_timeout_s
@@ -2868,26 +2895,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 await asyncio.to_thread(jobs.fail, job_id, f"successor backend "
                                         f"'{backend2.get('name')}' has no adapter")
                 return
-            # `mesh_param` must be a request field of the successor (accepted under param
-            # OR label, exactly like any incoming value) — both adapters silently drop an
-            # unknown param, so stage 2 would otherwise run on the workflow's baked-in
-            # mesh path (or, on Meshy, on no mesh at all) and deliver a stale/WRONG mesh
-            # as a "done" job. A Meshy successor carries no mapping: its request fields
-            # are the fixed label table, and the mesh is a FILE field (public_fields()[2]).
-            if s2.get("meshy") is not None:
-                s2_files = [f["name"] for f in adapters.public_fields(s2)[2]]
-                ok_param = mesh_param in s2_files
-                why = (f"chain mesh param '{mesh_param}' is not a file field of the Meshy "
-                       f"successor '{succ_alias}' — it takes "
-                       + (", ".join(f"'{n}'" for n in s2_files) if s2_files else
-                          "no file input at all (only a rigging alias does)"))
-            else:
-                ok_param = any(p == mesh_param or ((m or {}).get("label") or "").strip() == mesh_param
-                               for p, m in (s2.get("mapping") or {}).items())
-                why = (f"chain mesh param '{mesh_param}' is not a request field "
-                       f"(param or label) of successor '{succ_alias}' — map the "
-                       f"successor's mesh-load input or fix 'successor mesh param'")
-            if not ok_param:
+            why = _chain_mesh_param_error(s2, mesh_param, succ_alias)
+            if why:
                 await asyncio.to_thread(jobs.fail, job_id, why)
                 return
             s1_wf = stage1_cand.get("workflow_json") or {}
@@ -2897,6 +2906,17 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             export = adapter.chain_export(stage1_cand, succ, params, prefix)
             if export.error:
                 await asyncio.to_thread(jobs.fail, job_id, export.error)
+                return
+            # A Meshy successor takes ONE mesh format: the API's `model_url` is a glb.
+            # Refused here — before the slot claim and the GPU minutes — because the
+            # mismatch is in the stage-1 export node's `file_format`, knowable up front;
+            # discovering it from Meshy's rejection would cost a full stage-1 run.
+            if s2.get("meshy") is not None and not export.mesh_name.lower().endswith(".glb"):
+                await asyncio.to_thread(
+                    jobs.fail, job_id,
+                    f"chain: successor '{succ_alias}' runs on Meshy and takes a .glb mesh, "
+                    f"but stage 1 would export '{export.mesh_name}' — set the export node's "
+                    f"file_format to glb")
                 return
             mesh_name = export.mesh_name
             cross = relay == "upload" and bid2 != bid
