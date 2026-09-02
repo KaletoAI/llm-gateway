@@ -87,6 +87,14 @@ def endpoint_of(cand: dict) -> str:
     return ep if ep in ENDPOINTS else ENDPOINTS[0]
 
 
+def _rig_types_for(rig_model: str) -> tuple:
+    """Which rig types a RIG MODEL can actually do (API notes §7.2): `v1.0-20240301` rigs
+    BIPEDS only, `v2.5-20260210` every creature. A cross-field rule, so it cannot live in
+    the option form — that renders one field at a time — and must be enforced here, where
+    the request builder, `options_of` and the advertised schema all read the same answer."""
+    return ("biped",) if rig_model == RIG_MODELS[0] else RIG_TYPES
+
+
 def options_of(cand: dict) -> dict:
     """OPTION_DEFAULTS overlaid with the candidate's stored options (unknown keys dropped),
     then normalized. The console editor runs the SAME function on save, so a stored alias
@@ -105,6 +113,11 @@ def options_of(cand: dict) -> dict:
     for k in ("texture", "pbr", "quad", "smart_low_poly", "generate_parts", "auto_size",
               "enable_image_autofix", "thumbnail", "rig_check"):
         out[k] = bool(out[k])
+    if out["rig_type"] not in _rig_types_for(out["rig_model"]):
+        # Same class of documented incompatibility as generate_parts below: rig model v1.0
+        # answers 400 for anything but a biped, and a two-click console configuration must
+        # not be able to store one.
+        out["rig_type"] = "biped"
     if out["generate_parts"]:
         # Tripo REJECTS the combination (segmented parts carry no texture, no quads), so a
         # stored alias must not be able to build a request that comes back 400.
@@ -219,11 +232,15 @@ def build_request(cand: dict, values: dict, images: dict,
         tok = (files or {}).get("input_mesh_path")
         if not tok:
             raise TripoInput("`files.input_mesh_path` is required")
+        allowed = _rig_types_for(opts["rig_model"])
         rt = values.get("input_rig_type")
         if rt in (None, ""):
             rt = opts["rig_type"]
-        if rt not in RIG_TYPES:
-            raise TripoInput("`input_rig_type` must be one of " + ", ".join(RIG_TYPES))
+        if rt not in allowed:
+            # REFUSED, not clamped to biped: a caller asking for a quadruped rig on a v1.0
+            # alias must learn that the alias cannot do it, not receive a biped skeleton.
+            raise TripoInput(f"`input_rig_type` must be one of {', '.join(allowed)} "
+                             f"(rig model {opts['rig_model']})")
         return {"input": tok, "model": opts["rig_model"], "rig_type": rt,
                 "spec": opts["spec"], "out_format": opts["target_formats"][0]}
     m = cand.get("model")
@@ -300,7 +317,7 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
         # A rig job is the mesh plus one knob. None of the generation labels exist here,
         # and advertising them would promise settings the request builder drops.
         return ([{"name": "input_rig_type", "type": "string", "default": opts["rig_type"],
-                  "choices": list(RIG_TYPES)},
+                  "choices": list(_rig_types_for(opts["rig_model"]))},
                  {"name": "input_name", "type": "string", "default": ""},
                  {"name": "input_no_fingers", "type": "bool", "default": False}],
                 images, files)
@@ -401,9 +418,12 @@ OPTION_FIELDS: list = [
     {"key": "rig_check", "label": "rig check", "type": "bool", "rig_only": True,
      "checkbox_text": "run the free rig-check first and refuse an unriggable mesh before the 25 credits"},
     {"key": "rig_model", "label": "rig model", "type": "select", "rig_only": True, "choices": list(RIG_MODELS),
-     "hint": "v1.0: biped only, 90+ animation presets · v2.5: every rig type, 16 presets."},
+     "hint": "v1.0: biped only, 90+ animation presets · v2.5: every rig type, 16 presets. "
+             "Picking v1.0 forces <b>rig type</b> to biped — Tripo refuses any other, and a "
+             "client <code>input_rig_type</code> that is not biped is then refused too."},
     {"key": "rig_type", "label": "rig type", "type": "select", "rig_only": True, "choices": list(RIG_TYPES),
-     "hint": "Default; a client <code>input_rig_type</code> wins."},
+     "hint": "Default; a client <code>input_rig_type</code> wins — but only a type the rig "
+             "model above supports."},
     {"key": "spec", "label": "skeleton", "type": "select", "rig_only": True,
      "choices": [("mixamo", "mixamo — Mixamo-compatible bone names"), ("tripo", "tripo — Tripo's own skeleton")]},
     {"key": "animations", "label": "animations", "type": "list", "rig_only": True,

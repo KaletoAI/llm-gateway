@@ -62,6 +62,12 @@ class Options(unittest.TestCase):
         self.assertFalse(o["texture"]); self.assertFalse(o["pbr"])
         self.assertFalse(o["quad"]); self.assertFalse(o["smart_low_poly"])
 
+    def test_rig_model_v1_rigs_bipeds_only(self):
+        o = tripo.options_of(cand("rig", rig_model="v1.0-20240301", rig_type="quadruped"))
+        self.assertEqual(o["rig_type"], "biped")            # admin option normalized
+        o = tripo.options_of(cand("rig", rig_model="v2.5-20260210", rig_type="quadruped"))
+        self.assertEqual(o["rig_type"], "quadruped")        # v2.5 does every creature
+
     def test_face_limit_for(self):
         self.assertEqual(tripo.face_limit_for("v3.1-20260211", False, "2500000"), 1_500_000)
         self.assertEqual(tripo.face_limit_for("v3.1-20260211", True, "2500000"), 150_000)
@@ -145,6 +151,15 @@ class BuildRequest(unittest.TestCase):
         with self.assertRaises(tripo.TripoInput):
             tripo.build_request(cand("rig"), {}, {}, {})
 
+    def test_client_rig_type_must_suit_the_rig_model(self):
+        with self.assertRaises(tripo.TripoInput) as e:      # refused, not silently biped
+            tripo.build_request(cand("rig"), {"input_rig_type": "quadruped"}, {}, {"input_mesh_path": "m"})
+        self.assertIn("v1.0-20240301", str(e.exception))
+        self.assertIn("biped", str(e.exception))
+        body = tripo.build_request(cand("rig", rig_model="v2.5-20260210"),
+                                   {"input_rig_type": "quadruped"}, {}, {"input_mesh_path": "m"})
+        self.assertEqual(body["rig_type"], "quadruped")
+
     def test_follow_up_bodies(self):
         self.assertEqual(tripo.build_rig_check("t"), {"input": "t"})
         self.assertEqual(tripo.build_convert("task_1", "fbx", False), {"input": "task_1", "format": "FBX", "with_animation": False})
@@ -189,6 +204,9 @@ class PublicFields(unittest.TestCase):
         self.assertEqual(files, [{"name": "input_mesh_path", "required": True, "accept": ["glb"]}])
         rt = next(p for p in params if p["name"] == "input_rig_type")
         self.assertEqual(rt["default"], "biped")
+        self.assertEqual(rt["choices"], ["biped"])          # default rig model is v1.0
+        rt = next(p for p in tripo.public_fields(cand("rig", rig_model="v2.5-20260210"))[0]
+                  if p["name"] == "input_rig_type")
         self.assertEqual(rt["choices"], list(tripo.RIG_TYPES))
         self.assertEqual({p["name"] for p in params}, {"input_rig_type", "input_name", "input_no_fingers"})
 
