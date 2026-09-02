@@ -312,7 +312,12 @@ _SCROLL_JS = ("<script>(function(){"
 # the server renders rows in insertion order and the morph re-imposes that order
 # on the live DOM, so without the hook a clicked sort is undone on every tick.
 # The hook re-reads sessionStorage rather than closing over the state — that
-# store is the source of truth and stays it. Tables with `data-sk` get a stable key; others key off path+index.
+# store is the source of truth and stays it. For the same reason no call site
+# captures the storage key: the morph reuses an unkeyed table node for a
+# different logical table when a dashboard panel appears or disappears, which
+# rewrites its data-sk while the header cells keep their old handlers. Every
+# read and write therefore derives 'sort:'+key(tbl,i) at the moment it acts, so
+# writer and reader always agree on the node's LIVE data-sk. Tables with `data-sk` get a stable key; others key off path+index.
 # Grouped tables (a `tr.grp` header row followed by its member rows — the routing
 # views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
 # key for column 0 (it is the alias name), later columns key off the first member row.
@@ -340,12 +345,13 @@ _SORT_JS = ("<script>(function(){"
             "var hs=hdr.cells;for(var i=0;i<hs.length;i++)ind(hs[i],i===idx?(dir<0?'\\u25bc':'\\u25b2'):'');}"
             "function key(tbl,i){return tbl.getAttribute('data-sk')||(location.pathname+'#'+i);}"
             "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
-            "var hdr=tbl.rows[0];if(!hdr)return;var k='sort:'+key(tbl,i);"
-            "[].forEach.call(hdr.cells,function(th,idx){th.addEventListener('click',function(){var c={};"
+            "var hdr=tbl.rows[0];if(!hdr)return;"
+            "[].forEach.call(hdr.cells,function(th,idx){th.addEventListener('click',function(){"
+            "var k='sort:'+key(tbl,i),c={};"
             "try{c=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
             "var dir=(c.idx===idx&&c.dir>0)?-1:1;sortIt(tbl,idx,dir);"
             "try{sessionStorage.setItem(k,JSON.stringify({idx:idx,dir:dir}));}catch(e){}});});"
-            "var s={};try{s=JSON.parse(sessionStorage.getItem(k)||'{}');}catch(e){}"
+            "var s={};try{s=JSON.parse(sessionStorage.getItem('sort:'+key(tbl,i))||'{}');}catch(e){}"
             "if(s.idx!=null)sortIt(tbl,s.idx,s.dir||1);});"
             "window.gwLiveHooks=window.gwLiveHooks||[];"
             "window.gwLiveHooks.push(function(){"
