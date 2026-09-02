@@ -95,6 +95,21 @@ class LiveScriptPresence(unittest.TestCase):
         self.assertIn("gwLiveHooks.push", admin._SORT_JS)
         self.assertIn("gwLiveHooks.push", admin._FILTER_JS)
 
+    def test_filter_no_longer_restores_focus_and_caret(self):
+        # Reload compensation only: the morph never replaces a focused input, so the
+        # caret needs no rescuing. The filter TEXT persistence stays — it serves real
+        # navigation, which the morph does not cover.
+        self.assertNotIn("setSelectionRange", admin._FILTER_JS)
+        self.assertNotIn("beforeunload", admin._FILTER_JS)
+        self.assertNotIn("selectionStart", admin._FILTER_JS)
+        self.assertIn("sessionStorage.setItem", admin._FILTER_JS)
+
+    def test_scroll_keeps_master_column_but_drops_main_restore(self):
+        # <main> is never replaced any more, so its scrollTop needs no restoring.
+        # The .col/|master key survives: it is a master/detail navigation feature.
+        self.assertIn("|master", admin._SCROLL_JS)
+        self.assertNotIn("'|main'", admin._SCROLL_JS)
+
 
 # Fixtures for the identity tests below. Built from what the three row templates
 # actually read — nothing invented: `_job_row` needs id/status plus the created/

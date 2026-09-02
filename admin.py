@@ -289,11 +289,14 @@ details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129
 # `saved=1` is stripped from that query: it is a transient banner flag the Save redirect
 # appends, and keying on it made every Save read as a fresh URL — the whole point of
 # Save being the ONE action that must not move the pane you were working in.
+# `<main>` is deliberately NOT tracked any more: the live morph updates it in place
+# instead of reloading the page, so the window scroll is simply never lost, and the
+# only thing that still moves it is real navigation — where restoring a stale offset
+# would fight the browser's own scroll restoration rather than help it.
 _SCROLL_JS = ("<script>(function(){"
               "var q=location.search.replace(/([?&])saved=[^&]*&?/,'$1').replace(/[?&]$/,'');"
               "var b='scr:'+location.pathname;"
-              "function t(){var o=[],m=document.querySelector('main');"
-              "if(m)o.push([m,b+q+'|main']);"
+              "function t(){var o=[];"
               "[].slice.call(document.querySelectorAll('.col')).forEach(function(e,j){"
               "o.push([e,j===0?b+'|master':b+q+'|c'+j]);});return o;}"
               "try{t().forEach(function(p){var v=sessionStorage.getItem(p[1]);"
@@ -4836,11 +4839,14 @@ def _recent_calls_table(rows, aliases, src: str = "llm") -> str:
 _BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
 # Row filter for `table.filterable`, driven by the ONE `#sf` input a view renders.
 # The typed text is persisted in sessionStorage per view and re-applied on load — like
-# the sort order above, and for the same reason: Media Jobs auto-refreshes every 5 s
-# while a job runs, and a full-page reload otherwise wipes the search you just typed
-# (reported from the Media Jobs list). Focus + caret come back too, but ONLY when the
-# save is seconds old: that means the reload pulled the page out from under someone who
-# was typing, whereas re-opening the tab later must not steal focus.
+# the sort order above, and for the same reason: it must survive REAL navigation (a tab
+# switch, a form POST, F5), which the live morph does not cover.
+# Focus and caret are deliberately NOT saved any more. That was pure compensation for
+# the old full-page auto-refresh, which yanked the page out from under someone typing;
+# the morph never replaces a focused or dirty control (see _LIVE_JS), so the input the
+# caret sits in is exactly the node it was, and the 15-second "was someone typing"
+# window it needed had itself been made meaningless by the hook below re-saving on
+# every tick. Every write is now just the text, so a tick rewriting it is a no-op.
 # A gwLiveHooks entry re-runs the filter after every live morph, because rows the
 # morph brings in fresh carry no display style and would otherwise ignore it.
 # The hook is registered outside the `if(i)` guard and no-ops when the view has no
@@ -4848,8 +4854,7 @@ _BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;borde
 _FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.search;"
               "function el(){return document.getElementById('sf');}"
               "function save(){var i=el();if(!i)return;try{sessionStorage.setItem(K,"
-              "JSON.stringify({v:i.value,c:i.selectionStart,f:document.activeElement===i,"
-              "t:Date.now()}));}catch(e){}}"
+              "JSON.stringify({v:i.value}));}catch(e){}}"
               "window.sfRun=function(){var i=el();if(!i)return;"
               "var q=(i.value||'').toLowerCase();"
               "document.querySelectorAll('.filterable tr').forEach(function(r){"
@@ -4857,10 +4862,7 @@ _FILTER_JS = ("<script>(function(){var K='flt:'+location.pathname+location.searc
               "r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none';});save();};"
               "var i=el();if(i){var s=null;"
               "try{s=JSON.parse(sessionStorage.getItem(K)||'null');}catch(e){}"
-              "if(s&&s.v){i.value=s.v;window.sfRun();"
-              "if(s.f&&Date.now()-(s.t||0)<15000){i.focus();"
-              "try{i.setSelectionRange(s.c,s.c);}catch(e){}}}"
-              "i.addEventListener('blur',save);window.addEventListener('beforeunload',save);}"
+              "if(s&&s.v){i.value=s.v;window.sfRun();}}"
               "window.gwLiveHooks=window.gwLiveHooks||[];"
               "window.gwLiveHooks.push(function(){if(window.sfRun)window.sfRun();});"
               "})();</script>")
