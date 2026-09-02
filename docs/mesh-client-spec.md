@@ -1,6 +1,6 @@
 # Mesh-Generierung über das Gateway — Client-Spezifikation
 
-Stand 2026-08-03. Gilt für die Mesh-Aliase auf dem Prod-Gateway. Maschinenlesbare
+Stand 2026-09-02. Gilt für die Mesh-Aliase auf dem Prod-Gateway. Maschinenlesbare
 Quelle der Wahrheit ist immer `GET /v1/generations/{alias}/schema` — dieses Dokument
 erklärt die Semantik dahinter; bei Abweichungen gewinnt das Schema.
 
@@ -13,7 +13,7 @@ Alle Aufrufe mit `Authorization: Bearer <key>`.
 | Schritt | Aufruf |
 |---|---|
 | Aliase entdecken | `GET /v1/models?type=image` |
-| Parameter eines Alias | `GET /v1/generations/{alias}/schema` (Namen, Typen, Defaults, Bild-Slots) |
+| Parameter eines Alias | `GET /v1/generations/{alias}/schema` (Namen, Typen, Defaults, Bild-Slots `images[]`, Datei-Felder `files[]`) |
 | Job starten | `POST /v1/generations` mit `{"model": "<alias>", "mode": "sync"\|"async", "params": {…}, "images": {…}, "files": {…}}` |
 | Status/Ergebnis | `GET /v1/jobs/{job_id}` — `sync` blockt und liefert dieselbe Job-View direkt (Status `done`), `async` antwortet `202 {job_id, status: "queued", …}` |
 | Artefakt laden | `GET /v1/jobs/{job_id}/result/{n}` (owner-gated, gleicher Bearer-Key) |
@@ -42,13 +42,25 @@ unbekannter Schlüssel oder unlesbarer Wert → `400`, Datei über **64 MB** →
 falschem Eingang liefern. Die Bytes werden nicht als Job-Input gespeichert; in
 der Job-Ansicht steht nur ein Vermerk `<upload:… (N MB)>`.
 
+Welche Schlüssel ein Alias unter `files` annimmt, steht im Schema als eigene Liste
+**`files[]`** — neben `params[]` und `images[]`:
+
+```json
+"files": [{"name": "input_mesh_path", "required": true, "accept": ["glb"]}]
+```
+
+`required: true` heißt: ohne diese Datei wird der Request abgelehnt (so bei
+`Meshy-Rig`). Bei den ComfyUI-Aliasen steht `required: false`, weil dasselbe
+Eingangs-Mesh alternativ als Backend-Pfad in `params` genannt werden kann (siehe
+3.4); `accept` nennt, wenn vorhanden, die zulässigen Container.
+
 ### Antwortform (Job-View)
 
 ```json
 {
   "job_id": "…", "status": "queued|running|done|failed",
   "alias": "…", "backend": "…", "error": null,
-  "rig": "generic|mixamo",              // nur bei Rigging-Ketten
+  "rig": "generic|mixamo|meshy",        // nur bei Rigging-Ketten (siehe 3.1)
   "warnings": ["x.glb is 41 MB (> 30 MB guideline)"],
   "results": [
     {"n": 0, "name": "Held_articulationxl.fbx",   "mime": "application/octet-stream", "kind": "file",  "sha256": "…", "url": "…/result/0"},
@@ -74,6 +86,7 @@ davor der Endung. Match als Substring, z. B. `*_basecolor*`:
 | ComfyUI-Export (Meshes, Texturkarten) | `<name>_00001_.glb`, `<name>_basecolor_00001_.png`, `<name>_metallic_00001_.jpg` | ja — ComfyUI hängt `_00001_` an, **auch ans Haupt-GLB** |
 | UniRig (`-Generic`) | `<name>_articulationxl.fbx` | nein |
 | Make-It-Animatable (`-Humanoid`) | `…_rigged.glb` — in Ketten mit **technischem** Präfix `gwchain_<jobid>…`, nicht `<name>` | nein |
+| Meshy (Cloud) | feste Namen ohne `<name>`: `model.glb`, `preview.png`; beim Rigging `rigged.glb` / `rigged.fbx` und optional `walking.glb` / `running.glb` | nein |
 
 Tokens: `_basecolor`, `_metallic`, `_articulationxl` (FBX), `_rigged` (Humanoid-GLB).
 Verlasse dich für das Haupt-Asset nicht auf `<name>` — bei Humanoid-Ketten trägt
@@ -131,6 +144,24 @@ Jede `img2mesh`-Familie gibt es in bis zu drei Varianten, die über das
 `input_no_fingers` wird bei allen Familien angenommen, wirkt aber **nur** in der
 `-Humanoid`-Rig-Stufe (Hände ohne Einzelfinger riggen).
 
+**Das Job-Feld `rig`** benennt die Art des ausgelieferten Skeletts und damit den
+Speicher-Kontrakt. Es gibt drei Werte:
+
+| `rig` | Skelett | Auslieferung |
+|---|---|---|
+| `generic` | UniRig / ArticulationXL, FBX | FBX + Basecolor-Bild, untrennbar (Zeile oben); Karten V-korrigiert, ggf. JPEG |
+| `mixamo` | Make-It-Animatable, mixamorig-Namen, GLB | ein selbsttragendes GLB; Skin und Textur werden hart validiert |
+| `meshy` | **Meshys eigenes Skelett** (Cloud-Rigging, Biped) | `rigged.glb` (ggf. zusätzlich `rigged.fbx`) mit eingebetteter Textur; bei eingeschalteten Animationen zusätzlich `walking.*` / `running.*` als eigene Results |
+
+Neu ist `meshy`: das Gateway **kennzeichnet** diese Auslieferung nur, es normalisiert
+und validiert sie nicht — kein V-Flip, keine JPEG-Umkodierung, keine Paar-Prüfung.
+Meshy riggt nach eigenen Konventionen; die Dateien so speichern, wie sie kommen. Die
+Clips sind eine Zugabe, kein garantierter Bestandteil: liefert Meshy einen Clip nicht,
+fehlt er kommentarlos (das Rig-Mesh selbst fehlt nie — dafür scheitert der Job).
+`rig` setzt das Gateway bei **Ketten**-Ergebnissen (und bei Aliasen, die ihre
+Rig-Variante selbst melden); ein Direktaufruf von `Meshy-Rig` (3.5) liefert dieselben
+Dateien, aber kein `rig`-Feld — dort ist `rigged.glb` das Erkennungsmerkmal.
+
 ### 3.2 `img2mesh`-Familien
 
 Gemeinsame Parameter (Defaults je Familie in der Tabelle): `input_image`
@@ -146,6 +177,8 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Pixal3D-Generic`, `Pixal3D-Humanoid`, `Pixal3D-Object` | 50000 | 2048 | höchste Auflösung |
 | `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. `-Object` liefert zusätzlich frei wählbare LOD-Stufen, siehe unten. |
 | `Meshy-Object`, `Meshy-Multiview` | Meshy-Default (30000 bei Remesh) | 2048 | Cloud (Meshy.ai, bezahlt pro Task, nur als Fallback oder gezielt). `-Multiview` nimmt `input_image_front` (Pflicht) + optional `input_image_back` / `_left` / `_right`. Zusätzlich `input_texture_prompt` (string) und `input_pose` (`a-pose`/`t-pose`). `input_remove_background`/`input_no_fingers` werden angenommen, wirken nicht. Kein `files`-Upload (`400` — Bilder gehören unter `images`). Liefert `model.glb` (Texturen eingebettet) + `preview.png`. |
+| `Meshy-Humanoid`, `Meshy-Humanoid-Multiview` | wie oben | 2048 | Cloud-Mesh (t-pose) → **lokales** Rigging mit Make-It-Animatable, Kette wie `Trellis2-Humanoid-*`: Auslieferung ein `*_rigged.glb`, Job-Feld `rig: "mixamo"`, Speicher-Kontrakt der `-Humanoid`-Zeile in 3.1. `-Multiview` nimmt dieselben vier Bild-Slots wie `Meshy-Multiview`. |
+| `Meshy-Humanoid-Cloud` | wie oben | 2048 | Cloud-Mesh (t-pose) → **Cloud**-Rigging (`Meshy-Rig`, 3.5), das Mesh verlässt Meshy nie. Auslieferung `rigged.glb` (+ optionale Clips), Job-Feld `rig: "meshy"` — nicht normalisiert, nicht validiert (3.1). Ein mitgeschicktes `input_height_m` wird an die Rig-Stufe durchgereicht (Default 1.7 m); zwei Tasks = Mesh-Credits + 5 Credits. |
 
 **`input_face_num` bei den Meshy-Aliasen.** Hier gibt es — anders als bei den
 ComfyUI-Familien — keinen vom Gateway gesetzten Default: Bleibt der Parameter weg,
@@ -294,9 +327,9 @@ jeder Naht-Vertex existiert danach mehrfach. Das ist unvermeidlich, wenn ein Mes
 eine Textur tragen soll — wer Vertices zählt, misst das UV-Layout mit, nicht die
 Geometrie.
 
-### 3.5 Rigger direkt (`mesh-rig-unirig`, `mesh-mia`)
+### 3.5 Rigger direkt (`mesh-rig-unirig`, `mesh-mia`, `Meshy-Rig`)
 
-Beide sind API-sichtbar, primär aber die Stage-2 der `-Generic`/`-Humanoid`-
+`mesh-rig-unirig` und `mesh-mia` sind API-sichtbar, primär aber die Stage-2 der `-Generic`/`-Humanoid`-
 Ketten. Direktaufruf ist möglich (Mesh über `files.input_mesh_path` wie in 3.4),
 liefert aber **nur** das Rig-Ergebnis: `mesh-rig-unirig` die nackte FBX (ohne
 Basecolor — das Pflichtpaar aus 3.1 muss der Client dann selbst sicherstellen),
@@ -307,6 +340,27 @@ der gleichnamige FBX-Rigger „MIA" (`MIAAutoRig`, Workflow `mesh-reg-mia`) ist
 auf dem Gateway **nicht registriert**. Im Zweifel die Ketten-Aliase verwenden —
 dort garantiert das Gateway die vollständige Auslieferung.
 
+**`Meshy-Rig`** ist der dritte Rigger und der einzige in der Cloud: ein `mesh2rig`-Alias
+auf dem Meshy-Backend (Endpoint `rigging`, **5 Credits je Lauf**), der jedes GLB riggt —
+auch eines aus einer lokalen Pipeline oder von außerhalb des Gateways.
+
+| Punkt | Regel |
+|---|---|
+| Eingang | `files.input_mesh_path` — **Pflicht**, und ausschließlich ein **binäres glTF** (`.glb`). Das Gateway prüft die Container-Signatur und lehnt alles andere ab, **bevor** der Task angelegt wird (eine umbenannte OBJ kostet also nichts). |
+| Parameter | `input_name` (string, benennt den Task bei Meshy) und `input_height_m` (float, Default **1.7** — die angenommene Körpergröße, an der Meshy das Skelett ausrichtet). `input_no_fingers` wird angenommen und ignoriert; die Mesh-Optionen (Textur, Topologie, Polycount …) gibt es hier nicht. |
+| Auslieferung | `rigged.glb`, zusätzlich `rigged.fbx`, wenn der Betreiber `fbx` in den Ausgabeformaten führt (mehr als glb/fbx kann Rigging nicht). Ist die Option **animations** gesetzt, kommen `walking.glb` / `running.glb` (je Format) als weitere Results dazu — Zugabe, kein garantierter Bestandteil. |
+| Grenzen | Nur **Bipeds** mit klar getrennten Gliedmaßen, Blick in **+Z**, höchstens **300.000** Dreiecke. Ein `failed` mit Meshys Meldung ist endgültig (Meshy erstattet die Credits) — kein blinder Retry. |
+
+```json
+{"model": "Meshy-Rig", "mode": "async",
+ "params": {"input_name": "Held", "input_height_m": 1.8},
+ "files":  {"input_mesh_path": "data:model/gltf-binary;base64,…"}}
+```
+
+Anders als bei `mesh-shrink` ist ein Backend-**Pfad** in `params` hier kein Ersatz:
+Meshy hat kein Dateisystem, das Mesh reist immer als Datei mit (das Schema führt es
+deshalb mit `required: true`).
+
 ---
 
 ## 4. Fehlerbilder
@@ -316,6 +370,7 @@ dort garantiert das Gateway die vollständige Auslieferung.
 | `status: "failed"` + `error` | Workflow-/Validierungsfehler (z. B. „no basecolor PNG", „embedded texture is a 2x2 dummy", per-Node-Fehler des Backends). Nicht blind retrien — Fehlertext auswerten. |
 | `503` + `Retry-After` beim Start | Park-Zeit abgelaufen, alle Backends belegt — nach `Retry-After` neu einreichen. |
 | Job hängt lange in `running` | Mesh-Jobs dauern Minuten; `progress` beachten. Hunyuan3D mit `face_num` > 40000: siehe 3.2 — vermeiden. |
+| `status: "failed"` bei `Meshy-Rig` / `Meshy-Humanoid-Cloud` | Meshys Rigging hat abgelehnt (kein erkennbarer Biped, zu viele Dreiecke, unbrauchbare Pose) — endgültig, Credits werden erstattet. Mesh prüfen (3.5), nicht retrien. `400` schon beim Start heißt: Datei fehlt oder ist kein binäres glTF. |
 | `404` auf `result/{n}` | Job-TTL abgelaufen (Default **24 h**, `ttl_s` 86400) — Artefakte werden serverseitig aufgeräumt; Ergebnisse zeitnah abholen und selbst speichern. |
 
 ---

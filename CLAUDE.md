@@ -178,7 +178,24 @@ hot-reload-safe.
   raises, never a silently smaller delivery), the advertised schema (`public_fields`)
   and `default_candidate`/`options_of` (admin option defaults, deep-copied — a shallow
   copy would hand every alias the same `target_formats` list). No `main`/`adapters`
-  imports; covered by `test_meshy.py` + `test_meshy_adapter.py` (HTTP stub). A Meshy
+  imports; covered by `test_meshy.py` + `test_meshy_adapter.py` (HTTP stub).
+  Three `ENDPOINTS`: the two image ones and **`rigging`** (`POST /openapi/v1/rigging`,
+  5 credits, bipeds) — a different request entirely (`_build_rigging`: the mesh as a
+  `model_url` data URI + `height_meters` + `name`, none of the image-to-3d options),
+  so its inputs are FILES, not image slots: `FILES` names them per endpoint
+  (`rigging: ["input_mesh_path"]`) and `public_fields` is a TRIPLE
+  `(params, images, files)` — `files` entries carry `{name, required, accept}` and are
+  what the schema endpoint advertises, what the playground renders as an upload and
+  what `main._decode_upload_files` checks a Meshy `files` key against (an image
+  endpoint has none → 400). `glb_data_uri` sniffs the `glTF` magic, so a renamed OBJ
+  is refused before 5 credits are spent, and `options_of` narrows `target_formats` to
+  `RIG_FORMATS` (glb/fbx) for the endpoint. `parse_task(task, formats, endpoint,
+  animations)`: `rigging` reads the urls off `task["result"]`
+  (`rigged_character_<fmt>_url`, `basic_animations.<clip>_<fmt>_url`) instead of
+  `model_urls`, and `TaskState.downloads` is `[(filename, url)]` — the FILENAME is
+  decided here (`rigged.glb` vs `model.glb`, `walking`/`running` clips only with the
+  `animations` option), the adapter just downloads them in order. A missing FORMAT
+  still raises; a missing CLIP is skipped (a courtesy, not the delivery). A Meshy
   alias candidate has no workflow — `cand["meshy"] = {endpoint, options}`; the client
   may set only what the label table names (`input_name`, `input_face_num` →
   `target_polycount` + `should_remesh`, `input_texture_resolution` px → 2k/4k/8k,
@@ -342,12 +359,31 @@ hot-reload-safe.
 - **Workflow chains** (`_run_chain`): a gen alias's stage-1 config carries a
   `successor` (`{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`);
   stage 1 exports a mesh under a gateway-pinned filename (`gwchain_<jobid>`) and
-  ONLY stage 2's result is delivered (+ any `keep_from_mesh` files). Stage 1 gets
+  ONLY stage 2's result is delivered (+ any `keep_from_mesh` files). The three
+  backend-specific spots are **adapter hooks**, not branches in the router
+  (`ChainExport` + `chain_export`/`chain_take_mesh`/`chain_feed_mesh`; the base class
+  refuses both roles, so a new backend type is opt-in): ComfyUI pins the export node's
+  `filename_prefix` (extension from pins/mapped params on `file_format`), takes the
+  mesh off `/view` and feeds a PATH (shared disk) or an upload into the stage-2 input
+  dir; **Meshy** names it `gwchain_<jobid>.glb` with NO pins, takes the `model.glb`
+  RESULT BLOB and feeds it as `req2.upload_files[mesh_param]` (embedded as the rigging
+  `model_url` data URI, `mesh_ref` = `<upload:… (N MB)>`). So EITHER stage may be
+  Meshy: `Meshy-Humanoid` → `mesh-mia` and `Trellis2-…` → `Meshy-Rig` are the same
+  code path. A Meshy stage has no shared disk, so `_kind_meshy` on either side FORCES
+  `relay: upload` whatever the alias stored (the editor hides the field); a Meshy
+  stage 1 without `glb` in `target_formats`, and a `rigging` alias as stage 1 at all,
+  are refused by `chain_export` BEFORE credits are spent. `mesh_param` is validated
+  against the successor's mapping (param or label) or — a Meshy successor has no
+  mapping — against its file fields (`public_fields()[2]`). A paid stage-1 cloud task
+  keeps its own task id/endpoint/request/credits under `meta.chain_stage1` (stage 2's
+  are the top-level meta, which would otherwise overwrite them in the merge), and
+  `admin._meshy_table` renders one table per Meshy stage. `rig` accepts a third value
+  `meshy`: tagged on the delivery like the others, but NEVER normalized or validated —
+  `normalize_delivery`/`validate_delivery` run for `generic`/`mixamo` only, a cloud rig
+  follows Meshy's conventions. Stage 1 gets
   the normal routing guarantees: candidates re-resolved while parked (force pin +
   LoRA eligibility kept), misconfigured candidates skipped, connection errors fail
-  over (stage-2/hand-off errors are FINAL); `mesh_param` is validated against the
-  successor's mapping (param or label) and the mesh extension honors pins/mapped
-  params on the export node's `file_format`. The job row's `backend` is re-pointed
+  over (stage-2/hand-off errors are FINAL). The job row's `backend` is re-pointed
   at claim and hand-off (`jobs.set_backend`) so cancel interrupts the LIVE backend.
   Stage-1 params are threaded to the successor by mapping **label** (never the raw
   node-based name), and `_apply_mapping` SILENTLY skips a name the successor does not
@@ -359,7 +395,8 @@ hot-reload-safe.
   failure is when the hand-off matters most. Without it, "did my param reach the
   rigger?" was only answerable from the backend's own ComfyUI history.
   Chain stages run with `slot_held` (the chain claims the one slot itself — no
-  double count). Two hand-offs:
+  double count). Two hand-offs (ComfyUI↔ComfyUI; with a Meshy stage the second is
+  forced):
   `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot
   held across both — queue-isolated) and passes the mesh's absolute output path;
   `relay: upload` lets the successor run on a **different** backend — the gateway

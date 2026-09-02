@@ -199,6 +199,38 @@ virtual_models:
 #         endpoint: multi-image-to-3d # or image-to-3d (images.input_image)
 #         options: {should_texture: true, enable_pbr: false, texture_resolution: "2k",
 #                   topology: triangle, target_formats: [glb], thumbnail: true}
+#
+# The third endpoint, `rigging`, takes a MESH instead of an image (5 credits): the
+# client sends it as files.input_mesh_path (a binary .glb of a biped) and gets back
+# Meshy's own skeleton. Its only client params are input_name and input_height_m
+# (default 1.7); rigging knows glb/fbx and nothing else, and `animations: true`
+# delivers Meshy's walking/running clips as extra artifacts.
+#   "Meshy-Rig":
+#     - backend: meshy
+#       task: mesh2rig
+#       meshy:
+#         endpoint: rigging
+#         options: {target_formats: [glb], animations: false}
+#
+# Workflow chain: a stage-1 alias carries a `successor` and the gateway delivers ONLY
+# the successor's result (the mesh stage's own output is dropped, minus keep_from_mesh).
+# Either stage may be ComfyUI or Meshy — here a Meshy mesh rigged locally by mesh-mia.
+# A Meshy stage shares no disk with anything, so the mesh always travels as BYTES (any
+# stored `relay` is ignored) and glb must be in target_formats, else the job is refused
+# before credits are spent. Point `successor.alias` at "Meshy-Rig" instead to rig in the
+# cloud — then `rig: meshy`, and the mesh never leaves Meshy.
+#   "Meshy-Humanoid":
+#     - backend: meshy
+#       task: img2mesh
+#       model: latest
+#       meshy:
+#         endpoint: image-to-3d
+#         options: {target_formats: [glb], pose_mode: t-pose}
+#       successor:
+#         alias: mesh-mia             # the rigging alias (a ComfyUI or a Meshy one)
+#         mesh_param: input_mesh_path # must be a request field of that alias
+#         rig: mixamo                 # client-facing rig tag: mixamo | generic | meshy
+#         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
 # maps to a list of candidates (the fastest free unpaid one is used;

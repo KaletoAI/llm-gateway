@@ -23,7 +23,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
-- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai cloud meshes, aliases, mapping, LoRA, jobs
+- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
 - [Endpoint reference](#endpoint-reference)
@@ -613,10 +613,11 @@ bus needs a host reboot instead — the backend then simply stays down.
 
 ### Meshy.ai (cloud mesh generation)
 
-A Meshy backend (`type: meshy`, <https://docs.meshy.ai>) serves **image → 3D** and
-**multi-image → 3D** through the same `POST /v1/generations` API as a ComfyUI mesh
-alias — same `input_*` labels, same image slots, same job endpoints. It is always a
-**paid** backend: the scheduler reaches for it only when no unpaid backend is free.
+A Meshy backend (`type: meshy`, <https://docs.meshy.ai>) serves **image → 3D**,
+**multi-image → 3D** and **rigging** through the same `POST /v1/generations` API as a
+ComfyUI mesh alias — same `input_*` labels, same image slots, same job endpoints. It is
+always a **paid** backend: the scheduler reaches for it only when no unpaid backend is
+free.
 
 ```yaml
 backends:
@@ -634,8 +635,9 @@ Register an alias on the Meshy backend in **Mapping › Media** (no workflow JSO
 pick the endpoint: `image-to-3d` takes `images.input_image`; `multi-image-to-3d` takes
 `images.input_image_front` (required) plus optional `input_image_back`,
 `input_image_left`, `input_image_right` — the slot names of the Trellis2 multiview
-alias, so a client can switch by changing `model` only. Mesh uploads under `files` are
-refused with a `400` (there is no workflow to bind them to).
+alias, so a client can switch by changing `model` only. On those two endpoints an
+upload under `files` is refused with a `400` (images belong under `images`) — `rigging`
+is the endpoint that takes a file, see below.
 
 Client params: `input_name`, `input_face_num`, `input_texture_resolution` (pixels →
 2k/4k/8k), `input_texture_prompt`, `input_pose` (`a-pose`/`t-pose`);
@@ -655,6 +657,30 @@ While a task is polled, a persistent `4xx` (three in a row, `429` excepted) fail
 job with that status named, while transport errors, `5xx` and `429` are tolerated for
 `disconnect_grace` seconds (default 30) and then fail over. Cancelling stops the
 gateway's job only — Meshy finishes the task and bills it.
+
+**Cloud rigging (`Meshy-Rig`).**
+The third endpoint, `rigging`, takes a **mesh** instead of an image: a `.glb` biped
+under `files.input_mesh_path` (5 credits), and gives it Meshy's own skeleton. Register
+it as its own alias — `Meshy-Rig`, task `mesh2rig` — and it works standalone on any GLB,
+including one a local ComfyUI pipeline produced:
+
+```json
+{"model": "Meshy-Rig", "mode": "async",
+ "params": {"input_name": "Held", "input_height_m": 1.8},
+ "files":  {"input_mesh_path": "data:model/gltf-binary;base64,…"}}
+```
+
+Client params are `input_name` and `input_height_m` (float, default `1.7`);
+`input_no_fingers` is accepted and ignored, and **none** of the image-to-3D options
+apply. Delivered artifacts are `rigged.glb` — plus `rigged.fbx` when the alias's
+*deliver formats* include `fbx`, the only two formats rigging knows — and, with the
+alias option **animations**, Meshy's `walking.*` / `running.*` clips as extra results.
+A missing file, or one that is not a binary glTF (sniffed by magic, so a renamed OBJ
+is caught), is refused *before* the task is created and costs nothing.
+
+A Meshy alias can also be **either stage of a workflow chain** — a Meshy mesh rigged by
+a local ComfyUI rigger, or a locally generated mesh rigged by `Meshy-Rig`; see
+[Workflow chains](#workflow-chains-successor-aliases) below.
 
 ### Generation aliases + mapping
 
@@ -721,6 +747,48 @@ Key mapping concepts:
 - **Numeric fields** (strength, steps, cfg) render with `min`/`max`/`step` pulled
   live from `/object_info`.
 
+### Workflow chains (successor aliases)
+
+A generation alias can carry a **`successor`**: a second alias the gateway runs on the
+first stage's mesh, delivering only the second stage's result (plus any
+`keep_from_mesh` files of the first). Both stages may be either backend kind — the
+stage-specific parts (how the mesh is exported, taken and fed) are adapter hooks:
+
+| stage 1 | stage 2 | hand-off |
+|---|---|---|
+| ComfyUI | ComfyUI | the mesh's absolute path on a shared disk (`relay: path`), or an upload into the stage-2 backend's input dir (`relay: upload`) |
+| ComfyUI | Meshy (`Meshy-Rig`) | the mesh bytes ride in the rigging request as its `model_url` |
+| Meshy | ComfyUI (`mesh-mia`, `mesh-rig-unirig`) | the mesh comes back as a result blob and is uploaded into the rigger's input dir |
+| Meshy | Meshy | as above, bytes in the request |
+
+A Meshy stage shares no disk with anything, so with Meshy on **either** side the
+gateway forces `relay: upload` whatever the alias stored (the editor hides the field
+for a Meshy stage 1). A Meshy stage 1 must deliver `glb` — otherwise the job is refused
+up front, before credits are spent — and a `rigging` alias cannot be stage 1 at all (it
+rigs an existing mesh and would have no way to obtain one). `successor.mesh_param` must
+be a request field of the successor: a mapped param or label on a ComfyUI alias, a
+**file field** on a Meshy one (`input_mesh_path`). Stage-1 params are threaded on, so a
+`Meshy-Humanoid-Cloud` request can carry `input_height_m` for the rigging stage.
+
+`successor.rig` tags the delivery for the client. `mixamo`/`generic` are additionally
+normalized (texture V-flip, optional JPEG) and validated at chain level; the third
+value **`meshy`** is only tagged — a cloud rig follows Meshy's own conventions, and
+re-flipping or validating it against ComfyUI-shaped rules would only break it. A Meshy
+stage of a chain keeps its own task id, request and credits on the job
+(`meta.chain_stage1` for stage 1, the top-level meta for stage 2), so the Media Jobs
+view shows one Meshy table per Meshy stage.
+
+The Meshy alias set this is built for (register them in **Mapping › Media**; the
+successor column is the chain config above):
+
+| Alias | Task | Meshy endpoint | Successor |
+|---|---|---|---|
+| `Meshy-Object`, `Meshy-Multiview` | `img2mesh` | image-to-3d / multi-image-to-3d | – |
+| `Meshy-Humanoid` | `img2mesh` | image-to-3d, `pose_mode: t-pose` | `mesh-mia` · `input_mesh_path` · `rig: mixamo` |
+| `Meshy-Humanoid-Multiview` | `img2mesh` | multi-image-to-3d, `pose_mode: t-pose` | as above |
+| `Meshy-Humanoid-Cloud` | `img2mesh` | image-to-3d, `pose_mode: t-pose` | `Meshy-Rig` · `input_mesh_path` · `rig: meshy` |
+| `Meshy-Rig` | `mesh2rig` | rigging | – |
+
 ### LoRAs
 
 LoRAs are first-class:
@@ -770,6 +838,14 @@ which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
   needs a path on a backend. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`.
+- **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
+  `params`, `images` (loader slots with their empty behaviour) and **`files`** — the
+  uploads that are not images. A ComfyUI alias lists its mapped mesh params there
+  (`required: false`; the same input can also be named as a backend-side path in
+  `params`), a Meshy rigging alias lists
+  `{"name": "input_mesh_path", "required": true, "accept": ["glb"]}`. It is the
+  machine-readable source of truth — a client builds a valid request from it without
+  out-of-band docs.
 
 **Playground.** In the console's **Media** playground a mesh parameter takes a real
 file (glb/gltf/obj/fbx/stl/ply — sent as `files`) or, as before, a path that already
@@ -924,6 +1000,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`); per-field reference images via `images: {param: base64\|URL}`, other file inputs (meshes) via `files: {param: base64\|URL}` |
+| `GET` | `/v1/generations/{alias}/schema` | alias self-description: `params`, `images`, `files` (mesh uploads), LoRA/fps info |
 | `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias |
 | `GET` | `/v1/jobs/{id}` | job status + results |
 | `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |
