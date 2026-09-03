@@ -376,7 +376,8 @@ OPTION_FIELDS: list = [
      "hint": "Face budget applied when the client sends no <code>input_face_num</code> "
              "(100–300000; turns remesh on). A client value still wins. An alias that "
              "<b>chains into a rigger</b> should stay ≤ 300000: Meshy's rigging endpoint refuses "
-             "more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02)."},
+             "more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02), "
+             "which is a mesh the hand-off then has to push through as base64."},
     {"key": "pose_mode", "label": "pose", "type": "select", "choices": [(p, p or "none") for p in POSES]},
     {"key": "image_enhancement", "label": "input", "type": "bool"},
     {"key": "remove_lighting", "label": "", "type": "bool"},

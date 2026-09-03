@@ -78,5 +78,115 @@ class AdminKindNeutral(unittest.TestCase):
         self.assertNotIn("if(u&&!u.value)", js)               # the old fill-only rule is gone
 
 
+class CloudEditor(unittest.TestCase):
+    """The schema-driven cloud alias editor: ONE form rendered from `mod.OPTION_FIELDS`
+    serves every cloud kind. A field the editor forgets fails SILENTLY — the option keeps
+    whatever is stored and the admin never sees it — so every field of every kind and
+    endpoint is pinned here."""
+
+    def _render(self, mod, endpoint):
+        import admin
+        c = mod.default_candidate("b")
+        c[mod.KIND]["endpoint"] = endpoint
+        admin._gen_backends = lambda: [{"name": "b", "type": mod.KIND}]
+        html = admin._cloud_editor(mod.KIND, "A-1", [c])
+        for fld in mod.OPTION_FIELDS:
+            self.assertIn(f'name="opt__{fld["key"]}"', html, fld["key"])
+        for f in (mod.RIG_FORMATS if endpoint == mod.RIG_ENDPOINT else mod.FORMATS):
+            self.assertIn(f'name="fmt__{f}"', html)
+        self.assertIn('name="cloud_endpoint"', html)
+        self.assertIn('name="cloud_model"', html)
+        self.assertIn('action="/ui/mapping/cloud-update"', html)
+        self.assertIn('name="chain_rig"', html)
+        self.assertIn('value="tripo"', html)
+        self.assertIn(mod.VENDOR, html)
+        return html
+
+    def test_renders_meshy_and_tripo_every_endpoint(self):
+        import tripo
+        for mod in (meshy, tripo):
+            for ep in mod.ENDPOINTS:
+                self._render(mod, ep)
+
+    def test_bool_fields_with_blank_label_share_a_row(self):
+        import tripo
+        html = self._render(tripo, "image-to-model")
+        # `pbr` (label "") rides in the `texture` row: exactly one field row carries both boxes
+        row = html[html.index('name="opt__texture"'):html.index('name="opt__texture_quality"')]
+        self.assertIn('name="opt__pbr"', row)
+
+    def test_tripo_defaults_show_mixamo(self):
+        import tripo
+        html = self._render(tripo, "rig")
+        self.assertIn('value="mixamo" selected', html)
+
+    def test_meshy_form_names_are_unchanged(self):
+        """Stored Meshy aliases keep working: the schema editor posts exactly the field
+        names the hand-written one did (only endpoint/model were renamed to the kind-neutral
+        pair) — a renamed `opt__` field would silently save the DEFAULT on the next save."""
+        html = self._render(meshy, "image-to-3d")
+        for n in ("opt__should_texture", "opt__enable_pbr", "opt__texture_resolution", "opt__topology",
+                  "opt__should_remesh", "opt__target_polycount", "opt__pose_mode", "opt__ultra_mode",
+                  "opt__image_enhancement", "opt__remove_lighting", "opt__moderation",
+                  "opt__animations", "opt__thumbnail", "new_alias", "retries", "successor",
+                  "chain_mesh_param", "chain_keep", "chain_rig", "task"):
+            self.assertIn(f'name="{n}"', html)
+
+    def test_cloud_update_apply_normalizes_and_copies(self):
+        import admin, tripo
+        c = tripo.default_candidate("b"); cands = [c, dict(c, backend="b2")]
+        form = {"cloud_endpoint": "rig", "cloud_model": "v3.0-20250812", "opt__spec": "tripo",
+                # v2.5 is the rig model that can do a non-biped; with the default (v1.0)
+                # `avian` is normalized away, which the next test pins
+                "opt__rig_model": "v2.5-20260210",
+                "opt__rig_type": "avian", "opt__animations": "preset:walk preset:run", "opt__face_limit": "9",
+                "fmt__fbx": "on", "task": "mesh2rig", "retries": "1",
+                "successor": "", "chain_mesh_param": "", "chain_keep": "", "chain_rig": ""}
+        admin._cloud_update_apply("tripo", cands, form)
+        for x in cands:
+            self.assertEqual(x["tripo"]["endpoint"], "rig")
+            self.assertEqual(x["model"], "v3.0-20250812")
+            self.assertEqual(x["tripo"]["options"]["spec"], "tripo")
+            self.assertEqual(x["tripo"]["options"]["rig_type"], "avian")
+            self.assertEqual(x["tripo"]["options"]["animations"], ["preset:walk", "preset:run"])
+            self.assertIsNone(x["tripo"]["options"]["face_limit"])      # 9 < 100 → ignored by options_of
+            self.assertEqual(x["tripo"]["options"]["target_formats"], ["fbx"])
+            self.assertEqual(x["task"], "mesh2rig"); self.assertEqual(x["retries"], "1")
+            self.assertNotIn("successor", x)
+        self.assertIsNot(cands[0]["tripo"]["options"], cands[1]["tripo"]["options"])
+        form.update({"successor": "mesh-mia", "chain_rig": "mixamo", "chain_keep": "preview.png"})
+        admin._cloud_update_apply("tripo", cands, form)
+        self.assertEqual(cands[0]["successor"], {"alias": "mesh-mia", "mesh_param": "input_mesh_path",
+                                                 "keep_from_mesh": ["preview.png"], "rig": "mixamo"})
+        self.assertIsNot(cands[0]["successor"], cands[1]["successor"])
+
+    def test_cloud_update_apply_runs_the_modules_normalizer(self):
+        """Save stores what the request builder would send: the editor offers all seven rig
+        types (rendering one field cannot know another's value), and a combination the vendor
+        refuses is normalized away at SAVE time, not discovered on a paid request."""
+        import admin, tripo
+        cands = [tripo.default_candidate("b")]
+        admin._cloud_update_apply("tripo", cands, {"cloud_endpoint": "rig", "cloud_model": "v3.1-20260211",
+                                                   "opt__rig_model": "v1.0-20240301", "opt__rig_type": "avian",
+                                                   "opt__generate_parts": "1", "opt__texture": "1",
+                                                   "fmt__glb": "on"})
+        o = cands[0]["tripo"]["options"]
+        self.assertEqual(o["rig_type"], "biped")        # rig model v1.0 rigs bipeds only
+        self.assertFalse(o["texture"])                  # generate_parts forbids texture/pbr/quad
+
+    def test_cloud_update_apply_keeps_meshy_semantics(self):
+        import admin
+        cands = [meshy.default_candidate("b")]
+        admin._cloud_update_apply("meshy", cands, {"cloud_endpoint": "rigging", "cloud_model": "meshy-6",
+                                                   "opt__should_remesh": "false", "opt__target_polycount": "42",
+                                                   "opt__should_texture": "1", "fmt__glb": "on", "fmt__obj": "on"})
+        o = cands[0]["meshy"]["options"]
+        self.assertIs(o["should_remesh"], False)
+        self.assertIsNone(o["target_polycount"])        # 42 < 100 → meshy.opt_polycount drops it
+        self.assertEqual(o["target_formats"], ["glb"])  # rigging delivers glb/fbx only
+        self.assertEqual(cands[0]["meshy"]["endpoint"], "rigging")
+        self.assertEqual(cands[0]["model"], "meshy-6")
+
+
 if __name__ == "__main__":
     unittest.main()

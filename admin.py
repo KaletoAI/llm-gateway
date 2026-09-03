@@ -29,12 +29,11 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 import adapters
+import cloudtask
 import jobs
-import meshy
 import reasoning
 import stats
 import store
-import tripo
 
 logger = logging.getLogger(__name__)
 
@@ -3205,32 +3204,86 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             f"{body}{add_sel}")
 
 
-def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
-    """Editor for a Meshy alias: endpoint, model and the admin option defaults — no
-    workflow, no mapping, no pins (the public fields are a fixed table, see meshy.py).
-    It DOES carry the chain successor: a Meshy alias can be stage 1 (mesh here, rigging
-    in the successor) — without an export node or a hand-off choice, because the mesh
-    comes back as a result blob and always travels to stage 2 as bytes."""
+def _option_rows(mod, opts: dict, ep: str) -> str:
+    """The vendor option block of a cloud alias editor, rendered from `mod.OPTION_FIELDS`.
+
+    Consecutive bool fields whose label is "" share the previous field's row (Meshy's
+    `texture` row = should_texture + enable_pbr). `rig_only` fields carry a marker
+    outside the rig endpoint but are still rendered and saved — switching an alias's
+    endpoint back and forth must not silently drop what the other endpoint needs."""
+    rows, pending_label, pending_ctrls, pending_hint = [], None, [], ""
+
+    def flush():
+        if pending_ctrls:
+            rows.append(_field(pending_label or "", "".join(pending_ctrls)))
+            if pending_hint:
+                rows.append(f"<p class='hint' style='margin:-4px 0 10px'>{pending_hint}</p>")
+
+    for fld in mod.OPTION_FIELDS:
+        k, t, label = fld["key"], fld["type"], fld.get("label", fld["key"])
+        # plain text, not markup: both _field and _checkbox escape their label. It rides
+        # on the row label, except for a blank-label box that HAS no row label of its own.
+        rig_mark = " (rig only)" if fld.get("rig_only") and ep != mod.RIG_ENDPOINT else ""
+        if t == "bool":
+            txt = fld.get("checkbox_text") or k
+            if label == "" and pending_ctrls:
+                pending_ctrls.append(_checkbox(f"opt__{k}", bool(opts.get(k)), txt + rig_mark))
+                pending_hint = fld.get("hint") or pending_hint
+                continue
+            flush()
+            pending_label = label + rig_mark
+            pending_ctrls = [_checkbox(f"opt__{k}", bool(opts.get(k)), txt)]
+            pending_hint = fld.get("hint") or ""
+            continue
+        flush()
+        pending_label, pending_ctrls, pending_hint = None, [], ""
+        if t == "select":
+            # _select treats a bare list as a scalar option — its choices must be TUPLES
+            choices = [tuple(c) if isinstance(c, (tuple, list)) else (c, c) for c in fld["choices"]]
+            ctrl = _select(f"opt__{k}", choices, cloudtask.field_value_str(fld, opts.get(k)))
+        elif t == "tristate":
+            ctrl = _select(f"opt__{k}", [("", "model default"), ("true", "always"), ("false", "never")],
+                           cloudtask.field_value_str(fld, opts.get(k)))
+        else:                                   # int | text | list
+            ctrl = _inp(f"opt__{k}", cloudtask.field_value_str(fld, opts.get(k)),
+                        placeholder=fld.get("placeholder", ""), typ="number" if t == "int" else "text")
+        rows.append(_field(label + rig_mark, ctrl, short=(t == "int")))
+        if fld.get("hint"):
+            rows.append(f"<p class='hint' style='margin:-4px 0 10px'>{fld['hint']}</p>")
+    flush()
+    return "".join(rows)
+
+
+def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False) -> str:
+    """Editor for a cloud alias (Meshy, Tripo): endpoint, ai model and the admin option
+    defaults — no workflow, no mapping, no pins (the public fields are a fixed table, see
+    the vendor module). Everything vendor-specific is READ from that module (OPTION_FIELDS,
+    the endpoint/model/format tuples, the two hints), so a second cloud kind gets this
+    editor instead of a fork of it — and a vendor option can never be offered here without
+    the request builder knowing it.
+    It DOES carry the chain successor: a cloud alias can be stage 1 (mesh here, rigging in
+    the successor) — without an export node or a hand-off choice, because the mesh comes
+    back as a result blob and always travels to stage 2 as bytes."""
+    mod = adapters.cloud_module(kind)
+    vendor = mod.VENDOR
     cand = cands[0]
     s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
     keep = [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]
     rig_cur = (s.get("rig") or "").strip()
-    rig_opts: list = [("", "blank — trust the successor"), "mixamo", "generic", "meshy"]
+    rig_opts: list = [("", "blank — trust the successor"), "mixamo", "generic", "meshy", "tripo"]
     if rig_cur and rig_cur not in rig_opts:      # keep an unknown stored value visible
         rig_opts.append((rig_cur, f"{rig_cur} — (unknown)"))   # …a Save would clear it otherwise
-    ep = meshy.endpoint_of(cand)
-    opts = meshy.options_of(cand)
-    model = cand.get("model") if cand.get("model") in meshy.AI_MODELS else "latest"
+    ep = mod.endpoint_of(cand)
+    opts = mod.options_of(cand)
+    model = cand.get("model") if cand.get("model") in mod.AI_MODELS else mod.AI_MODELS[0]
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "img2mesh"
-    # rigging answers with glb/fbx only (meshy.options_of filters server-side either way,
-    # so a stored alias that is switched TO rigging cannot keep an impossible format)
+    # the rig endpoint answers with a narrower format set (options_of filters either way,
+    # so a stored alias that is switched TO it cannot keep an impossible format)
     fmts = "".join(f'<label style="margin-right:10px"><input type="checkbox" name="fmt__{_esc(f)}"'
                    f'{" checked" if f in opts["target_formats"] else ""}> {_esc(f)}</label>'
-                   for f in (meshy.RIG_FORMATS if ep == "rigging" else meshy.FORMATS))
-    cb = lambda k, txt: _checkbox(f"opt__{k}", bool(opts.get(k)), txt)
-    remesh = {None: "", True: "true", False: "false"}.get(opts.get("should_remesh"), "")
-    params, images, files = meshy.public_fields(cand)
+                   for f in (mod.RIG_FORMATS if ep == mod.RIG_ENDPOINT else mod.FORMATS))
+    params, images, files = adapters.public_fields(cand)
     fields = "".join(f"<tr><td><code>{_esc(i['name'])}</code></td><td>image · {_esc(i['on_empty'])}</td></tr>"
                      for i in images)
     fields += "".join(f"<tr><td><code>{_esc(x['name'])}</code></td><td>file · "
@@ -3241,49 +3294,21 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                       f"{' · default ' + _esc(str(p['default'])) if p.get('default') not in (None, '') else ''}"
                       f"{' · ' + '/'.join(_esc(c or 'none') for c in p['choices']) if p.get('choices') else ''}"
                       "</td></tr>" for p in params)
-    return (f'<form action="/ui/mapping/meshy-update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
+    ignored = getattr(mod, "IGNORED_PARAMS", ())
+    ign_hint = (" " + " / ".join(f"<code>{_esc(n)}</code>" for n in ignored)
+                + " are accepted and ignored.") if ignored else ""
+    return (f'<form action="/ui/mapping/cloud-update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
             + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "") + "</div>"
             + _field("alias name", _inp("new_alias", alias), short=True)
             + _field("task", _task_select(cur_task), short=True)
-            + '<h2 style="margin-top:18px">Meshy</h2>'
-            + _field("endpoint", _select("meshy_endpoint", list(meshy.ENDPOINTS), ep))
-            + "<p class='hint' style='margin:-4px 0 10px'><b>image-to-3d</b> takes <code>input_image</code>; "
-              "<b>multi-image-to-3d</b> takes <code>input_image_front</code> (required) plus optional "
-              "<code>_back/_left/_right</code> — the same slot names as the Trellis2 multiview alias. "
-              "<b>rigging</b> takes no image at all: it rigs an uploaded <code>input_mesh_path</code> "
-              "(a <code>.glb</code> biped, 5 credits) and ignores every option below except "
-              "<b>deliver formats</b> (glb/fbx) and <b>animations</b>.</p>"
-            + _field("ai model", _select("meshy_model", list(meshy.AI_MODELS), model))
-            + _field("texture", cb("should_texture", "should_texture") + cb("enable_pbr", "enable_pbr (PBR maps)"))
-            + _field("texture resolution", _select("opt__texture_resolution", list(meshy.TEXTURE_RES),
-                                                   opts["texture_resolution"]))
-            + "<p class='hint' style='margin:-4px 0 10px'>Default when the client sends no "
-              "<code>input_texture_resolution</code> (≤2048 → 2k, ≤4096 → 4k, else 8k). 4k/8k need Meshy-6+.</p>"
-            + _field("topology", _select("opt__topology", list(meshy.TOPOLOGIES), opts["topology"]))
-            + _field("remesh", _select("opt__should_remesh",
-                                       [("", "model default"), ("true", "always"), ("false", "never")], remesh))
-            + "<p class='hint' style='margin:-4px 0 10px'>A client <code>input_face_num</code> always turns "
-              "remesh on for that request (a polycount needs the remesh pass).</p>"
-            + _field("target polycount", _inp("opt__target_polycount",
-                                              "" if opts.get("target_polycount") is None
-                                              else str(opts["target_polycount"]),
-                                              placeholder="blank = Meshy default / no remesh",
-                                              typ="number"), short=True)
-            + "<p class='hint' style='margin:-4px 0 10px'>Face budget applied when the client sends no "
-              "<code>input_face_num</code> (100–300000; turns remesh on). A client value still wins. "
-              "An alias that <b>chains into a rigger</b> should stay ≤ 300000: Meshy's rigging endpoint "
-              "refuses more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02), "
-              "which is a mesh the hand-off then has to push through as base64.</p>"
-            + _field("pose", _select("opt__pose_mode", [(p, p or "none") for p in meshy.POSES],
-                                     opts.get("pose_mode") or ""))
-            + _field("input", cb("image_enhancement", "image_enhancement") + cb("remove_lighting", "remove_lighting")
-                     + cb("moderation", "moderation"))
-            + _field("ultra", cb("ultra_mode", "ultra_mode (+5 credits, Meshy-7 only)"))
+            + f'<h2 style="margin-top:18px">{_esc(vendor)}</h2>'
+            + _field("endpoint", _select("cloud_endpoint", list(mod.ENDPOINTS), ep))
+            + f"<p class='hint' style='margin:-4px 0 10px'>{mod.ENDPOINT_HINT}</p>"
+            + _field("ai model", _select("cloud_model", list(mod.AI_MODELS), model))
+            + _option_rows(mod, opts, ep)
             + _field("deliver formats", fmts)
-            + _field("animations", cb("animations", "rigging only: also deliver walking/running clips"))
-            + _field("thumbnail", cb("thumbnail", "deliver Meshy's preview.png as an extra image artifact"))
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
             + '<h2 style="margin-top:18px">Chain (successor)</h2>'
@@ -3297,38 +3322,34 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                      placeholder="e.g. preview.png"), short=True)
             + _field("delivered rig type", _select("chain_rig", rig_opts, rig_cur), short=True)
             + "<p class='hint'>The mesh (glb) is relayed as <b>bytes</b> to the successor's backend — no "
-              "export node, no hand-off choice (a Meshy stage shares no disk with anything). It arrives "
-              "under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh workflows "
-              "label their mesh input), which must be a request field (param or label) of "
-              "the successor. The successor may itself be a <b>Meshy alias</b> (e.g. "
-              "<code>Meshy-Rig</code>, endpoint <code>rigging</code>) — it then takes the mesh as its file "
-              "field <code>input_mesh_path</code>, and the <b>delivered rig type</b> is <code>meshy</code>. "
-              "<b>keep from this stage</b>: globs for files THIS stage produces that must ship "
-              "with the successor's result (Meshy embeds its texture in the GLB, so this is usually empty — "
-              "<code>preview.png</code> is the one candidate). <b>delivered rig type</b> tags the delivery; "
+              f"export node, no hand-off choice (a {_esc(vendor)} stage shares no disk with anything). It "
+              "arrives under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh "
+              "workflows label their mesh input), which must be a request field (param or label) of the "
+              "successor. <b>keep from this stage</b>: globs for files THIS stage produces that must ship "
+              "with the successor's result. <b>delivered rig type</b> tags the delivery; "
               "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
-              "level, <code>meshy</code> is only tagged (Meshy rigs to its own conventions). Requires "
-              "<code>glb</code> in <b>deliver formats</b> — the job is refused up front otherwise, before "
-              "credits are spent. Any OTHER format in <b>deliver formats</b> is wasted on a chained "
-              "alias: Meshy bills every one of them, but only the successor's result (plus what "
-              "<b>keep from this stage</b> matches) is delivered — the rest is discarded.</p>"
+              "level, <code>meshy</code>/<code>tripo</code> are only tagged (a cloud vendor rigs to its own "
+              "conventions). Requires <code>glb</code> in <b>deliver formats</b> — the job is refused up "
+              f"front otherwise, before credits are spent. {mod.CHAIN_HINT}</p>"
             + '<h2 style="margin-top:18px">Request fields</h2>'
-            + "<p class='hint'>Fixed for Meshy aliases — what <code>GET /v1/generations/{alias}/schema</code> "
-              "advertises. <code>input_remove_background</code> / <code>input_no_fingers</code> are accepted "
-              "and ignored.</p>"
+            + f"<p class='hint'>Fixed for {_esc(vendor)} aliases — what "
+              f"<code>GET /v1/generations/{{alias}}/schema</code> advertises.{ign_hint}</p>"
             + f"<table class='pins'><tr><th>name</th><th>type</th></tr>{fields}</table>"
             + "</form>"
             + '<h2 style="margin-top:18px">Backends</h2>'
             + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free one; on a "
-              "connection error the next one is used. Only Meshy backends can be added to a Meshy alias.</p>"
+              f"connection error the next one is used. Only {_esc(vendor)} backends can be added to a "
+              f"{_esc(vendor)} alias.</p>"
             + _backends_section(alias, cands))
 
 
-# The editor's third column ("Available fields") is a workflow view — a Meshy alias
-# has no workflow, so it carries the reason instead of rendering empty.
-_MESHY_SIDE = ("<h2>Available fields</h2><p class='hint'>A Meshy alias has no workflow: its request "
-               "fields are the fixed table in the editor, and everything else is an admin option "
-               "set on the left.</p>")
+def _cloud_side(kind: str) -> str:
+    """The editor's third column ("Available fields") is a workflow view — a cloud alias
+    has no workflow, so it carries the reason instead of rendering empty."""
+    vendor = adapters.cloud_module(kind).VENDOR
+    return (f"<h2>Available fields</h2><p class='hint'>A {_esc(vendor)} alias has no workflow: its request "
+            "fields are the fixed table in the editor, and everything else is an admin option "
+            "set on the left.</p>")
 
 
 async def _alias_editor(alias: str, saved: bool = False) -> str:
@@ -3341,14 +3362,8 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
         return f'<p class="bad">alias \'{_esc(alias)}\' not found</p>'
     cand = cands[0]
     kind = adapters.cloud_kind(cand)             # no workflow, no mapping, no /object_info
-    if kind == "meshy":
-        return _meshy_editor(alias, cands, saved), _MESHY_SIDE
     if kind:
-        # Another cloud kind's option set is NOT Meshy's — rendering the Meshy editor for
-        # it would show fields the vendor does not have and silently save them.
-        vendor = adapters.cloud_module(kind).VENDOR
-        return (f"<p class='hint'>{_esc(vendor)} alias editor arrives in the next task</p>",
-                _MESHY_SIDE)
+        return _cloud_editor(kind, alias, cands, saved), _cloud_side(kind)
     wf = cand.get("workflow_json")
     if wf is None and cand.get("workflow"):
         try:
@@ -3838,35 +3853,25 @@ async def update(request: Request):
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
-async def meshy_update(request: Request):
-    """Save a Meshy alias: endpoint + ai model + the admin options, on EVERY candidate
-    (they are the alias's shape, not per-backend). Refuses a ComfyUI alias — its
-    fields live in /ui/mapping/update."""
-    f = await _form(request)
-    alias = (f.get("alias", "") or "").strip()
-    cands = store.get(alias)
-    if not alias or not cands or cands[0].get("meshy") is None:
-        raise HTTPException(404, "meshy alias not found")
-    ep = (f.get("meshy_endpoint", "") or "").strip()
-    model = (f.get("meshy_model", "") or "").strip()
-    opts = dict(meshy.OPTION_DEFAULTS)
-    for k in ("should_texture", "enable_pbr", "ultra_mode", "image_enhancement",
-              "remove_lighting", "moderation", "thumbnail", "animations"):
-        opts[k] = bool(f.get(f"opt__{k}"))
-    tr = (f.get("opt__texture_resolution", "") or "").strip()
-    opts["texture_resolution"] = tr if tr in meshy.TEXTURE_RES else "2k"
-    tp = (f.get("opt__topology", "") or "").strip()
-    opts["topology"] = tp if tp in meshy.TOPOLOGIES else "triangle"
-    opts["should_remesh"] = {"true": True, "false": False}.get((f.get("opt__should_remesh", "") or "").strip())
-    pm = (f.get("opt__pose_mode", "") or "").strip()
-    opts["pose_mode"] = pm if pm in meshy.POSES else ""
-    # blank or garbage → None (Meshy's default, no remesh); meshy.opt_polycount owns
-    # the range check, so the editor and the request builder cannot drift apart.
-    opts["target_polycount"] = meshy.opt_polycount((f.get("opt__target_polycount", "") or "").strip())
-    opts["target_formats"] = [x for x in meshy.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
+def _cloud_update_apply(kind: str, cands: list, f: dict) -> None:
+    """Apply a cloud alias form to EVERY candidate (they are the alias's shape, not
+    per-backend). Options go through `parse_options` (the schema) and then the module's
+    `options_of` (the same normalization the request builder applies), so what is stored
+    is exactly what will be sent — a combination the vendor refuses cannot survive a Save
+    and turn up as a 400 on a paid request."""
+    mod = adapters.cloud_module(kind)
+    ep = (f.get("cloud_endpoint", "") or "").strip()
+    ep = ep if ep in mod.ENDPOINTS else mod.ENDPOINTS[0]
+    model = (f.get("cloud_model", "") or "").strip()
+    model = model if model in mod.AI_MODELS else mod.AI_MODELS[0]
+    opts = cloudtask.parse_options(mod.OPTION_FIELDS, f, mod.OPTION_DEFAULTS)
+    # ASSIGN, never mutate: parse_options shallow-copies the defaults, so appending here
+    # would rewrite OPTION_DEFAULTS["target_formats"] for every future alias.
+    opts["target_formats"] = [x for x in mod.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
+    opts = mod.options_of({mod.KIND: {"endpoint": ep, "options": opts}, "model": model})
     task = (f.get("task", "") or "").strip()
     retries = (f.get("retries", "") or "").strip()
-    # chain successor (blank alias → not a chain). No export_node and no relay: a Meshy
+    # chain successor (blank alias → not a chain). No export_node and no relay: a cloud
     # stage's mesh is a result blob and always travels to stage 2 as bytes (_run_chain
     # forces `upload`), so those two ComfyUI fields would only be misleading here.
     succ_alias = (f.get("successor", "") or "").strip()
@@ -3880,9 +3885,8 @@ async def meshy_update(request: Request):
     for c in cands:
         # a fresh options dict per candidate — one shared object would let a later
         # in-place edit of one candidate rewrite the others
-        c["meshy"] = {"endpoint": ep if ep in meshy.ENDPOINTS else meshy.ENDPOINTS[0],
-                      "options": json.loads(json.dumps(opts))}
-        c["model"] = model if model in meshy.AI_MODELS else "latest"
+        c[mod.KIND] = {"endpoint": ep, "options": json.loads(json.dumps(opts))}
+        c["model"] = model
         c["retries"] = retries
         if succ:
             c["successor"] = json.loads(json.dumps(succ))    # own copy per candidate (see above)
@@ -3890,12 +3894,25 @@ async def meshy_update(request: Request):
             c.pop("successor", None)
         if task:
             c["task"] = task
+
+
+async def cloud_update(request: Request):
+    """Save a cloud alias (Meshy, Tripo): endpoint + ai model + the admin options, on
+    every candidate. Refuses a ComfyUI alias — its fields live in /ui/mapping/update."""
+    f = await _form(request)
+    alias = (f.get("alias", "") or "").strip()
+    cands = store.get(alias) if alias else []
+    kind = adapters.cloud_kind(cands[0]) if cands else None
+    if not kind:
+        raise HTTPException(404, "cloud alias not found")
+    _cloud_update_apply(kind, cands, f)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name
         alias = new_alias
     store.upsert(alias, cands)
-    logger.info(f"ui: updated meshy alias '{alias}' ({cands[0]['meshy']['endpoint']}, {cands[0]['model']})")
+    logger.info(f"ui: updated {kind} alias '{alias}' "
+                f"({cands[0][kind]['endpoint']}, {cands[0]['model']})")
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
@@ -6486,7 +6503,7 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/bypass-del", bypass_del, methods=["GET"])
     app.add_api_route("/ui/mapping/field-order", field_order, methods=["GET"])
     app.add_api_route("/ui/mapping/update", update, methods=["POST"])
-    app.add_api_route("/ui/mapping/meshy-update", meshy_update, methods=["POST"])
+    app.add_api_route("/ui/mapping/cloud-update", cloud_update, methods=["POST"])
     app.add_api_route("/ui/mapping/export", mapping_export, methods=["GET"])
     app.add_api_route("/ui/mapping/export-all", mapping_export_all, methods=["GET"])
     app.add_api_route("/ui/mapping/copy", copy, methods=["GET"])
