@@ -271,6 +271,14 @@ class NormalizedRequest:
     job_id: str = ""                                # the job row this request runs for. Only live progress
                                                     # uses it (ctx.note_progress keys on it); blank simply
                                                     # means "report nothing", never an error.
+    cloud_trace: dict = field(default_factory=dict)  # what a cloud adapter has BILLABLY done so far, written
+                                                    # the moment the vendor's task exists rather than on the
+                                                    # way out: a failed run returns no GenOutput, so without
+                                                    # this the job row keeps no task id, endpoint or request
+                                                    # and the one question a failure raises ("which task, and
+                                                    # what did we send?") is answerable only from the vendor's
+                                                    # dashboard. Per-REQUEST, so concurrent jobs on one
+                                                    # adapter cannot overwrite each other's facts.
 
     def __post_init__(self):
         if self.cloud is None and self.meshy is not None:
@@ -3375,7 +3383,35 @@ class CloudTaskAdapter(BackendAdapter):
             meta.setdefault("rig", mod.KIND)
         return GenOutput(blobs=blobs, meta=meta)
 
-    async def _create(self, client, url: str, body: dict, endpoint: str) -> str:
+    def _note_task(self, req: Optional[NormalizedRequest], task_id: str, endpoint: str,
+                   body: Optional[dict] = None, role: Optional[str] = None) -> None:
+        """Record a vendor task on the request the moment it EXISTS, under the same keys
+        the success meta uses — so `admin._cloud_table` renders a failed run with no
+        special case, and `main` can put the facts on the failed job row.
+
+        Deliberately called from `_create` rather than from each vendor's `_run`: every
+        task a job creates passes through there, so none can be forgotten (Tripo's
+        converts and clips included), and the LAST one to be created is the one the job
+        died on."""
+        if req is None:
+            return                              # a direct _create caller (tests) traces nothing
+        tr = req.cloud_trace
+        tr.setdefault("backend", self.name)
+        tr.setdefault("cloud", self.mod.KIND)
+        # `role` given = a SIDE task (Tripo's rig-check, convert:<fmt>, clip:<preset>): it
+        # joins the task list but must not claim `cloud_task_id`/`endpoint`, which name the
+        # PRIMARY task in the success meta and mean the same thing here.
+        if role is None:
+            tr.update({"cloud_task_id": task_id, "endpoint": endpoint})
+            if body is not None:
+                tr["request"] = self.mod.request_summary(body)
+        # No `credits` here: what a task consumed is only known from its POLL, and a
+        # guess on a failed row is worse than the silence (the vendor bills what it bills).
+        tr.setdefault("tasks", []).append({"role": role or endpoint, "task_id": task_id})
+
+    async def _create(self, client, url: str, body: dict, endpoint: str,
+                      req: Optional[NormalizedRequest] = None,
+                      role: Optional[str] = None) -> str:
         """POST the task and return its id, or raise the verdict `_classify_create` gives."""
         # The create POST is the one call that carries the whole INPUT in its body — image
         # data URIs, and for rigging the entire mesh as base64. Measured 2026-09-02 on
@@ -3404,6 +3440,7 @@ class CloudTaskAdapter(BackendAdapter):
             raise RuntimeError(f"{self.vendor} returned no task id")
         if self.ctx.log_enabled():
             logger.info(f"→ [{self.name}] {self.mod.KIND} {endpoint} task {task_id}")
+        self._note_task(req, task_id, endpoint, body, role)
         return task_id
 
     async def _poll(self, client, endpoint: str, task_id: str, formats: list, opts: dict,
@@ -3555,7 +3592,8 @@ class MeshyAdapter(CloudTaskAdapter):
         endpoint = meshy.endpoint_of(cand)
         body = meshy.build_request(cand, _gen_values(req), req.upload_images or {},
                                    req.upload_files or {})            # MeshyInput → final
-        task_id = await self._create(client, self._api(f"/{endpoint}"), body, endpoint)
+        task_id = await self._create(client, self._api(f"/{endpoint}"), body, endpoint, req)
+        req.cloud_trace["meshy_task_id"] = task_id      # the name existing rows/views read
         state = await self._poll(client, endpoint, task_id, opts["target_formats"], opts,
                                  poll_interval, max_wait)
         # `meshy_task_id`, not the neutral key: existing job rows and the job view read
@@ -3759,7 +3797,8 @@ class TripoAdapter(CloudTaskAdapter):
         if endpoint == tripo.RIG_ENDPOINT and opts.get("rig_check"):
             cid = await self._create(client, self._api("/animations/rig-check"),
                                      tripo.build_rig_check(body["input"]),
-                                     tripo.RIG_CHECK_ENDPOINT)
+                                     tripo.RIG_CHECK_ENDPOINT, req,
+                                     role=tripo.RIG_CHECK_ENDPOINT)
             cst = await self._poll(client, tripo.RIG_CHECK_ENDPOINT, cid, formats, opts,
                                    poll_interval, left())
             took(tripo.RIG_CHECK_ENDPOINT, cid, cst)
@@ -3775,7 +3814,8 @@ class TripoAdapter(CloudTaskAdapter):
                                f"{body.get('rig_type')}")
             extra["rig_type"] = cst.rig_type or body.get("rig_type")
         # 3. the primary task
-        task_id = await self._create(client, self._api(self._CREATE_PATH[endpoint]), body, endpoint)
+        task_id = await self._create(client, self._api(self._CREATE_PATH[endpoint]), body,
+                                     endpoint, req)
         state = await self._poll(client, endpoint, task_id, formats, opts, poll_interval, left())
         took(endpoint, task_id, state)
         stem = "rigged" if endpoint == tripo.RIG_ENDPOINT else "model"
@@ -3797,7 +3837,7 @@ class TripoAdapter(CloudTaskAdapter):
             cbody = tripo.build_convert(task_id, fmt, endpoint == tripo.RIG_ENDPOINT)
             try:
                 cid = await self._create(client, self._api("/models/convert"), cbody,
-                                         f"convert:{fmt}")
+                                         f"convert:{fmt}", req, role=f"convert:{fmt}")
                 cst = await self._poll(client, "convert", cid, [fmt], opts, poll_interval, left())
             except (httpx.HTTPError, ConnectionError, TimeoutError, RuntimeError) as e:
                 raise RuntimeError(f"{self.vendor} convert to {fmt} failed after the paid "
@@ -3813,7 +3853,8 @@ class TripoAdapter(CloudTaskAdapter):
                 rbody = tripo.build_retarget(task_id, preset, native)
                 try:
                     cid = await self._create(client, self._api("/animations/retarget"),
-                                             rbody, f"clip:{preset}")
+                                             rbody, f"clip:{preset}", req,
+                                             role=f"clip:{preset}")
                     cst = await self._poll(client, "retarget", cid, [native], opts,
                                            poll_interval, left())
                 except (httpx.HTTPError, RuntimeError, ConnectionError, TimeoutError) as e:

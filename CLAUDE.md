@@ -197,6 +197,17 @@ hot-reload-safe.
   shared CONSTANT. `_cleanup_uploads` overwrites the job's inputs with that 72-byte
   placeholder after a CLEAN success only (a timed-out prompt may still read them);
   it never raises.
+  A failed run returns no `GenOutput`, so the job meta every cloud success carries would
+  be lost exactly when it is needed: `_create` therefore records each task on the REQUEST
+  (`NormalizedRequest.cloud_trace`, per-request so concurrent jobs cannot overwrite each
+  other) under the SAME keys the success meta uses — `cloud`, `cloud_task_id`, `endpoint`,
+  `request`, `tasks` — and `main._gen_fail_meta`/`_run_chain`'s `fail_meta()` put them on
+  the failed row (a cloud stage 2 at top level, stage 1 under `chain_stage1`, mirroring
+  success). `admin._cloud_table` then renders a failed run with no special case. Recording
+  from `_create` and not from each `_run` is what makes it unforgettable — Tripo's converts
+  and clips pass through there too; those carry a `role` and join `tasks` WITHOUT claiming
+  `cloud_task_id`/`endpoint`, which name the primary task on both paths. No `credits` is
+  ever guessed onto a failed row: only a poll knows what was consumed.
   `CloudTaskAdapter` (`cloud = True`, `serves_generation = True`) is the vendor-NEUTRAL
   half of every cloud task backend — `MeshyAdapter` and `TripoAdapter` are subclasses,
   and a third vendor is a subclass plus a pure module, not a second copy of the

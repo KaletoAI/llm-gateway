@@ -197,6 +197,24 @@ class TestMeshyAdapter(unittest.TestCase):
             self._run(self.ad.generate(self._req({"input_image": PNG})))
         self.assertNotIsInstance(cm.exception, ConnectionError)
 
+    def test_failed_run_leaves_the_task_facts_on_the_request(self):
+        # A failed run returns no GenOutput, so the task id / endpoint / request summary
+        # reach the job row ONLY through the request's cloud_trace. Without it a cloud
+        # failure is diagnosable only from the vendor's dashboard (job 9cf448115b4b).
+        _Stub.script = [_task("FAILED", task_error={"message": "bad input"})]
+        req = self._req({"input_image": PNG})
+        with self.assertRaises(RuntimeError):
+            self._run(self.ad.generate(req))
+        tr = req.cloud_trace
+        self.assertEqual(tr["cloud"], "meshy")
+        self.assertEqual(tr["backend"], "meshy")
+        self.assertEqual(tr["cloud_task_id"], "task-1")
+        self.assertEqual(tr["meshy_task_id"], "task-1")      # the name existing views read
+        self.assertEqual(tr["endpoint"], "image-to-3d")
+        self.assertEqual(tr["tasks"], [{"role": "image-to-3d", "task_id": "task-1"}])
+        self.assertIn("request", tr)                          # what was actually sent
+        self.assertNotIn("credits", tr)                       # never guessed on a failure
+
     def test_402_fails_over(self):
         _Stub.post_status = 402
         with self.assertRaises(adapters.MeshyNoCredits):
