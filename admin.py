@@ -119,6 +119,7 @@ _comfy_backends: Callable[[], list] = lambda: []
 _gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI, Meshy, Tripo)
 _gateway_info: Callable[[], dict] = lambda: {}
 _gen_speed_info: Callable[[], dict] = lambda: {"speed": {}, "quarantine": {}}
+_job_progress: Callable[[str], Optional[dict]] = lambda job_id: None   # live ws progress, None = none
 _cancel_generation = None
 _drain_backend = None
 _cancel_drain = None
@@ -4743,10 +4744,19 @@ _JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
 
 def _job_status_text(j: dict) -> str:
     """Status label with the multi-stage sub-step appended while running — a chain in
-    stage 1 shows 'running 1/2', in stage 2 'running 2/2'. Single-stage jobs are plain."""
+    stage 1 shows 'running 1/2', in stage 2 'running 2/2'. Single-stage jobs are plain.
+
+    Plus the backend's own step counter when its websocket feed is reporting one:
+    'running 25/35' is the answer to "is it stuck?", and it is the same number ComfyUI
+    prints in its log. Absent for a backend that does not report — never faked."""
     st = j.get("status") or ""
     stg = j.get("stage")
-    return f"{st} {stg}" if st == "running" and stg else st
+    txt = f"{st} {stg}" if st == "running" and stg else st
+    if st == "running":
+        live = _job_progress(j.get("id") or "") or {}
+        if live.get("step") is not None and live.get("steps"):
+            txt += f" {live['step']}/{live['steps']}"
+    return txt
 
 
 _DUR_EST: dict = {}          # "alias|backend" → (cached_at, median seconds | None)
@@ -4790,6 +4800,11 @@ def _job_dur_cell(j: dict, now: int) -> str:
         if st in ("running", "queued") else None
     exp = f" <span class='muted'>/ ~{_dur(est * 1000)}</span>" if est else ""
     if st == "running":
+        # The backend's own step counter beats the median whenever we have it: it knows
+        # THIS run's seconds per step, so "8.9 min left" is measured, not typical.
+        live = _job_progress(j["id"]) or {}
+        if live.get("eta_s") is not None:
+            exp = (f" <span class='muted'>/ ~{_dur(live['eta_s'] * 1000)} left</span>")
         return (f"<td class='muted'><span class='jdur' data-since='{cr}'>"
                 f"{_dur((now - cr) * 1000)}</span>{exp}</td>")
     if st == "queued" and est:
@@ -5244,7 +5259,25 @@ async def job_detail_page(job_id: str, request: Request):
     inbox += _cloud_table("Cloud · stage 1", meta.get("chain_stage1") or {})
     inbox += _cloud_table("Cloud", meta)
     if st in ("queued", "running"):
+        # A long render used to be a spinner and nothing else — the one question it
+        # could not answer was whether anything was still happening. The backend's step
+        # feed answers it: a bar that moves, the node that is counting, and an ETA from
+        # the seconds per step measured in THIS run. No feed → the plain line as before.
         outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
+        live = _job_progress(job_id) or {}
+        if live.get("fraction") is not None:
+            pct = min(100, int(live["fraction"] * 100))
+            eta = (f" · ~{_dur(live['eta_s'] * 1000)} left"
+                   if live.get("eta_s") is not None else "")
+            node = f" · node {_esc(live['node'])}" if live.get("node") else ""
+            nodes = (f" · {live['nodes_done']}/{live['nodes_total']} nodes"
+                     if live.get("nodes_total") else "")
+            outbox += (
+                f"<div style='max-width:520px;margin:6px 0 2px'>"
+                f"<div style='height:8px;background:#232a35;border-radius:4px;overflow:hidden'>"
+                f"<div style='height:8px;width:{pct}%;background:#6cb0ef'></div></div>"
+                f"<p class='muted' style='margin:4px 0 0'>step {live.get('step')}/"
+                f"{live.get('steps')} ({pct}%){eta}{node}{nodes}</p></div>")
     elif st == "failed":
         outbox = f"<p class='bad'>✗ failed</p><pre class='err'>{_esc(job.get('error'))}</pre>"
     elif job.get("results"):

@@ -212,6 +212,24 @@ hosts_meta: dict[str, dict] = {}                               # host → {label
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
 gen_speed: dict = {}                                           # "alias|bid" → EMA seconds of a successful media job
 gen_exec_faults: dict = {}                                     # "alias|bid" → proven execution-fault record (scheduler.exec_fault_*)
+gen_progress: dict = {}                                        # job id → live progress from the backend's ws feed
+
+
+def _note_progress(job_id: str, info: Optional[dict]) -> None:
+    """Adapter hook (`AdapterContext.note_progress`): record one job's live progress,
+    or drop it when `info` is None (the run ended — the job ROW owns the outcome from
+    then on, and a stale 'running 25/35' next to a finished job would be a lie).
+
+    In memory on purpose: this updates several times a second per running job, and none
+    of it is worth a SQLite write — it is a view of something already in flight, and a
+    gateway restart legitimately forgets it (the jobs it belonged to are failed by
+    `reconcile_orphans` anyway)."""
+    if not job_id:
+        return
+    if info is None:
+        gen_progress.pop(job_id, None)
+        return
+    gen_progress[job_id] = {**info, "at": time.time()}
 backend_last_key: dict = {}                                    # bid → type key last DISPATCHED (media: alias, LLM: real model)
 
 
@@ -1518,6 +1536,7 @@ adapter_ctx = AdapterContext(
     source_of=_source_of,
     record_call=stats.record_call,
     note_speed=_note_speed,
+    note_progress=_note_progress,
     log_enabled=lambda: log_per_call,
     active_register=_active_register,
     active_done=_active_done,
@@ -2445,6 +2464,22 @@ async def _job_view(job_id: str, request: Request) -> dict:
         elapsed = max(0, int(time.time()) - int(job.get("created") or 0))
         view["elapsed_s"] = elapsed
         if job["status"] == "running":
+            # The backend's own step counter wins when we have it: the median can only
+            # say what jobs of this shape USUALLY take, while this one knows that this
+            # run is at step 25 of 35 — and derives its ETA from the seconds per step
+            # actually measured here. Falls back to the median the moment the feed is
+            # unavailable (old ComfyUI, no websockets module, a dropped socket).
+            live = gen_progress.get(job_id)
+            if live and live.get("fraction") is not None:
+                view["progress"] = round(min(live["fraction"], 0.99), 2)
+                view["progress_basis"] = "live"
+                view["progress_step"] = f"{live.get('step')}/{live.get('steps')}"
+                if live.get("node"):
+                    view["progress_node"] = live["node"]
+                if live.get("eta_s") is not None:
+                    view["eta_s"] = live["eta_s"]
+                view["progress_age_s"] = max(0, int(time.time() - (live.get("at") or 0)))
+                return view
             med = (await asyncio.to_thread(jobs.median_duration, job["alias"], job["backend"])
                    or await asyncio.to_thread(jobs.median_duration, job["alias"]))
             if med and med > 0:
@@ -3082,7 +3117,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     bypass=(stage1_cand.get("bypass") or []),
                     upload_images=dict(upload_images or {}), raw=request,
                     upload_files=dict(upload_files or {}),
-                    upload_prefix=_upload_prefix(job_id, "s1"),
+                    upload_prefix=_upload_prefix(job_id, "s1"), job_id=job_id,
                     loras=body.get("loras"), slot_held=True)
                 # runbook B: retry a sporadic fault on the SAME backend first — the held
                 # slot (`held`) spans the repeats; the last attempt re-raises into the
@@ -3144,7 +3179,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
                     node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
                     upload_files={},
-                    upload_prefix=_upload_prefix(job_id, "s2"),
+                    upload_prefix=_upload_prefix(job_id, "s2"), job_id=job_id,
                     raw=request, output_node=(s2.get("output_node") or None),
                     output_ext=(s2.get("output_ext") or None), output_globs=(s2.get("output_globs") or None),
                     output_cases=(s2.get("output_cases") or None),
@@ -3491,6 +3526,7 @@ async def run_generation(body: dict, request: Request,
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
             upload_files=dict(upload_files or {}), upload_prefix=_upload_prefix(job_id),
+            job_id=job_id,                                        # keys the live progress feed
             loras=body.get("loras"), output_node=(cand.get("output_node") or None),
             output_ext=(cand.get("output_ext") or None),
             output_globs=(cand.get("output_globs") or None),
@@ -4260,6 +4296,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            gen_backends=lambda: [b for b in backends if _is_gen(b)],
            gateway_info=gateway_info,
            gen_speed_info=gen_speed_info,
+           job_progress=lambda job_id: gen_progress.get(job_id),
            apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
            config_chat_aliases=lambda: dict(config_virtual_models),

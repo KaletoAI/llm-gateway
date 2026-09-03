@@ -17,6 +17,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import fnmatch
 import json
@@ -26,11 +27,13 @@ import random
 import re
 import struct
 import time
+import uuid
 import zlib
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
+from urllib.parse import quote
 
 import httpx
 from fastapi import Request
@@ -249,6 +252,9 @@ class NormalizedRequest:
                                                     # way; folded into `cloud` below, nothing reads it
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
+    job_id: str = ""                                # the job row this request runs for. Only live progress
+                                                    # uses it (ctx.note_progress keys on it); blank simply
+                                                    # means "report nothing", never an error.
 
     def __post_init__(self):
         if self.cloud is None and self.meshy is not None:
@@ -340,6 +346,10 @@ class AdapterContext:
     # constructions valid; the guard (200-only, min tokens) lives in main._note_speed.
     note_speed: Callable[[str, int, int, int], None] = \
         lambda bid, out_tok, dur_ms, status: None
+    # Live generation progress: (job_id, info | None) — info None clears the entry.
+    # Fed by ComfyUI's /ws feed (see _ws_progress), read by the job view. A no-op
+    # default keeps every non-main construction (and every test) valid.
+    note_progress: Callable[[str, Optional[dict]], None] = lambda job_id, info: None
     # Normalized reasoning toggle: (backend, model, requested, payload) -> (payload, control).
     # Default no-op (auto) so non-main constructions stay valid.
     apply_reasoning: Callable[[dict, Optional[str], Optional[str], dict], Any] = \
@@ -2780,7 +2790,12 @@ class ComfyUIAdapter(BackendAdapter):
             # multi-second generation job costs nothing.
             timeout = httpx.Timeout(30.0, read=float(b.get("read_timeout", 60)))
             async with httpx.AsyncClient(timeout=timeout) as client:
-                pr = await client.post(f"{url}/prompt", json={"prompt": wf})
+                # A client_id ties this prompt to our websocket listener below. ComfyUI
+                # 0.30 broadcasts progress to everyone, 0.34 measurably does not — sending
+                # the id is what makes the feed work on both, and it is inert otherwise.
+                client_id = f"gw-{req.job_id or uuid.uuid4().hex[:12]}"
+                pr = await client.post(f"{url}/prompt",
+                                       json={"prompt": wf, "client_id": client_id})
                 if pr.status_code != 200:
                     raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
                 submitted = pr.json() or {}
@@ -2796,7 +2811,21 @@ class ComfyUIAdapter(BackendAdapter):
                     raise RuntimeError("ComfyUI returned no prompt_id")
                 if log_on:
                     logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
-                outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
+                # Live progress runs BESIDE the /history poll, never instead of it: the
+                # poll owns the job's outcome (and its timeout, disconnect grace and
+                # failover), the socket only says how far along it is. If the socket
+                # never connects the job is completely unaffected.
+                ws_state = {"prompt_id": prompt_id, "began": time.monotonic()}
+                ws_task = asyncio.create_task(
+                    self._ws_progress(url, client_id, req.job_id, ws_state))
+                try:
+                    outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
+                finally:
+                    ws_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await ws_task
+                    if req.job_id:
+                        self.ctx.note_progress(req.job_id, None)   # the row owns it now
                 rig, warnings = None, []
                 if req.output_cases:                 # conditional case delivery (+ rig + validation)
                     blobs, rig = await self._fetch_by_cases(client, url, outputs, req.output_cases)
@@ -2841,6 +2870,107 @@ class ComfyUIAdapter(BackendAdapter):
             **({"rig": rig} if rig else {}),
             **({"warnings": warnings} if warnings else {}),
         })
+
+    async def _ws_progress(self, url: str, client_id: str, job_id: str, state: dict) -> None:
+        """Follow ComfyUI's /ws feed and report this job's real step progress.
+
+        REST cannot answer "how far along is it?": `/queue` says only WHICH prompt runs
+        and `/history` appears once it is over, which is why the job view had to
+        estimate from the median of past runs. The sampler's per-step counter — the
+        `25/35` in ComfyUI's own log — is published over the websocket only:
+          progress:       {"value": 25, "max": 35, "node": "34", "prompt_id": …}
+          progress_state: {"prompt_id": …, "nodes": {"34": {value, max, state}, …}}
+        We submit with a `client_id` and connect with the SAME id: ComfyUI 0.30 happens
+        to broadcast progress to every listener, but that is not something to rely on —
+        measured 2026-09-03, a 0.34 box sent a fresh listener nothing at all while a job
+        was running. Messages for another prompt are ignored either way (`prompt_id` is
+        on every one), so one stray broadcast cannot mislabel this job's progress.
+
+        Best-effort by construction: any failure — no `websockets` module, a refused
+        connection, a message shape we do not know — just leaves the estimate as it was.
+        It never raises into the job, and it is never the reason a generation fails.
+        `state` is the caller's dict, so the poll loop can read what arrived (and notice
+        that nothing has arrived for a while) while this task runs.
+        """
+        try:
+            import websockets                       # ships with uvicorn[standard], like watchfiles
+        except ImportError:
+            return
+        ws_url = re.sub(r"^http", "ws", url) + f"/ws?clientId={quote(client_id)}"
+        try:
+            async with websockets.connect(ws_url, max_size=None,
+                                          open_timeout=10) as ws:
+                while True:
+                    raw = await ws.recv()
+                    if isinstance(raw, (bytes, bytearray)):
+                        continue                    # binary = a preview image frame
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        continue
+                    view = self._progress_apply(state, msg, time.monotonic())
+                    if view is not None:
+                        self.ctx.note_progress(job_id, view)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                      # never a reason for a job to fail
+            logger.debug(f"[{self.backend.get('name')}] ws progress unavailable: {e}")
+
+    def _progress_apply(self, state: dict, msg: dict, now: float) -> Optional[dict]:
+        """Fold one /ws message into `state`; return the view to report, or None to
+        ignore the message. Pure apart from `state` — this is where every rule that
+        would fail SILENTLY lives, so it is unit-tested (`test_ws_progress.py`).
+
+        The `prompt_id` gate is the important one: ComfyUI 0.30 broadcasts progress for
+        EVERY prompt on the box to every listener, so without it a job would happily
+        display the step count of somebody else's render."""
+        data = msg.get("data") or {}
+        if data.get("prompt_id") != state.get("prompt_id"):
+            return None                             # another job on the same backend
+        kind = msg.get("type")
+        if kind == "progress":
+            val, mx = data.get("value"), data.get("max")
+            if not (isinstance(val, (int, float)) and isinstance(mx, (int, float)) and mx > 0):
+                return None
+            node = str(data.get("node") or "")
+            # Time the steps from the FIRST one, not from the submit: everything before
+            # it is model loading, and charging that to step one predicted 250 s for a
+            # job that took 15 (measured 2026-09-04). A new node — or a counter that
+            # went backwards — starts a fresh measurement; a graph can hold several
+            # samplers, and each has its own pace.
+            if node != state.get("node") or val < state.get("value", 0):
+                state.update({"first_at": now, "first_val": float(val)})
+            state.update({"value": float(val), "max": float(mx), "node": node, "at": now})
+            return self._progress_view(state)
+        if kind == "progress_state":
+            nodes = data.get("nodes") or {}
+            if not nodes:
+                return None
+            done = sum(1 for n in nodes.values()
+                       if isinstance(n, dict) and n.get("state") == "finished")
+            state.update({"nodes_done": done, "nodes_total": len(nodes), "at": now})
+            return self._progress_view(state)
+        return None
+
+    def _progress_view(self, state: dict) -> dict:
+        """The public shape of live progress: fraction + an ETA derived from the
+        MEASURED seconds per step of THIS run — far better than a median over past
+        jobs, which cannot know that this one is a 1536² render on a busy box."""
+        val, mx = state.get("value"), state.get("max")
+        out = {"basis": "live", "backend": self.backend.get("name"),
+               "node": state.get("node") or None,
+               "nodes_done": state.get("nodes_done"), "nodes_total": state.get("nodes_total"),
+               "updated_ago_s": 0}
+        if isinstance(val, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
+            out.update({"step": int(val), "steps": int(mx),
+                        "fraction": round(min(val / mx, 1.0), 3)})
+            # Needs at least one step-to-step interval; before that there is no rate to
+            # extrapolate from and NO eta is far better than a wrong one.
+            first_at, first_val, t0 = state.get("first_at"), state.get("first_val"), state.get("at")
+            if first_at and t0 and val > (first_val or 0):
+                per_step = (t0 - first_at) / (val - first_val)
+                out["eta_s"] = max(0, int(per_step * (mx - val)))
+        return out
 
     async def _poll(self, client, url, prompt_id, poll_interval, max_wait, started) -> dict:
         # If /history stops responding *after* the run was reachable for a while,

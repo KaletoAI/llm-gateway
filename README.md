@@ -43,6 +43,10 @@ code, image clients like anima-verse, …) and a fleet of backends.
   **fastest free unpaid** backend that can serve it takes it, a backend that
   frees up prefers the request type it just ran (no model reload), and nothing
   waits longer than `affinity_max_wait_s` for that preference.
+- **Live progress for generation jobs.** ComfyUI's own step counter (`25/35`) is read
+  off its websocket, so a running job shows `running 25/35` with a bar and an ETA
+  computed from the seconds per step measured in that very run — not a guess from past
+  jobs. Backends that do not report it simply fall back to the old estimate.
 - **A backend that burns jobs is taken out of rotation.** A generation backend can
   answer every health check and still fail every prompt (a broken driver update, a
   missing custom node). Such a job now moves on to the next backend instead of dying,

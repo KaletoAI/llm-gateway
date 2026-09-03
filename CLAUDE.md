@@ -147,6 +147,29 @@ hot-reload-safe.
   on nothing; those are BYPASSED, not pruned (pruning cuts the path behind them), by
   joining `req.bypass` for the single `_apply_bypass` pass, so both sources dedupe,
   chain-resolve and report together under `bypassed`;
+  **Live progress** (`_ws_progress` + the pure `_progress_apply`/`_progress_view`):
+  REST cannot say how far along a run is — `/queue` names the running prompt and
+  `/history` appears only once it is over — so the job view had to estimate from the
+  median of past runs. The sampler's own step counter (the `25/35` ComfyUI prints) is
+  published on the **websocket** only: `progress` `{value,max,node,prompt_id}` and
+  `progress_state` `{nodes:{id:{value,max,state}}}`. `generate()` submits with a
+  `client_id` and a task connects to `/ws?clientId=` with the SAME id — 0.30 broadcasts
+  progress to every listener, 0.34 measurably does not (2026-09-03), and the id is what
+  works on both. Every message carries a `prompt_id` and one that is not ours is
+  DROPPED: under 0.30's broadcast a job would otherwise display a stranger's steps,
+  which is worse than showing none. It runs BESIDE the `/history` poll, never instead
+  of it (the poll still owns outcome, timeout, disconnect grace and failover), is
+  cancelled in a `finally`, and reports `None` at the end so a finished row cannot keep
+  a stale "25/35". Any failure — no `websockets` (it ships with `uvicorn[standard]`,
+  like watchfiles), a refused socket, an unknown shape — silently leaves the median
+  estimate in place. The ETA is derived from the seconds per step measured in THIS run,
+  timed from the FIRST step and restarted whenever the node changes or the counter goes
+  backwards: timing from submit charges the model load to step one and predicted 250 s
+  for a job that took 15 (measured 2026-09-04). Fed to `main.gen_progress` via
+  `ctx.note_progress(job_id, …)` (in memory — it updates several times a second and a
+  restart forgets it, which is correct); `_job_view` prefers it (`progress_basis:
+  "live"`) over the median, and the console shows `running 25/35`, `~8.9 min left` and
+  a bar on the job page. Covered by `test_ws_progress.py`.
   `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
   rejections are translated to readable per-node errors (node title, class,
   field, offending request param) via `_comfy_prompt_error`; raw body stays the
@@ -483,7 +506,7 @@ hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls test_*.py` is the count of record —
-  **nineteen** files today — and each exists for that same reason: the mechanism it
+  **twenty** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -514,7 +537,12 @@ hot-reload-safe.
   `test_run_job_failover.py` (what `_run_job` does with an execution error: every case
   ends in a plausible-looking job row — a job dead on the first candidate reads like a
   workflow error, a fault charged to the winner idles a healthy backend for 15 minutes,
-  and a cloud candidate that fails over re-runs a task the vendor already BILLED).
+  and a cloud candidate that fails over re-runs a task the vendor already BILLED);
+  `test_ws_progress.py` (folding ComfyUI's /ws messages into a job's progress: 0.30
+  BROADCASTS every prompt's progress to every listener, so a missing prompt_id gate
+  shows a job a stranger's step count — a lying feature, not an absent one — and an ETA
+  looks plausible whatever it says, which is how timing the steps from job start
+  predicted 250 s for a 15 s job).
   Run them all with `python -m unittest discover -p 'test_*.py'` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
