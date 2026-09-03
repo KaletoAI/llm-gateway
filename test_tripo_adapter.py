@@ -368,6 +368,64 @@ class TestTripoAdapter(unittest.TestCase):
         self.assertEqual([p for p, _ in _Stub.posted],
                          ["/v3/generation/image-to-model", "/v3/models/convert"])
 
+    def _create_raising(self, exc, role_prefix):
+        """Make the REAL _create raise `exc` for one role only (the create leg's bare
+        client.post is what a transport fault hits), leaving every other create intact."""
+        real = self.ad._create
+
+        async def flaky(client, url, body, endpoint):
+            if endpoint.startswith(role_prefix):
+                raise exc
+            return await real(client, url, body, endpoint)
+        self.ad._create = flaky
+
+    def test_convert_create_transport_fault_is_final(self):
+        """httpx's transport errors are subclasses of NEITHER ConnectionError nor
+        TimeoutError, but main._GEN_FAILOVER_ERRORS lists them literally — so a dropped
+        connection on the convert CREATE would fail over and re-bill the primary task."""
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 30,
+                               "output": {"model_url": f"{self.url}/asset/m.glb"}}]}
+        self._create_raising(httpx.ConnectError("boom"), "convert")
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req(images={"input_image": PNG},
+                                                 target_formats=["glb", "obj"])))
+        self.assertNotIsInstance(cm.exception, httpx.HTTPError)
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+        self.assertIn("obj", str(cm.exception))
+        self.assertIn("boom", str(cm.exception))
+        self.assertEqual([p for p, _ in _Stub.posted], ["/v3/generation/image-to-model"])
+
+    def test_clip_create_transport_fault_is_skipped(self):
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 25,
+                               "output": {"model_url": f"{self.url}/asset/r.glb",
+                                          "riggable": True, "rig_type": "biped"}}]}
+        self._create_raising(httpx.ConnectError("boom"), "clip")
+        with self.assertLogs(adapters.logger, "WARNING") as log:
+            out = self._run(self.ad.generate(self._req(
+                endpoint="rig", files={"input_mesh_path": ("m.glb", GLB)},
+                animations=["preset:walk"])))
+        self.assertIn("preset:walk", log.output[0])
+        self.assertEqual([b.name for b in out.blobs], ["rigged.glb"])
+
+    def test_artifact_download_fault_after_the_paid_task_is_final(self):
+        """The task is done and billed before the first byte is fetched: a blip on the
+        asset host must not fail over and buy the same mesh twice."""
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 30,
+                               "output": {"model_url": f"{self.url}/asset/m.glb"}}]}
+
+        async def reset(client, url):
+            raise httpx.ReadError("connection reset")
+        self.ad._download = reset
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req(images={"input_image": PNG})))
+        self.assertNotIsInstance(cm.exception, httpx.HTTPError)
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+        self.assertIn("model.glb", str(cm.exception))
+        # the PAID task id (upload = seq 1, the primary create = seq 2), so the finished
+        # mesh can be fetched from Tripo's dashboard by hand
+        self.assertIn("task_2", str(cm.exception))
+        self.assertEqual(self.counts["dec"], 1)                          # slot still freed
+
     def test_clip_create_429_is_skipped_not_the_job(self):
         """The same money rule seen from the other side: a busy retarget queue costs a
         courtesy clip, never the rigged mesh that is already finished and paid for."""

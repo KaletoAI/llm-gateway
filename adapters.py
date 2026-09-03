@@ -3190,7 +3190,16 @@ class CloudTaskAdapter(BackendAdapter):
                 state, endpoint = run.state, run.endpoint
                 blobs = []
                 for name, url in state.downloads:      # the pure module named them
-                    data = await self._download(client, url)
+                    try:
+                        data = await self._download(client, url)
+                    except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+                        # The task is DONE and BILLED by now, so a blip fetching its
+                        # artifact must not raise a member of main._GEN_FAILOVER_ERRORS
+                        # (httpx's transport errors are listed there literally): _run_job
+                        # would re-run the whole task on the next candidate and pay again.
+                        # Final, naming the paid task so the file can be fetched by hand.
+                        raise RuntimeError(f"{self.vendor} artifact download failed after "
+                                           f"the paid task {run.task_id}: {name}: {e}") from e
                     mime, kind = _mime_and_kind(name)
                     blobs.append(GenBlob(data=data, mime=mime, kind=kind, name=name))
                 # the rig endpoint has no thumbnail — its input already had a preview
@@ -3624,10 +3633,12 @@ class TripoAdapter(CloudTaskAdapter):
         #    From HERE on the job is FINAL, whatever goes wrong: the primary task is done
         #    and billed (30 credits for a generation), and every failover-class error —
         #    CloudBusy from a 429 (converts run in Tripo's separate model-processing pool,
-        #    so a rate limit there is routine), ConnectionError from a 5xx or a transport
-        #    fault, TimeoutError from the job's max_wait running out — would otherwise
-        #    escape into main._GEN_FAILOVER_ERRORS and make _run_job re-run the WHOLE
-        #    image-to-model task on this or the next Tripo candidate, paying for it again.
+        #    so a rate limit there is routine), ConnectionError from a 5xx, TimeoutError
+        #    from the job's max_wait running out, and the RAW httpx errors a create's POST
+        #    can raise (ConnectError/WriteTimeout/ReadError are subclasses of NEITHER, and
+        #    main._GEN_FAILOVER_ERRORS lists them literally) — would otherwise make
+        #    _run_job re-run the WHOLE image-to-model task on the next Tripo candidate,
+        #    paying for it again.
         #    The message names the format AND the paid task id, so the operator can fetch
         #    the finished mesh from Tripo's dashboard instead of buying it twice.
         for fmt in formats[1:]:
@@ -3636,7 +3647,7 @@ class TripoAdapter(CloudTaskAdapter):
                 cid = await self._create(client, self._api("/models/convert"), cbody,
                                          f"convert:{fmt}")
                 cst = await self._poll(client, "convert", cid, [fmt], opts, poll_interval, left())
-            except (ConnectionError, TimeoutError, RuntimeError) as e:
+            except (httpx.HTTPError, ConnectionError, TimeoutError, RuntimeError) as e:
                 raise RuntimeError(f"{self.vendor} convert to {fmt} failed after the paid "
                                    f"task {task_id}: {e}") from e
             took(f"convert:{fmt}", cid, cst)
@@ -3653,12 +3664,14 @@ class TripoAdapter(CloudTaskAdapter):
                                              rbody, f"clip:{preset}")
                     cst = await self._poll(client, "retarget", cid, [native], opts,
                                            poll_interval, left())
-                except (RuntimeError, ConnectionError, TimeoutError) as e:
-                    # Every class, create and poll alike (a 429 on the create is a
-                    # ConnectionError-derived CloudBusy): the job's max_wait running out or
-                    # the clip pool being busy must not throw away the rigged mesh, which is
-                    # finished, paid for and in hand — and must not fail the job into a
-                    # failover that would rig and bill it a second time.
+                except (httpx.HTTPError, RuntimeError, ConnectionError, TimeoutError) as e:
+                    # Every class, create and poll alike — a 429 on the create is a
+                    # ConnectionError-derived CloudBusy, and a raw httpx transport error is
+                    # neither a ConnectionError nor a TimeoutError but IS in
+                    # main._GEN_FAILOVER_ERRORS. The job's max_wait running out, the clip
+                    # pool being busy or the connection dropping must not throw away the
+                    # rigged mesh, which is finished, paid for and in hand — and must not
+                    # fail the job into a failover that would rig and bill it a second time.
                     logger.warning(f"[{self.name}] tripo clip {preset} skipped: {e}")
                     continue
                 took(f"clip:{preset}", cid, cst)

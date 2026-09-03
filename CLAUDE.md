@@ -300,13 +300,17 @@ hot-reload-safe.
   `formats[0]` leads the list; a failed CONVERT fails the job (a requested delivery must
   never silently shrink) while a failed or timed-out CLIP is skipped with a warning
   (`clip_name`: `preset:walk` → `walk.glb`) — the rigged mesh is finished and paid for.
-  Once the PRIMARY task is billed, every later failure is FINAL: convert and clip errors
-  of EVERY class (a 429 → `CloudBusy`, a 5xx/transport `ConnectionError`, a `max_wait`
-  `TimeoutError`) are re-raised as a plain `RuntimeError` naming the format and the paid
-  task id, because those classes sit in `main._GEN_FAILOVER_ERRORS` and would otherwise
-  make `_run_job` re-run — and re-bill — the whole image-to-model task on the next
-  candidate; a client's `input_rig_type` is checked (`tripo.check_rig_type`, the same
-  `_rig_types_for` rule) BEFORE the uploads, so a refused rig job never pushes its mesh.
+  Once the PRIMARY task is billed, nothing after it may FAIL OVER: a convert failure of
+  EVERY class (429 → `CloudBusy`, 5xx → `ConnectionError`, `max_wait` → `TimeoutError`,
+  and the raw `httpx.HTTPError` a create's POST raises — a subclass of NEITHER, but named
+  literally in `main._GEN_FAILOVER_ERRORS`) is re-raised as a plain `RuntimeError` naming
+  the format and the paid task id, a CLIP failure of those same classes is skipped with a
+  warning, and an artifact DOWNLOAD failure (`CloudTaskAdapter.generate`, Meshy included)
+  becomes the same final `RuntimeError` — otherwise `_run_job` re-runs and re-bills the
+  whole image-to-model task on the next candidate over a blip on the asset host. Only the
+  rig-check, which runs BEFORE the paid task, keeps normal failover semantics. A client's
+  `input_rig_type` is checked (`tripo.check_rig_type`, the same `_rig_types_for` rule)
+  BEFORE the uploads, so a refused rig job never pushes its mesh.
   Meta: `cloud`/`cloud_task_id`/`endpoint`/`ai_model`/`request`/`consumed_credits`
   (SUMMED over every task)/`elapsed_ms`, plus `tasks: [{role, task_id, credits}]` (roles
   `rig-check`, the endpoint, `convert:<fmt>`, `clip:<preset>`) so the job view can name
