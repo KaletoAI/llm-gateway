@@ -25,6 +25,9 @@ sys.path.insert(0, _here)
 try:
     import main
     import admin
+    import adapters
+    import meshy
+    import tripo
 finally:
     os.chdir(_prev)
     _tmp.cleanup()
@@ -91,6 +94,46 @@ class TestSameKind(unittest.TestCase):
 
     def test_unknown_backend(self):
         self.assertFalse(admin._same_kind([WF_CAND], "nope"))
+
+
+class MainKindNeutral(unittest.TestCase):
+    """Meshy is no longer the only cloud kind: every kind decision in main must read the
+    candidate's/backend's kind (adapters.cand_kind / backend_kind / cloud_kind) and name
+    the vendor from the exception, never a hardcoded "meshy"/"Meshy"."""
+
+    def test_chain_mesh_param_error_for_cloud_successors(self):
+        s2 = tripo.default_candidate("tripo")
+        s2["tripo"]["endpoint"] = "rig"
+        self.assertIsNone(main._chain_mesh_param_error(s2, "input_mesh_path", "Tripo-Rig"))
+        err = main._chain_mesh_param_error(s2, "mesh_path", "Tripo-Rig")
+        self.assertIsNotNone(err)
+        self.assertIn("Tripo", err)
+        self.assertIn("input_mesh_path", err)
+        s2m = meshy.default_candidate("meshy")
+        s2m["meshy"]["endpoint"] = "rigging"
+        self.assertIsNone(main._chain_mesh_param_error(s2m, "input_mesh_path", "Meshy-Rig"))
+        gen = tripo.default_candidate("tripo")        # an image endpoint takes no file at all
+        why = main._chain_mesh_param_error(gen, "input_mesh_path", "Tripo-Object")
+        self.assertIsNotNone(why)
+        self.assertIn("no file input", why)
+
+    def test_gen_backend_for_matches_kind(self):
+        pool = [{"name": "gpu", "type": "comfyui"}, {"name": "gpu", "type": "tripo"},
+                {"name": "gpu", "type": "meshy"}]
+        self.assertEqual(main._gen_backend_for("gpu", tripo.default_candidate("gpu"), pool)["type"],
+                         "tripo")
+        self.assertEqual(main._gen_backend_for("gpu", meshy.default_candidate("gpu"), pool)["type"],
+                         "meshy")
+        self.assertEqual(main._gen_backend_for("gpu", {"workflow_json": {}}, pool)["type"],
+                         "comfyui")
+
+    def test_fault_labels_name_the_vendor(self):
+        self.assertIn("Tripo", main._gen_exhausted_msg(adapters.CloudNoCredits("x", vendor="Tripo")))
+        self.assertIn("Meshy", main._gen_exhausted_msg(adapters.CloudBusy("x", vendor="Meshy")))
+        self.assertEqual(main._fault_label(adapters.CloudNoCredits("x", vendor="Tripo")),
+                         "no credits left")
+        self.assertEqual(main._fault_label(adapters.CloudBusy("x", vendor="Tripo")),
+                         "Tripo queue full")
 
 
 if __name__ == "__main__":

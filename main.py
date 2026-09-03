@@ -140,8 +140,9 @@ def rebuild_backends() -> None:
     for b in backends:
         # Cost tier for the scheduler (spec 2026-09-01): a paid backend is a candidate
         # only when no unpaid one is free. Normalized here — config and store entries
-        # may omit the key entirely. A Meshy backend bills per task, so it is ALWAYS paid.
-        b["paid"] = True if b.get("type") == "meshy" else bool(b.get("paid"))
+        # may omit the key entirely. A cloud backend (Meshy, Tripo) bills per task, so it
+        # is ALWAYS paid.
+        b["paid"] = True if b.get("type") in adapters.CLOUD_TYPES else bool(b.get("paid"))
     backend_hosts = {backend_id(b): backend_host(b) for b in backends}
     host_backends = {}
     for bid, h in backend_hosts.items():
@@ -246,7 +247,7 @@ def backend_id(backend: dict) -> str:
 
 
 def _is_gen(b: dict) -> bool:
-    """A generation backend (ComfyUI, Meshy): routed by POST /v1/generations, never
+    """A generation backend (ComfyUI, Meshy, Tripo): routed by POST /v1/generations, never
     listed in the chat catalogs. Type-agnostic replacement for `type == "comfyui"`."""
     return b.get("type") in adapters.GEN_TYPES
 
@@ -981,7 +982,7 @@ def split_backend_prefix(model: str) -> tuple[Optional[str], str]:
 # assigned) — safe for the off-loop readers (get_gen_routes runs in a thread).
 _backend_names: set = set()            # all backend names — split_backend_prefix test
 _llm_backends: list = []               # enabled non-ComfyUI backends
-_gen_backends: list = []               # enabled generation backends (ComfyUI, Meshy)
+_gen_backends: list = []               # enabled generation backends (ComfyUI, Meshy, Tripo)
 _route_index: dict = {}                # alias/model-id → [(backend, real_model)] candidates
 
 
@@ -2151,14 +2152,14 @@ async def audio_speech(request: Request, authorization: Optional[str] = Header(N
 
 def _gen_backend_for(name: str, cand: Optional[dict],
                      pool: Optional[list] = None) -> Optional[dict]:
-    """The generation backend `name` of the SAME KIND as `cand` (Meshy candidate ↔ meshy
-    backend, workflow candidate ↔ comfyui backend). Backends are keyed (name, type), so a
-    ComfyUI and a Meshy backend may share a name; a bare-name match could route a Meshy
-    alias onto a GPU box (or a workflow alias onto the cloud API) and fail opaquely.
-    `pool` defaults to the enabled generation backends."""
-    want_meshy = cand is not None and cand.get("meshy") is not None
+    """The generation backend `name` of the SAME KIND as `cand` (a cloud candidate ↔ a
+    backend of that cloud type, workflow candidate ↔ comfyui backend). Backends are keyed
+    (name, type), so a ComfyUI and a Meshy/Tripo backend may share a name; a bare-name
+    match could route a cloud alias onto a GPU box (or a workflow alias onto the cloud
+    API) and fail opaquely. `pool` defaults to the enabled generation backends."""
+    want = adapters.cand_kind(cand or {})
     for b in (pool if pool is not None else _gen_backends):
-        if b.get("name") == name and (b.get("type") == "meshy") == want_meshy:
+        if b.get("name") == name and adapters.backend_kind(b) == want:
             return b
     return None
 
@@ -2182,10 +2183,10 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     candidates = store.get(alias) if store.is_active() else None
     if candidates is None:
         candidates = image_models.get(alias, [])
-    # generation routes only to generation backends (ComfyUI, Meshy), so a name shared
-    # with an LLM backend resolves to the right one — and, since backends are keyed
+    # generation routes only to generation backends (ComfyUI, Meshy, Tripo), so a name
+    # shared with an LLM backend resolves to the right one — and, since backends are keyed
     # (name, type), the candidate's own KIND picks between a same-named ComfyUI and
-    # Meshy backend (see _gen_backend_for).
+    # cloud backend (see _gen_backend_for).
     gen = [b for b in _gen_backends if not is_draining(b)]
     allc = []
     for cand in candidates:
@@ -2427,10 +2428,10 @@ def _err_text(e: BaseException) -> str:
 def _fault_label(e: BaseException) -> str:
     """How to name a failover-worthy generation fault in a log line. Three distinct
     causes hide behind one failover path — say which one it was."""
-    if isinstance(e, adapters.MeshyNoCredits):
+    if isinstance(e, adapters.CloudNoCredits):
         return "no credits left"
-    if isinstance(e, adapters.MeshyBusy):
-        return "Meshy queue full"
+    if isinstance(e, adapters.CloudBusy):
+        return f"{e.vendor} queue full"
     if isinstance(e, TimeoutError):            # the adapter's own max_wait cap
         return "did not finish in time"
     if isinstance(e, httpx.TimeoutException):  # a single HTTP round trip timed out
@@ -2452,10 +2453,10 @@ def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
     # message ending in a bare colon (see _err_text). None only reaches here when no
     # candidate was ever tried, which has no exception to name.
     txt = _err_text(last) if last is not None else "no candidate was tried"
-    if isinstance(last, adapters.MeshyNoCredits):
-        return f"no candidate backend could run it — Meshy account out of credits: {txt}"
-    if isinstance(last, adapters.MeshyBusy):
-        return f"no candidate backend could run it — Meshy queue limit reached: {txt}"
+    if isinstance(last, adapters.CloudNoCredits):
+        return f"no candidate backend could run it — {last.vendor} account out of credits: {txt}"
+    if isinstance(last, adapters.CloudBusy):
+        return f"no candidate backend could run it — {last.vendor} queue limit reached: {txt}"
     if isinstance(last, TimeoutError):
         return (f"no candidate backend finished in time — the gateway's per-backend "
                 f"`max_wait` (default 600s; raise it in Backends for slow workflows): {txt}")
@@ -2657,16 +2658,19 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
 def _chain_mesh_param_error(s2: dict, mesh_param: str, succ_alias: str) -> Optional[str]:
     """Why `mesh_param` cannot carry the mesh into the successor candidate `s2` (None = it
     can). `mesh_param` must be a request field of the successor (accepted under param OR
-    label, exactly like any incoming value) — both adapters silently drop an unknown
-    param, so stage 2 would otherwise run on the workflow's baked-in mesh path (or, on
-    Meshy, on no mesh at all) and deliver a stale/WRONG mesh as a "done" job. A Meshy
-    successor carries no mapping: its request fields are the fixed label table, and the
-    mesh is a FILE field (public_fields()[2]). Pure over `s2` — unit-tested."""
-    if s2.get("meshy") is not None:
+    label, exactly like any incoming value) — every adapter silently drops an unknown
+    param, so stage 2 would otherwise run on the workflow's baked-in mesh path (or, on a
+    cloud backend, on no mesh at all) and deliver a stale/WRONG mesh as a "done" job. A
+    cloud successor (Meshy, Tripo) carries no mapping: its request fields are the fixed
+    label table, and the mesh is a FILE field (public_fields()[2]). Pure over `s2` —
+    unit-tested."""
+    k = adapters.cloud_kind(s2)
+    if k:
+        vendor = adapters.cloud_module(k).VENDOR
         s2_files = [f["name"] for f in adapters.public_fields(s2)[2]]
         if mesh_param in s2_files:
             return None
-        return (f"chain mesh param '{mesh_param}' is not a file field of the Meshy "
+        return (f"chain mesh param '{mesh_param}' is not a file field of the {vendor} "
                 f"successor '{succ_alias}' — it takes "
                 + (", ".join(f"'{n}'" for n in s2_files) if s2_files else
                    "no file input at all (only a rigging alias does)"))
@@ -2728,8 +2732,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         backend (e.g. mesh on dx10-02, rig on a UniRig box). The stage-1 slot is
         released (and its ComfyUI VRAM freed) once its mesh is in hand, then the
         stage-2 slot is claimed — different backends, so they need not be atomic.
-        A Meshy stage (either side) shares no disk with anything, so it FORCES this
-        mode regardless of what the alias stored.
+        A cloud stage (Meshy, Tripo; either side) shares no disk with anything, so it
+        FORCES this mode regardless of what the alias stored.
 
     successor config: {alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}."""
     succ_alias = (succ.get("alias") or "").strip()
@@ -2739,14 +2743,15 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     chain_rig = (succ.get("rig") or "").strip() or None
     relay = (succ.get("relay") or "path").strip().lower()      # "path" (shared disk) | "upload" (relay bytes)
 
-    # A Meshy stage has no shared disk: with Meshy on EITHER side the mesh travels as
-    # bytes, whatever the stored relay says (the editor hides the field for such aliases).
-    def _kind_meshy(alias_name: str) -> bool:
+    # A cloud stage (Meshy, Tripo) shares no disk with anything: with one on EITHER side
+    # the mesh travels as bytes, whatever the stored relay says (the editor hides the
+    # field for such aliases).
+    def _kind_cloud(alias_name: str) -> bool:
         c = (store.get(alias_name) if store.is_active() else None) or image_models.get(alias_name) or []
-        return bool(c) and c[0].get("meshy") is not None
-    s1_meshy = await asyncio.to_thread(_kind_meshy, alias)
-    s2_meshy = await asyncio.to_thread(_kind_meshy, succ_alias)
-    if s1_meshy or s2_meshy:
+        return bool(c) and adapters.cloud_kind(c[0]) is not None
+    s1_cloud = await asyncio.to_thread(_kind_cloud, alias)
+    s2_cloud = await asyncio.to_thread(_kind_cloud, succ_alias)
+    if s1_cloud or s2_cloud:
         relay = "upload"
     # inputs/params come pre-computed from the endpoint (one _gen_inputs_params +
     # _apply_seconds pass, which also raised any 400); the per-attempt _apply_seconds
@@ -2784,7 +2789,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         (`jobs.fail` merges; `complete`'s _mark_done rewrites, hence the explicit key
         there). `s2_info` is None until the hand-off, so a stage-1 failure carries only
         the attempt count, as before. `chain_stage1` rides along whenever stage 1 was a
-        PAID cloud task: a chain that dies after it must still name the Meshy task that
+        PAID cloud task: a chain that dies after it must still name the cloud task that
         was billed, which `complete`'s meta would otherwise be the only record of."""
         m = {**({"attempts": gen_attempts} if gen_attempts > 2 else {}),
              **({"chain_stage2": s2_info} if s2_info else {}),
@@ -2918,21 +2923,23 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 await asyncio.to_thread(jobs.fail, job_id, why)
                 return
             s1_wf = stage1_cand.get("workflow_json") or {}
-            # Stage-1 export is backend-specific (ComfyUI pins an export node; Meshy
-            # delivers the mesh as a blob) — the adapter decides, and a candidate that
-            # cannot export as configured is refused HERE, before GPU-minutes/credits.
+            # Stage-1 export is backend-specific (ComfyUI pins an export node; a cloud
+            # backend delivers the mesh as a blob) — the adapter decides, and a candidate
+            # that cannot export as configured is refused HERE, before GPU-minutes/credits.
             export = adapter.chain_export(stage1_cand, succ, params, prefix)
             if export.error:
                 await asyncio.to_thread(jobs.fail, job_id, export.error)
                 return
-            # A Meshy successor takes ONE mesh format: the API's `model_url` is a glb.
-            # Refused here — before the slot claim and the GPU minutes — because the
-            # mismatch is in the stage-1 export node's `file_format`, knowable up front;
-            # discovering it from Meshy's rejection would cost a full stage-1 run.
-            if s2.get("meshy") is not None and not export.mesh_name.lower().endswith(".glb"):
+            # A cloud successor (Meshy, Tripo) takes ONE mesh format: the API's mesh url
+            # is a glb. Refused here — before the slot claim and the GPU minutes — because
+            # the mismatch is in the stage-1 export node's `file_format`, knowable up
+            # front; discovering it from the cloud's rejection would cost a full stage-1 run.
+            s2_kind = adapters.cloud_kind(s2)
+            if s2_kind and not export.mesh_name.lower().endswith(".glb"):
                 await asyncio.to_thread(
                     jobs.fail, job_id,
-                    f"chain: successor '{succ_alias}' runs on Meshy and takes a .glb mesh, "
+                    f"chain: successor '{succ_alias}' runs on "
+                    f"{adapters.cloud_module(s2_kind).VENDOR} and takes a .glb mesh, "
                     f"but stage 1 would export '{export.mesh_name}' — set the export node's "
                     f"file_format to glb")
                 return
@@ -2952,7 +2959,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             held = bid
             active = backend
             s1_done = False                             # mesh in hand → stage-2 errors are final
-            s1_meta = None                              # a paid stage-1 cloud task (Meshy), for the job view
+            s1_meta = None                              # a paid stage-1 cloud task, for the job view
             s2_info = None                              # what stage 2 was actually handed (job view)
             await asyncio.to_thread(jobs.set_status, job_id, "running")
             await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
@@ -3010,14 +3017,18 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                        "check the export node / file_format")
                 mesh_bytes = mesh if need_bytes else None
                 s1_done = True
-                # A Meshy stage 1 is a PAID cloud task: its task id (what Meshy's own
-                # dashboard is searched by), endpoint, request and credits are knowable
-                # only from THIS run — and stage 2's meta would overwrite every one of
-                # those keys in the merge below, so they are kept under their own key.
+                # A cloud stage 1 is a PAID task: its kind and task id (what the vendor's
+                # own dashboard is searched by), endpoint, request, sub-tasks and credits
+                # are knowable only from THIS run — and stage 2's meta would overwrite
+                # every one of those keys in the merge below, so they are kept under their
+                # own key. `meshy_task_id` rides along beside the neutral `cloud_task_id`:
+                # existing job rows and the job view still read the Meshy-era name.
                 s1_meta = ({k: out1.meta.get(k) for k in
-                            ("backend", "meshy_task_id", "endpoint", "consumed_credits", "request")
+                            ("backend", "cloud", "cloud_task_id", "meshy_task_id", "endpoint",
+                             "consumed_credits", "request", "tasks")
                             if out1.meta.get(k) is not None}
-                           if out1.meta.get("meshy_task_id") else None)
+                           if (out1.meta.get("cloud_task_id") or out1.meta.get("meshy_task_id"))
+                           else None)
 
                 # Stage 2's request is built BEFORE the hand-off: the feed is the
                 # stage-2 adapter's business and may have to put the mesh ON the request
@@ -3127,9 +3138,9 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     # `generic`/`mixamo` name deliveries the GATEWAY shapes and checks:
                     # V-flip (+ optional jpeg) textures — normalize-once flagged; the knob
                     # lives on the CLIENT-FACING (stage-1) alias, covering kept stage-1 files
-                    # too — then validate the COMBINED delivery at chain level. `meshy` is a
-                    # rig the cloud built to its own conventions: tag it, never re-flip it or
-                    # fail it against ComfyUI-shaped rules.
+                    # too — then validate the COMBINED delivery at chain level. `meshy`/`tripo`
+                    # are rigs the cloud built to its own conventions: tag them, never re-flip
+                    # them or fail them against ComfyUI-shaped rules.
                     if chain_rig in ("generic", "mixamo"):
                         normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
                         warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
@@ -3187,7 +3198,7 @@ def _spawn_gen(job_id: str, coro) -> None:
 async def cancel_generation(job_id: str) -> bool:
     """Cancel a queued/running generation job: best-effort interrupt on the backend
     (adapter.cancel — ComfyUI /interrupt frees the GPU; a cloud task API has nothing
-    to stop, Meshy finishes and bills the task), cancel the worker task, mark the job
+    to stop, the vendor finishes and bills the task), cancel the worker task, mark the job
     failed. Returns False if the job is already finished/unknown."""
     job = await asyncio.to_thread(jobs.get, job_id)
     if not job or job.get("status") not in ("queued", "running"):
@@ -3472,7 +3483,7 @@ def _file_param(wf: dict, mapping: dict, key: str) -> str:
 
 async def _decode_one_file(key: str, param: str, val) -> tuple:
     """One `files` entry → (slot name, bytes). The name is a HINT (display + extension);
-    a ComfyUI upload is renamed under the job's prefix, a Meshy one is embedded as a
+    a ComfyUI upload is renamed under the job's prefix, a cloud one is embedded as a
     data-URI — neither ever writes the raw client name."""
     got = await _decode_ref_blob(val)
     if not got or not got[0]:
@@ -3494,18 +3505,20 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     baked-in default and hand back a confidently wrong result."""
     wf, mapping = await asyncio.to_thread(_gen_alias_mapping, alias)
     # Same lookup as every other alias read (_gen_routes, gen_alias_schema): store first,
-    # config `image_models` for aliases the store doesn't hold — a config-defined Meshy
+    # config `image_models` for aliases the store doesn't hold — a config-defined cloud
     # alias must hit the branch below too, not fall through and drop the files silently.
     cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
         or image_models.get(alias)
-    if cands and cands[0].get("meshy") is not None:
-        # A Meshy alias has no mapping — its file inputs are the endpoint's fixed table
-        # (rigging: input_mesh_path; the image endpoints: none), so the keys are checked
-        # against public_fields instead, and are their OWN param names.
+    k = adapters.cloud_kind(cands[0]) if cands else None
+    if k:
+        # A cloud alias (Meshy, Tripo) has no mapping — its file inputs are the endpoint's
+        # fixed table (the rig endpoint: input_mesh_path; the image ones: none), so the
+        # keys are checked against public_fields instead, and are their OWN param names.
+        vendor = adapters.cloud_module(k).VENDOR
         allowed = {f["name"] for f in adapters.public_fields(cands[0])[2]}
         if not allowed:
-            raise HTTPException(400, f"generation alias '{alias}' runs on Meshy and accepts no `files`"
-                                     f" — send images under `images`")
+            raise HTTPException(400, f"generation alias '{alias}' runs on {vendor} and accepts"
+                                     f" no `files` — send images under `images`")
         out = {}
         for key, val in files.items():
             if key not in allowed:
@@ -3578,8 +3591,8 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     if not cands:
         raise HTTPException(404, f"generation alias '{alias}' not found")
     cand = cands[0]
-    # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; Meshy:
-    # the endpoint's fixed label table) — see adapters.public_fields.
+    # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; a cloud
+    # backend: the endpoint's fixed label table) — see adapters.public_fields.
     params, images, files = adapters.public_fields(cand)
     wf = cand.get("workflow_json") or {}
     mapping = cand.get("mapping") or {}
@@ -3673,7 +3686,7 @@ def _gen_image_slots(alias: str) -> list:
     if not routes:
         return []
     _, cand = routes[0]
-    if cand.get("meshy") is not None:
+    if adapters.cloud_kind(cand):
         # [1] = the IMAGE slots only: a `files` entry (a rigging mesh) is not something
         # a positional reference image may ever land on.
         return [i["name"] for i in adapters.public_fields(cand)[1]]   # labels ARE the params
@@ -3853,12 +3866,12 @@ def _comfy_watch_info(b: dict) -> dict:
     return info
 
 
-def _meshy_info(b: dict) -> dict:
-    """Credit balance seen at the last discovery of a Meshy backend, plus the same
-    rolling fail-rate the comfy backends carry (merged into /health + the UI
+def _cloud_info(b: dict) -> dict:
+    """Credit balance seen at the last discovery of a cloud backend (Meshy, Tripo), plus
+    the same rolling fail-rate the comfy backends carry (merged into /health + the UI
     snapshot); {} for every other type. fail_rate is display-only — it never
     reorders routing."""
-    if b.get("type") != "meshy":
+    if b.get("type") not in adapters.CLOUD_TYPES:
         return {}
     info: dict = {}
     fs = _gen_fail_stats(backend_id(b))      # same rolling fail-rate as comfy backends
@@ -3889,7 +3902,7 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            **_comfy_watch_info(b), **_meshy_info(b),
+            **_comfy_watch_info(b), **_cloud_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
@@ -4146,7 +4159,7 @@ async def health():
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
-                **_comfy_watch_info(b), **_meshy_info(b),
+                **_comfy_watch_info(b), **_cloud_info(b),
             }
             for b in backends
         },

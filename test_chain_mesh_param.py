@@ -35,6 +35,10 @@ finally:
 MESHY_RIG = {"backend": "meshy", "meshy": {"endpoint": "rigging"}}
 # A Meshy image-to-3d alias takes no file at all (it cannot be a rigging successor).
 MESHY_I23 = {"backend": "meshy", "meshy": {"endpoint": "image-to-3d"}}
+# The same two shapes on the OTHER cloud kind: the guard must read the candidate's KIND,
+# not the literal `meshy` key (Tripo's rig endpoint is `rig`, its file field the same name).
+TRIPO_RIG = {"backend": "tripo", "tripo": {"endpoint": "rig"}}
+TRIPO_I2M = {"backend": "tripo", "tripo": {"endpoint": "image-to-model"}}
 # A ComfyUI successor: the mesh-load input is mapped under the label `input_mesh_path`,
 # while its raw param name is node-based (`value_12`) and must not be needed.
 COMFY_RIG = {"backend": "gpu", "workflow_json": {"12": {"inputs": {"mesh": ""}}},
@@ -55,6 +59,21 @@ class TestChainMeshParam(unittest.TestCase):
 
     def test_meshy_successor_without_any_file_input(self):
         why = main._chain_mesh_param_error(MESHY_I23, "input_mesh_path", "img23")
+        self.assertIsNotNone(why)
+        self.assertIn("no file input at all", why)
+
+    def test_tripo_successor_accepts_its_file_field(self):
+        self.assertIsNone(main._chain_mesh_param_error(TRIPO_RIG, "input_mesh_path", "rig"))
+
+    def test_tripo_successor_rejects_a_comfy_style_name(self):
+        why = main._chain_mesh_param_error(TRIPO_RIG, "mesh_path", "rig")
+        self.assertIsNotNone(why)
+        self.assertIn("Tripo", why)                # names the VENDOR, never a hardcoded "Meshy"
+        self.assertIn("input_mesh_path", why)      # names what it DOES take
+        self.assertIn("rig", why)
+
+    def test_tripo_successor_without_any_file_input(self):
+        why = main._chain_mesh_param_error(TRIPO_I2M, "input_mesh_path", "img2m")
         self.assertIsNotNone(why)
         self.assertIn("no file input at all", why)
 
