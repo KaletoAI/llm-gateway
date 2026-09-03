@@ -42,8 +42,9 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Twelve self-contained Python files hold everything. `main.py` owns app state; the
-others (`adapters`, `meshy`, `jobs`, `store`, `stats`, `admin`, `reasoning`,
+Fifteen self-contained Python files hold everything (`ls *.py` minus the tests is the
+count of record). `main.py` owns app state; the others (`adapters`, `meshy`, `tripo`,
+`cloudtask`, `jobs`, `store`, `stats`, `admin`, `reasoning`, `scheduler`,
 `responses_bridge`, `anthropic_bridge`, `openai_image_bridge`, `previewanim`) never
 import `main` — they receive what they need via injected callables, staying
 hot-reload-safe.
@@ -173,6 +174,31 @@ hot-reload-safe.
   shared CONSTANT. `_cleanup_uploads` overwrites the job's inputs with that 72-byte
   placeholder after a CLEAN success only (a timed-out prompt may still read them);
   it never raises.
+  `CloudTaskAdapter` (`cloud = True`, `serves_generation = True`) is the vendor-NEUTRAL
+  half of every cloud task backend — `MeshyAdapter` and `TripoAdapter` are subclasses,
+  and a third vendor is a subclass plus a pure module, not a second copy of the
+  ~60 sites Meshy used to be wired into. It owns the in-flight slot (incl. the `finally`
+  decrement and `slot_held` for chain stages), `generate()` (run → download every
+  `state.downloads` in order → thumbnail outside the rig endpoint → the job meta),
+  `_create` (serialise ONCE, size-scaled timeout ≈ 4 s/MiB — a 93 MB body once died on
+  the 30 s client timeout with an EMPTY `str(e)`), `_poll` (a 4xx, or a 200 whose BODY
+  refuses the task, is a verdict about the TASK: three IN A ROW → final; transport
+  errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-rate
+  429 must not end a task that is running and already paid for), `_download` (NO auth
+  header: signed CDN urls, the bearer must not leak there) and the three chain hooks.
+  A subclass supplies only `discover`, `_run` (build → create → poll, plus whatever
+  follow-up tasks the vendor needs, returning `RunResult`), `_task_request`,
+  `_task_body`, `_classify_create` (→ `nocredits`/`busy`/`server`/`rejected`/None),
+  `_task_id_of` and `_msg`. The kind seam `main`/`admin` ask instead of `== "meshy"`:
+  `cloud_kind(cand)` (the key its block sits under, None = ComfyUI candidate),
+  `cand_kind`/`backend_kind` (a candidate may run on a backend iff they are EQUAL —
+  backends are keyed `(name, type)`, so a bare-name match could hand a Meshy alias the
+  GPU box), `cloud_module(kind)`, `cloud_block(cand)` (a COPY — the request must not
+  write through into the stored candidate) and the derived `CLOUD_TYPES`/
+  `CLOUD_MODULES`. `NormalizedRequest.cloud` carries that block (`.meshy` stays as the
+  pre-Tripo name, folded in by `__post_init__`), and `MeshyNoCredits`/`MeshyBusy` are
+  now `CloudNoCredits`/`CloudBusy` with a `vendor` attribute that `main._fault_label`/
+  `_gen_exhausted_msg` name (the old names stay as aliases).
 - **`meshy.py`** — the PURE half of the Meshy.ai backend (`type: meshy`; the HTTP half
   is `adapters.MeshyAdapter`): the fixed `input_*` label table → Meshy request body
   (`build_request`), the recorded request (`request_summary`, image data → byte size),
@@ -223,6 +249,82 @@ hot-reload-safe.
   the successor config instead), so a rigged delivery is recognisable by that field on
   either path; `normalize_delivery`/`validate_delivery` never run for `meshy` — the
   cloud rigs to its own conventions, so the files ship exactly as they arrive.
+  Since Tripo joined, everything above is ONE half of a two-vendor interface: `meshy.py`
+  and `tripo.py` export the same names and nothing but those names is read by the
+  adapter, the console editor and `main` (duck-typed, no ABC — they are modules):
+  `KIND`/`VENDOR`/`URL` (kind key, display name, the backend form's fixed URL),
+  `ENDPOINTS`/`RIG_ENDPOINT`/`SUCCESS_STATUS`, `POLL_INTERVAL_DEFAULT`/
+  `MAX_WAIT_DEFAULT`, `AI_MODELS`/`FORMATS`/`RIG_FORMATS`, `OPTION_DEFAULTS` +
+  `OPTION_FIELDS` (the console's option FORM as data), `SLOTS`/`FILES`/
+  `IGNORED_PARAMS`, `endpoint_of`/`options_of`/`default_candidate`/`public_fields`/
+  `build_request`/`request_summary`/`parse_task`, a `<Kind>Input(RuntimeError)` for
+  final content errors, and the three help texts `BACKEND_HINT`/`ENDPOINT_HINT`/
+  `CHAIN_HINT`. `parse_task(task, formats, endpoint, options=…)` takes the whole option
+  block so the signature is identical for both (Meshy reads `options["animations"]`,
+  and keeps accepting the legacy 4th positional bool).
+- **`cloudtask.py`** — the pure leaf both cloud modules import (no `main`/`adapters`
+  imports, no I/O): `TaskState` (status/progress/error/downloads/thumbnail/credits,
+  plus `riggable`/`rig_type` for a task that answers a QUESTION instead of delivering a
+  file — Tripo's rig-check), and `parse_options(fields, form, defaults)` +
+  `field_value_str`, the reader and writer of the `opt__<key>` form the ONE console
+  editor renders from a module's `OPTION_FIELDS`. `parse_options` never raises on a
+  form — an unknown value falls back to that key's default, because the module's
+  `options_of` is the validator of record and runs on every read anyway. `meshy.py`
+  re-exports `TaskState` from here so `test_meshy.py` stayed unchanged. Covered by
+  `test_cloudtask.py`.
+- **`tripo.py`** — the PURE half of the Tripo3D backend (`type: tripo`, API **V3**; the
+  HTTP half is `adapters.TripoAdapter`), declaring the module interface above. The one
+  structural difference from Meshy: **Tripo takes no inline bytes at all**, so
+  `build_request` receives `{label: file_token}` where `meshy.build_request` receives
+  bytes — the adapter `POST`s every image and mesh to `/v3/files` first
+  (`_collect_inputs` validates slot count and sniffs the magic BEFORE the first upload:
+  an upload for a request that can never run is litter nobody cleans up). Three
+  `ENDPOINTS` — `image-to-model`, `multiview-to-model` and **`rig`** (`RIG_ENDPOINT`,
+  25 credits, `input_mesh_path` as a FILE like Meshy's `rigging`). `rig-check` is
+  deliberately NOT among them: no alias can be configured on it, the adapter runs it as
+  a free step of the rig. Multiview needs `input_image_front` plus at least one more
+  view (Tripo refuses fewer than two) — checked in `_view_inputs` AND in
+  `_collect_inputs`. Every response is a `{code, data}` envelope, so `_task_body`
+  unwraps `data` and raises `_TaskVerdict` on a non-zero `code` under HTTP 200 (`_poll`
+  counts it exactly like a 4xx: three in a row = final), and `_classify_create` reads
+  **403 + code 2010** as out-of-credits (Tripo has no 402) → `CloudNoCredits`, 429 →
+  `CloudBusy`, 5xx/transport (uploads included) → `ConnectionError`, anything else
+  non-2xx or `code != 0` → final `rejected`. `parse_task` is TOTAL over the documented
+  statuses: one outside `TASK_STATUSES` is terminal with an explaining error rather
+  than polled to `max_wait` holding the slot (V2 also knew `banned`/`expired`).
+  One job is SEVERAL tasks — rig-check → the endpoint → one `/models/convert` per extra
+  format (5 credits) → one `/animations/retarget` per `animations` preset (10 credits) —
+  and they share ONE `max_wait`: every follow-up poll gets the REMAINDER of the budget
+  (the backend form says so). Only the NATIVE format is delivered by the primary task
+  (`model.glb`, or `rigged.<out_format>` = the FIRST ticked deliver format), so
+  `formats[0]` leads the list; a failed CONVERT fails the job (a requested delivery must
+  never silently shrink) while a failed or timed-out CLIP is skipped with a warning
+  (`clip_name`: `preset:walk` → `walk.glb`) — the rigged mesh is finished and paid for.
+  Meta: `cloud`/`cloud_task_id`/`endpoint`/`ai_model`/`request`/`consumed_credits`
+  (SUMMED over every task)/`elapsed_ms`, plus `tasks: [{role, task_id, credits}]` (roles
+  `rig-check`, the endpoint, `convert:<fmt>`, `clip:<preset>`) so the job view can name
+  every BILLED task, and on the rig endpoint `rig: "tripo"`, `rig_spec` (`mixamo`
+  default — the Mixamo-compatible bone names Meshy has no answer for) and `rig_type`
+  (what the rig-check DETECTED, else what was submitted). Two cross-field rules live in
+  ONE place each so the builder, `options_of` and the advertised schema cannot diverge:
+  `_rig_types_for` — rig model `v1.0-20240301` rigs BIPEDS only, so `options_of`
+  normalizes a stored `rig_type` to `biped`, `public_fields` narrows
+  `input_rig_type.choices` to `["biped"]`, and a client value outside the set is
+  REFUSED (`TripoInput` — a final content error that ends the job before the rig task
+  exists, never quietly bent to biped: a caller asking for a quadruped must learn the
+  alias cannot do it); and `generate_parts`, which Tripo
+  rejects together with texture/pbr/quad/smart_low_poly, so `options_of` forces those
+  four off and a stored alias can never build a request that comes back 400. Client
+  labels: `input_face_num` → `face_limit` CLAMPED to 100…the model's cap (v3.1 1.5M,
+  v3.0 1M, v2.5 500k, P-series 50k; 150k with `quad`), `input_texture_resolution` px →
+  the `standard`/`detailed`/`extreme` bucket, `input_rig_type`; `input_name`/
+  `input_remove_background`/`input_no_fingers` are accepted and inert, and
+  `input_texture_prompt`/`input_pose`/`input_height_m` are NOT advertised at all —
+  Tripo has no field for them, and listing them would promise what the builder never
+  sends. The admin `face_limit` option is validated-or-`None`, NOT clamped (same
+  reasoning as `meshy.opt_polycount`: a stored value out of range means the candidate
+  is broken, and silently rewriting an admin's number is worse than falling back).
+  Covered by `test_tripo.py` + `test_tripo_adapter.py` (HTTP stub).
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
@@ -246,7 +348,21 @@ hot-reload-safe.
   Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
   Mapping: Chat | Media, Input & Routing: Input | Chat aliases | LLM models |
   Media aliases | Image models | LoRAs); the workflow Mapping editor owns a pasted
-  ComfyUI API JSON and offers discovery-fed dropdowns. Mapping's sub-tab is derived
+  ComfyUI API JSON and offers discovery-fed dropdowns. A CLOUD alias has no workflow at
+  all: `_cloud_editor(kind, …)` + `cloud_update` (`POST /ui/mapping/cloud-update`, which
+  REPLACED the Meshy-only `/ui/mapping/meshy-update`) render the vendor's option block
+  from `mod.OPTION_FIELDS` and read it back through `cloudtask.parse_options` →
+  `mod.options_of` — the same normalization the request builder applies, so editor and
+  builder cannot drift; the structural fields (alias, task, endpoint, model, deliver
+  formats, retries, the chain block, the request-field table) stay the editor's and the
+  vendor supplies only the hints. The backend form's `#cloudopts` block carries
+  `cloud_max_wait`/`cloud_poll_interval` (named `cloud_*` because `#comfyopts` already
+  spends `max_wait`/`poll_interval`, and one form may carry each name only once), and
+  `_type_select` fills in the chosen kind's fixed URL when the field is blank or still
+  holds ANOTHER cloud kind's fixed URL — switching meshy → tripo would otherwise store a
+  Tripo backend pointing at api.meshy.ai, which surfaces only as an auth error at
+  discovery; a URL the operator typed themselves is never overwritten.
+  Mapping's sub-tab is derived
   when `?sub=` is absent (`?edit=`/`?new=` → media, else chat), so the dozens of
   existing action links keep working unchanged and still land in the right tab.
   The Media list groups by `task` in `_TASK_OPTIONS` order (unknown tasks trail
@@ -341,13 +457,31 @@ hot-reload-safe.
   server-side tools), raise `UnsupportedContent` → 400 where dropping would
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
-  silently rather than crashing). There are **six** test files, and each exists for
-  that same reason — the mechanism it guards fails SILENTLY, so it is named next to
-  that mechanism above: `test_anthropic_bridge.py`, `test_prune_branch.py` (a
+  silently rather than crashing). `ls test_*.py` is the count of record —
+  **seventeen** files today — and each exists for that same reason: the mechanism it
+  guards fails SILENTLY, so it is named next to that mechanism above.
+  `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
-  generation, not an exception), `test_chain_export_node.py`,
-  `test_ratelimit_headers.py`, `test_scheduler.py` and `test_admin_live.py`. Run them
-  all with `python -m unittest discover -p 'test_*.py'` (no runner dependency).
+  generation, not an exception), `test_chain_export_node.py`, `test_chain_hooks.py`,
+  `test_chain_mesh_param.py`, `test_ratelimit_headers.py`, `test_scheduler.py`,
+  `test_admin_live.py`, `test_err_text.py`, `test_gen_backend_for.py`,
+  `test_playground_files.py`, `test_meshy.py`, `test_meshy_adapter.py` — plus the four
+  the Tripo backend brought:
+  `test_cloudtask.py` (the option-form reader: a field the schema-driven editor loses —
+  a missing `opt__<key>`, a type parsed wrong — does not error, it silently saves that
+  key's DEFAULT, so an alias's textures quietly turn off on the next Save);
+  `test_tripo.py` (the pure builder/parser: a body Tripo REJECTS costs a round trip, but
+  one it accepts with the wrong face cap, texture bucket or rig type delivers a
+  plausible WRONG mesh — and a task status treated as "not finished yet" instead of
+  terminal polls to `max_wait` holding the slot);
+  `test_tripo_adapter.py` (the run ORDER and the error classes: a rig-check that does
+  not gate the rig spends 25 credits on an unriggable mesh, a 403/2010 classed as final
+  stops the failover that would have found the next candidate, and a convert or clip
+  that quietly goes missing is a smaller delivery than the client asked for);
+  `test_cloud_editor.py` (the console's kind-neutrality — a job view that renders
+  nothing for a Tripo run, an editor offering the wrong backends, a type select whose JS
+  never reveals the cloud option block: all three are silent in the BROWSER).
+  Run them all with `python -m unittest discover -p 'test_*.py'` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
   slot mapping, `images_response`); imports only the leaf `jobs`. `main.py`
@@ -419,7 +553,9 @@ hot-reload-safe.
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   the alias via the **separate** generation store (`image_models`/store), filtered
-  to enabled+healthy comfy backends; LoRA-aware preference + busy→park; a
+  to enabled+healthy generation backends of the candidate's own kind
+  (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
+  busy→park; a
   `jobs.py` job runs via `adapter.generate()` (sync inline or async job-id). A
   running job can be cancelled (`cancel_generation` → ComfyUI `/interrupt` + task
   cancel).
@@ -432,22 +568,32 @@ hot-reload-safe.
   refuses both roles, so a new backend type is opt-in): ComfyUI pins the export node's
   `filename_prefix` (extension from pins/mapped params on `file_format`), takes the
   mesh off `/view` and feeds a PATH (shared disk) or an upload into the stage-2 input
-  dir; **Meshy** names it `gwchain_<jobid>.glb` with NO pins, takes the `model.glb`
-  RESULT BLOB and feeds it as `req2.upload_files[mesh_param]` (embedded as the rigging
-  `model_url` data URI, `mesh_ref` = `<upload:… (N MB)>`). So EITHER stage may be
-  Meshy: `Meshy-Humanoid` → `mesh-mia` and `Trellis2-…` → `Meshy-Rig` are the same
-  code path. A Meshy stage has no shared disk, so `_kind_meshy` on either side FORCES
-  `relay: upload` whatever the alias stored (the editor hides the field); a Meshy
-  stage 1 without `glb` in `target_formats`, and a `rigging` alias as stage 1 at all,
+  dir; a **cloud stage** (`CloudTaskAdapter`, so Meshy AND Tripo) names it
+  `gwchain_<jobid>.glb` with NO pins, takes the `model.glb`
+  RESULT BLOB and feeds it as `req2.upload_files[mesh_param]` (Meshy embeds it as the
+  rigging `model_url` data URI, Tripo uploads it to `/v3/files` and sends the token;
+  `mesh_ref` = `<upload:… (N MB)>` either way). So EITHER stage may be a cloud one, and all nine
+  ComfyUI/Meshy/Tripo × ComfyUI/Meshy/Tripo combinations run: `Meshy-Humanoid` →
+  `mesh-mia`, `Trellis2-…` → `Meshy-Rig` and `Tripo-Humanoid` → `Tripo-Rig` are the
+  same code path. A cloud stage
+  has no shared disk, so `_kind_cloud` on either side FORCES
+  `relay: upload` whatever the alias stored (the editor hides the field); a cloud
+  stage 1 without `glb` in `target_formats`, and a rigging alias (`mod.RIG_ENDPOINT`)
+  as stage 1 at all,
   are refused by `chain_export` BEFORE credits are spent. `mesh_param` is validated
-  against the successor's mapping (param or label) or — a Meshy successor has no
+  against the successor's mapping (param or label) or — a cloud successor has no
   mapping — against its file fields (`public_fields()[2]`). A paid stage-1 cloud task
-  keeps its own task id/endpoint/request/credits under `meta.chain_stage1` (stage 2's
+  keeps its own kind/task id/endpoint/request/sub-tasks/credits under
+  `meta.chain_stage1` (keys `backend, cloud, cloud_task_id, meshy_task_id, endpoint,
+  consumed_credits, request, tasks`; stage 2's
   are the top-level meta, which would otherwise overwrite them in the merge), and
-  `admin._meshy_table` renders one table per Meshy stage. `rig` accepts a third value
-  `meshy`: tagged on the delivery like the others, but NEVER normalized or validated —
+  `admin._cloud_table` renders one table per cloud stage — naming the VENDOR from that
+  stage's own meta, because the two stages may be different vendors. `rig` accepts the
+  cloud values `meshy` and `tripo`: tagged on the delivery like the others, but NEVER
+  normalized or validated —
   `normalize_delivery`/`validate_delivery` run for `generic`/`mixamo` only, a cloud rig
-  follows Meshy's conventions. Stage 1 gets
+  follows its vendor's conventions (which bone names a `tripo` one carries is
+  `meta.rig_spec`). Stage 1 gets
   the normal routing guarantees: candidates re-resolved while parked (force pin +
   LoRA eligibility kept), misconfigured candidates skipped, connection errors fail
   over (stage-2/hand-off errors are FINAL). The job row's `backend` is re-pointed
@@ -462,7 +608,7 @@ hot-reload-safe.
   failure is when the hand-off matters most. Without it, "did my param reach the
   rigger?" was only answerable from the backend's own ComfyUI history.
   Chain stages run with `slot_held` (the chain claims the one slot itself — no
-  double count). Two hand-offs (ComfyUI↔ComfyUI; with a Meshy stage the second is
+  double count). Two hand-offs (ComfyUI↔ComfyUI; with a cloud stage the second is
   forced):
   `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot
   held across both — queue-isolated) and passes the mesh's absolute output path;
@@ -601,7 +747,11 @@ requests `include_usage` upstream); a backend that reports zeros/nothing
 - Generation: workflow + mapping are **backend-independent** (shared across an
   alias's candidates); **pinned values** (`fixed`) AND **per-node bypass**
   (`bypass`: node ids) are per-backend. A pinned `(node,field)` is authoritative —
-  never overridden by an API request param.
+  never overridden by an API request param. A **cloud** alias (Meshy, Tripo) has
+  neither workflow nor mapping: endpoint + an admin option block, and the options are
+  what `fixed` is to a ComfyUI alias — the client may set only what the kind's fixed
+  label table names. An alias stays homogeneous (one kind), so a Meshy alias can never
+  be given a Tripo backend or vice versa (`cand_kind` == `backend_kind`).
 - Single instance only; verify with compile + a route/render check; restart the
   one instance when the user says idle. Never commit `config.yaml`, `store.db`
   (+ `secret.key`), `stats.db*`, `jobs.db*`, `jobs/`, `voiceref/`, `*.key`.

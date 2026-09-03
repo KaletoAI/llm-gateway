@@ -23,7 +23,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
-- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
+- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai and Tripo3D cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
 - [Endpoint reference](#endpoint-reference)
@@ -565,8 +565,9 @@ respect.
 
 ## Media generation
 
-Generation runs on two backend types: **`type: comfyui`** — a ComfyUI server on
-your own GPU — and **`type: meshy`**, the Meshy.ai cloud (further down). A ComfyUI
+Generation runs on three backend types: **`type: comfyui`** — a ComfyUI server on
+your own GPU — and the two cloud mesh APIs **`type: meshy`** (Meshy.ai) and
+**`type: tripo`** (Tripo3D), both further down. A ComfyUI
 backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
 dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
@@ -684,8 +685,134 @@ A missing file, or one that is not a binary glTF (sniffed by magic, so a renamed
 is caught), is refused *before* the task is created and costs nothing.
 
 A Meshy alias can also be **either stage of a workflow chain** — a Meshy mesh rigged by
-a local ComfyUI rigger, or a locally generated mesh rigged by `Meshy-Rig`; see
-[Workflow chains](#workflow-chains-successor-aliases) below.
+a local ComfyUI rigger, or a locally generated mesh rigged by `Meshy-Rig` (or by
+`Tripo-Rig`, see below); see [Workflow chains](#workflow-chains-successor-aliases).
+
+*Console note:* since Tripo joined, **one** schema-driven editor serves every cloud
+alias, and its form posts to `/ui/mapping/cloud-update`. The Meshy-only
+`POST /ui/mapping/meshy-update` route is **gone** — a saved script or bookmark against
+it now answers `404`. Nothing changed for the form's field names, for a stored alias,
+or for the public API.
+
+### Tripo3D (cloud mesh generation + Mixamo rigging)
+
+A Tripo backend (`type: tripo`, <https://developers.tripo3d.ai/en/docs>, **API V3**) is
+the second cloud mesh backend and serves **image → 3D**, **multiview → 3D** and
+**auto-rigging** through the same `POST /v1/generations` API as a Meshy or a ComfyUI
+mesh alias — same `input_*` labels, same image slots, same job endpoints. Like Meshy it
+is always **paid**: the scheduler reaches for it only when no unpaid backend is free.
+
+```yaml
+backends:
+  - name: tripo
+    type: tripo
+    url: https://openapi.tripo3d.ai   # V3 only (V2 ends 2026-11-01) — the form pre-fills it
+    api_key: tsk_…                    # Tripo console → API Keys
+    max_concurrent: 4                 # keep it ≤ Tripo's per-account pool: 10 for the
+                                      # H-series (v2.5/v3.0/v3.1) and for animation
+                                      # tasks, 5 for the P-series — beyond it: 429
+    # poll_interval: 2                # seconds between task polls (the docs' own advice)
+    # max_wait: 900                   # cap for the WHOLE job — every task shares it
+    # disconnect_grace: 30            # unreachability tolerated while polling
+```
+
+What is different from Meshy (none of it visible to a client):
+
+- **Uploads instead of base64.** Tripo takes no inline bytes at all. Every image and
+  every mesh is `POST`ed to `/v3/files` first and travels as a file token. Clients keep
+  sending `images` / `files` exactly as before; the upload is the gateway's business.
+- **Only GLB is native.** A generation task delivers `model.glb`, a rig task
+  `rigged.<first deliver format>`. **Every other ticked format is its own convert task
+  at 5 credits**, delivered as `model.<fmt>` / `rigged.<fmt>`. A convert that fails
+  fails the job — a requested delivery must never silently shrink.
+- **A free rig-check before every rig.** The `rig` endpoint first runs Tripo's
+  0-credit rig-check; a mesh it calls unriggable ends the job *before* the rig's 25
+  credits are spent, naming the rig type it did detect. The alias option **rig check**
+  turns it off.
+- **Mixamo-compatible skeletons.** The rig alias's **skeleton** option (`spec`) decides
+  the bone names — `mixamo` by default, `tripo` for Tripo's own — and the job records
+  it as `meta.rig_spec`. The delivery is tagged `rig: "tripo"`.
+- **Animation clips by preset.** The rig alias's **animations** option is a list of
+  Tripo preset names (`preset:walk`, …); each is a retarget task at 10 credits,
+  delivered as its own artifact (`walk.glb`). A clip that fails or runs out of time is
+  skipped with a log warning — never the rigged mesh, which is finished and paid for.
+- **One `max_wait` for the whole job.** Rig-check, the main task, every convert and
+  every clip share the backend's budget, so an alias with extra formats or clips needs
+  a bigger one than a plain single-task alias.
+- **Two rig models.** `v1.0-20240301` rigs **bipeds only** (90+ animation presets),
+  `v2.5-20260210` all seven rig types (`biped`, `quadruped`, `hexapod`, `octopod`,
+  `avian`, `serpentine`, `aquatic`; 16 presets). On a v1.0 alias the schema narrows
+  `input_rig_type` to `["biped"]`, and a client that asks for another type has its job
+  refused *before* the rig task is created (so no credits) instead of quietly receiving
+  a biped skeleton.
+
+Register a Tripo alias in **Mapping › Media** (no workflow JSON — endpoint plus admin
+option defaults) and pick the endpoint: `image-to-model` takes `images.input_image`;
+`multiview-to-model` takes `images.input_image_front` **plus at least one** of
+`input_image_back` / `input_image_left` / `input_image_right` — Tripo refuses a
+multiview job with fewer than two views, and the gateway refuses it before the upload;
+`rig` takes no image at all, only the file `files.input_mesh_path`.
+
+Client params:
+
+| Param | Endpoint | Effect |
+|---|---|---|
+| `input_image` | image-to-model | the source image (required) |
+| `input_image_front` (+ `_back` / `_left` / `_right`) | multiview-to-model | `front` required, at least two views in total |
+| `input_mesh_path` | rig | the mesh as a **file** (`files`, not `params`) — binary glTF only, sniffed by magic |
+| `input_face_num` | the two generation ones | Tripo's `face_limit`, clamped to 100 … the model's maximum (v3.1 1.5M, v3.0 1M, v2.5 500k, P-series 50k; 150k with `quad`) |
+| `input_texture_resolution` | the two generation ones | pixels → Tripo's texture quality: ≤2048 `standard`, ≤4096 `detailed`, else `extreme` |
+| `input_rig_type` | rig | overrides the alias's rig-type default — but only a type the **rig model** supports; anything else fails the job before the rig task is created (no credits), never a silent fallback to `biped` |
+| `input_name`, `input_remove_background`, `input_no_fingers` | all | accepted and ignored (Tripo has no such field) |
+
+`input_texture_prompt`, `input_pose` and `input_height_m` are **not** advertised for a
+Tripo alias and are ignored like any unknown param — Tripo has no field for them, and
+listing them would promise something the request builder never sends. Textures, PBR,
+geometry quality, the face budget, quads, parts, orientation, compression, the
+delivered formats and the preview thumbnail are alias defaults set by the admin.
+
+**Cloud rigging (`Tripo-Rig`).** The `rig` endpoint takes a `.glb` under
+`files.input_mesh_path` (25 credits after the free rig-check) and returns
+`rigged.<format>` with the texture embedded. Register it as its own alias — `Tripo-Rig`,
+task `mesh2rig` — and it works standalone on any GLB, including one a local ComfyUI
+pipeline produced:
+
+```bash
+MESH="data:model/gltf-binary;base64,$(base64 -w0 Held.glb)"
+jq -n --arg m "$MESH" '{model:"Tripo-Rig", mode:"async",
+                        params:{input_rig_type:"biped"},
+                        files:{input_mesh_path:$m}}' \
+  | curl -s "$B/v1/generations" -H "Authorization: Bearer $KEY" \
+         -H "Content-Type: application/json" -d @-
+```
+
+The job records the kind (`meta.cloud: "tripo"`), the primary task id
+(`meta.cloud_task_id`), the endpoint, the body actually sent (`meta.request`), the
+credits **summed over every task**, and `meta.tasks` — one row per billed task with its
+`role` (`rig-check`, the endpoint, `convert:<fmt>`, `clip:<preset>`), id and credits, so
+each one can be looked up in Tripo's own dashboard. A rig job additionally carries
+`rig: "tripo"`, `rig_spec` (`mixamo` | `tripo`) and `rig_type` (what the rig-check
+detected, else what was submitted). `/health` and the Backends tab show the credit
+balance with the age of that reading and the same rolling fail-rate the ComfyUI backends
+carry — a balance of 0 takes the backend **down** with that reason.
+
+Errors: `403` + code `2010` (out of credits) and `429` (concurrency or request rate)
+fail over to the next candidate, as do `5xx` and transport errors — including a failed
+upload. Any other `4xx`, and a non-zero `code` in the response envelope, is Tripo's
+verdict on the request and ends the job. While a task is polled, a persistent `4xx` or a
+non-zero `code` (three in a row, `429` excepted) fails the job with that message named,
+while transport errors, `5xx` and `429` are tolerated for `disconnect_grace` seconds and
+then fail over. Cancelling stops the gateway's job only — Tripo has no cancel endpoint in
+V3, so the task finishes and is billed.
+
+The Tripo alias set this is built for (register them in **Mapping › Media**):
+
+| Alias | Task | Tripo endpoint | Successor |
+|---|---|---|---|
+| `Tripo-Object` | `img2mesh` | image-to-model | – |
+| `Tripo-Multiview` | `img2mesh` | multiview-to-model (front + ≥1 more view) | – |
+| `Tripo-Humanoid` | `img2mesh` | image-to-model, `face_limit: 150000` | `Tripo-Rig` · `input_mesh_path` · `rig: tripo` |
+| `Tripo-Rig` | `mesh2rig` | rig (`spec: mixamo`) | – |
 
 ### Generation aliases + mapping
 
@@ -763,25 +890,31 @@ stage-specific parts (how the mesh is exported, taken and fed) are adapter hooks
 |---|---|---|
 | ComfyUI | ComfyUI | the mesh's absolute path on a shared disk (`relay: path`), or an upload into the stage-2 backend's input dir (`relay: upload`) |
 | ComfyUI | Meshy (`Meshy-Rig`) | the mesh bytes ride in the rigging request as its `model_url` |
+| ComfyUI | Tripo (`Tripo-Rig`) | the mesh bytes are uploaded to `/v3/files` and ride in the rig request as their file token |
 | Meshy | ComfyUI (`mesh-mia`, `mesh-rig-unirig`) | the mesh comes back as a result blob and is uploaded into the rigger's input dir |
-| Meshy | Meshy | as above, bytes in the request |
+| Tripo | ComfyUI (`mesh-mia`, `mesh-rig-unirig`) | as above |
+| Meshy | Meshy, or Tripo (`Tripo-Rig`) | as above, bytes in the second stage's request |
+| Tripo | Tripo (`Tripo-Rig`), or Meshy | as above |
 
-A Meshy stage shares no disk with anything, so with Meshy on **either** side the
-gateway forces `relay: upload` whatever the alias stored (the editor hides the field
-for a Meshy stage 1). A Meshy stage 1 must deliver `glb` — otherwise the job is refused
-up front, before credits are spent — and a `rigging` alias cannot be stage 1 at all (it
-rigs an existing mesh and would have no way to obtain one). `successor.mesh_param` must
-be a request field of the successor: a mapped param or label on a ComfyUI alias, a
-**file field** on a Meshy one (`input_mesh_path`). Stage-1 params are threaded on, so a
-`Meshy-Humanoid-Cloud` request can carry `input_height_m` for the rigging stage.
+A **cloud stage (Meshy, Tripo) shares no disk with anything**, so with a cloud alias on
+**either** side the gateway forces `relay: upload` whatever the alias stored (the editor
+hides the field for a cloud stage 1). A cloud stage 1 must deliver `glb` — otherwise the
+job is refused up front, before credits are spent — and a rigging alias (Meshy's
+`rigging`, Tripo's `rig`) cannot be stage 1 at all (it rigs an existing mesh and would
+have no way to obtain one). `successor.mesh_param` must be a request field of the
+successor: a mapped param or label on a ComfyUI alias, a **file field** on a cloud one
+(`input_mesh_path` for both kinds). Stage-1 params are threaded on, so a
+`Meshy-Humanoid-Cloud` request can carry `input_height_m` for the rigging stage, and a
+`Tripo-Humanoid` one an `input_rig_type`.
 
 `successor.rig` tags the delivery for the client. `mixamo`/`generic` are additionally
-normalized (texture V-flip, optional JPEG) and validated at chain level; the third
-value **`meshy`** is only tagged — a cloud rig follows Meshy's own conventions, and
-re-flipping or validating it against ComfyUI-shaped rules would only break it. A Meshy
-stage of a chain keeps its own task id, request and credits on the job
+normalized (texture V-flip, optional JPEG) and validated at chain level; the cloud
+values **`meshy`** and **`tripo`** are only tagged — a cloud rig follows its vendor's
+own conventions, and re-flipping or validating it against ComfyUI-shaped rules would
+only break it. (Which bone names a `tripo` delivery carries is `meta.rig_spec`.) A cloud
+stage of a chain keeps its own task id, request, sub-tasks and credits on the job
 (`meta.chain_stage1` for stage 1, the top-level meta for stage 2), so the Media Jobs
-view shows one Meshy table per Meshy stage.
+view shows one table per cloud stage — and the two stages may be different vendors.
 
 The Meshy alias set this is built for (register them in **Mapping › Media**; the
 successor column is the chain config above):
@@ -840,15 +973,16 @@ which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
   other file input (a mesh to shrink/rig). A `files` entry is uploaded into the
   input dir of whichever backend runs the job — after parking and across
   failover — and the param gets that file's absolute path, so a client never
-  needs a path on a backend; on a cloud backend (Meshy) it rides in the request
-  instead (embedded as a `model_url` data URI), so no path exists. The bytes are not kept as a job input.
+  needs a path on a backend; on a cloud backend it rides in the request
+  instead (Meshy embeds it as a `model_url` data URI, Tripo uploads it to `/v3/files`
+  and sends the token), so no path exists. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`.
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
   `params`, `images` (loader slots with their empty behaviour) and **`files`** — the
   uploads that are not images. A ComfyUI alias lists its mapped mesh params there
   (`required: false`; the same input can also be named as a backend-side path in
-  `params`), a Meshy rigging alias lists
+  `params`), a Meshy or Tripo rigging alias lists
   `{"name": "input_mesh_path", "required": true, "accept": ["glb"]}`. It is the
   machine-readable source of truth — a client builds a valid request from it without
   out-of-band docs.
@@ -891,10 +1025,10 @@ locked). Tabs:
 |---|---|
 | **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
 | **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy), incl. the `paid` cost tier |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier |
 | **Input** | what clients can call — chat aliases, generation models, endpoints |
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
-| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a Meshy alias needs no workflow — endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
+| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL), plus the media requests that were refused before they became a job |
@@ -1028,7 +1162,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 | `GET` | `/v1/jobs/{id}` | job status + results |
 | `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |
 | `GET` | `/v1/jobs/{id}/input/{n}` | a stored reference image (owner-gated) |
-| `POST` | `/v1/jobs/{id}/cancel` | cancel a queued/running job (interrupts ComfyUI; a Meshy task keeps running and is billed) |
+| `POST` | `/v1/jobs/{id}/cancel` | cancel a queued/running job (interrupts ComfyUI; a cloud task — Meshy, Tripo — keeps running and is billed) |
 
 ### Other
 

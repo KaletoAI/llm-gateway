@@ -229,7 +229,80 @@ virtual_models:
 #       successor:
 #         alias: mesh-mia             # the rigging alias (a ComfyUI or a Meshy one)
 #         mesh_param: input_mesh_path # must be a request field of that alias
-#         rig: mixamo                 # client-facing rig tag: mixamo | generic | meshy
+#         rig: mixamo                 # client-facing rig tag: mixamo | generic | meshy | tripo
+#         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
+
+# Tripo3D (https://developers.tripo3d.ai, API V3) is the second cloud mesh backend —
+# same idea as Meshy, billed per task in credits, hence ALWAYS paid. Two differences
+# that show up in the knobs: it takes no inline bytes (every image/mesh is uploaded to
+# /v3/files first — the gateway's business, not the client's), and one job may be
+# SEVERAL tasks (rig-check, the main task, one convert per extra format, one retarget
+# per animation clip). Its knobs:
+#   poll_interval     -> seconds between task polls (default 2, the docs' own advice)
+#   max_wait          -> cap for the WHOLE job, all its tasks together (default 900) —
+#                        an alias with extra formats or clips needs more than a
+#                        single-task one
+#   disconnect_grace  -> as with Meshy (default 30); a persistent 4xx, or a non-zero
+#                        `code` in Tripo's {code,data} envelope, fails the job outright
+#
+#   - name: tripo
+#     type: tripo
+#     url: https://openapi.tripo3d.ai # V3 only; V2 (api.tripo3d.ai/v2) ends 2026-11-01
+#     api_key: tsk_...                # Tripo console -> API Keys
+#     max_concurrent: 4               # keep it <= Tripo's per-account pool: 10 for the
+#                                     # H-series (v2.5/v3.0/v3.1) and animation tasks,
+#                                     # 5 for the P-series - beyond it Tripo answers 429
+#     poll_interval: 2
+#     max_wait: 900
+#
+# A Tripo alias carries no workflow either — endpoint + admin option defaults (edit
+# them in the console; the option keys are tripo.OPTION_DEFAULTS). Tripo generates GLB
+# and nothing else: every OTHER format in target_formats becomes its own convert task
+# at 5 credits, and a convert that fails fails the job.
+#   "Tripo-Object":
+#     - backend: tripo
+#       task: img2mesh
+#       model: v3.1-20260211          # v3.1-20260211 | v3.0-20250812 | v2.5-20250123
+#                                     # | P1-20260311 | P2-20260801
+#       tripo:
+#         endpoint: image-to-model    # or multiview-to-model: images.input_image_front
+#                                     # (required) PLUS at least one of _back/_left/
+#                                     # _right - Tripo refuses fewer than two views
+#         options: {texture: true, pbr: true, texture_quality: standard,
+#                   geometry_quality: standard, face_limit: null,
+#                   target_formats: [glb], thumbnail: true}
+#
+# The third endpoint, `rig`, takes a MESH instead of an image: files.input_mesh_path (a
+# binary .glb), 25 credits — preceded by Tripo's FREE rig-check, which ends the job
+# before those credits if the mesh is not riggable. `spec: mixamo` gives the skeleton
+# Mixamo-compatible bone names (job meta: rig_spec); `rig_model` v1.0-20240301 rigs
+# BIPEDS only (a client input_rig_type that is not biped is then refused), v2.5-20260210
+# every rig type. Each `animations` preset is a retarget task (10 credits) delivered as
+# its own artifact, e.g. walk.glb; a clip that fails is skipped, never the job.
+#   "Tripo-Rig":
+#     - backend: tripo
+#       task: mesh2rig
+#       tripo:
+#         endpoint: rig
+#         options: {target_formats: [glb],   # the FIRST format is delivered natively
+#                   rig_check: true, rig_model: v1.0-20240301, rig_type: biped,
+#                   spec: mixamo, animations: [preset:walk]}
+#
+# Chained: a Tripo mesh rigged by Tripo itself (either stage may also be ComfyUI or
+# Meshy — all combinations run). A cloud stage shares no disk, so the mesh always
+# travels as BYTES and glb must be in the stage-1 target_formats. `face_limit` matters
+# here: a rigger should not be handed a multi-million-face mesh.
+#   "Tripo-Humanoid":
+#     - backend: tripo
+#       task: img2mesh
+#       model: v3.1-20260211
+#       tripo:
+#         endpoint: image-to-model
+#         options: {target_formats: [glb], face_limit: 150000}
+#       successor:
+#         alias: Tripo-Rig            # the rigging alias (ComfyUI, Meshy or Tripo)
+#         mesh_param: input_mesh_path # must be a request field of that alias
+#         rig: tripo                  # tagged only - a cloud rig is never normalized
 #         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
