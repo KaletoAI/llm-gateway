@@ -63,6 +63,20 @@ class AdminKindNeutral(unittest.TestCase):
         self.assertIn('value="tripo" selected', html)
         self.assertIn("cloudopts", html)
 
+    def test_type_select_replaces_another_kinds_url(self):
+        """Switching meshy → tripo must not leave api.meshy.ai in the url field: the
+        backend would be saved pointing at the wrong vendor and only fail at discovery,
+        with an auth error that names the wrong service. The handler therefore overwrites
+        a url that is blank OR equals ANOTHER kind's fixed URL — never a typed one."""
+        import admin
+        js = admin._type_select("meshy")
+        self.assertIn("for(var k in cloudUrls)", js)          # every other kind is compared
+        self.assertIn("u.value===cloudUrls[k]", js)           # …against the url field
+        self.assertIn("u.value=cloudUrls[t]", js)             # …and replaced by the new kind's
+        for url in (meshy.URL, tripo.URL):
+            self.assertIn(url, js)
+        self.assertNotIn("if(u&&!u.value)", js)               # the old fill-only rule is gone
+
 
 if __name__ == "__main__":
     unittest.main()

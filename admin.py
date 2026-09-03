@@ -1255,9 +1255,14 @@ def _sampling_text(d) -> str:
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
     (LLM / ComfyUI / cloud / Anthropic — the form renders all, only one is ever visible).
-    A cloud type also pre-fills its fixed URL, reveals its own backend hint and forces
-    `paid` (it bills per task); the disabled box is not submitted, so `backend_save`
-    sets it server-side too.
+    A cloud type also reveals its own backend hint and forces `paid` (it bills per task);
+    the disabled box is not submitted, so `backend_save` sets it server-side too.
+
+    The URL field is filled with the chosen kind's fixed endpoint when it is blank OR
+    still holds ANOTHER cloud kind's fixed URL — switching meshy → tripo would otherwise
+    store a Tripo backend pointing at api.meshy.ai, which only surfaces as an auth error
+    at discovery, pointing at the wrong thing. Anything else the operator typed (a
+    self-hosted proxy) is never overwritten. `backend_save` applies the same rule.
 
     Every cloud kind comes from adapters.CLOUD_MODULES, so a new one appears here without
     touching this handler. ES5 only (var/function, no arrows): an inline attribute is
@@ -1277,7 +1282,9 @@ def _type_select(current: str) -> str:
             "if(a)a.style.display=t==='anthropic'?'':'none';"
             "Array.prototype.forEach.call(document.querySelectorAll('[data-cloud-hint]'),"
             "function(h){h.style.display=h.getAttribute('data-cloud-hint')===t?'':'none'});"
-            "if(cloudUrls[t]){if(u&&!u.value)u.value=cloudUrls[t];"
+            "if(cloudUrls[t]){if(u){var ow=!u.value;"
+            "for(var k in cloudUrls){if(k!==t&&u.value===cloudUrls[k])ow=true}"
+            "if(ow)u.value=cloudUrls[t]}"
             "if(p){if(p.dataset.was===undefined)p.dataset.was=p.checked?'1':'';"
             "p.checked=true;p.disabled=true}}"
             "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
@@ -1582,8 +1589,16 @@ async def backend_save(request: Request):
     name = (f.get("name", "") or "").strip()
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
-    if not url and new_type in adapters.CLOUD_TYPES:
-        url = _cloud_urls()[new_type]      # one fixed cloud endpoint — nothing to type
+    if new_type in adapters.CLOUD_TYPES:
+        # One fixed cloud endpoint per kind — nothing to type. Fill it when the field is
+        # blank, and REPLACE another cloud kind's fixed URL: switching an existing meshy
+        # backend to tripo would otherwise store api.meshy.ai on a Tripo backend, which
+        # surfaces only as an auth error at discovery, pointing at the wrong thing. A URL
+        # the operator typed himself (a self-hosted proxy) is left alone. The form's JS
+        # does the same live; this is the authority, since the field is editable.
+        curls = _cloud_urls()
+        if not url or any(k != new_type and url == u for k, u in curls.items()):
+            url = curls.get(new_type, "")
     if not name or not url:
         return HTMLResponse(_page("Backends", '<p class="bad">name and url are required</p>'
             f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
