@@ -49,6 +49,9 @@ class AdminKindNeutral(unittest.TestCase):
 
     def test_same_kind_matches_backend_type(self):
         import admin, tripo
+        # restored: _gen_backends is a module global the whole console reads, and a test
+        # that leaves a stub behind decides what LATER tests see (order-dependent failures).
+        self.addCleanup(setattr, admin, "_gen_backends", admin._gen_backends)
         admin._gen_backends = lambda: [{"name": "x", "type": "comfyui"}, {"name": "x", "type": "tripo"},
                                        {"name": "m", "type": "meshy"}]
         self.assertTrue(admin._same_kind([tripo.default_candidate("x")], "x"))
@@ -78,6 +81,23 @@ class AdminKindNeutral(unittest.TestCase):
         self.assertNotIn("if(u&&!u.value)", js)               # the old fill-only rule is gone
 
 
+class CloudBackendUrl(unittest.TestCase):
+    """`backend_save`'s url rule, as the pure helper it delegates to. It fails SILENTLY:
+    a Tripo backend saved with api.meshy.ai only shows up as an auth error at discovery,
+    naming the wrong vendor."""
+
+    def test_cloud_url_for(self):
+        import admin, meshy, tripo
+        self.assertEqual(admin._cloud_url_for("tripo", meshy.URL), tripo.URL)   # kind switched
+        self.assertEqual(admin._cloud_url_for("tripo", ""), tripo.URL)          # blank → filled
+        self.assertEqual(admin._cloud_url_for("tripo", "https://my.proxy"),
+                         "https://my.proxy")                                    # typed → kept
+        self.assertEqual(admin._cloud_url_for("meshy", tripo.URL), meshy.URL)
+        self.assertEqual(admin._cloud_url_for("comfyui", "http://gpu:8188"), "http://gpu:8188")
+        self.assertEqual(admin._cloud_url_for("comfyui", ""), "")               # never touched
+        self.assertEqual(admin._cloud_url_for("tripo", tripo.URL), tripo.URL)   # already right
+
+
 class CloudEditor(unittest.TestCase):
     """The schema-driven cloud alias editor: ONE form rendered from `mod.OPTION_FIELDS`
     serves every cloud kind. A field the editor forgets fails SILENTLY — the option keeps
@@ -88,6 +108,7 @@ class CloudEditor(unittest.TestCase):
         import admin
         c = mod.default_candidate("b")
         c[mod.KIND]["endpoint"] = endpoint
+        self.addCleanup(setattr, admin, "_gen_backends", admin._gen_backends)
         admin._gen_backends = lambda: [{"name": "b", "type": mod.KIND}]
         html = admin._cloud_editor(mod.KIND, "A-1", [c])
         for fld in mod.OPTION_FIELDS:

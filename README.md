@@ -731,7 +731,8 @@ What is different from Meshy (none of it visible to a client):
   turns it off.
 - **Mixamo-compatible skeletons.** The rig alias's **skeleton** option (`spec`) decides
   the bone names — `mixamo` by default, `tripo` for Tripo's own — and the job records
-  it as `meta.rig_spec`. The delivery is tagged `rig: "tripo"`.
+  it as `meta.rig_spec`, lifted to the job object's top-level `rig_spec` next to
+  `rig: "tripo"` (the client spec's §3.1 field).
 - **Animation clips by preset.** The rig alias's **animations** option is a list of
   Tripo preset names (`preset:walk`, …); each is a retarget task at 10 credits,
   delivered as its own artifact (`walk.glb`). A clip that fails or runs out of time is

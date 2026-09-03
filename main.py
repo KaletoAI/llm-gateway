@@ -2377,6 +2377,11 @@ async def _job_view(job_id: str, request: Request) -> dict:
     # character-model spec. The workflow identity is already `view["alias"]`.
     if meta.get("rig"):
         view["rig"] = meta["rig"]
+    if meta.get("rig_spec"):
+        # Which bone-naming convention a `rig: "tripo"` delivery carries (mixamo|tripo).
+        # The client spec documents it as a TOP-LEVEL job field, so lift it like `rig`:
+        # a client that reads only the job object cannot see meta.
+        view["rig_spec"] = meta["rig_spec"]
     if meta.get("warnings"):
         view["warnings"] = meta["warnings"]
     view["inputs"] = meta.get("inputs")

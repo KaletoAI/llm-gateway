@@ -136,5 +136,32 @@ class MainKindNeutral(unittest.TestCase):
                          "Tripo queue full")
 
 
+class JobViewFields(unittest.TestCase):
+    """`_job_view` is the client contract (docs/mesh-client-spec.md §3.1): a field the
+    spec promises at the TOP level and only meta carries is invisible to every client
+    that reads the job object — and nothing fails, it is simply never there."""
+
+    def _view(self, meta):
+        import asyncio
+        import types
+        job = {"status": "done", "task": "img2mesh", "alias": "Tripo-Rig",
+               "backend": "tripo", "error": None, "results": [], "meta": meta}
+        prev = main.jobs.get
+        self.addCleanup(setattr, main.jobs, "get", prev)
+        main.jobs.get = lambda job_id: job
+        req = types.SimpleNamespace(base_url="http://gw/")
+        return asyncio.run(main._job_view("j1", req))
+
+    def test_rig_and_rig_spec_are_lifted(self):
+        view = self._view({"rig": "tripo", "rig_spec": "mixamo"})
+        self.assertEqual(view["rig"], "tripo")
+        self.assertEqual(view["rig_spec"], "mixamo")
+
+    def test_absent_stays_absent(self):
+        view = self._view({"rig": "generic"})
+        self.assertEqual(view["rig"], "generic")
+        self.assertNotIn("rig_spec", view)          # a ComfyUI rig has no bone spec to name
+
+
 if __name__ == "__main__":
     unittest.main()

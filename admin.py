@@ -44,6 +44,22 @@ logger = logging.getLogger(__name__)
 def _cloud_urls() -> dict:
     return {k: m.URL for k, m in adapters.CLOUD_MODULES.items()}
 
+
+def _cloud_url_for(new_type: str, url: str) -> str:
+    """The url a backend of type `new_type` is SAVED with. One fixed cloud endpoint per
+    kind — nothing to type. Fill it when the field is blank, and REPLACE another cloud
+    kind's fixed URL: switching an existing meshy backend to tripo would otherwise store
+    api.meshy.ai on a Tripo backend, which surfaces only as an auth error at discovery,
+    pointing at the wrong thing. A URL the operator typed himself (a self-hosted proxy)
+    is left alone, and a non-cloud type is never touched. The form's JS does the same
+    live; this is the authority, since the field is editable."""
+    if new_type not in adapters.CLOUD_TYPES:
+        return url
+    curls = _cloud_urls()
+    if not url or any(k != new_type and url == u for k, u in curls.items()):
+        return curls.get(new_type, "")
+    return url
+
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", "controlnet")
 
@@ -1588,16 +1604,7 @@ async def backend_save(request: Request):
     name = (f.get("name", "") or "").strip()
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
-    if new_type in adapters.CLOUD_TYPES:
-        # One fixed cloud endpoint per kind — nothing to type. Fill it when the field is
-        # blank, and REPLACE another cloud kind's fixed URL: switching an existing meshy
-        # backend to tripo would otherwise store api.meshy.ai on a Tripo backend, which
-        # surfaces only as an auth error at discovery, pointing at the wrong thing. A URL
-        # the operator typed himself (a self-hosted proxy) is left alone. The form's JS
-        # does the same live; this is the authority, since the field is editable.
-        curls = _cloud_urls()
-        if not url or any(k != new_type and url == u for k, u in curls.items()):
-            url = curls.get(new_type, "")
+    url = _cloud_url_for(new_type, url)      # pure rule, tested in test_cloud_editor.py
     if not name or not url:
         return HTMLResponse(_page("Backends", '<p class="bad">name and url are required</p>'
             f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
