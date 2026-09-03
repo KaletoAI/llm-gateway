@@ -29,17 +29,36 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 import adapters
+import cloudtask
 import jobs
-import meshy
 import reasoning
 import stats
 import store
 
 logger = logging.getLogger(__name__)
 
-# Meshy is one fixed cloud endpoint — the form pre-fills it and backend_save
-# accepts a blank url for that type.
-_MESHY_URL = "https://api.meshy.ai"
+
+# Each cloud kind (Meshy, Tripo) is one FIXED endpoint — the form pre-fills it and
+# backend_save accepts a blank url for those types. Derived from the modules, never
+# a literal here: a new kind must not need a second edit in the console.
+def _cloud_urls() -> dict:
+    return {k: m.URL for k, m in adapters.CLOUD_MODULES.items()}
+
+
+def _cloud_url_for(new_type: str, url: str) -> str:
+    """The url a backend of type `new_type` is SAVED with. One fixed cloud endpoint per
+    kind — nothing to type. Fill it when the field is blank, and REPLACE another cloud
+    kind's fixed URL: switching an existing meshy backend to tripo would otherwise store
+    api.meshy.ai on a Tripo backend, which surfaces only as an auth error at discovery,
+    pointing at the wrong thing. A URL the operator typed himself (a self-hosted proxy)
+    is left alone, and a non-cloud type is never touched. The form's JS does the same
+    live; this is the authority, since the field is editable."""
+    if new_type not in adapters.CLOUD_TYPES:
+        return url
+    curls = _cloud_urls()
+    if not url or any(k != new_type and url == u for k, u in curls.items()):
+        return curls.get(new_type, "")
+    return url
 
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", "controlnet")
@@ -97,7 +116,7 @@ def _num(s: str):
 # catalog of bindable names; bind(**overrides) rebinds them by keyword (`foo=` sets
 # `_foo`). No triple bookkeeping (signature + global stmt + assignments) to keep in sync.
 _comfy_backends: Callable[[], list] = lambda: []
-_gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI + Meshy)
+_gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI, Meshy, Tripo)
 _gateway_info: Callable[[], dict] = lambda: {}
 _cancel_generation = None
 _drain_backend = None
@@ -789,8 +808,9 @@ def _type_badge(t: str) -> str:
     t = (t or "openai").lower()
     if t == "comfyui":
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
-    if t == "meshy":
-        return _badge("☁ meshy", "img", "Meshy.ai cloud mesh generation (paid, per task)")
+    if t in adapters.CLOUD_TYPES:
+        mod = adapters.cloud_module(t)
+        return _badge(f"☁ {t}", "img", f"{mod.VENDOR} cloud mesh generation (paid, per task)")
     if t == "anthropic":
         # plain glyph on purpose: the enclosed-A (🅐) renders as a blank box in the
         # console's system font stack
@@ -1107,6 +1127,12 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
     title = "Edit Backend" if b else "Add Backend"
     orig = f'<input type="hidden" name="orig" value="{_esc(_bid(b))}">' if b else ""
     hlist = "".join(f'<option value="{_esc(h)}">' for h in hosts)
+    # The cloud option block is rendered for EVERY cloud kind at once (one hint each,
+    # only the current type's visible) — the type select toggles them client-side, so
+    # switching type must not need a round trip.
+    cur_type = g("type", "openai")
+    cmod = adapters.cloud_module(cur_type) if cur_type in adapters.CLOUD_TYPES else None
+    num = lambda x: str(int(x)) if float(x) == int(x) else str(x)   # 5.0 → "5" (a placeholder)
     host_inp = (f'<input name="host" value="{_esc(g("host"))}" list="hostlist" '
                 f'placeholder="auto: URL host/IP" autocomplete="off">'
                 f'<datalist id="hostlist">{hlist}</datalist>')
@@ -1119,18 +1145,21 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "(llama.cpp / llama-swap / vLLM / LocalAI / cloud) — including <b>TTS/voice</b> and whisper "
               "models, which are discovered and routed like any other model. <b>comfyui</b> = workflow-based "
               "media generation. <b>meshy</b> = Meshy.ai cloud mesh generation (image / multi-image → 3D), "
-              "billed per task in credits — always <b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
+              "billed per task in credits — always <b>paid</b>. <b>tripo</b> = Tripo3D cloud mesh "
+              "generation + Mixamo-spec rigging (image / multi-image → 3D), billed per task — always "
+              "<b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
               "Claude Code, reachable through <code>/v1/messages</code> only.</p>"
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
             + _field("host", host_inp)
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
               "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
               "host/IP, which groups correctly for most setups.</p>"
-            # Meshy bills per task, so `paid` is not a choice there: shown checked +
-            # disabled (a disabled box is NOT submitted — backend_save forces it too).
+            # A cloud backend (Meshy, Tripo) bills per task, so `paid` is not a choice
+            # there: shown checked + disabled (a disabled box is NOT submitted —
+            # backend_save forces it too).
             + _field("cost tier", ('<label class="ckbox"><input type="checkbox" name="paid" value="1" '
-                                   'checked disabled> paid — always, Meshy bills per task</label>')
-                     if g("type", "openai") == "meshy" else
+                                   'checked disabled> paid — always, a cloud backend bills per task</label>')
+                     if cur_type in adapters.CLOUD_TYPES else
                      _checkbox("paid", gb("paid"), "paid — used only when no unpaid backend is free"))
             + "<p class='hint' style='margin:-4px 0 10px'><b>paid</b>: this backend bills per request "
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
@@ -1179,23 +1208,21 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "<code>/system_stats</code>) before failing over — for hosts with sporadic driver "
               "faults. Blank/0 = fail over immediately; content errors are never retried.</p>"
             + "</div>"
-            # Meshy-only options — a cloud task API: no dirs, no watchdog, no self-retry.
-            # The fields are named meshy_* because #comfyopts already renders max_wait /
-            # poll_interval, and one form may carry each name only once.
-            + f'<div id="meshyopts" style="{"" if g("type", "openai") == "meshy" else "display:none"}">'
-            + '<div class="grouphdr">Meshy</div>'
-            + _field("max wait s", _inp("meshy_max_wait", g("max_wait"), placeholder="900", typ="number"))
-            + _field("poll interval s", _inp("meshy_poll_interval", g("poll_interval"),
-                     placeholder="5", typ="number", step="0.5"))
-            + "<p class='hint' style='margin:-4px 0 10px'><b>api key</b> (above) is the Meshy key "
-              "(<code>msy_…</code>, Meshy dashboard → API). <b>max_concurrent</b> should stay at or below "
-              "your Meshy tier's concurrent-task limit — this account is on <b>Pro (10)</b> "
-              "(Studio 20 · Premium 30 · Ultra 100; the limit is shared by every key of the account) — "
-              "beyond it Meshy answers 429 and the job fails over. "
-              "<b>max wait s</b> caps one task incl. Meshy's own queue (blank = 900); <b>poll interval s</b> "
-              "is the gap between task polls (blank = 5). Credits: 20 (no texture) / 30 (textured) / "
-              "35 (8K) per Meshy-6/7 task, +5 ultra; refunded when a task fails. The current balance shows "
-              "in the backend list after the next health poll.</p>"
+            # Cloud-only options (Meshy, Tripo) — a cloud task API: no dirs, no watchdog,
+            # no self-retry. The fields are named cloud_* because #comfyopts already
+            # renders max_wait / poll_interval, and one form may carry each name only once.
+            # One hint per kind, all rendered, only the selected type's shown: the type
+            # select reveals the right one without a round trip.
+            + f'<div id="cloudopts" style="{"" if cmod else "display:none"}">'
+            + '<div class="grouphdr">Cloud task API</div>'
+            + _field("max wait s", _inp("cloud_max_wait", g("max_wait"), typ="number",
+                     placeholder=num(cmod.MAX_WAIT_DEFAULT) if cmod else "900"))
+            + _field("poll interval s", _inp("cloud_poll_interval", g("poll_interval"),
+                     typ="number", step="0.5",
+                     placeholder=num(cmod.POLL_INTERVAL_DEFAULT) if cmod else "5"))
+            + "".join(f"<p class='hint' data-cloud-hint=\"{k}\" style=\"margin:-4px 0 10px"
+                      f'{"" if k == cur_type else ";display:none"}">{m.BACKEND_HINT}</p>'
+                      for k, m in adapters.CLOUD_MODULES.items())
             + "</div>"
             # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
             + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
@@ -1272,20 +1299,37 @@ def _sampling_text(d) -> str:
 
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
-    (LLM / ComfyUI / Meshy / Anthropic — the form renders all, only one is ever visible).
-    Meshy also pre-fills the fixed cloud URL and forces `paid` (it bills per task); the
-    disabled box is not submitted, so `backend_save` sets it server-side too."""
+    (LLM / ComfyUI / cloud / Anthropic — the form renders all, only one is ever visible).
+    A cloud type also reveals its own backend hint and forces `paid` (it bills per task);
+    the disabled box is not submitted, so `backend_save` sets it server-side too.
+
+    The URL field is filled with the chosen kind's fixed endpoint when it is blank OR
+    still holds ANOTHER cloud kind's fixed URL — switching meshy → tripo would otherwise
+    store a Tripo backend pointing at api.meshy.ai, which only surfaces as an auth error
+    at discovery, pointing at the wrong thing. Anything else the operator typed (a
+    self-hosted proxy) is never overwritten. `backend_save` applies the same rule.
+
+    Every cloud kind comes from adapters.CLOUD_MODULES, so a new one appears here without
+    touching this handler. ES5 only (var/function, no arrows): an inline attribute is
+    never transpiled, and test_admin_live pins the console's JS to ES5."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
-                   for t in ("comfyui", "meshy", "openai", "anthropic"))
-    return ('<select name="type" onchange="var t=this.value,'
+                   for t in ("comfyui", "meshy", "tripo", "openai", "anthropic"))
+    # single-quoted: this JS sits inside a double-quoted HTML attribute, and JSON's
+    # double quotes would close it early.
+    urls = json.dumps(_cloud_urls()).replace('"', "'")
+    return ('<select name="type" onchange="var t=this.value,cloudUrls=' + urls + ","
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
-            "m=document.getElementById('meshyopts'),a=document.getElementById('anthopts'),"
+            "m=document.getElementById('cloudopts'),a=document.getElementById('anthopts'),"
             "u=document.querySelector('input[name=url]'),p=document.querySelector('input[name=paid]');"
             "if(l)l.style.display=t==='openai'?'':'none';"
             "if(c)c.style.display=t==='comfyui'?'':'none';"
-            "if(m)m.style.display=t==='meshy'?'':'none';"
+            "if(m)m.style.display=cloudUrls[t]?'':'none';"
             "if(a)a.style.display=t==='anthropic'?'':'none';"
-            "if(t==='meshy'){if(u&&!u.value)u.value='" + _MESHY_URL + "';"
+            "Array.prototype.forEach.call(document.querySelectorAll('[data-cloud-hint]'),"
+            "function(h){h.style.display=h.getAttribute('data-cloud-hint')===t?'':'none'});"
+            "if(cloudUrls[t]){if(u){var ow=!u.value;"
+            "for(var k in cloudUrls){if(k!==t&&u.value===cloudUrls[k])ow=true}"
+            "if(ow)u.value=cloudUrls[t]}"
             "if(p){if(p.dataset.was===undefined)p.dataset.was=p.checked?'1':'';"
             "p.checked=true;p.disabled=true}}"
             "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
@@ -1356,7 +1400,7 @@ async def backends_page(request: Request):
               if b.get("fail_rate") is not None else "")
         smp = (f" · sampling {_sampling_text(b['sampling_defaults'])}"
                if b.get("sampling_defaults") else "")
-        # Meshy credit balance WITH its age: the number is a snapshot from the last
+        # Cloud credit balance WITH its age: the number is a snapshot from the last
         # successful discovery, and a stale one is worth spotting before a job fails.
         cr = ""
         if b.get("credits") is not None:
@@ -1367,7 +1411,7 @@ async def backends_page(request: Request):
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
-    # Meshy, …), alphabetical within each
+    # Meshy, Tripo, …), alphabetical within each
     binfo = sorted(binfo, key=lambda b: b["name"].lower())
     llm = [b for b in binfo if b.get("type", "openai") not in adapters.GEN_TYPES]
     img = [b for b in binfo if b.get("type") in adapters.GEN_TYPES]
@@ -1590,8 +1634,7 @@ async def backend_save(request: Request):
     name = (f.get("name", "") or "").strip()
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
-    if not url and new_type == "meshy":
-        url = _MESHY_URL                   # one fixed cloud endpoint — nothing to type
+    url = _cloud_url_for(new_type, url)      # pure rule, tested in test_cloud_editor.py
     if not name or not url:
         return HTMLResponse(_page("Backends", '<p class="bad">name and url are required</p>'
             f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
@@ -1646,14 +1689,14 @@ async def backend_save(request: Request):
         b["poll_interval"] = pi_val
     else:
         b.pop("poll_interval", None)           # blank/0/garbage = the 1.0 s default
-    # Meshy: a cloud task API — bills per task, so `paid` is not the operator's choice
-    # (the form's box is disabled and therefore NOT submitted; it is forced here).
-    # Its max_wait/poll_interval arrive under meshy_* names because #comfyopts already
-    # renders those two names, and none of the ComfyUI-only keys apply.
-    if new_type == "meshy":
+    # A cloud backend (Meshy, Tripo): a cloud task API — bills per task, so `paid` is not
+    # the operator's choice (the form's box is disabled and therefore NOT submitted; it is
+    # forced here). Its max_wait/poll_interval arrive under cloud_* names because
+    # #comfyopts already renders those two names, and none of the ComfyUI-only keys apply.
+    if new_type in adapters.CLOUD_TYPES:
         b["paid"] = True                       # bills per task — never an unpaid candidate
-        for src, dst, cast in (("meshy_max_wait", "max_wait", int),
-                               ("meshy_poll_interval", "poll_interval", float)):
+        for src, dst, cast in (("cloud_max_wait", "max_wait", int),
+                               ("cloud_poll_interval", "poll_interval", float)):
             v = (f.get(src, "") or "").strip()
             try:
                 val = cast(float(v))
@@ -1662,7 +1705,7 @@ async def backend_save(request: Request):
             if val > 0:
                 b[dst] = val
             else:
-                b.pop(dst, None)               # blank = defaults (900 / 5)
+                b.pop(dst, None)               # blank = the kind's own defaults
         for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
                   "stuck_after_s", "self_retries"):
             b.pop(k, None)
@@ -1989,7 +2032,8 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
         entries = sorted(per_backend.get(sel, []), key=lambda e: e[0].lower())
         rows = ""
         for alias, c, cands in entries:
-            mapped = (f"meshy · {meshy.endpoint_of(c)}" if c.get("meshy") is not None
+            k = adapters.cloud_kind(c)      # a cloud alias has an endpoint where a workflow has a mapping
+            mapped = (f"{k} · {adapters.cloud_module(k).endpoint_of(c)}" if k
                       else ", ".join((c.get("mapping") or {}).keys()) or "auto")
             pins = len([b for b in (c.get("fixed") or []) if b.get("node")])
             byp = len(c.get("bypass") or [])
@@ -2550,8 +2594,9 @@ def _register_form() -> str:
             f'<div class="formbar"><h2>Register Workflow</h2>{_btn("Register", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}</div>'
             "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
-            "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>meshy</b> backend "
-            "no JSON is needed — the alias is created with Meshy defaults and edited next.</p>"
+            "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>cloud</b> backend "
+            "(meshy, tripo) no JSON is needed — the alias is created with that vendor's defaults and "
+            "edited next.</p>"
             + _field("alias", _inp("alias", placeholder="flux"))
             + _field("backend", _select("backend", backend_opts))
             + _field("task", _task_select())
@@ -2618,7 +2663,8 @@ def _mapping_list_media(iedit: str) -> str:
                  f'<span class="muted" style="font-weight:normal">{len(entries)}</span></div>')
         for alias, cands in entries:
             c = cands[0]
-            mapped = (f"meshy · {meshy.endpoint_of(c)}" if c.get("meshy") is not None
+            k = adapters.cloud_kind(c)      # a cloud alias has an endpoint where a workflow has a mapping
+            mapped = (f"{k} · {adapters.cloud_module(k).endpoint_of(c)}" if k
                       else ", ".join((c.get("mapping") or {}).keys()) or "auto")
             backends = ", ".join(x.get("backend", "") for x in cands)
             acts = _icon_acts(
@@ -2689,22 +2735,24 @@ async def register_post(request: Request):
                             f'<div class="actions" style="padding-left:0">{_btn("← Back", "/ui/mapping?sub=media", "secondary")}</div>', "mapping"))
     if not alias or not backend:
         return err("alias and backend are required")
-    # A Meshy alias has no workflow at all: its request fields are the fixed label
-    # table in meshy.py, its per-backend half is a set of admin options. Registering
-    # creates the default candidate; everything else is edited in _meshy_editor.
-    # The KIND comes from the picked backend, and a name is unique only per type (a
-    # ComfyUI and a Meshy backend may both be called "gpu") — so match on (name, type)
-    # instead of trusting whichever same-named backend comes first.
-    if any(b["name"] == backend and b.get("type") == "meshy" for b in _gen_backends()):
-        cand = meshy.default_candidate(backend)
-        # The task dropdown defaults to `text2img`, which Meshy cannot do at all (it
-        # only turns images into 3D). So the form's untouched default — like a missing
-        # field — keeps default_candidate's `img2mesh`; only a task the user actually
-        # PICKED overrides it. Without this the alias landed in the text2img group.
+    # A cloud alias (Meshy, Tripo) has no workflow at all: its request fields are the
+    # fixed label table in the kind's module, its per-backend half is a set of admin
+    # options. Registering creates the default candidate; everything else is edited in
+    # the alias editor. The KIND comes from the picked backend, and a name is unique only
+    # per type (a ComfyUI and a Meshy backend may both be called "gpu") — so match on
+    # (name, type) instead of trusting whichever same-named backend comes first.
+    bt = next((b.get("type") for b in _gen_backends()
+               if b["name"] == backend and b.get("type") in adapters.CLOUD_TYPES), None)
+    if bt:
+        cand = adapters.cloud_module(bt).default_candidate(backend)
+        # The task dropdown defaults to `text2img`, which no cloud backend can do at all
+        # (they only turn images into 3D). So the form's untouched default — like a
+        # missing field — keeps default_candidate's `img2mesh`; only a task the user
+        # actually PICKED overrides it. Without this the alias landed in the text2img group.
         if picked_task and picked_task != "text2img":
             cand["task"] = picked_task
         store.upsert(alias, [cand])
-        logger.info(f"ui: registered '{alias}' -> {backend} (meshy, no workflow)")
+        logger.info(f"ui: registered '{alias}' -> {backend} ({bt}, no workflow)")
         return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
     try:
         if isinstance(upload, (bytes, bytearray)) and upload.strip():
@@ -2806,13 +2854,13 @@ def _reorder_js(alias: str) -> str:
 
 
 def _same_kind(cands: list, backend_name: str) -> bool:
-    """An alias is homogeneous: ComfyUI candidates only or Meshy candidates only (the
-    editor, schema and playground read the FIRST candidate as the alias's shape).
+    """An alias is homogeneous: candidates of ONE kind only — ComfyUI, or one cloud kind
+    (the editor, schema and playground read the FIRST candidate as the alias's shape).
 
     Backends are keyed (name, type), so a bare-name lookup could answer about the
     same-named backend of the OTHER kind — match on the wanted kind directly."""
-    want_meshy = bool(cands) and cands[0].get("meshy") is not None
-    return any(x["name"] == backend_name and (x.get("type") == "meshy") == want_meshy
+    want = adapters.cand_kind(cands[0]) if cands else "comfyui"
+    return any(x["name"] == backend_name and adapters.backend_kind(x) == want
                for x in _gen_backends())
 
 
@@ -3044,12 +3092,14 @@ def _chain_section(wf: dict, cands: list) -> str:
     if cur_exp and not listed:                       # keep a stale choice visible instead of silently clearing
         node_opts += f'<option value="{_esc(cur_exp)}" selected>{_esc(cur_exp)} — (stale: node missing)</option>'
     cur_relay = (s.get("relay") or "path").strip().lower()
-    # A Meshy successor never reads a shared disk — the mesh always travels as bytes.
-    # Offering a hand-off choice there would only let the user pick one that is ignored.
-    succ_meshy = (store.get(str(s.get("alias") or "").strip()) or [{}])[0].get("meshy") is not None
-    if succ_meshy:
+    # A cloud successor (Meshy, Tripo) never reads a shared disk — the mesh always travels
+    # as bytes. Offering a hand-off choice there would only let the user pick one that is
+    # ignored.
+    succ_kind = adapters.cloud_kind((store.get(str(s.get("alias") or "").strip()) or [{}])[0])
+    if succ_kind:
         relay_field = ('<input type="hidden" name="chain_relay" value="upload">'
-                       '<p class="hint" style="margin:0">upload — forced: the successor runs on Meshy</p>')
+                       '<p class="hint" style="margin:0">upload — forced: the successor runs on '
+                       f'{adapters.cloud_module(succ_kind).VENDOR}</p>')
     else:
         relay_opts = "".join(
             f'<option value="{v}"{" selected" if cur_relay == v else ""}>{lbl}</option>'
@@ -3059,7 +3109,8 @@ def _chain_section(wf: dict, cands: list) -> str:
     return ("<h2 style='margin-top:18px'>Chain (successor)</h2>"
             "<p class='hint'>Optional: run a second alias after this one and deliver only its result — "
             "e.g. mesh here, rigging as the successor (a ComfyUI rigger on the same or another backend, "
-            "or a Meshy rigging alias). The path hand-off needs the backend's <b>comfy output dir</b>; "
+            "or a cloud rigging alias — Meshy-Rig, Tripo-Rig). The path hand-off needs the backend's "
+            "<b>comfy output dir</b>; "
             "the upload hand-off does not. Leave the successor blank for a normal single-stage alias.</p>"
             + _field("successor alias", _inp("successor", s.get("alias", ""),
                      placeholder="e.g. mesh-reg-mia"), short=True)
@@ -3079,20 +3130,22 @@ def _chain_section(wf: dict, cands: list) -> str:
               "successor candidate, preferring the same backend as stage 1; so only list the successor on "
               "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
               "threaded to the successor by matching param name. The successor may also be a "
-              "<b>Meshy alias</b> (e.g. <code>Meshy-Rig</code>, endpoint <code>rigging</code>) — the mesh then "
-              "travels to Meshy as bytes (the hand-off setting is ignored), the <b>mesh param</b> must be one "
+              "<b>cloud alias</b> (e.g. <code>Meshy-Rig</code> endpoint <code>rigging</code>, "
+              "<code>Tripo-Rig</code> endpoint <code>rig</code>) — the mesh then travels to that vendor as "
+              "bytes (the hand-off setting is ignored), the <b>mesh param</b> must be one "
               "of that alias's file fields (<code>input_mesh_path</code>) and the <b>delivered rig type</b> is "
-              "<code>meshy</code>.</p>"
+              "<code>meshy</code> / <code>tripo</code>.</p>"
             + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
                      placeholder="e.g. *_basecolor*.png"), short=True)
             + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
-                     placeholder="blank · mixamo · generic · meshy"), short=True)
+                     placeholder="blank · mixamo · generic · meshy · tripo"), short=True)
             + "<p class='hint'><b>keep from this stage</b>: globs for files THIS (mesh) stage produces that "
               "must ship with the successor's result — e.g. the <code>*_basecolor*.png</code> the texturing "
               "bakes here (the UniRig fbx only references its texture). <b>delivered rig type</b>: set "
               "<code>generic</code>/<code>mixamo</code> to tag + validate the COMBINED delivery at the chain "
-              "level (generic needs fbx + basecolor); <code>meshy</code> (a cloud rig) is only tagged, never "
-              "re-normalized or validated. Blank = trust the successor's own output config.</p>"
+              "level (generic needs fbx + basecolor); <code>meshy</code>/<code>tripo</code> (a cloud rig) are "
+              "only tagged, never re-normalized or validated. Blank = trust the successor's own output "
+              "config.</p>"
             + _chain_rig_warning(wf, s))
 
 
@@ -3196,32 +3249,86 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             f"{body}{add_sel}")
 
 
-def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
-    """Editor for a Meshy alias: endpoint, model and the admin option defaults — no
-    workflow, no mapping, no pins (the public fields are a fixed table, see meshy.py).
-    It DOES carry the chain successor: a Meshy alias can be stage 1 (mesh here, rigging
-    in the successor) — without an export node or a hand-off choice, because the mesh
-    comes back as a result blob and always travels to stage 2 as bytes."""
+def _option_rows(mod, opts: dict, ep: str) -> str:
+    """The vendor option block of a cloud alias editor, rendered from `mod.OPTION_FIELDS`.
+
+    Consecutive bool fields whose label is "" share the previous field's row (Meshy's
+    `texture` row = should_texture + enable_pbr). `rig_only` fields carry a marker
+    outside the rig endpoint but are still rendered and saved — switching an alias's
+    endpoint back and forth must not silently drop what the other endpoint needs."""
+    rows, pending_label, pending_ctrls, pending_hint = [], None, [], ""
+
+    def flush():
+        if pending_ctrls:
+            rows.append(_field(pending_label or "", "".join(pending_ctrls)))
+            if pending_hint:
+                rows.append(f"<p class='hint' style='margin:-4px 0 10px'>{pending_hint}</p>")
+
+    for fld in mod.OPTION_FIELDS:
+        k, t, label = fld["key"], fld["type"], fld.get("label", fld["key"])
+        # plain text, not markup: both _field and _checkbox escape their label. It rides
+        # on the row label, except for a blank-label box that HAS no row label of its own.
+        rig_mark = " (rig only)" if fld.get("rig_only") and ep != mod.RIG_ENDPOINT else ""
+        if t == "bool":
+            txt = fld.get("checkbox_text") or k
+            if label == "" and pending_ctrls:
+                pending_ctrls.append(_checkbox(f"opt__{k}", bool(opts.get(k)), txt + rig_mark))
+                pending_hint = fld.get("hint") or pending_hint
+                continue
+            flush()
+            pending_label = label + rig_mark
+            pending_ctrls = [_checkbox(f"opt__{k}", bool(opts.get(k)), txt)]
+            pending_hint = fld.get("hint") or ""
+            continue
+        flush()
+        pending_label, pending_ctrls, pending_hint = None, [], ""
+        if t == "select":
+            # _select treats a bare list as a scalar option — its choices must be TUPLES
+            choices = [tuple(c) if isinstance(c, (tuple, list)) else (c, c) for c in fld["choices"]]
+            ctrl = _select(f"opt__{k}", choices, cloudtask.field_value_str(fld, opts.get(k)))
+        elif t == "tristate":
+            ctrl = _select(f"opt__{k}", [("", "model default"), ("true", "always"), ("false", "never")],
+                           cloudtask.field_value_str(fld, opts.get(k)))
+        else:                                   # int | text | list
+            ctrl = _inp(f"opt__{k}", cloudtask.field_value_str(fld, opts.get(k)),
+                        placeholder=fld.get("placeholder", ""), typ="number" if t == "int" else "text")
+        rows.append(_field(label + rig_mark, ctrl, short=(t == "int")))
+        if fld.get("hint"):
+            rows.append(f"<p class='hint' style='margin:-4px 0 10px'>{fld['hint']}</p>")
+    flush()
+    return "".join(rows)
+
+
+def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False) -> str:
+    """Editor for a cloud alias (Meshy, Tripo): endpoint, ai model and the admin option
+    defaults — no workflow, no mapping, no pins (the public fields are a fixed table, see
+    the vendor module). Everything vendor-specific is READ from that module (OPTION_FIELDS,
+    the endpoint/model/format tuples, the two hints), so a second cloud kind gets this
+    editor instead of a fork of it — and a vendor option can never be offered here without
+    the request builder knowing it.
+    It DOES carry the chain successor: a cloud alias can be stage 1 (mesh here, rigging in
+    the successor) — without an export node or a hand-off choice, because the mesh comes
+    back as a result blob and always travels to stage 2 as bytes."""
+    mod = adapters.cloud_module(kind)
+    vendor = mod.VENDOR
     cand = cands[0]
     s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
     keep = [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]
     rig_cur = (s.get("rig") or "").strip()
-    rig_opts: list = [("", "blank — trust the successor"), "mixamo", "generic", "meshy"]
+    rig_opts: list = [("", "blank — trust the successor"), "mixamo", "generic", "meshy", "tripo"]
     if rig_cur and rig_cur not in rig_opts:      # keep an unknown stored value visible
         rig_opts.append((rig_cur, f"{rig_cur} — (unknown)"))   # …a Save would clear it otherwise
-    ep = meshy.endpoint_of(cand)
-    opts = meshy.options_of(cand)
-    model = cand.get("model") if cand.get("model") in meshy.AI_MODELS else "latest"
+    ep = mod.endpoint_of(cand)
+    opts = mod.options_of(cand)
+    model = cand.get("model") if cand.get("model") in mod.AI_MODELS else mod.AI_MODELS[0]
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "img2mesh"
-    # rigging answers with glb/fbx only (meshy.options_of filters server-side either way,
-    # so a stored alias that is switched TO rigging cannot keep an impossible format)
+    # the rig endpoint answers with a narrower format set (options_of filters either way,
+    # so a stored alias that is switched TO it cannot keep an impossible format)
     fmts = "".join(f'<label style="margin-right:10px"><input type="checkbox" name="fmt__{_esc(f)}"'
                    f'{" checked" if f in opts["target_formats"] else ""}> {_esc(f)}</label>'
-                   for f in (meshy.RIG_FORMATS if ep == "rigging" else meshy.FORMATS))
-    cb = lambda k, txt: _checkbox(f"opt__{k}", bool(opts.get(k)), txt)
-    remesh = {None: "", True: "true", False: "false"}.get(opts.get("should_remesh"), "")
-    params, images, files = meshy.public_fields(cand)
+                   for f in (mod.RIG_FORMATS if ep == mod.RIG_ENDPOINT else mod.FORMATS))
+    params, images, files = adapters.public_fields(cand)
     fields = "".join(f"<tr><td><code>{_esc(i['name'])}</code></td><td>image · {_esc(i['on_empty'])}</td></tr>"
                      for i in images)
     fields += "".join(f"<tr><td><code>{_esc(x['name'])}</code></td><td>file · "
@@ -3232,49 +3339,21 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                       f"{' · default ' + _esc(str(p['default'])) if p.get('default') not in (None, '') else ''}"
                       f"{' · ' + '/'.join(_esc(c or 'none') for c in p['choices']) if p.get('choices') else ''}"
                       "</td></tr>" for p in params)
-    return (f'<form action="/ui/mapping/meshy-update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
+    ignored = getattr(mod, "IGNORED_PARAMS", ())
+    ign_hint = (" " + " / ".join(f"<code>{_esc(n)}</code>" for n in ignored)
+                + " are accepted and ignored.") if ignored else ""
+    return (f'<form action="/ui/mapping/cloud-update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
             + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "") + "</div>"
             + _field("alias name", _inp("new_alias", alias), short=True)
             + _field("task", _task_select(cur_task), short=True)
-            + '<h2 style="margin-top:18px">Meshy</h2>'
-            + _field("endpoint", _select("meshy_endpoint", list(meshy.ENDPOINTS), ep))
-            + "<p class='hint' style='margin:-4px 0 10px'><b>image-to-3d</b> takes <code>input_image</code>; "
-              "<b>multi-image-to-3d</b> takes <code>input_image_front</code> (required) plus optional "
-              "<code>_back/_left/_right</code> — the same slot names as the Trellis2 multiview alias. "
-              "<b>rigging</b> takes no image at all: it rigs an uploaded <code>input_mesh_path</code> "
-              "(a <code>.glb</code> biped, 5 credits) and ignores every option below except "
-              "<b>deliver formats</b> (glb/fbx) and <b>animations</b>.</p>"
-            + _field("ai model", _select("meshy_model", list(meshy.AI_MODELS), model))
-            + _field("texture", cb("should_texture", "should_texture") + cb("enable_pbr", "enable_pbr (PBR maps)"))
-            + _field("texture resolution", _select("opt__texture_resolution", list(meshy.TEXTURE_RES),
-                                                   opts["texture_resolution"]))
-            + "<p class='hint' style='margin:-4px 0 10px'>Default when the client sends no "
-              "<code>input_texture_resolution</code> (≤2048 → 2k, ≤4096 → 4k, else 8k). 4k/8k need Meshy-6+.</p>"
-            + _field("topology", _select("opt__topology", list(meshy.TOPOLOGIES), opts["topology"]))
-            + _field("remesh", _select("opt__should_remesh",
-                                       [("", "model default"), ("true", "always"), ("false", "never")], remesh))
-            + "<p class='hint' style='margin:-4px 0 10px'>A client <code>input_face_num</code> always turns "
-              "remesh on for that request (a polycount needs the remesh pass).</p>"
-            + _field("target polycount", _inp("opt__target_polycount",
-                                              "" if opts.get("target_polycount") is None
-                                              else str(opts["target_polycount"]),
-                                              placeholder="blank = Meshy default / no remesh",
-                                              typ="number"), short=True)
-            + "<p class='hint' style='margin:-4px 0 10px'>Face budget applied when the client sends no "
-              "<code>input_face_num</code> (100–300000; turns remesh on). A client value still wins. "
-              "An alias that <b>chains into a rigger</b> should stay ≤ 300000: Meshy's rigging endpoint "
-              "refuses more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02), "
-              "which is a mesh the hand-off then has to push through as base64.</p>"
-            + _field("pose", _select("opt__pose_mode", [(p, p or "none") for p in meshy.POSES],
-                                     opts.get("pose_mode") or ""))
-            + _field("input", cb("image_enhancement", "image_enhancement") + cb("remove_lighting", "remove_lighting")
-                     + cb("moderation", "moderation"))
-            + _field("ultra", cb("ultra_mode", "ultra_mode (+5 credits, Meshy-7 only)"))
+            + f'<h2 style="margin-top:18px">{_esc(vendor)}</h2>'
+            + _field("endpoint", _select("cloud_endpoint", list(mod.ENDPOINTS), ep))
+            + f"<p class='hint' style='margin:-4px 0 10px'>{mod.ENDPOINT_HINT}</p>"
+            + _field("ai model", _select("cloud_model", list(mod.AI_MODELS), model))
+            + _option_rows(mod, opts, ep)
             + _field("deliver formats", fmts)
-            + _field("animations", cb("animations", "rigging only: also deliver walking/running clips"))
-            + _field("thumbnail", cb("thumbnail", "deliver Meshy's preview.png as an extra image artifact"))
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
             + '<h2 style="margin-top:18px">Chain (successor)</h2>'
@@ -3288,38 +3367,34 @@ def _meshy_editor(alias: str, cands: list, saved: bool = False) -> str:
                      placeholder="e.g. preview.png"), short=True)
             + _field("delivered rig type", _select("chain_rig", rig_opts, rig_cur), short=True)
             + "<p class='hint'>The mesh (glb) is relayed as <b>bytes</b> to the successor's backend — no "
-              "export node, no hand-off choice (a Meshy stage shares no disk with anything). It arrives "
-              "under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh workflows "
-              "label their mesh input), which must be a request field (param or label) of "
-              "the successor. The successor may itself be a <b>Meshy alias</b> (e.g. "
-              "<code>Meshy-Rig</code>, endpoint <code>rigging</code>) — it then takes the mesh as its file "
-              "field <code>input_mesh_path</code>, and the <b>delivered rig type</b> is <code>meshy</code>. "
-              "<b>keep from this stage</b>: globs for files THIS stage produces that must ship "
-              "with the successor's result (Meshy embeds its texture in the GLB, so this is usually empty — "
-              "<code>preview.png</code> is the one candidate). <b>delivered rig type</b> tags the delivery; "
+              f"export node, no hand-off choice (a {_esc(vendor)} stage shares no disk with anything). It "
+              "arrives under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh "
+              "workflows label their mesh input), which must be a request field (param or label) of the "
+              "successor. <b>keep from this stage</b>: globs for files THIS stage produces that must ship "
+              "with the successor's result. <b>delivered rig type</b> tags the delivery; "
               "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
-              "level, <code>meshy</code> is only tagged (Meshy rigs to its own conventions). Requires "
-              "<code>glb</code> in <b>deliver formats</b> — the job is refused up front otherwise, before "
-              "credits are spent. Any OTHER format in <b>deliver formats</b> is wasted on a chained "
-              "alias: Meshy bills every one of them, but only the successor's result (plus what "
-              "<b>keep from this stage</b> matches) is delivered — the rest is discarded.</p>"
+              "level, <code>meshy</code>/<code>tripo</code> are only tagged (a cloud vendor rigs to its own "
+              "conventions). Requires <code>glb</code> in <b>deliver formats</b> — the job is refused up "
+              f"front otherwise, before credits are spent. {mod.CHAIN_HINT}</p>"
             + '<h2 style="margin-top:18px">Request fields</h2>'
-            + "<p class='hint'>Fixed for Meshy aliases — what <code>GET /v1/generations/{alias}/schema</code> "
-              "advertises. <code>input_remove_background</code> / <code>input_no_fingers</code> are accepted "
-              "and ignored.</p>"
+            + f"<p class='hint'>Fixed for {_esc(vendor)} aliases — what "
+              f"<code>GET /v1/generations/{{alias}}/schema</code> advertises.{ign_hint}</p>"
             + f"<table class='pins'><tr><th>name</th><th>type</th></tr>{fields}</table>"
             + "</form>"
             + '<h2 style="margin-top:18px">Backends</h2>'
             + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free one; on a "
-              "connection error the next one is used. Only Meshy backends can be added to a Meshy alias.</p>"
+              f"connection error the next one is used. Only {_esc(vendor)} backends can be added to a "
+              f"{_esc(vendor)} alias.</p>"
             + _backends_section(alias, cands))
 
 
-# The editor's third column ("Available fields") is a workflow view — a Meshy alias
-# has no workflow, so it carries the reason instead of rendering empty.
-_MESHY_SIDE = ("<h2>Available fields</h2><p class='hint'>A Meshy alias has no workflow: its request "
-               "fields are the fixed table in the editor, and everything else is an admin option "
-               "set on the left.</p>")
+def _cloud_side(kind: str) -> str:
+    """The editor's third column ("Available fields") is a workflow view — a cloud alias
+    has no workflow, so it carries the reason instead of rendering empty."""
+    vendor = adapters.cloud_module(kind).VENDOR
+    return (f"<h2>Available fields</h2><p class='hint'>A {_esc(vendor)} alias has no workflow: its request "
+            "fields are the fixed table in the editor, and everything else is an admin option "
+            "set on the left.</p>")
 
 
 async def _alias_editor(alias: str, saved: bool = False) -> str:
@@ -3331,8 +3406,9 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     if not cands:
         return f'<p class="bad">alias \'{_esc(alias)}\' not found</p>'
     cand = cands[0]
-    if cand.get("meshy") is not None:            # no workflow, no mapping, no /object_info
-        return _meshy_editor(alias, cands, saved), _MESHY_SIDE
+    kind = adapters.cloud_kind(cand)             # no workflow, no mapping, no /object_info
+    if kind:
+        return _cloud_editor(kind, alias, cands, saved), _cloud_side(kind)
     wf = cand.get("workflow_json")
     if wf is None and cand.get("workflow"):
         try:
@@ -3790,14 +3866,18 @@ async def update(request: Request):
     succ_alias = (f.get("successor", "") or "").strip()
     keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
     relay = (f.get("chain_relay", "") or "path").strip().lower()
-    # A Meshy successor has exactly one file field and no mapping to rename it, so a
-    # blank mesh param must default to ITS name (`input_mesh_path`) — ComfyUI's
-    # `mesh_path` would be a param the Meshy stage cannot bind.
-    succ_meshy = (store.get(succ_alias) or [{}])[0].get("meshy") is not None
+    # A cloud successor (Meshy, Tripo) has exactly one file field and no mapping to rename
+    # it, so a blank mesh param must default to ITS name (`input_mesh_path`) — ComfyUI's
+    # `mesh_path` would be a param the cloud stage cannot bind. Read off the successor's
+    # own file fields rather than hard-coding a name per vendor.
+    succ_cand = (store.get(succ_alias) or [{}])[0]
+    succ_kind = adapters.cloud_kind(succ_cand)
+    files = adapters.public_fields(succ_cand)[2] if succ_kind else []
     succ = ({"alias": succ_alias,
              "export_node": (f.get("chain_export_node", "") or "").strip(),
              "mesh_param": ((f.get("chain_mesh_param", "") or "").strip()
-                            or ("input_mesh_path" if succ_meshy else "mesh_path")),
+                            or (files[0]["name"] if files else
+                                ("input_mesh_path" if succ_kind else "mesh_path"))),
              **({"relay": relay} if relay == "upload" else {}),
              **({"keep_from_mesh": keep} if keep else {}),
              **({"rig": (f.get("chain_rig", "") or "").strip()} if (f.get("chain_rig", "") or "").strip() else {})}
@@ -3818,35 +3898,25 @@ async def update(request: Request):
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
-async def meshy_update(request: Request):
-    """Save a Meshy alias: endpoint + ai model + the admin options, on EVERY candidate
-    (they are the alias's shape, not per-backend). Refuses a ComfyUI alias — its
-    fields live in /ui/mapping/update."""
-    f = await _form(request)
-    alias = (f.get("alias", "") or "").strip()
-    cands = store.get(alias)
-    if not alias or not cands or cands[0].get("meshy") is None:
-        raise HTTPException(404, "meshy alias not found")
-    ep = (f.get("meshy_endpoint", "") or "").strip()
-    model = (f.get("meshy_model", "") or "").strip()
-    opts = dict(meshy.OPTION_DEFAULTS)
-    for k in ("should_texture", "enable_pbr", "ultra_mode", "image_enhancement",
-              "remove_lighting", "moderation", "thumbnail", "animations"):
-        opts[k] = bool(f.get(f"opt__{k}"))
-    tr = (f.get("opt__texture_resolution", "") or "").strip()
-    opts["texture_resolution"] = tr if tr in meshy.TEXTURE_RES else "2k"
-    tp = (f.get("opt__topology", "") or "").strip()
-    opts["topology"] = tp if tp in meshy.TOPOLOGIES else "triangle"
-    opts["should_remesh"] = {"true": True, "false": False}.get((f.get("opt__should_remesh", "") or "").strip())
-    pm = (f.get("opt__pose_mode", "") or "").strip()
-    opts["pose_mode"] = pm if pm in meshy.POSES else ""
-    # blank or garbage → None (Meshy's default, no remesh); meshy.opt_polycount owns
-    # the range check, so the editor and the request builder cannot drift apart.
-    opts["target_polycount"] = meshy.opt_polycount((f.get("opt__target_polycount", "") or "").strip())
-    opts["target_formats"] = [x for x in meshy.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
+def _cloud_update_apply(kind: str, cands: list, f: dict) -> None:
+    """Apply a cloud alias form to EVERY candidate (they are the alias's shape, not
+    per-backend). Options go through `parse_options` (the schema) and then the module's
+    `options_of` (the same normalization the request builder applies), so what is stored
+    is exactly what will be sent — a combination the vendor refuses cannot survive a Save
+    and turn up as a 400 on a paid request."""
+    mod = adapters.cloud_module(kind)
+    ep = (f.get("cloud_endpoint", "") or "").strip()
+    ep = ep if ep in mod.ENDPOINTS else mod.ENDPOINTS[0]
+    model = (f.get("cloud_model", "") or "").strip()
+    model = model if model in mod.AI_MODELS else mod.AI_MODELS[0]
+    opts = cloudtask.parse_options(mod.OPTION_FIELDS, f, mod.OPTION_DEFAULTS)
+    # ASSIGN, never mutate: parse_options shallow-copies the defaults, so appending here
+    # would rewrite OPTION_DEFAULTS["target_formats"] for every future alias.
+    opts["target_formats"] = [x for x in mod.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
+    opts = mod.options_of({mod.KIND: {"endpoint": ep, "options": opts}, "model": model})
     task = (f.get("task", "") or "").strip()
     retries = (f.get("retries", "") or "").strip()
-    # chain successor (blank alias → not a chain). No export_node and no relay: a Meshy
+    # chain successor (blank alias → not a chain). No export_node and no relay: a cloud
     # stage's mesh is a result blob and always travels to stage 2 as bytes (_run_chain
     # forces `upload`), so those two ComfyUI fields would only be misleading here.
     succ_alias = (f.get("successor", "") or "").strip()
@@ -3860,9 +3930,8 @@ async def meshy_update(request: Request):
     for c in cands:
         # a fresh options dict per candidate — one shared object would let a later
         # in-place edit of one candidate rewrite the others
-        c["meshy"] = {"endpoint": ep if ep in meshy.ENDPOINTS else meshy.ENDPOINTS[0],
-                      "options": json.loads(json.dumps(opts))}
-        c["model"] = model if model in meshy.AI_MODELS else "latest"
+        c[mod.KIND] = {"endpoint": ep, "options": json.loads(json.dumps(opts))}
+        c["model"] = model
         c["retries"] = retries
         if succ:
             c["successor"] = json.loads(json.dumps(succ))    # own copy per candidate (see above)
@@ -3870,12 +3939,25 @@ async def meshy_update(request: Request):
             c.pop("successor", None)
         if task:
             c["task"] = task
+
+
+async def cloud_update(request: Request):
+    """Save a cloud alias (Meshy, Tripo): endpoint + ai model + the admin options, on
+    every candidate. Refuses a ComfyUI alias — its fields live in /ui/mapping/update."""
+    f = await _form(request)
+    alias = (f.get("alias", "") or "").strip()
+    cands = store.get(alias) if alias else []
+    kind = adapters.cloud_kind(cands[0]) if cands else None
+    if not kind:
+        raise HTTPException(404, "cloud alias not found")
+    _cloud_update_apply(kind, cands, f)
     new_alias = (f.get("new_alias", "") or "").strip()
     if new_alias and new_alias != alias and not store.get(new_alias):
         store.delete(alias)            # rename: move under the new name
         alias = new_alias
     store.upsert(alias, cands)
-    logger.info(f"ui: updated meshy alias '{alias}' ({cands[0]['meshy']['endpoint']}, {cands[0]['model']})")
+    logger.info(f"ui: updated {kind} alias '{alias}' "
+                f"({cands[0][kind]['endpoint']}, {cands[0]['model']})")
     return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
 
 
@@ -4020,15 +4102,15 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     imgset = set(adapters.image_params(wf, mapping))
     defaults = _alias_defaults(cand) if cand else {}
     rows = ""
-    # A Meshy alias has no workflow to read fields off — its public fields are the
-    # fixed label table (same source the schema endpoint uses), so they are rendered
-    # from adapters.public_fields and the workflow-driven loop below is skipped.
-    if cand and cand.get("meshy") is not None:
+    # A cloud alias (Meshy, Tripo) has no workflow to read fields off — its public fields
+    # are the fixed label table (same source the schema endpoint uses), so they are
+    # rendered from adapters.public_fields and the workflow-driven loop below is skipped.
+    if cand and adapters.cloud_kind(cand):
         params, images, mfiles = adapters.public_fields(cand)
         for x in mfiles:
             # Same row as a ComfyUI mesh param (upload or an earlier job's artifact) —
-            # WITHOUT the "path on the backend" field: Meshy reads the bytes out of the
-            # request, there is no backend disk a path could point into.
+            # WITHOUT the "path on the backend" field: Meshy/Tripo read the bytes out of
+            # the request, there is no backend disk a path could point into.
             acc = ",".join("." + a for a in (x.get("accept") or [])) or _PG_FILE_ACCEPT
             extra = (kept_badge(x["name"], show_name=True) if kept and x["name"] in kept else
                      ' <span class="muted">required</span>' if x.get("required") else "")
@@ -4205,9 +4287,9 @@ async def playground_page(request: Request):
     vals = {"model": model, "backend": qp.get("backend", "")}
     defaults = _alias_defaults(cand) if cand else {}
     # the alias's public param names: a mapping for a ComfyUI alias, the fixed label
-    # table for a Meshy one — without this a p__<field> from the URL (Send to
-    # Playground, or the post-Generate redirect) would never reach the form
-    if cand and cand.get("meshy") is not None:
+    # table for a cloud one (Meshy, Tripo) — without this a p__<field> from the URL
+    # (Send to Playground, or the post-Generate redirect) would never reach the form
+    if cand and adapters.cloud_kind(cand):
         _pf, _, _ff = adapters.public_fields(cand)
         pnames = [x["name"] for x in _pf] + [x["name"] for x in _ff]
     else:
@@ -4295,10 +4377,10 @@ async def generate(request: Request):
             stash[p] = got
     # only the slots/params this alias actually has ride along — the stash may carry
     # another alias's inputs (that is the point of it surviving a model switch).
-    if cand and cand.get("meshy") is not None:
+    if cand and adapters.cloud_kind(cand):
         _, m_imgs, m_files = adapters.public_fields(cand)
         slots = {i["name"] for i in m_imgs}
-        fset = {x["name"] for x in m_files}           # rigging: input_mesh_path
+        fset = {x["name"] for x in m_files}           # a rigging alias: input_mesh_path
     else:
         slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
         fset = set(adapters.file_params(wf_i, map_i))
@@ -4896,23 +4978,43 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
 
 
-def _meshy_table(title: str, m: dict) -> str:
-    """One Meshy run in the job view: the body actually sent (image data replaced by its
-    size) plus the task id — the id is what Meshy's own dashboard is searched by, and the
-    body answers "which options did this run use?" without re-deriving them from today's
-    config. '' when `m` is not a Meshy run (no task id), so a chain renders a table per
-    Meshy STAGE: the top-level meta is the last stage's, a stage-1 Meshy run is kept
-    beside it under `meta.chain_stage1`."""
-    if not m.get("meshy_task_id") or not m.get("request"):
+def _cloud_table(title: str, m: dict) -> str:
+    """One cloud run (Meshy, Tripo) in the job view: the body actually sent (image data
+    replaced by its size) plus the task id — the id is what the vendor's own dashboard is
+    searched by, and the body answers "which options did this run use?" without
+    re-deriving them from today's config. '' when `m` is not a cloud run (no task id), so
+    a chain renders a table per cloud STAGE: the top-level meta is the last stage's, a
+    stage-1 cloud run is kept beside it under `meta.chain_stage1`.
+
+    `title` names the stage generically ("Cloud · stage 1"); the VENDOR is substituted
+    from the run's own meta, because the two stages of a chain may be different vendors.
+    `meshy_task_id` is read as well: rows written before the kind existed carry only that
+    key and no `cloud`, and a job view that suddenly renders nothing for them would look
+    like the run was never recorded."""
+    tid = m.get("cloud_task_id") or m.get("meshy_task_id")
+    if not tid or not m.get("request"):
         return ""
+    kind = m.get("cloud") or "meshy"
+    vendor = adapters.cloud_module(kind).VENDOR if kind in adapters.CLOUD_MODULES else str(kind)
     rows = "".join(f"<tr><td><code>{_esc(str(k))}</code></td>"
                    f"<td>{_esc(json.dumps(v) if isinstance(v, (list, dict)) else str(v))}</td></tr>"
                    for k, v in (m.get("request") or {}).items())
     cr = m.get("consumed_credits")
-    return (f"<h3>{_esc(title)} <span class='muted' style='font-weight:normal'>· task "
-            f"<code>{_esc(str(m['meshy_task_id']))}</code> · {_esc(str(m.get('endpoint') or ''))}"
+    # A vendor may run SEVERAL tasks for one generation (Tripo: rig-check, the main task,
+    # every convert and animation clip). Each is billed and each has its own id in the
+    # vendor's dashboard, so they are listed instead of hidden behind the last one.
+    tasks = m.get("tasks") if isinstance(m.get("tasks"), list) else []
+    trows = "".join(f"<tr><td>{_esc(str((t or {}).get('role') or ''))}</td>"
+                    f"<td><code>{_esc(str((t or {}).get('task_id') or ''))}</code></td>"
+                    f"<td>{_esc(str((t or {}).get('credits')))}</td></tr>" for t in tasks)
+    sub = (f"<p class='hint' style='margin:8px 0 2px'>tasks</p>"
+           f"<table><tr><th>role</th><th>task id</th><th>credits</th></tr>{trows}</table>"
+           if trows else "")
+    return (f"<h3>{_esc(title.replace('Cloud', vendor))} "
+            f"<span class='muted' style='font-weight:normal'>· task "
+            f"<code>{_esc(str(tid))}</code> · {_esc(str(m.get('endpoint') or ''))}"
             f"{' · ' + _esc(str(cr)) + ' credits' if cr is not None else ''}</span></h3>"
-            f"<table>{rows}</table>")
+            f"<table>{rows}</table>{sub}")
 
 
 def _stage2_section(s2: dict) -> str:
@@ -4927,20 +5029,21 @@ def _stage2_section(s2: dict) -> str:
     have changed since the run. `applied` is absent when stage 2 never reported back
     (a failed hand-off); the rows then say what the CURRENT config would bind, and say so.
 
-    A **Meshy** successor has no mapping at all — its request fields are a fixed label
-    table (meshy.public_fields) and it reports no `applied` set. Its rows therefore say
-    "handed", never "dropped": claiming a loss nobody measured would send you hunting a
-    mapping that does not exist."""
+    A **cloud** successor (Meshy, Tripo) has no mapping at all — its request fields are a
+    fixed label table (the kind's public_fields) and it reports no `applied` set. Its rows
+    therefore say "handed", never "dropped": claiming a loss nobody measured would send
+    you hunting a mapping that does not exist."""
     alias2, b2 = s2.get("alias") or "?", s2.get("backend") or "?"
     params = s2.get("params") or {}
     mesh_param = s2.get("mesh_param") or ""
     applied = s2.get("applied")               # None → stage 2 never got that far
-    mapping2, meshy2 = {}, False
+    mapping2, cloud2 = {}, None
     if store.is_active():
         cs = store.get(alias2) or []
         c2 = next((x for x in cs if x.get("backend") == b2), cs[0] if cs else None) or {}
         mapping2 = c2.get("mapping") or {}
-        meshy2 = c2.get("meshy") is not None
+        cloud2 = adapters.cloud_kind(c2)
+    vendor2 = adapters.cloud_module(cloud2).VENDOR if cloud2 else ""
 
     def target(k):                            # (node, field) the successor binds `k` to, per CURRENT config
         for p, m in mapping2.items():
@@ -4954,10 +5057,10 @@ def _stage2_section(s2: dict) -> str:
         if k == mesh_param:                   # the mesh itself gets its own line below
             continue
         node, field = target(k)
-        if meshy2:                            # no mapping to look up — and none to miss
+        if cloud2:                            # no mapping to look up — and none to miss
             hit = True
-            tag = "<span class='muted' title='Meshy binds a fixed label table; a name it " \
-                  "does not know is ignored'>handed · Meshy fixed table</span>"
+            tag = (f"<span class='muted' title='{_esc(vendor2)} binds a fixed label table; a name "
+                   f"it does not know is ignored'>handed · {_esc(vendor2)} fixed table</span>")
         elif applied is None:                 # unverified: describe the binding, don't claim it ran
             hit = node is not None
             tag = (f"<span class='muted' title='from the successor alias config as it "
@@ -4981,8 +5084,8 @@ def _stage2_section(s2: dict) -> str:
     warn = ("" if applied is not None else
             " <span class='bad'>· stage 2 did not report back — bindings shown are from "
             "the current alias config</span>")
-    if meshy2:                                # nothing to tally against: no mapping, no `applied`
-        tally = (f"{len(rows)} param(s) handed · Meshy takes its fixed label table and "
+    if cloud2:                                # nothing to tally against: no mapping, no `applied`
+        tally = (f"{len(rows)} param(s) handed · {vendor2} takes its fixed label table and "
                  f"ignores the rest" if rows else "no params handed besides the mesh")
         warn = "" if applied is not None else " <span class='bad'>· stage 2 did not report back</span>"
     mesh = (f"<p style='margin:6px 0'><code>{_esc(mesh_param)}</code> "
@@ -5086,11 +5189,11 @@ async def job_detail_page(job_id: str, request: Request):
     elif meta.get("chain") or cand.get("successor"):
         inbox += ("<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2</span></h3>"
                   "<p class='muted'>Hand-off params not recorded (job predates this feature).</p>")
-    # Meshy runs (task id + the body actually sent + credits — see _meshy_table): a
-    # chain's stage-1 Meshy run FIRST, then the top-level meta (stage 2's on a chain),
-    # so a Meshy→Meshy chain reads in the order it ran.
-    inbox += _meshy_table("Meshy · stage 1", meta.get("chain_stage1") or {})
-    inbox += _meshy_table("Meshy", meta)
+    # Cloud runs (task id + the body actually sent + credits — see _cloud_table): a
+    # chain's stage-1 cloud run FIRST, then the top-level meta (stage 2's on a chain),
+    # so a cloud→cloud chain reads in the order it ran. Each table names its OWN vendor.
+    inbox += _cloud_table("Cloud · stage 1", meta.get("chain_stage1") or {})
+    inbox += _cloud_table("Cloud", meta)
     if st in ("queued", "running"):
         outbox = f"<p>⏳ <b>{_esc(_job_status_text(job))}</b> · this view auto-updates</p>"
     elif st == "failed":
@@ -5163,8 +5266,8 @@ async def job_to_playground(job_id: str, request: Request):
     # "remove background"), because a client sends them under the schema's label.
     # The playground reads p__<param>/img__<param>, so translate external→param;
     # else nothing lands (this was the "Send to Playground does nothing" for mesh).
-    # A Meshy alias has no mapping at all: its external names ARE its param names,
-    # so the empty table below leaves the .get(k, k) lookups as the identity.
+    # A cloud alias (Meshy, Tripo) has no mapping at all: its external names ARE its param
+    # names, so the empty table below leaves the .get(k, k) lookups as the identity.
     mapping = ((store.get(alias) or [{}])[0]).get("mapping") or {}
     ext2param = {}
     for p, m in mapping.items():
@@ -6445,7 +6548,7 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping/bypass-del", bypass_del, methods=["GET"])
     app.add_api_route("/ui/mapping/field-order", field_order, methods=["GET"])
     app.add_api_route("/ui/mapping/update", update, methods=["POST"])
-    app.add_api_route("/ui/mapping/meshy-update", meshy_update, methods=["POST"])
+    app.add_api_route("/ui/mapping/cloud-update", cloud_update, methods=["POST"])
     app.add_api_route("/ui/mapping/export", mapping_export, methods=["GET"])
     app.add_api_route("/ui/mapping/export-all", mapping_export_all, methods=["GET"])
     app.add_api_route("/ui/mapping/copy", copy, methods=["GET"])

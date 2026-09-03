@@ -11,8 +11,19 @@ from __future__ import annotations
 
 import base64
 import copy
-from dataclasses import dataclass, field
 from typing import Optional
+
+from cloudtask import TaskState                # shared with tripo.py; re-exported for callers
+
+# The cloud-kind interface every cloud task module declares (see the design spec
+# 2026-09-03 §3.2): kind key, display name, default backend URL, and which of its
+# ENDPOINTS rigs. Adapter, console editor and `main` read these instead of
+# hard-coding "meshy" a second time for the next vendor.
+KIND, VENDOR, URL = "meshy", "Meshy", "https://api.meshy.ai"
+RIG_ENDPOINT = "rigging"
+SUCCESS_STATUS = "SUCCEEDED"            # the one `TaskState.status` that means delivered
+POLL_INTERVAL_DEFAULT = 5.0             # backend defaults when the form leaves them blank
+MAX_WAIT_DEFAULT = 900
 
 ENDPOINTS = ("image-to-3d", "multi-image-to-3d", "rigging")
 AI_MODELS = ("latest", "meshy-7", "meshy-6", "meshy-5")
@@ -284,21 +295,11 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
     return params, images, files
 
 
-@dataclass
-class TaskState:
-    status: str
-    progress: int = 0
-    error: Optional[str] = None
-    downloads: list = field(default_factory=list)      # [(filename, url)] in requested order
-    thumbnail: Optional[str] = None
-    credits: Optional[int] = None
-
-
 TASK_STATUSES = ("PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED", "CANCELED")
 
 
 def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
-               animations: bool = False) -> TaskState:
+               animations: bool = False, options: Optional[dict] = None) -> TaskState:
     """Read a task object (GET …/{id}). On SUCCEEDED every requested format must have
     a URL — a missing one raises, never a silently smaller delivery.
 
@@ -310,7 +311,13 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
     (a poll must not die on a cosmetic field), and any status outside TASK_STATUSES is
     terminal-FAILED with an explaining error. Falling through as "not finished yet"
     would poll an unknown state until `max_wait` — holding the backend slot for the
-    full wait to learn nothing."""
+    full wait to learn nothing.
+
+    `options` is the whole admin option block, which is what the shared cloud adapter
+    hands every kind (the signature is the same for Meshy and Tripo). Given, it decides
+    the clips; the older `animations` bool stays for direct callers."""
+    if options is not None:
+        animations = bool(options.get("animations"))
     status = str(task.get("status") or "").upper()
     try:
         progress = int(task.get("progress") or 0)
@@ -347,3 +354,61 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
                     if u:
                         st.downloads.append((f"{clip}.{f}", u))
     return st
+
+
+# The console's option form for a Meshy alias — rendered and parsed by admin's cloud
+# editor from THIS table (cloudtask.parse_options). Order = form order. An empty `label`
+# means "same row as the bool field above", which is what keeps Meshy's grouped rows
+# (`texture` = should_texture + enable_pbr, `input` = three boxes) as they are today.
+OPTION_FIELDS: list = [
+    {"key": "should_texture", "label": "texture", "type": "bool"},
+    {"key": "enable_pbr", "label": "", "type": "bool", "checkbox_text": "enable_pbr (PBR maps)"},
+    {"key": "texture_resolution", "label": "texture resolution", "type": "select",
+     "choices": list(TEXTURE_RES),
+     "hint": "Default when the client sends no <code>input_texture_resolution</code> "
+             "(≤2048 → 2k, ≤4096 → 4k, else 8k). 4k/8k need Meshy-6+."},
+    {"key": "topology", "label": "topology", "type": "select", "choices": list(TOPOLOGIES)},
+    {"key": "should_remesh", "label": "remesh", "type": "tristate",
+     "hint": "A client <code>input_face_num</code> always turns remesh on for that request "
+             "(a polycount needs the remesh pass)."},
+    {"key": "target_polycount", "label": "target polycount", "type": "int",
+     "placeholder": "blank = Meshy default / no remesh",
+     "hint": "Face budget applied when the client sends no <code>input_face_num</code> "
+             "(100–300000; turns remesh on). A client value still wins. An alias that "
+             "<b>chains into a rigger</b> should stay ≤ 300000: Meshy's rigging endpoint refuses "
+             "more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02), "
+             "which is a mesh the hand-off then has to push through as base64."},
+    {"key": "pose_mode", "label": "pose", "type": "select", "choices": [(p, p or "none") for p in POSES]},
+    {"key": "image_enhancement", "label": "input", "type": "bool"},
+    {"key": "remove_lighting", "label": "", "type": "bool"},
+    {"key": "moderation", "label": "", "type": "bool"},
+    {"key": "ultra_mode", "label": "ultra", "type": "bool", "checkbox_text": "ultra_mode (+5 credits, Meshy-7 only)"},
+    {"key": "animations", "label": "animations", "type": "bool", "rig_only": True,
+     "checkbox_text": "rigging only: also deliver walking/running clips"},
+    {"key": "thumbnail", "label": "thumbnail", "type": "bool",
+     "checkbox_text": "deliver Meshy's preview.png as an extra image artifact"},
+]
+
+BACKEND_HINT = (
+    "<b>api key</b> (above) is the Meshy key (<code>msy_…</code>, Meshy dashboard → API). "
+    "<b>max_concurrent</b> should stay at or below your Meshy tier's concurrent-task limit — "
+    "this account is on <b>Pro (10)</b> (Studio 20 · Premium 30 · Ultra 100; the limit is shared "
+    "by every key of the account) — beyond it Meshy answers 429 and the job fails over. "
+    "<b>max wait s</b> caps one task incl. Meshy's own queue (blank = 900); <b>poll interval s</b> "
+    "is the gap between task polls (blank = 5). Credits: 20 (no texture) / 30 (textured) / "
+    "35 (8K) per Meshy-6/7 task, +5 ultra; refunded when a task fails. The current balance shows "
+    "in the backend list after the next health poll.")
+ENDPOINT_HINT = (
+    "<b>image-to-3d</b> takes <code>input_image</code>; <b>multi-image-to-3d</b> takes "
+    "<code>input_image_front</code> (required) plus optional <code>_back/_left/_right</code> — the "
+    "same slot names as the Trellis2 multiview alias. <b>rigging</b> takes no image at all: it rigs "
+    "an uploaded <code>input_mesh_path</code> (a <code>.glb</code> biped, 5 credits) and ignores every "
+    "option below except <b>deliver formats</b> (glb/fbx) and <b>animations</b>.")
+CHAIN_HINT = (
+    "The successor may itself be a <b>Meshy alias</b> (e.g. <code>Meshy-Rig</code>, endpoint "
+    "<code>rigging</code>) — it then takes the mesh as its file field <code>input_mesh_path</code>, "
+    "and the <b>delivered rig type</b> is <code>meshy</code>. Meshy embeds its texture in the GLB, so "
+    "<b>keep from this stage</b> is usually empty — <code>preview.png</code> is the one candidate. "
+    "Any OTHER format in <b>deliver formats</b> is wasted on a chained alias: Meshy bills every one "
+    "of them, but only the successor's result (plus what <b>keep from this stage</b> matches) is "
+    "delivered.")

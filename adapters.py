@@ -37,7 +37,9 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import anthropic_bridge
+import cloudtask
 import meshy
+import tripo
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +68,29 @@ class ComfyExecutorStuck(Exception):
     (queue_pending non-empty, queue_running empty, same head across checks)."""
 
 
-class MeshyNoCredits(ConnectionError):
-    """Meshy account has no credits (balance 0 on discovery, 402 on submit). A
-    ConnectionError on purpose: _GEN_FAILOVER_ERRORS moves the job to the next
-    candidate without touching that tuple; _fault_label names it apart."""
+class CloudNoCredits(ConnectionError):
+    """A cloud task account has no credits (balance 0 on discovery; Meshy 402 / Tripo
+    403+2010 on submit). A ConnectionError on purpose: _GEN_FAILOVER_ERRORS moves the job
+    to the next candidate without touching that tuple; _fault_label names it apart and
+    `vendor` says whose account."""
+
+    def __init__(self, msg: str = "", vendor: str = "cloud"):
+        super().__init__(msg)
+        self.vendor = vendor
 
 
-class MeshyBusy(ConnectionError):
-    """Meshy refused the task with 429 (NoMoreConcurrentTasks / RateLimitExceeded):
-    the account's queue limit is full — other API keys of the same account fill it
-    too, so the gateway's own max_concurrent cannot rule it out. Failover-class."""
+class CloudBusy(ConnectionError):
+    """The cloud refused the task with 429 (Meshy NoMoreConcurrentTasks /
+    RateLimitExceeded): the account's concurrency limit is full — other API keys of the
+    same account fill it too, so the gateway's own max_concurrent cannot rule it out.
+    Failover-class."""
+
+    def __init__(self, msg: str = "", vendor: str = "cloud"):
+        super().__init__(msg)
+        self.vendor = vendor
+
+
+MeshyNoCredits, MeshyBusy = CloudNoCredits, CloudBusy   # pre-Tripo names (main._fault_label, tests)
 
 
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
@@ -226,10 +241,54 @@ class NormalizedRequest:
                                                     # for workflows that legitimately export a 1x1/2x2 texture)
     bypass: list = field(default_factory=list)      # per-backend node ids to bypass (ComfyUI mode-4: remove
                                                     # the node, rewire consumers to its same-typed input)
-    meshy: Optional[dict] = None                    # Meshy alias candidate block {endpoint, options}
-                                                    # (cand["meshy"]); None on ComfyUI candidates
+    cloud: Optional[dict] = None                    # cloud alias candidate block {endpoint, options} of
+                                                    # whatever kind — `cloud_block(cand)`; None on ComfyUI
+                                                    # candidates
+    meshy: Optional[dict] = None                    # the pre-Tripo name of `cloud`, kept so existing
+                                                    # callers keep constructing a Meshy request the old
+                                                    # way; folded into `cloud` below, nothing reads it
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
+
+    def __post_init__(self):
+        if self.cloud is None and self.meshy is not None:
+            self.cloud = self.meshy
+
+
+# ── cloud task kinds (Meshy, Tripo): the one seam main/admin ask "which kind?" ──
+CLOUD_MODULES: dict = {meshy.KIND: meshy, tripo.KIND: tripo}     # kind → pure module
+
+
+def cloud_kind(cand: dict) -> Optional[str]:
+    """The cloud kind of a generation alias candidate (the key its block sits under),
+    None for a ComfyUI (workflow) candidate."""
+    for k in CLOUD_MODULES:
+        if (cand or {}).get(k) is not None:
+            return k
+    return None
+
+
+def cand_kind(cand: dict) -> str:
+    return cloud_kind(cand) or "comfyui"
+
+
+def backend_kind(b: dict) -> str:
+    """A generation backend's kind: its type for a cloud backend, else comfyui. A
+    candidate may run on a backend iff cand_kind(cand) == backend_kind(b) — backends are
+    keyed (name, type), so a bare-name match could route a cloud alias onto a GPU box."""
+    t = (b or {}).get("type")
+    return t if t in CLOUD_MODULES else "comfyui"
+
+
+def cloud_module(kind: str):
+    return CLOUD_MODULES[kind]
+
+
+def cloud_block(cand: dict) -> Optional[dict]:
+    """The candidate's cloud block, whatever kind it is — what NormalizedRequest.cloud
+    carries. A copy: the request must not write through into the stored candidate."""
+    k = cloud_kind(cand)
+    return dict(cand.get(k) or {}) if k else None
 
 
 @dataclass
@@ -1554,14 +1613,15 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
     """The public request fields of a generation alias candidate — what the schema
     endpoint advertises, the playground renders and the OpenAI shims map reference
     images onto. ONE seam for both candidate kinds: a ComfyUI candidate derives them
-    from workflow + mapping (labels are the external names), a Meshy candidate from
-    its fixed label table (meshy.public_fields).
+    from workflow + mapping (labels are the external names), a cloud candidate from
+    its fixed label table (<kind>.public_fields).
 
     Three lists: params (scalars), images (loader slots) and files (uploads that are
     not images — a mesh). A ComfyUI file param ALSO stays in `params`: there it is the
     backend-side path, which is the second, upload-free way to name the same input."""
-    if cand.get("meshy") is not None:
-        return meshy.public_fields(cand)
+    k = cloud_kind(cand)
+    if k:
+        return cloud_module(k).public_fields(cand)
     wf = cand.get("workflow_json") or {}
     mapping = cand.get("mapping") or {}
     files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p, "required": False}
@@ -3020,105 +3080,136 @@ class ComfyUIAdapter(BackendAdapter):
         return blobs
 
 
-# ── Meshy.ai (cloud image → 3D) ───────────────────────────────────────────────
+# ── Cloud task backends (Meshy, Tripo): POST a task, poll, download ────────────
 
-_MESHY_API = "/openapi/v1"
-_MESHY_DISCOVERY_TIMEOUT = 8.0
-_MESHY_HTTP_TIMEOUT = 30.0
-_MESHY_DOWNLOAD_TIMEOUT = 120.0
+_CLOUD_DISCOVERY_TIMEOUT = 8.0
+_CLOUD_HTTP_TIMEOUT = 30.0
+_CLOUD_DOWNLOAD_TIMEOUT = 120.0
+_MESHY_HTTP_TIMEOUT = _CLOUD_HTTP_TIMEOUT    # pre-Tripo name (test_meshy_adapter reads it)
 
 
-class MeshyAdapter(BackendAdapter):
-    """Meshy.ai task API: POST a task, poll GET …/{id}, download the model urls.
-    The request/response SHAPE lives in meshy.py (pure); this class owns the HTTP,
-    the in-flight slot and the credit balance seen at discovery."""
+class _TaskVerdict(RuntimeError):
+    """A 200 poll whose body says the task cannot be read (Tripo `code != 0`) — counted
+    like a 4xx by CloudTaskAdapter._poll (three in a row = final)."""
 
-    type = "meshy"
+
+@dataclass
+class RunResult:
+    """What a vendor's `_run` hands back: the PRIMARY task (its id, endpoint and the body
+    sent) and the final TaskState whose `downloads` already include every follow-up task's
+    file (converts, clips). `extra_meta` is merged into the job meta."""
+    task_id: str
+    endpoint: str
+    body: dict
+    state: "cloudtask.TaskState"
+    extra_meta: dict = field(default_factory=dict)
+
+
+class CloudTaskAdapter(BackendAdapter):
+    """Everything a cloud task API shares: the in-flight slot, the create/poll/download
+    loop with its grace rules, the job meta and the chain roles. A vendor subclass
+    supplies the URLs, the response envelope and the run order (see the hooks below).
+
+    The request/response SHAPE lives in the pure module (`mod`: meshy.py / tripo.py);
+    this class owns the HTTP, the in-flight slot and the credit balance seen at
+    discovery."""
+
+    cloud = True
     serves_generation = True
+    mod = meshy                      # the pure module; every subclass overrides it
+    type = mod.KIND
 
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
-        self.credits: Optional[int] = None
+        self.credits: Optional[float] = None
         self.credits_at: float = 0.0
+        self.vendor: str = self.mod.VENDOR
 
     def _headers(self) -> dict:
         key = (self.backend.get("api_key") or "").strip()
         return {"Authorization": f"Bearer {key}"} if key else {}
 
-    def _api(self, path: str) -> str:
-        return f"{self.backend['url'].rstrip('/')}{_MESHY_API}{path}"
-
+    # ── vendor hooks ──────────────────────────────────────────────────────────
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
-        r = await client.get(self._api("/balance"), headers=self._headers(),
-                             timeout=_MESHY_DISCOVERY_TIMEOUT)
-        r.raise_for_status()                       # 401 → auth kind in main._classify_error
-        bal = int((r.json() or {}).get("balance") or 0)
-        self.credits, self.credits_at = bal, time.time()
-        if bal <= 0:
-            raise MeshyNoCredits("no credits left on the Meshy account")
-        return Capabilities(models=set(meshy.AI_MODELS), pricing={}, loras=set())
+        """The balance call: models + the credits shown in /health. 0 → CloudNoCredits."""
+        raise NotImplementedError
 
+    async def _run(self, client, req: NormalizedRequest, cand: dict, opts: dict,
+                   poll_interval: float, max_wait: float) -> RunResult:
+        """Everything between the request values and the downloads: build the body,
+        `_create` it, `_poll` it — plus whatever follow-up tasks the vendor needs."""
+        raise NotImplementedError
+
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        """One poll of a task (the HTTP response, not the body)."""
+        raise NotImplementedError
+
+    def _task_body(self, r) -> dict:
+        """The task object out of a 200 poll response; raise _TaskVerdict for a body that
+        is a verdict about the task (Tripo's code != 0)."""
+        return r.json() or {}
+
+    def _classify_create(self, r) -> Optional[str]:
+        """'nocredits' | 'busy' | 'server' | 'rejected' | None (= accepted) for a create
+        response — every vendor spells the same four verdicts differently."""
+        raise NotImplementedError
+
+    def _task_id_of(self, js: dict) -> str:
+        """The new task's id out of an accepted create response."""
+        raise NotImplementedError
+
+    def _msg(self, r) -> str:
+        try:
+            return str((r.json() or {}).get("message") or r.text[:200])
+        except Exception:
+            return r.text[:200]
+
+    def _thumb_name(self) -> str:
+        return "preview.png"
+
+    # ── the shared run ────────────────────────────────────────────────────────
     async def generate(self, req: NormalizedRequest) -> GenOutput:
-        b = self.backend
-        cand = {"model": req.real_model, "meshy": req.meshy or {}}
-        endpoint = meshy.endpoint_of(cand)
-        opts = meshy.options_of(cand)
-        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {},
-                                   req.upload_files or {})            # MeshyInput → final
-        poll_interval = float(b.get("poll_interval", 5.0))
-        max_wait = float(b.get("max_wait", 900))
+        b, mod = self.backend, self.mod
+        cand = {"model": req.real_model, mod.KIND: req.cloud or {}}
+        opts = mod.options_of(cand)
+        poll_interval = float(b.get("poll_interval", mod.POLL_INTERVAL_DEFAULT))
+        max_wait = float(b.get("max_wait", mod.MAX_WAIT_DEFAULT))
         if not req.slot_held:
             self.ctx.inflight_inc(self.bid)
         started = time.monotonic()
         log_on = self.ctx.log_enabled()
         try:
             # The client default stays SHORT (30 s): every poll runs on it, and the
-            # disconnect_grace logic below only reacts as fast as a poll gives up.
-            async with httpx.AsyncClient(timeout=_MESHY_HTTP_TIMEOUT) as client:
-                # The create POST is the one call that carries the whole INPUT in its
-                # body — image data URIs, and for rigging the entire mesh as base64.
-                # Measured 2026-09-02 on prod: a no-remesh 70 MB GLB became a ~93 MB
-                # JSON body, the POST hit the 30 s client timeout, and httpx's
-                # WriteTimeout has an EMPTY str() — the job died as "chain failed: "
-                # with nothing after the colon. So the create gets its OWN size-scaled
-                # budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
-                raw = json.dumps(body)              # serialised ONCE, sent as content=
-                mb = len(raw) / (1024 * 1024)       # ASCII JSON: chars == bytes
-                pr = await client.post(
-                    self._api(f"/{endpoint}"), content=raw,
-                    headers={**self._headers(), "Content-Type": "application/json"},
-                    timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
-                                          write=max(60.0, mb * 4), pool=30.0))
-                if pr.status_code == 402:
-                    raise MeshyNoCredits(f"Meshy: {_meshy_msg(pr)}")
-                if pr.status_code == 429:
-                    raise MeshyBusy(f"Meshy queue full: {_meshy_msg(pr)}")
-                if pr.status_code >= 500:
-                    raise ConnectionError(f"Meshy {pr.status_code}: {_meshy_msg(pr)}")
-                # Meshy ACCEPTS a task with 202 (measured 2026-09-02 on prod: the first live
-                # job died as "rejected (202)" while Meshy had created and billed it) — any
-                # 2xx that carries a task id is a success, not just 200.
-                if not 200 <= pr.status_code < 300:
-                    raise RuntimeError(f"Meshy rejected the task ({pr.status_code}): {_meshy_msg(pr)}")
-                task_id = str((pr.json() or {}).get("result") or "")
-                if not task_id:
-                    raise RuntimeError("Meshy returned no task id")
-                if log_on:
-                    logger.info(f"→ [{self.name}] meshy {endpoint} task {task_id}")
-                state = await self._poll(client, endpoint, task_id, opts["target_formats"],
-                                         poll_interval, max_wait, bool(opts.get("animations")))
+            # disconnect_grace logic in _poll only reacts as fast as a poll gives up.
+            # The create POST carries the whole input and gets its own budget (_create).
+            async with httpx.AsyncClient(timeout=_CLOUD_HTTP_TIMEOUT) as client:
+                run = await self._run(client, req, cand, opts, poll_interval, max_wait)
+                # `run.endpoint`, never the alias's: a vendor whose `_run` chases several
+                # tasks names the PRIMARY one there, and the rig/thumbnail decisions and
+                # the job meta must all describe the task that was actually run.
+                state, endpoint = run.state, run.endpoint
                 blobs = []
-                for name, url in state.downloads:      # meshy.parse_task named them
-                    data = await self._download(client, url)
+                for name, url in state.downloads:      # the pure module named them
+                    try:
+                        data = await self._download(client, url)
+                    except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+                        # The task is DONE and BILLED by now, so a blip fetching its
+                        # artifact must not raise a member of main._GEN_FAILOVER_ERRORS
+                        # (httpx's transport errors are listed there literally): _run_job
+                        # would re-run the whole task on the next candidate and pay again.
+                        # Final, naming the paid task so the file can be fetched by hand.
+                        raise RuntimeError(f"{self.vendor} artifact download failed after "
+                                           f"the paid task {run.task_id}: {name}: {e}") from e
                     mime, kind = _mime_and_kind(name)
                     blobs.append(GenBlob(data=data, mime=mime, kind=kind, name=name))
-                # rigging has no thumbnail_url — its input already had a preview
-                if endpoint != "rigging" and opts.get("thumbnail") and state.thumbnail:
+                # the rig endpoint has no thumbnail — its input already had a preview
+                if endpoint != mod.RIG_ENDPOINT and opts.get("thumbnail") and state.thumbnail:
                     try:
                         thumb = await self._download(client, state.thumbnail)
-                        blobs.append(GenBlob(data=thumb, mime="image/png", kind="image", name="preview.png"))
+                        blobs.append(GenBlob(data=thumb, mime="image/png", kind="image",
+                                             name=self._thumb_name()))
                     except Exception as e:           # a preview is a courtesy, the mesh is the job
-                        logger.warning(f"[{self.name}] meshy thumbnail download failed: {e}")
+                        logger.warning(f"[{self.name}] {mod.KIND} thumbnail download failed: {e}")
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
@@ -3126,18 +3217,51 @@ class MeshyAdapter(BackendAdapter):
         if log_on:
             logger.info(f"← [{self.name}] {len(blobs)} artifact(s) in {elapsed_ms} ms, "
                         f"{state.credits} credits")
-        return GenOutput(blobs=blobs, meta={
-            "backend": self.name, "meshy_task_id": task_id, "endpoint": endpoint,
-            "ai_model": body.get("ai_model"), "request": meshy.request_summary(body),
-            "consumed_credits": state.credits, "elapsed_ms": elapsed_ms,
-            # A standalone rigging job is a rig delivery like a chain's stage 2 is —
-            # `main._job_view` reads meta["rig"], so name it here too or the job view
-            # shows no rig type at all for the one endpoint that always produces one.
-            **({"rig": "meshy"} if endpoint == "rigging" else {}),
-        })
+        meta = {"backend": self.name, "cloud": mod.KIND, "cloud_task_id": run.task_id,
+                "endpoint": endpoint,
+                "ai_model": run.body.get("ai_model") or run.body.get("model"),
+                "request": mod.request_summary(run.body), "consumed_credits": state.credits,
+                "elapsed_ms": elapsed_ms, **run.extra_meta}
+        if endpoint == mod.RIG_ENDPOINT:
+            # A standalone rig job is a rig delivery like a chain's stage 2 is — `main._job_view`
+            # reads meta["rig"], so name it here too or the job view shows no rig type at all
+            # for the one endpoint that always produces one.
+            meta.setdefault("rig", mod.KIND)
+        return GenOutput(blobs=blobs, meta=meta)
 
-    async def _poll(self, client, endpoint, task_id, formats, poll_interval, max_wait,
-                    animations: bool = False) -> "meshy.TaskState":
+    async def _create(self, client, url: str, body: dict, endpoint: str) -> str:
+        """POST the task and return its id, or raise the verdict `_classify_create` gives."""
+        # The create POST is the one call that carries the whole INPUT in its body — image
+        # data URIs, and for rigging the entire mesh as base64. Measured 2026-09-02 on
+        # prod: a no-remesh 70 MB GLB became a ~93 MB JSON body, the POST hit the 30 s
+        # client timeout, and httpx's WriteTimeout has an EMPTY str() — the job died as
+        # "chain failed: " with nothing after the colon. So the create gets its OWN
+        # size-scaled budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
+        raw = json.dumps(body)                  # serialised ONCE, sent as content=
+        mb = len(raw) / (1024 * 1024)           # ASCII JSON: chars == bytes
+        pr = await client.post(
+            url, content=raw,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
+                                  write=max(60.0, mb * 4), pool=30.0))
+        verdict = self._classify_create(pr)
+        if verdict == "nocredits":
+            raise CloudNoCredits(f"{self.vendor}: {self._msg(pr)}", vendor=self.vendor)
+        if verdict == "busy":
+            raise CloudBusy(f"{self.vendor} queue full: {self._msg(pr)}", vendor=self.vendor)
+        if verdict == "server":
+            raise ConnectionError(f"{self.vendor} {pr.status_code}: {self._msg(pr)}")
+        if verdict == "rejected":
+            raise RuntimeError(f"{self.vendor} rejected the task ({pr.status_code}): {self._msg(pr)}")
+        task_id = self._task_id_of(pr.json() or {})
+        if not task_id:
+            raise RuntimeError(f"{self.vendor} returned no task id")
+        if self.ctx.log_enabled():
+            logger.info(f"→ [{self.name}] {self.mod.KIND} {endpoint} task {task_id}")
+        return task_id
+
+    async def _poll(self, client, endpoint: str, task_id: str, formats: list, opts: dict,
+                    poll_interval: float, max_wait: float) -> "cloudtask.TaskState":
         # A poll that answers is not proof the task is running. A revoked key (401) or a
         # task that is gone (404) would otherwise be reported as a max_wait TimeoutError —
         # the wrong cause, AND only after holding the in-flight slot for the full wait.
@@ -3148,94 +3272,414 @@ class MeshyAdapter(BackendAdapter):
         # 429 sits on the service side deliberately: a poll-rate limit says nothing about
         # the task, which is running and already paid for — ending it would burn credits.
         # Any 200 resets both counters: only an unbroken run of failures means anything.
+        # `max_wait` is a budget from HERE, so a vendor that runs several tasks for one
+        # job passes the REMAINDER of the job's budget to each poll.
         grace = float(self.backend.get("disconnect_grace", 30))
         deadline = time.monotonic() + max_wait
         client_errs, gone_since = 0, None
         while time.monotonic() < deadline:
             await asyncio.sleep(poll_interval)
             try:
-                r = await client.get(self._api(f"/{endpoint}/{task_id}"), headers=self._headers())
+                r = await self._task_request(client, endpoint, task_id)
             except httpx.HTTPError as e:            # one failed poll is not a verdict
                 gone_since = gone_since or time.monotonic()
                 if time.monotonic() - gone_since > grace:
                     raise ConnectionError(
-                        f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
+                        f"{self.vendor} unreachable for >{grace:.0f}s while polling task {task_id}"
                         f": {type(e).__name__}: {e}")
                 continue
             if 400 <= r.status_code < 500 and r.status_code != 429:
                 client_errs += 1
                 if client_errs >= 3:
-                    raise RuntimeError(f"Meshy task {task_id}: poll answered "
-                                       f"{r.status_code} — {_meshy_msg(r)}")
+                    raise RuntimeError(f"{self.vendor} task {task_id}: poll answered "
+                                       f"{r.status_code} — {self._msg(r)}")
                 continue
             if r.status_code != 200:                # 5xx / 429 — the service, not this task
                 gone_since = gone_since or time.monotonic()
                 if time.monotonic() - gone_since > grace:
                     raise ConnectionError(
-                        f"Meshy unreachable for >{grace:.0f}s while polling task {task_id}"
+                        f"{self.vendor} unreachable for >{grace:.0f}s while polling task {task_id}"
                         f": HTTP {r.status_code}")
                 continue
-            client_errs, gone_since = 0, None
-            state = meshy.parse_task(r.json() or {}, formats,      # MeshyInput → final
-                                     endpoint, animations)
-            if state.error:            # FAILED/CANCELED — or a status this gateway does not know
-                raise RuntimeError(f"Meshy task {task_id} {state.status.lower()}: {state.error}")
-            if state.status == "SUCCEEDED":
+            gone_since = None                       # the service answered — it is reachable
+            try:
+                task = self._task_body(r)
+            except _TaskVerdict as e:               # a 200 whose BODY refuses the task: the
+                client_errs += 1                    # same class of verdict as a 4xx, counted alike
+                if client_errs >= 3:
+                    raise RuntimeError(f"{self.vendor} task {task_id}: {e}")
+                continue
+            client_errs = 0
+            # `options` by KEYWORD: meshy.parse_task takes the legacy `animations` bool in
+            # the 4th positional slot, so a positional options dict would land there.
+            state = self.mod.parse_task(task, formats, endpoint, options=opts)
+            if state.error:            # failed/cancelled — or a status this gateway does not know
+                raise RuntimeError(f"{self.vendor} task {task_id} {state.status.lower()}: {state.error}")
+            if state.status == self.mod.SUCCESS_STATUS:
                 return state
-        raise TimeoutError(f"Meshy task {task_id} not finished within max_wait={max_wait:.0f}s "
-                           f"(still running at Meshy — fetch it by id from the Meshy dashboard)")
+        raise TimeoutError(f"{self.vendor} task {task_id} not finished within max_wait={max_wait:.0f}s "
+                           f"(still running at {self.vendor} — fetch it by id from the "
+                           f"{self.vendor} dashboard)")
 
     @staticmethod
     async def _download(client, url: str) -> bytes:
-        # NO auth header: signed asset URLs on assets.meshy.ai; the bearer must not leak there.
-        r = await client.get(url, timeout=_MESHY_DOWNLOAD_TIMEOUT, follow_redirects=True)
+        # NO auth header: signed asset URLs on a CDN host; the bearer must not leak there.
+        r = await client.get(url, timeout=_CLOUD_DOWNLOAD_TIMEOUT, follow_redirects=True)
         if r.status_code != 200:
-            raise RuntimeError(f"Meshy asset download failed ({r.status_code}) for {url.split('?')[0]}")
+            raise RuntimeError(f"asset download failed ({r.status_code}) for {url.split('?')[0]}")
         return r.content
 
     # ── the chain roles (main._run_chain calls these) ─────────────────────────
     def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
-        """Stage 1 on Meshy: nothing to pin — the mesh comes back as a RESULT BLOB, not
+        """Stage 1 in the cloud: nothing to pin — the mesh comes back as a RESULT BLOB, not
         off a disk, so the name is ours to choose (it only labels the hand-off upload).
         A task that does not deliver glb is refused here, before credits are spent: the
-        successor is fed a glb, and Meshy bills the task either way."""
-        if meshy.endpoint_of(cand) == "rigging":
+        successor is fed a glb, and the vendor bills the task either way."""
+        mod = self.mod
+        if mod.endpoint_of(cand) == mod.RIG_ENDPOINT:
             # A rigging alias is a stage-2 product: it delivers `rigged.glb`, and its
             # request needs a mesh it has no way to get here. Refused by name — the
-            # generic path would spend 5 credits and then fail on "produced no mesh"
+            # generic path would spend credits and then fail on "produced no mesh"
             # (chain_take_mesh looks for `model.glb`, which a rig task never returns).
-            return ChainExport("", error="chain: a Meshy rigging alias cannot be stage 1 — "
-                                         "it rigs an existing mesh; use an image-to-3d alias")
-        opts = meshy.options_of({"meshy": cand.get("meshy") or {}})
+            return ChainExport("", error=f"chain: a {self.vendor} rigging alias cannot be stage 1 — "
+                                         f"it rigs an existing mesh; use an image-to-3d alias")
+        opts = mod.options_of({mod.KIND: cand.get(mod.KIND) or {}, "model": cand.get("model")})
         if "glb" not in opts["target_formats"]:
-            return ChainExport("", error=f"chain: Meshy stage 1 must deliver glb — add it to "
+            return ChainExport("", error=f"chain: {self.vendor} stage 1 must deliver glb — add it to "
                                          f"target_formats (now {opts['target_formats']})")
         return ChainExport(f"{prefix}.glb")             # no pins: the mesh is a result blob
 
     async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
         """Stage 1's mesh is already in hand: the `model.glb` blob `generate()` downloaded
-        (b'' when only its existence is asked for — nothing to fetch either way)."""
+        (b'' when only its existence is asked for — nothing to fetch either way). Both
+        kinds name it that: the pure module's `parse_task` decides the stem."""
         blob = next((b for b in (out.blobs or []) if (b.name or "") == "model.glb"), None)
         if blob is None:
             return None
         return blob.data if want_bytes else b""
 
     async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
-        """Stage 2 on Meshy reads the mesh off the REQUEST — `meshy.build_request` embeds
-        `upload_files[mesh_param]` as the `model_url` data URI. There is no disk to upload
-        to and no path Meshy could resolve, so the bytes are mandatory (a `path` relay is
-        forced to `upload` in _run_chain whenever either stage is Meshy)."""
+        """Stage 2 in the cloud reads the mesh off the REQUEST — `build_request` embeds
+        `upload_files[mesh_param]` (Meshy as the `model_url` data URI, Tripo as an uploaded
+        file token). There is no disk to upload to and no path the vendor could resolve, so
+        the bytes are mandatory (a `path` relay is forced to `upload` in _run_chain whenever
+        either stage is a cloud kind)."""
         if mesh_bytes is None:
-            raise RuntimeError("chain: a Meshy stage 2 needs the mesh bytes (upload relay)")
-        req2.upload_files[mesh_param] = (mesh_name, mesh_bytes)   # embedded as the model_url data URI
+            raise RuntimeError(f"chain: a {self.vendor} stage 2 needs the mesh bytes (upload relay)")
+        req2.upload_files[mesh_param] = (mesh_name, mesh_bytes)
         return f"<upload:{mesh_name} ({len(mesh_bytes) / (1024 * 1024):.1f} MB)>"
 
 
-def _meshy_msg(r) -> str:
-    try:
-        return str((r.json() or {}).get("message") or r.text[:200])
-    except Exception:
-        return r.text[:200]
+# ── Meshy.ai (cloud image → 3D) ───────────────────────────────────────────────
+
+_MESHY_API = "/openapi/v1"
+
+
+class MeshyAdapter(CloudTaskAdapter):
+    """Meshy.ai: POST /openapi/v1/<endpoint>, poll GET …/<endpoint>/{id}, download the
+    model urls. Everything vendor-neutral is CloudTaskAdapter's — this class only says
+    where the URLs are and how Meshy spells its answers."""
+
+    mod = meshy
+    type = mod.KIND
+
+    def _api(self, path: str) -> str:
+        return f"{self.backend['url'].rstrip('/')}{_MESHY_API}{path}"
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        r = await client.get(self._api("/balance"), headers=self._headers(),
+                             timeout=_CLOUD_DISCOVERY_TIMEOUT)
+        r.raise_for_status()                       # 401 → auth kind in main._classify_error
+        bal = int((r.json() or {}).get("balance") or 0)
+        self.credits, self.credits_at = bal, time.time()
+        if bal <= 0:
+            raise CloudNoCredits("no credits left on the Meshy account", vendor=self.vendor)
+        return Capabilities(models=set(meshy.AI_MODELS), pricing={}, loras=set())
+
+    async def _run(self, client, req: NormalizedRequest, cand: dict, opts: dict,
+                   poll_interval: float, max_wait: float) -> RunResult:
+        """One task, one delivery: Meshy answers every requested format off the same
+        task, so there is nothing to chase after the poll."""
+        endpoint = meshy.endpoint_of(cand)
+        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {},
+                                   req.upload_files or {})            # MeshyInput → final
+        task_id = await self._create(client, self._api(f"/{endpoint}"), body, endpoint)
+        state = await self._poll(client, endpoint, task_id, opts["target_formats"], opts,
+                                 poll_interval, max_wait)
+        # `meshy_task_id`, not the neutral key: existing job rows and the job view read
+        # it by that name.
+        return RunResult(task_id, endpoint, body, state, {"meshy_task_id": task_id})
+
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        return await client.get(self._api(f"/{endpoint}/{task_id}"), headers=self._headers())
+
+    def _classify_create(self, r) -> Optional[str]:
+        if r.status_code == 402:
+            return "nocredits"
+        if r.status_code == 429:                   # NoMoreConcurrentTasks / RateLimitExceeded
+            return "busy"
+        if r.status_code >= 500:
+            return "server"
+        # Meshy ACCEPTS a task with 202 (measured 2026-09-02 on prod: the first live job
+        # died as "rejected (202)" while Meshy had created and billed it) — any 2xx that
+        # carries a task id is a success, not just 200.
+        return None if 200 <= r.status_code < 300 else "rejected"
+
+    def _task_id_of(self, js: dict) -> str:
+        return str(js.get("result") or "")
+
+
+# ── Tripo3D (cloud image → 3D, and its rigger) ────────────────────────────────
+
+
+class TripoAdapter(CloudTaskAdapter):
+    """Tripo3D V3: every input is uploaded to `/v3/files` FIRST (the API takes no inline
+    bytes — no data URI, no base64), then one task per endpoint under
+    `/v3/generation|animations|models`, all polled at `/v3/tasks/{id}`.
+
+    Where Meshy answers one job with one task, a Tripo job is SEVERAL: a rig runs
+    rig-check → rig → one convert per extra format → one retarget per clip. They share
+    the backend's `max_wait` (each poll gets the REMAINDER), their ids are recorded under
+    `meta.tasks` so the job view can name every billed task, and their credits are summed."""
+
+    mod = tripo
+    type = mod.KIND
+
+    # The endpoints an ALIAS can be configured on → the path that creates their task. The
+    # follow-up tasks (rig-check, convert, retarget) are created by _run itself.
+    _CREATE_PATH = {"image-to-model": "/generation/image-to-model",
+                    "multiview-to-model": "/generation/multiview-to-model",
+                    tripo.RIG_ENDPOINT: "/animations/rig"}
+
+    def _api(self, path: str) -> str:
+        return f"{self.backend['url'].rstrip('/')}{tripo.API}{path}"
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        r = await client.get(self._api("/account/balance"), headers=self._headers(),
+                             timeout=_CLOUD_DISCOVERY_TIMEOUT)
+        r.raise_for_status()                       # 401 → auth kind in main._classify_error
+        js = r.json() or {}
+        if js.get("code", 0) != 0:                 # a 200 that carries a refusal
+            raise RuntimeError(f"{self.vendor} balance: {js.get('message') or js.get('code')}")
+        bal = _to_float((js.get("data") or {}).get("balance"))
+        self.credits, self.credits_at = bal, time.time()
+        if bal <= 0:
+            raise CloudNoCredits("no credits left on the Tripo account", vendor=self.vendor)
+        return Capabilities(models=set(tripo.AI_MODELS), pricing={}, loras=set())
+
+    # ── the response envelope ────────────────────────────────────────────────
+    def _msg(self, r) -> str:
+        """Tripo's error body is `{code, message, suggestion}` — the suggestion is half
+        the answer ("Check whether the API Key is correct"), so it travels with it."""
+        try:
+            js = r.json() or {}
+            m = str(js.get("message") or "")
+            s = str(js.get("suggestion") or "")
+            return (m + (f" — {s}" if s else "")) or r.text[:200]
+        except Exception:
+            return r.text[:200]
+
+    @staticmethod
+    def _code_of(r):
+        try:
+            return (r.json() or {}).get("code")
+        except Exception:
+            return None
+
+    def _classify_create(self, r) -> Optional[str]:
+        code = self._code_of(r)
+        if r.status_code == 403 and code == 2010:  # Tripo has no 402: 403 + 2010 = broke
+            return "nocredits"
+        if r.status_code == 429:                   # 1007 request rate / 2000 concurrency
+            return "busy"
+        if r.status_code >= 500:
+            return "server"
+        # A non-zero `code` is a refusal even under HTTP 200 — the envelope is the truth.
+        if not 200 <= r.status_code < 300 or code not in (None, 0):
+            return "rejected"
+        return None
+
+    def _task_id_of(self, js: dict) -> str:
+        return str((js.get("data") or {}).get("task_id") or "")
+
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        # ONE poll url for every task kind — the endpoint is not part of it.
+        return await client.get(self._api(f"/tasks/{task_id}"), headers=self._headers())
+
+    def _task_body(self, r) -> dict:
+        js = r.json() or {}
+        if js.get("code", 0) != 0:
+            # HTTP 200 with a non-zero code says the task cannot be READ (gone, wrong
+            # key): a verdict, which _poll counts like a 4xx (three in a row = final).
+            raise _TaskVerdict(str(js.get("message") or f"code {js.get('code')}"))
+        return js.get("data") or {}
+
+    # ── uploads ──────────────────────────────────────────────────────────────
+    async def _upload(self, client, name: str, data: bytes) -> str:
+        """One `POST /v3/files` → file token. Every image and every mesh goes this way.
+
+        A transport error or a 5xx is re-raised as ConnectionError so the job FAILS OVER
+        to the next candidate: httpx's own transport exceptions are not ConnectionErrors,
+        and the message names the step — an upload failure and a create failure send you
+        looking in different places. A 4xx (or a non-zero envelope code) is Tripo's
+        verdict on the FILE and is final."""
+        try:
+            r = await client.post(self._api("/files"),
+                                  files={"file": (name, data, _mime_and_kind(name)[0])},
+                                  headers=self._headers(),
+                                  timeout=_upload_timeout_for(len(data)))
+        except httpx.HTTPError as e:
+            raise ConnectionError(f"{self.vendor} upload of {name} failed: "
+                                  f"{type(e).__name__}: {e}")
+        if r.status_code >= 500:
+            raise ConnectionError(f"{self.vendor} upload of {name} failed "
+                                  f"({r.status_code}): {self._msg(r)}")
+        if not 200 <= r.status_code < 300 or self._code_of(r) not in (None, 0):
+            raise RuntimeError(f"{self.vendor} refused upload {name}: {self._msg(r)}")
+        token = str(((r.json() or {}).get("data") or {}).get("file_token") or "")
+        if not token:
+            raise RuntimeError(f"{self.vendor} returned no file_token for {name}")
+        return token
+
+    def _collect_inputs(self, req: NormalizedRequest, endpoint: str,
+                        cand: dict, values: dict) -> tuple[dict, dict]:
+        """({slot: (filename, bytes)}, {file field: (filename, bytes)}) for the endpoint —
+        and every reason to refuse the request, checked BEFORE the first upload.
+
+        The pure module refuses the same requests when it builds the body, but by then the
+        files are already in the Tripo account: an upload for a request that can never run
+        is litter nobody cleans up. So the slot count, the format sniff and the client's
+        rig type (a 150 MB mesh pushed for a rig the alias's model cannot do) happen
+        here — the rig-type RULE itself stays in the pure module, which build_request
+        reads too."""
+        got = req.upload_images or {}
+        images = {s: got[s] for s in tripo.SLOTS[endpoint] if got.get(s)}
+        if endpoint == "multiview-to-model" and ("input_image_front" not in images
+                                                 or len(images) < 2):
+            raise tripo.TripoInput("Tripo multiview needs `input_image_front` plus at "
+                                   "least one more view")
+        if endpoint == "image-to-model" and "input_image" not in images:
+            raise tripo.TripoInput("`images.input_image` is required")
+        named = {s: (f"{s}.{tripo.image_ext(b)}", b) for s, b in images.items()}
+        files = {}
+        for fname in tripo.FILES[endpoint]:
+            f = (req.upload_files or {}).get(fname)
+            data = f[1] if isinstance(f, tuple) else f
+            if not data:
+                raise tripo.TripoInput(f"`files.{fname}` is required")
+            files[fname] = (f"{fname}.{tripo.mesh_ext(data)}", data)
+        if endpoint == tripo.RIG_ENDPOINT:
+            tripo.check_rig_type(cand, values)
+        return named, files
+
+    # ── the run ──────────────────────────────────────────────────────────────
+    async def _run(self, client, req: NormalizedRequest, cand: dict, opts: dict,
+                   poll_interval: float, max_wait: float) -> RunResult:
+        endpoint = tripo.endpoint_of(cand)
+        deadline = time.monotonic() + max_wait
+        tasks: list = []
+        credits = 0.0
+
+        def left() -> float:
+            """`max_wait` caps the WHOLE job, not one task: every follow-up poll gets
+            what is left of the budget (the backend form says so)."""
+            return max(0.0, deadline - time.monotonic())
+
+        def took(role: str, tid: str, st) -> None:
+            nonlocal credits
+            tasks.append({"role": role, "task_id": tid, "credits": st.credits})
+            credits += _to_float(st.credits)
+
+        # 1. inputs → file tokens (validated first, see _collect_inputs)
+        values = _gen_values(req)
+        images, files = self._collect_inputs(req, endpoint, cand, values)
+        tokens = {s: await self._upload(client, n, b) for s, (n, b) in images.items()}
+        ftokens = {f: await self._upload(client, n, b) for f, (n, b) in files.items()}
+        body = tripo.build_request(cand, values, tokens, ftokens)
+        # The format the primary task delivers ITSELF leads the list: generation is always
+        # GLB, a rig its `out_format`. parse_task names that download after formats[0], so
+        # an alias asking for obj alone would otherwise ship a GLB called `model.obj`;
+        # every OTHER requested format is a convert task below.
+        native = opts["target_formats"][0] if endpoint == tripo.RIG_ENDPOINT else tripo.NATIVE_FORMAT
+        formats = [native] + [f for f in opts["target_formats"] if f != native]
+        extra: dict = {}
+        # 2. the free rig-check: a verdict about the MESH, before the rig's 25 credits
+        if endpoint == tripo.RIG_ENDPOINT and opts.get("rig_check"):
+            cid = await self._create(client, self._api("/animations/rig-check"),
+                                     tripo.build_rig_check(body["input"]),
+                                     tripo.RIG_CHECK_ENDPOINT)
+            cst = await self._poll(client, tripo.RIG_CHECK_ENDPOINT, cid, formats, opts,
+                                   poll_interval, left())
+            took(tripo.RIG_CHECK_ENDPOINT, cid, cst)
+            if not cst.riggable:
+                raise RuntimeError(f"{self.vendor} rig-check: mesh is not riggable "
+                                   f"(detected rig_type={cst.rig_type or '?'})")
+            if cst.rig_type and cst.rig_type != body.get("rig_type"):
+                # Tripo rigs what the REQUEST asked for; the check only reports what it saw.
+                # A mismatch is a silently wrong skeleton (a quadruped rigged as a biped),
+                # so it is named here — meta.rig_type records the DETECTED type.
+                logger.warning(f"[{self.name}] tripo rig-check for {req.alias}: mesh looks "
+                               f"like {cst.rig_type}, but the request rigs as "
+                               f"{body.get('rig_type')}")
+            extra["rig_type"] = cst.rig_type or body.get("rig_type")
+        # 3. the primary task
+        task_id = await self._create(client, self._api(self._CREATE_PATH[endpoint]), body, endpoint)
+        state = await self._poll(client, endpoint, task_id, formats, opts, poll_interval, left())
+        took(endpoint, task_id, state)
+        stem = "rigged" if endpoint == tripo.RIG_ENDPOINT else "model"
+        # 4. extra formats — each its own paid convert task. A failed one FAILS the job:
+        #    a requested delivery must never silently shrink (same rule as Meshy's
+        #    missing url), and the caller asked for that format on purpose.
+        #    From HERE on the job is FINAL, whatever goes wrong: the primary task is done
+        #    and billed (30 credits for a generation), and every failover-class error —
+        #    CloudBusy from a 429 (converts run in Tripo's separate model-processing pool,
+        #    so a rate limit there is routine), ConnectionError from a 5xx, TimeoutError
+        #    from the job's max_wait running out, and the RAW httpx errors a create's POST
+        #    can raise (ConnectError/WriteTimeout/ReadError are subclasses of NEITHER, and
+        #    main._GEN_FAILOVER_ERRORS lists them literally) — would otherwise make
+        #    _run_job re-run the WHOLE image-to-model task on the next Tripo candidate,
+        #    paying for it again.
+        #    The message names the format AND the paid task id, so the operator can fetch
+        #    the finished mesh from Tripo's dashboard instead of buying it twice.
+        for fmt in formats[1:]:
+            cbody = tripo.build_convert(task_id, fmt, endpoint == tripo.RIG_ENDPOINT)
+            try:
+                cid = await self._create(client, self._api("/models/convert"), cbody,
+                                         f"convert:{fmt}")
+                cst = await self._poll(client, "convert", cid, [fmt], opts, poll_interval, left())
+            except (httpx.HTTPError, ConnectionError, TimeoutError, RuntimeError) as e:
+                raise RuntimeError(f"{self.vendor} convert to {fmt} failed after the paid "
+                                   f"task {task_id}: {e}") from e
+            took(f"convert:{fmt}", cid, cst)
+            state.downloads.append((f"{stem}.{fmt}", cst.downloads[0][1]))
+        # 5. animation clips (rig only) — a courtesy, like Meshy's: a clip that fails is
+        #    skipped with a warning, never the rigged mesh the job is actually about.
+        if endpoint == tripo.RIG_ENDPOINT:
+            extra["rig_spec"] = body.get("spec")
+            extra.setdefault("rig_type", body.get("rig_type"))
+            for preset in opts.get("animations") or []:
+                rbody = tripo.build_retarget(task_id, preset, native)
+                try:
+                    cid = await self._create(client, self._api("/animations/retarget"),
+                                             rbody, f"clip:{preset}")
+                    cst = await self._poll(client, "retarget", cid, [native], opts,
+                                           poll_interval, left())
+                except (httpx.HTTPError, RuntimeError, ConnectionError, TimeoutError) as e:
+                    # Every class, create and poll alike — a 429 on the create is a
+                    # ConnectionError-derived CloudBusy, and a raw httpx transport error is
+                    # neither a ConnectionError nor a TimeoutError but IS in
+                    # main._GEN_FAILOVER_ERRORS. The job's max_wait running out, the clip
+                    # pool being busy or the connection dropping must not throw away the
+                    # rigged mesh, which is finished, paid for and in hand — and must not
+                    # fail the job into a failover that would rig and bill it a second time.
+                    logger.warning(f"[{self.name}] tripo clip {preset} skipped: {e}")
+                    continue
+                took(f"clip:{preset}", cid, cst)
+                state.downloads.append((f"{tripo.clip_name(preset)}.{native}",
+                                        cst.downloads[0][1]))
+        state.credits = credits
+        extra["tasks"] = tasks
+        return RunResult(task_id, endpoint, body, state, extra)
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
@@ -3245,11 +3689,16 @@ ADAPTERS: dict[str, type[BackendAdapter]] = {
     "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
     "meshy": MeshyAdapter,
+    "tripo": TripoAdapter,
 }
 
 # Backend types that take POST /v1/generations work (main routes generation to these
 # and keeps them OUT of the chat catalogs). Derived from the classes, not listed twice.
 GEN_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if cls.serves_generation)
+
+# The cloud task backends among them (Meshy, Tripo) — a candidate's kind must match its
+# backend's (see backend_kind). Derived from the classes for the same reason as above.
+CLOUD_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if getattr(cls, "cloud", False))
 
 
 def make_adapter(backend: dict, ctx: AdapterContext) -> BackendAdapter:

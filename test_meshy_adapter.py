@@ -291,7 +291,7 @@ class TestMeshyAdapter(unittest.TestCase):
 class TestGenTypesAndFields(unittest.TestCase):
     def test_registry(self):
         self.assertIs(adapters.ADAPTERS["meshy"], adapters.MeshyAdapter)
-        self.assertEqual(adapters.GEN_TYPES, frozenset({"comfyui", "meshy"}))
+        self.assertEqual(adapters.GEN_TYPES, frozenset({"comfyui", "meshy", "tripo"}))
         self.assertFalse(adapters.OpenAIAdapter.serves_generation)
 
     def test_public_fields_meshy(self):
