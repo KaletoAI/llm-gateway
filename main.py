@@ -3952,6 +3952,28 @@ def dashboard_snapshot() -> dict:
     }
 
 
+def gen_speed_info() -> dict:
+    """What the media scheduler is actually routing on, keyed "alias|backend name".
+
+    `speed` is the live EMA in seconds (`gen_speed`, seeded at boot from the job store)
+    — the number `order_ready` sorts by; `None` there means UNMEASURED, which sorts
+    FIRST (probe-once) unless the candidate has spent its probe on a fault. `quarantine`
+    carries the seconds remaining per key. Keyed by backend NAME, not `backend_id`,
+    because that is what a job row and the console table show."""
+    speed, quar = {}, {}
+    by_bid = {backend_id(b): b["name"] for b in backends}
+    now = time.time()
+    for key, secs in gen_speed.items():
+        alias, _, bid = key.rpartition("|")
+        speed[f"{alias}|{by_bid.get(bid, bid)}"] = secs
+    for key, rec in gen_exec_faults.items():
+        alias, _, bid = key.rpartition("|")
+        left = rec.get("until", 0.0) - now
+        if left > 0:
+            quar[f"{alias}|{by_bid.get(bid, bid)}"] = int(left)
+    return {"speed": speed, "quarantine": quar}
+
+
 def _quarantine_info(bid: str) -> dict:
     """`quarantined`: the aliases this backend is currently held out of rotation for,
     with the error that earned it. Unlike the fail-rate this one DOES change routing,
@@ -4237,6 +4259,7 @@ def llm_backends_info() -> list[dict]:
 admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
            gen_backends=lambda: [b for b in backends if _is_gen(b)],
            gateway_info=gateway_info,
+           gen_speed_info=gen_speed_info,
            apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
            config_chat_aliases=lambda: dict(config_virtual_models),

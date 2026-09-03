@@ -226,6 +226,33 @@ def median_duration(alias: str, backend: Optional[str] = None, limit: int = 10) 
     return float(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2)
 
 
+def gen_stats_rows() -> list:
+    """(alias, backend, done, failed, avg_done_ms, last_ts) per alias+backend over media
+    jobs — the aggregate behind the console's "Media generation" panel.
+
+    Media never reaches `stats.calls` (a ComfyUI generation is a job, not a forwarded
+    call), so the Statistic tab could show LLM traffic only and media looked like it was
+    never measured at all. It is: this is the same data the scheduler routes on, and the
+    panel exists so "why did it pick THAT backend?" is answerable without reading code.
+    `avg_done_ms` covers DONE jobs only — averaging a three-second failure into a
+    two-minute render would make a broken backend look like the fastest one."""
+    if not _active:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT alias, backend, "
+            "  SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), "
+            "  AVG(CASE WHEN status = 'done' THEN (updated - created) * 1000.0 END), "
+            "  MAX(created) "
+            "FROM jobs "
+            f"WHERE task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))}) "
+            "AND alias IS NOT NULL AND alias != '' "
+            "AND backend IS NOT NULL AND backend != '' "
+            "GROUP BY alias, backend", _NON_MEDIA_TASKS).fetchall()
+    return [(r[0], r[1], r[2] or 0, r[3] or 0, r[4], r[5] or 0) for r in rows]
+
+
 def gen_speed_rows() -> list:
     """(alias, backend, avg_duration_ms) over all DONE jobs — boot seed for the
     scheduler's gen-speed EMA, so a restart routes on measured durations instead of

@@ -118,6 +118,7 @@ def _num(s: str):
 _comfy_backends: Callable[[], list] = lambda: []
 _gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI, Meshy, Tripo)
 _gateway_info: Callable[[], dict] = lambda: {}
+_gen_speed_info: Callable[[], dict] = lambda: {"speed": {}, "quarantine": {}}
 _cancel_generation = None
 _drain_backend = None
 _cancel_drain = None
@@ -4748,15 +4749,51 @@ def _job_status_text(j: dict) -> str:
     return f"{st} {stg}" if st == "running" and stg else st
 
 
+_DUR_EST: dict = {}          # "alias|backend" → (cached_at, median seconds | None)
+_DUR_EST_TTL = 60            # the median of the last 10 runs does not move by the second
+
+
+def _expected_dur_s(alias: str, backend: str):
+    """Expected runtime of a job on this alias, or None without history.
+
+    Same basis as the job detail view's ETA (`jobs.median_duration`: median of the
+    alias's last 10 done jobs, narrowed to this backend when it has its own history,
+    falling back to the alias across all backends) — the two must not disagree.
+    Memoised for `_DUR_EST_TTL`, because a job LIST renders one cell per running row
+    and each one would otherwise be its own SQLite query on every live tick."""
+    key = f"{alias}|{backend or ''}"
+    hit = _DUR_EST.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _DUR_EST_TTL:
+        return hit[1]
+    try:
+        med = jobs.median_duration(alias, backend) or jobs.median_duration(alias)
+    except Exception:                                  # a job store hiccup must not
+        med = None                                     # take the whole page down
+    _DUR_EST[key] = (now, med)
+    return med
+
+
 def _job_dur_cell(j: dict, now: int) -> str:
     """Duration cell: fixed for finished jobs, JS-ticking (`.jdur` + _JOB_TICK) while
-    running, em-dash while queued. Shared by Media Jobs and the dashboard."""
+    running, em-dash while queued — each of the two live states followed by the
+    EXPECTED runtime ("12.0 s / ~40 s"), so the list answers "is this one stuck or just
+    slow?" without opening the job. Shared by Media Jobs and the dashboard.
+
+    The estimate is a SIBLING of `.jdur`, never inside it: _JOB_TICK overwrites that
+    element's textContent once a second and would eat it."""
     st = j["status"]
     cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
     if st in ("done", "failed") and upd >= cr:
         return f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
+    est = _expected_dur_s(j.get("alias") or "", j.get("backend") or "") \
+        if st in ("running", "queued") else None
+    exp = f" <span class='muted'>/ ~{_dur(est * 1000)}</span>" if est else ""
     if st == "running":
-        return f"<td class='muted jdur' data-since='{cr}'>{_dur((now - cr) * 1000)}</td>"
+        return (f"<td class='muted'><span class='jdur' data-since='{cr}'>"
+                f"{_dur((now - cr) * 1000)}</span>{exp}</td>")
+    if st == "queued" and est:
+        return f"<td class='muted'>—<span class='muted'> / ~{_dur(est * 1000)}</span></td>"
     return "<td class='muted'>—</td>"
 
 
@@ -5679,11 +5716,62 @@ def _cache_spark(series: Optional[list]) -> str:
             f"{axis}{''.join(bars)}</svg>")
 
 
+def _media_gen_panel() -> str:
+    """"Media generation" — the aggregate for media jobs, and the ONLY place the media
+    routing decision is legible.
+
+    A ComfyUI/cloud generation is a job, not a forwarded call, so it never reaches
+    `stats.calls` and every table on this page was blind to it — media looked entirely
+    unmeasured. It is measured, and by exactly the number in the `routing` column: the
+    scheduler orders candidates unpaid-first, then fastest, on that per alias+backend
+    EMA. An unmeasured pair sorts FIRST once (probe-once), which is why a brand-new
+    backend gets one job before the ordering settles."""
+    rows = jobs.gen_stats_rows()
+    if not rows:
+        return ""
+    info = _gen_speed_info() or {}
+    speed, quar = info.get("speed") or {}, info.get("quarantine") or {}
+    out = []
+    for alias, backend, done, failed, avg_ms, last_ts in rows:
+        key = f"{alias}|{backend}"
+        secs = speed.get(key)
+        routing = (f"{_dur(secs * 1000)}" if secs
+                   else "<span class='muted'>unmeasured — tried first</span>")
+        held = quar.get(key)
+        note = (f"<b>⚠ quarantined, {max(1, held // 60)} min left</b>" if held
+                else (f"<span class='muted'>{failed} failed</span>" if failed else ""))
+        total = done + failed
+        out.append((alias, secs if secs else 0.0,
+                    f"<tr><td>{_esc(alias)}</td><td>{_esc(backend)}</td>"
+                    f"<td>{done}</td><td>{failed}</td>"
+                    f"<td>{round(100.0 * done / total) if total else 0}%</td>"
+                    f"<td>{_dur(avg_ms) if avg_ms else '—'}</td>"
+                    f"<td>{routing}</td><td class='muted'>{_age(last_ts)}</td>"
+                    f"<td>{note}</td></tr>"))
+    out.sort(key=lambda r: (r[0].lower(), r[1]))
+    tr = "".join(r[2] for r in out)
+    return (f"<h2>Media generation</h2>"
+            f"<p class='hint'>Media jobs never reach the call log (a generation is a job, "
+            f"not a forwarded call) — this is their aggregate. <b>routing</b> is what the "
+            f"scheduler orders on: unpaid backends first, then the fastest measured "
+            f"runtime for that alias+backend. A pair with no measurement yet is tried "
+            f"first once, so a new backend gets one probe job. <b>avg</b> counts finished "
+            f"jobs only — averaging a three-second failure in would make a broken backend "
+            f"look like the fastest one.</p>"
+            f"<table class='filterable sortable' data-sk='stat-media'>"
+            f"<tr><th>alias</th><th>backend</th><th>done</th><th>failed</th><th>ok</th>"
+            f"<th>avg</th><th title='the EMA the scheduler routes on'>routing</th>"
+            f"<th>last</th><th></th></tr>{tr}</table>")
+
+
 async def statistic_page(request: Request):
     if not stats.is_active():
+        # Media aggregates live in the JOB store, not in stats.calls — they are there to
+        # show even when call recording is off, and this is the page they belong on.
+        media = await asyncio.to_thread(_media_gen_panel)
         return HTMLResponse(_page("Statistic", "<h2>Statistic</h2><p class='hint'>Call recording is off. "
             "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to collect "
-            "per-call stats here.</p>", "statistic"))
+            "per-call stats here.</p>" + media + (_FILTER_JS if media else ""), "statistic"))
     user = (request.query_params.get("user") or "").strip() or None
     s = await asyncio.to_thread(stats.summary, user=user)
     aliases = store.get_ip_aliases()
@@ -5744,8 +5832,9 @@ async def statistic_page(request: Request):
     # to the aggregates. Point there so the link is discoverable.
     recent = ("<p class='hint' style='margin-top:18px'>Per-call history (with request/response bodies) "
               "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
+    media = await asyncio.to_thread(_media_gen_panel)
     head = f"<h2>Statistic{scope}</h2>{bar}"
-    body = head + cards + by_backend + by_model + by_source + recent + _FILTER_JS
+    body = head + cards + by_backend + by_model + by_source + media + recent + _FILTER_JS
     return HTMLResponse(_page("Statistic", body, "statistic"))
 
 

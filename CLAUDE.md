@@ -437,6 +437,20 @@ hot-reload-safe.
   back to a long list, a POST's 303), which the morph does not cover — it is merely
   inert from the first tick onward. POST bodies parsed by
   hand (`parse_qs`) to stay `python-multipart`-free.
+- **Media has no call log — it has the job store.** A ComfyUI/cloud generation is a
+  JOB, not a forwarded call, so it never reaches `stats.calls` and every table in the
+  Statistic tab was blind to it (it looked unmeasured; it never was). `jobs.gen_stats_rows()`
+  aggregates done/failed/avg per alias+backend and `admin._media_gen_panel()` renders it
+  as **Media generation** — including the `routing` column, which is the live
+  `gen_speed` EMA the scheduler actually orders on (`main.gen_speed_info()`, bound into
+  admin), so "why did it pick THAT backend?" is answerable in the console instead of
+  from the source. `avg` counts DONE jobs only: averaging a three-second failure into a
+  two-minute render would make a broken backend look like the fastest one. The panel
+  shows even with `stats.enabled` off — its data does not come from stats. The job
+  LISTS carry the same estimate per row (`_job_dur_cell` → `_expected_dur_s`, the same
+  `jobs.median_duration` basis as the job view's ETA, memoised 60 s): a running row
+  reads `12.0 s / ~1.7 min`, so "stuck or just slow?" needs no click. The estimate is a
+  SIBLING of `.jdur` — `_JOB_TICK` overwrites that element's text every second.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console). Zero new dependencies — keep it.
