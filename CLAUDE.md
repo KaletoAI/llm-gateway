@@ -263,7 +263,20 @@ hot-reload-safe.
   discovery = `GET /openapi/v1/balance` (0 → DOWN "no credits", balance + its age and
   the rolling gen fail-rate in `/health` + the Backends tab); 402/429 raise
   `MeshyNoCredits`/`MeshyBusy` (ConnectionError subclasses → failover, named by
-  `_fault_label`). A FAILED task is final. While polling, a 4xx is a verdict about the
+  `_fault_label`). A FAILED task is final UNLESS the vendor blames itself: Meshy's
+  `task_error.type` is the machine-readable verdict (`invalid_input` = permanent, while
+  `timeout`/`service_unavailable`/`server_error` are answered "retry the request" in the
+  docs), so `parse_task` sets `TaskState.retryable` from the TYPE — never from the
+  message prose — and `_poll` raises `CloudTaskRetryable` (ConnectionError subclass →
+  `self_retries`, then the next candidate) instead of the final `RuntimeError`. Two
+  guards keep that narrow: CANCELED is a decision, not a fault, and a task the vendor
+  already BILLED (`consumed_credits`) is never re-run whatever its type says — a retry
+  would buy the same mesh twice, the rule the Tripo convert/clip paths follow too.
+  A retryable failure only actually retries where a backend carries `self_retries` or a
+  second candidate exists; without either it still ends the job, just named correctly.
+  Tripo's V3 has no equivalent field, so its failures stay final by design (measured
+  2026-09-03, job 9cf448115b4b: a Meshy `server_error` at 45 % progress, 0 credits,
+  ended the job outright). While polling, a 4xx is a verdict about the
   TASK (3 in a row → final `RuntimeError` naming the status) while transport errors,
   5xx and 429 are about the SERVICE and get `disconnect_grace` seconds (default 30,
   same key as ComfyUI) of CONTINUOUS failure before the failover-class error — a

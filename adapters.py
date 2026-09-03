@@ -93,6 +93,22 @@ class CloudBusy(ConnectionError):
         self.vendor = vendor
 
 
+class CloudTaskRetryable(ConnectionError):
+    """The vendor failed the task on ITS side and says so in a machine-readable field
+    (Meshy `task_error.type` = server_error / timeout / service_unavailable — the docs
+    answer each with "retry the request"). Failover-class for the same reason CloudBusy
+    is: the fault is the service's, so another attempt is worth making, and the gateway
+    already owns that machinery (`self_retries`, then the next candidate). The narrow
+    part is what does NOT come here — a permanent `invalid_input` stays a final
+    RuntimeError, because a rejected input is rejected on every candidate alike, and a
+    task the vendor already BILLED is never re-run whatever it says (CloudTaskAdapter.
+    _poll checks the credits): retrying that would buy the same mesh twice."""
+
+    def __init__(self, msg: str = "", vendor: str = "cloud"):
+        super().__init__(msg)
+        self.vendor = vendor
+
+
 MeshyNoCredits, MeshyBusy = CloudNoCredits, CloudBusy   # pre-Tripo names (main._fault_label, tests)
 
 
@@ -3444,7 +3460,13 @@ class CloudTaskAdapter(BackendAdapter):
             # the 4th positional slot, so a positional options dict would land there.
             state = self.mod.parse_task(task, formats, endpoint, options=opts)
             if state.error:            # failed/cancelled — or a status this gateway does not know
-                raise RuntimeError(f"{self.vendor} task {task_id} {state.status.lower()}: {state.error}")
+                detail = f"{self.vendor} task {task_id} {state.status.lower()}: {state.error}"
+                # A failure the vendor blames on itself is the one kind worth attempting
+                # again — UNLESS it was already billed, in which case a retry would buy the
+                # same result twice (the paid-task rule the convert/clip paths follow too).
+                if state.retryable and not (state.credits or 0):
+                    raise CloudTaskRetryable(detail, vendor=self.vendor)
+                raise RuntimeError(detail)
             if state.status == self.mod.SUCCESS_STATUS:
                 return state
         raise TimeoutError(f"{self.vendor} task {task_id} not finished within max_wait={max_wait:.0f}s "

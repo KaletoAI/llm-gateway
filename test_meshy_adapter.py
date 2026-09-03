@@ -163,6 +163,40 @@ class TestMeshyAdapter(unittest.TestCase):
         self.assertIn("bad input", str(cm.exception))
         self.assertNotIsInstance(cm.exception, ConnectionError)
 
+    def test_failed_invalid_input_stays_final(self):
+        # The permanent half of `task_error.type`: a rejected input is the same job on any
+        # candidate, so it must NOT enter the failover class and re-submit elsewhere.
+        _Stub.script = [_task("FAILED", task_error={"type": "invalid_input",
+                                                    "code": "moderation_blocked",
+                                                    "message": "blocked by safety filters"})]
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+
+    def test_failed_server_error_is_failover_class(self):
+        # The vendor failed the task on its own side (0 credits) and says "retry": that is
+        # a fault of the SERVICE, so it must reach the same failover/self-retry path a
+        # transport fault does — otherwise a transient Meshy hiccup ends the job outright
+        # (measured 2026-09-03, job 9cf448115b4b).
+        _Stub.script = [_task("FAILED", consumed_credits=0,
+                              task_error={"type": "server_error",
+                                          "message": "An unexpected error occurred."})]
+        with self.assertRaises(adapters.CloudTaskRetryable) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertIsInstance(cm.exception, ConnectionError)     # _GEN_FAILOVER_ERRORS
+        self.assertIn("task-1", str(cm.exception))
+        self.assertIn("An unexpected error occurred.", str(cm.exception))
+        self.assertEqual(cm.exception.vendor, "Meshy")
+
+    def test_failed_server_error_that_consumed_credits_stays_final(self):
+        # The paid-task rule: once the vendor billed the task, nothing may re-run it —
+        # a retry would buy the same mesh twice. Same reasoning as tripo's convert path.
+        _Stub.script = [_task("FAILED", consumed_credits=30,
+                              task_error={"type": "server_error", "message": "boom"})]
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req({"input_image": PNG})))
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+
     def test_402_fails_over(self):
         _Stub.post_status = 402
         with self.assertRaises(adapters.MeshyNoCredits):

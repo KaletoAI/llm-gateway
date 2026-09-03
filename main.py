@@ -2518,6 +2518,8 @@ def _fault_label(e: BaseException) -> str:
         return "no credits left"
     if isinstance(e, adapters.CloudBusy):
         return f"{e.vendor} queue full"
+    if isinstance(e, adapters.CloudTaskRetryable):
+        return f"{e.vendor} failed the task on its side"
     if isinstance(e, TimeoutError):            # the adapter's own max_wait cap
         return "did not finish in time"
     if isinstance(e, httpx.TimeoutException):  # a single HTTP round trip timed out
@@ -2543,6 +2545,12 @@ def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
         return f"no candidate backend could run it — {last.vendor} account out of credits: {txt}"
     if isinstance(last, adapters.CloudBusy):
         return f"no candidate backend could run it — {last.vendor} queue limit reached: {txt}"
+    if isinstance(last, adapters.CloudTaskRetryable):
+        # Named apart from "unreachable": the task REACHED the vendor and the vendor broke
+        # it. Sending someone to check the network here is the same wrong turn the max_wait
+        # case warns about, and the credits question ("was I billed?") is answered too.
+        return (f"every attempt failed inside {last.vendor} — the vendor called it a "
+                f"retryable fault and consumed no credits: {txt}")
     if isinstance(last, TimeoutError):
         return (f"no candidate backend finished in time — the gateway's per-backend "
                 f"`max_wait` (default 600s; raise it in Backends for slow workflows): {txt}")
