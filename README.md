@@ -43,6 +43,12 @@ code, image clients like anima-verse, …) and a fleet of backends.
   **fastest free unpaid** backend that can serve it takes it, a backend that
   frees up prefers the request type it just ran (no model reload), and nothing
   waits longer than `affinity_max_wait_s` for that preference.
+- **A backend that burns jobs is taken out of rotation.** A generation backend can
+  answer every health check and still fail every prompt (a broken driver update, a
+  missing custom node). Such a job now moves on to the next backend instead of dying,
+  and a backend that fails twice where another one succeeded is skipped for that alias
+  for 15 minutes — shown as `quarantined` in `/health` and the Backends tab. If they
+  all fail alike the request is the suspect, so nothing is quarantined.
 - **Virtual aliases.** `fast`, `vision`, `translator` map to different real model
   IDs per backend.
 - **Cloud-as-backend.** A per-backend `api_key` wires in any OpenAI-compatible

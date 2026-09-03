@@ -469,7 +469,7 @@ hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls test_*.py` is the count of record —
-  **seventeen** files today — and each exists for that same reason: the mechanism it
+  **nineteen** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -492,6 +492,15 @@ hot-reload-safe.
   `test_cloud_editor.py` (the console's kind-neutrality — a job view that renders
   nothing for a Tripo run, an editor offering the wrong backends, a type select whose JS
   never reveals the cloud option block: all three are silent in the BROWSER).
+  Newest are the two the execution-fault quarantine brought:
+  `test_gen_quarantine.py` (the pure fault bookkeeping — a quarantine that never
+  triggers leaves a broken backend eating every job, one that triggers on an UNPROVEN
+  fault lets a single bad workflow disable an alias's whole fleet, and a candidate that
+  gets its probe-once head start back on expiry walks straight to the front again);
+  `test_run_job_failover.py` (what `_run_job` does with an execution error: every case
+  ends in a plausible-looking job row — a job dead on the first candidate reads like a
+  workflow error, a fault charged to the winner idles a healthy backend for 15 minutes,
+  and a cloud candidate that fails over re-runs a task the vendor already BILLED).
   Run them all with `python -m unittest discover -p 'test_*.py'` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -686,6 +695,33 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   LoRA-backend rather than spilling); a LoRA on no backend is ignored (the normal
   ordering wins); an explicit `backend` force is never overridden. Per-backend LoRA sets
   come from discovery (`backend_loras`).
+- **Execution-fault quarantine** (`scheduler.exec_fault_*`, state `main.gen_exec_faults`
+  keyed `alias|bid`): a generation backend that ANSWERS but cannot EXECUTE is invisible
+  to every other signal — discovery only calls `/object_info` so `backend_healthy` stays
+  True, and the executor watchdog only sees a STUCK queue while this one drains fine,
+  turning every prompt into an error in seconds. It was also self-reinforcing: a
+  candidate that never succeeds never gets a `gen_speed` sample, so it kept the
+  unmeasured **probe-once** head start and won the ordering again on the very next
+  retry (measured 2026-09-03 on comfyui-strix — a torch/ROCm update broke
+  `flux_time_shift`, so every Flux/Krea2 model load died while two healthy backends sat
+  idle and four consecutive user retries all landed on the broken one). So: an
+  execution error now **fails over to the next candidate** (never a repeat on the same
+  backend — it reproduces; `self_retries` stays a connection-path thing), and a fault is
+  charged ONLY once a later candidate succeeded on that same job — the difference
+  between "this backend is broken" and "this request is broken". When they all fail
+  alike nobody is charged and the report names the execution error plus the backends
+  that shared it, never `_gen_exhausted_msg`'s "unreachable". Two consecutive charged
+  faults quarantine that `alias|backend` for `EXEC_QUARANTINE_S` (900 s): it leaves
+  `ready` but stays at the END of `allc`, so the job PARKS for a healthy backend
+  instead of 503-ing and a failover can still reach it as the last resort — and if
+  EVERY candidate is quarantined the quarantine is ignored entirely (a blocked alias is
+  worse than a slow one). One success clears the record; `exec_probed` outlives the
+  window on purpose, or the expiry would hand the head start straight back. Surfaced as
+  `quarantined` in `/health` + the Backends tab, which it must be: unlike the fail rates
+  this one really does change routing. **A CLOUD candidate is excluded from the failover**
+  — a billed task may have failed AFTER creation, and re-running the job would buy the
+  same mesh twice (the invariant `tripo.py` protects). Covered by
+  `test_gen_quarantine.py` + `test_run_job_failover.py`.
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.

@@ -44,3 +44,77 @@ def designated_taker(pool: Iterable, can_serve: Callable, type_key: Callable,
         if same:
             return same[0]
     return servable[0]
+
+
+# ── Execution-fault quarantine (per alias|backend) ─────────────────────────────
+# A generation backend that ANSWERS but cannot EXECUTE is invisible to every other
+# signal: discovery only calls /object_info so `backend_healthy` stays True, and the
+# executor watchdog only sees a stuck queue — this one drains fine, it just turns
+# every prompt into an error in three seconds. Worse, it is SELF-REINFORCING: a
+# candidate that never succeeds never gets a gen_speed sample, so it keeps the
+# unmeasured "probe-once" head start and wins the ordering again on the next retry
+# (measured 2026-09-03: four consecutive retries all landed on the same broken box
+# while two healthy ones sat idle).
+#
+# The signal used here is deliberately narrow: a fault counts ONLY when the same job
+# then succeeded on another candidate. That is the difference between "this backend
+# is broken" and "this request is broken" — without it, one bad model name would
+# quarantine every backend an alias has. `main` therefore notes faults only after a
+# later candidate returns artifacts, and notes NONE when they all failed alike.
+EXEC_FAULT_THRESHOLD = 2       # consecutive proven faults before the candidate is held
+EXEC_QUARANTINE_S = 900        # ... and for how long (15 min — long enough to matter,
+                               # short enough that a fixed backend returns on its own)
+
+
+def exec_fault_note(state: dict, key: str, now: float, error: str = "",
+                    threshold: int = EXEC_FAULT_THRESHOLD,
+                    quarantine_s: float = EXEC_QUARANTINE_S) -> dict:
+    """Record one PROVEN execution fault for `key` (an "alias|backend id"), returning
+    its record. At `threshold` consecutive faults the candidate is quarantined for
+    `quarantine_s`. The record survives the quarantine window on purpose — see
+    `exec_probed`."""
+    e = state.get(key) or {"fails": 0, "until": 0.0, "error": "", "at": 0.0}
+    e["fails"] += 1
+    e["error"] = error
+    e["at"] = now
+    if e["fails"] >= threshold:
+        e["until"] = now + quarantine_s
+    state[key] = e
+    return e
+
+
+def exec_fault_clear(state: dict, key: str) -> None:
+    """Forget `key` — called on every SUCCESS, so the count means *consecutive*
+    faults and a backend that recovers is immediately first-class again."""
+    state.pop(key, None)
+
+
+def exec_quarantined(state: dict, key: str, now: float) -> bool:
+    """Is this candidate currently held out of rotation?"""
+    e = state.get(key)
+    return bool(e) and now < e.get("until", 0.0)
+
+
+def exec_probed(state: dict, key: str) -> bool:
+    """Has this candidate already spent its probe (i.e. produced a proven fault)?
+
+    Separate from `exec_quarantined` because it outlives the window: an unmeasured
+    candidate sorts FIRST (probe-once), and a candidate that has failed has had that
+    probe. Letting the head start come back when the quarantine expires would send
+    the next job straight back to the broken backend."""
+    return bool(state.get(key))
+
+
+def split_quarantined(cands: list, key_of: Callable, state: dict, now: float) -> tuple:
+    """(usable, held) over ordered candidates, preserving relative order.
+
+    `held` is never ALL of them: if every candidate is quarantined the quarantine is
+    ignored entirely and the caller gets its full list back. A blocked alias is worse
+    than a slow one — the quarantine exists to prefer a working backend, not to refuse
+    service when none is known to work."""
+    usable, held = [], []
+    for c in cands:
+        (held if exec_quarantined(state, key_of(c), now) else usable).append(c)
+    if not usable:
+        return list(cands), []
+    return usable, held

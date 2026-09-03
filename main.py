@@ -211,6 +211,7 @@ host_backends: dict[str, list] = {}                            # host → [bid, 
 hosts_meta: dict[str, dict] = {}                               # host → {label, avoid_llm_during_media, …}
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
 gen_speed: dict = {}                                           # "alias|bid" → EMA seconds of a successful media job
+gen_exec_faults: dict = {}                                     # "alias|bid" → proven execution-fault record (scheduler.exec_fault_*)
 backend_last_key: dict = {}                                    # bid → type key last DISPATCHED (media: alias, LLM: real model)
 
 
@@ -224,12 +225,49 @@ def _note_gen_speed(alias: str, bid: str, seconds: float) -> None:
     gen_speed[k] = scheduler.ema(gen_speed.get(k), seconds)
 
 
+def _settle_exec_faults(alias: str, ok_bid: str, exec_faults: list) -> None:
+    """Called on a SUCCESS: settle the execution faults this job collected on the way.
+
+    A candidate that failed to execute where this one then succeeded is PROVEN to be
+    the broken part — same alias, same workflow, same request, different outcome. Only
+    such proven faults are charged, which is what separates "this backend is broken"
+    from "this request is broken": if every candidate had failed we would never get
+    here and nobody is charged (see the tail of `_run_job`).
+
+    The success itself clears `ok_bid`, so the fault count means CONSECUTIVE faults and
+    a repaired backend is first-class again the moment it delivers once."""
+    scheduler.exec_fault_clear(gen_exec_faults, f"{alias}|{ok_bid}")
+    now = time.time()
+    for bid, name, err in exec_faults:
+        rec = scheduler.exec_fault_note(gen_exec_faults, f"{alias}|{bid}", now,
+                                        error=_err_text(err))
+        if rec["until"] > now:
+            logger.warning(
+                f"[{name}] quarantined for '{alias}' for "
+                f"{int(scheduler.EXEC_QUARANTINE_S / 60)} min — {rec['fails']} execution "
+                f"failures in a row where another backend succeeded: {rec['error']}")
+        else:
+            logger.info(f"[{name}] execution fault {rec['fails']}/"
+                        f"{scheduler.EXEC_FAULT_THRESHOLD} for '{alias}' "
+                        f"(another backend ran the same job): {rec['error']}")
+
+
 def _gen_speed_of(alias: str):
     """speed_of callable for scheduler.order_ready over media candidates: higher is
-    better, and an unmeasured backend sorts first (probe-once)."""
+    better, and an unmeasured backend sorts first (probe-once).
+
+    "Probe-ONCE" is the operative word: a candidate that has produced a proven
+    execution fault has HAD its probe and sorts LAST instead. Without that, a backend
+    which answers but cannot execute is unbeatable — it never completes a job, so it
+    never gets a gen_speed sample, so it keeps the unmeasured head start and wins the
+    ordering again on the very next retry (measured 2026-09-03 on comfyui-strix: four
+    consecutive retries, two idle healthy backends)."""
     def speed(backend: dict, _cand) -> float:
-        s = gen_speed.get(f"{alias}|{backend_id(backend)}")
-        return float("inf") if s is None else 1.0 / max(s, 0.001)
+        k = f"{alias}|{backend_id(backend)}"
+        s = gen_speed.get(k)
+        if s is None:
+            return 0.0 if scheduler.exec_probed(gen_exec_faults, k) else float("inf")
+        return 1.0 / max(s, 0.001)
     return speed
 
 
@@ -2195,7 +2233,15 @@ def _gen_routes(alias: str) -> tuple[list, list]:
             continue
         allc.append((b, cand))
     allc = scheduler.order_ready(allc, _gen_speed_of(alias), lambda b: bool(b.get("paid")))
-    ready = [r for r in allc if not backend_busy(r[0])]     # busy → only parkable, not ready
+    # A candidate under execution-fault quarantine drops out of `ready` but stays at the
+    # END of `allc`. Both halves matter: out of `ready` so it is never CHOSEN while a
+    # working backend exists, still in `allc` so "all busy" logic keeps seeing a
+    # candidate and the job PARKS for a healthy backend instead of 503-ing — and so a
+    # failover can still reach it as the last resort if everything else fails.
+    usable, held = scheduler.split_quarantined(
+        allc, lambda bx: f"{alias}|{backend_id(bx[0])}", gen_exec_faults, time.time())
+    allc = usable + held
+    ready = [r for r in usable if not backend_busy(r[0])]   # busy → only parkable, not ready
     raw = next((c.get("retries") for c in candidates if c.get("retries") not in (None, "")), None)
     if raw is not None:
         try:
@@ -2479,28 +2525,42 @@ _GEN_WINDOW_N = 50            # last N attempts …
 _GEN_WINDOW_S = 86400         # … no older than 24 h
 
 
-def _record_gen_attempt(bid: str, conn_fail: bool) -> None:
-    """Count one generate() attempt: every attempt lands in the window;
-    `conn_fail` marks connection-type aborts (_GEN_FAILOVER_ERRORS). Content
-    errors count as attempts, not as faults."""
+def _record_gen_attempt(bid: str, conn_fail: bool, exec_fail: bool = False) -> None:
+    """Count one generate() attempt: every attempt lands in the window; `conn_fail`
+    marks connection-type aborts (_GEN_FAILOVER_ERRORS), `exec_fail` marks a prompt the
+    backend RAN and blew up on.
+
+    The two are counted apart because they mean opposite things to an operator: a
+    connection rate says the backend keeps falling over, an execution rate says it is
+    up and burning every job it is given. Lumping them lost the second entirely — an
+    execution failure used to book as a clean attempt, so a backend that reliably
+    destroyed every job made its own fail-rate go DOWN with each one (measured
+    2026-09-03 on comfyui-strix: 53 %, and all of it from the crash phase)."""
     dq = backend_gen_window.setdefault(bid, deque(maxlen=_GEN_WINDOW_N))
-    dq.append((time.time(), bool(conn_fail)))
+    dq.append((time.time(), bool(conn_fail), bool(exec_fail)))
 
 
 def _gen_fail_stats(bid: str) -> Optional[dict]:
-    """{fail_rate, gen_fails, gen_attempts} over the window, or None without data."""
+    """{fail_rate, gen_fails, exec_fail_rate, exec_fails, gen_attempts} over the
+    window, or None without data. `fail_rate` keeps its old meaning (connection-type
+    faults) so nothing that reads it changes meaning; the execution rate is reported
+    beside it — see `_record_gen_attempt` for why they must not be merged."""
     dq = backend_gen_window.get(bid)
     if not dq:
         return None
     cutoff = time.time() - _GEN_WINDOW_S
-    total = fails = 0
-    for ts, cf in dq:
+    total = fails = xfails = 0
+    for entry in dq:
+        ts, cf = entry[0], entry[1]
+        xf = entry[2] if len(entry) > 2 else False   # window may predate the exec column
         if ts >= cutoff:
             total += 1
             fails += 1 if cf else 0
+            xfails += 1 if xf else 0
     if not total:
         return None
     return {"fail_rate": round(fails / total, 2), "gen_fails": fails,
+            "exec_fail_rate": round(xfails / total, 2), "exec_fails": xfails,
             "gen_attempts": total}
 
 
@@ -2586,10 +2646,17 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
     (runbook B: for sporadic driver faults the same host is the cheapest second
     try — no model re-load elsewhere, same success odds as attempt one). Its ONE
     job slot is held across the repeats, so no parked job slips in between.
-    Content errors are final (not retried). Stops at the first success."""
+    An execution error (the backend ran the prompt and it blew up) moves to the next
+    candidate too, but never repeats on the SAME backend — see the `except Exception`
+    arm for why that is not the same thing as a connection failover, and why a CLOUD
+    candidate is excluded from it. Stops at the first success."""
     await asyncio.to_thread(jobs.set_status, job_id, "running")
     last = None
     attempts = 0
+    # (bid, name, error) of candidates that ran the prompt and failed. Kept until the
+    # job ends because a fault only counts as the BACKEND's once a later candidate has
+    # succeeded — until then it is indistinguishable from a broken request.
+    exec_faults: list = []
     for backend, cand in candidates:
         bid = backend_id(backend)
         adapter = backend_adapters.get(bid)
@@ -2620,6 +2687,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     out = await adapter.generate(req)
                     _record_gen_attempt(bid, conn_fail=False)
                     _note_gen_speed(alias, bid, time.monotonic() - t0)
+                    _settle_exec_faults(alias, bid, exec_faults)
                     meta = dict(out.meta or {})
                     if attempts > 1:
                         meta["attempts"] = attempts    # retries must stay visible (runbook B)
@@ -2646,16 +2714,47 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                                    f"({type(e).__name__}: {e}) — failing over")
                     asyncio.create_task(_free_comfy_vram(backend, "job failover"))
                 except Exception as e:
-                    # content error (ComfyUI validation/execution) — final, never retried:
-                    # it would fail identically on any attempt and any backend.
-                    _record_gen_attempt(bid, conn_fail=False)
-                    logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {_err_text(e)}")
-                    await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
-                                            {"attempts": attempts} if attempts > 1 else None)
+                    # Execution error: the backend accepted the prompt and it blew up.
+                    # NEVER retried on the same backend (a re-run reproduces it), but it
+                    # does move on to the next CANDIDATE — the old assumption that such an
+                    # error "would fail identically on any backend" is only true when the
+                    # REQUEST is at fault. It is false when the backend is: a broken torch
+                    # build, a missing custom node, an incompatible platform all surface
+                    # here while /object_info keeps answering and the backend keeps
+                    # reporting healthy (measured 2026-09-03 on comfyui-strix — a ROCm
+                    # update broke every Flux-family model load, and four user retries in a
+                    # row died on it while two backends that could run the alias sat idle).
+                    _record_gen_attempt(bid, conn_fail=False, exec_fail=True)
+                    if adapters.cloud_kind(cand):
+                        # A cloud task is BILLED. Whatever failed here may have happened
+                        # after the paid task was created, and re-running the job on the
+                        # next candidate would buy the same mesh twice — the invariant
+                        # tripo.py/adapters.py go out of their way to preserve. Final.
+                        logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {_err_text(e)}")
+                        await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
+                                                {"attempts": attempts} if attempts > 1 else None)
+                        return
+                    exec_faults.append((bid, backend["name"], e))
+                    last = e
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] execution failed: "
+                                   f"{_err_text(e)} — trying the next backend")
                     asyncio.create_task(_free_comfy_vram(backend, "job failure"))
-                    return
+                    break                      # next candidate; never the same backend
         finally:
             _inflight_dec(bid)
+    # Every candidate is used up. If any of them EXECUTED and failed, that error is the
+    # report — "all candidate backends unreachable" would send you diagnosing a network
+    # that was never involved. And no fault is charged to anyone here: when they all
+    # failed, the request is the common factor, not the backends (this is what keeps one
+    # bad workflow from quarantining every backend an alias has).
+    if exec_faults:
+        msg = _err_text(exec_faults[0][2])
+        if len(exec_faults) > 1:
+            msg += (f" — the same on {len(exec_faults)} backends "
+                    f"({', '.join(n for _, n, _ in exec_faults)}), so the request is at fault")
+        await asyncio.to_thread(jobs.fail, job_id, msg,
+                                {"attempts": attempts} if attempts > 1 else None)
+        return
     await asyncio.to_thread(jobs.fail, job_id, _gen_exhausted_msg(last),
                             {"attempts": attempts} if attempts > 1 else None)
 
@@ -3853,16 +3952,35 @@ def dashboard_snapshot() -> dict:
     }
 
 
+def _quarantine_info(bid: str) -> dict:
+    """`quarantined`: the aliases this backend is currently held out of rotation for,
+    with the error that earned it. Unlike the fail-rate this one DOES change routing,
+    so it has to be visible — an operator must never have to guess why a backend sits
+    idle while jobs run elsewhere."""
+    now = time.time()
+    held = []
+    for key, rec in gen_exec_faults.items():
+        alias, _, key_bid = key.rpartition("|")
+        if key_bid != bid or now >= rec.get("until", 0.0):
+            continue
+        held.append({"alias": alias, "until": int(rec["until"]),
+                     "for_s": int(rec["until"] - now), "fails": rec.get("fails", 0),
+                     "error": (rec.get("error") or "")[:200]})
+    return {"quarantined": sorted(held, key=lambda h: h["alias"])} if held else {}
+
+
 def _comfy_watch_info(b: dict) -> dict:
     """Executor-watchdog + rolling fail-rate fields for comfy backends (merged
-    into /health + UI snapshot). fail_rate is display-only (runbook C): the
-    operator decides — it never reorders routing (A1)."""
+    into /health + UI snapshot). Both fail rates stay display-only (runbook C): the
+    operator decides — they never reorder routing (A1). The `quarantined` list beside
+    them is the one thing here that does, and is reported for exactly that reason."""
     if b.get("type") != "comfyui":
         return {}
     info: dict = {}
     fs = _gen_fail_stats(backend_id(b))
     if fs:
         info.update(fs)
+    info.update(_quarantine_info(backend_id(b)))
     ad = backend_adapters.get(backend_id(b))
     if ad is not None:
         info.update({"exec_stuck": bool(getattr(ad, "exec_stuck", False)),

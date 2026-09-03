@@ -1396,8 +1396,20 @@ async def backends_page(request: Request):
         flags = "".join(f" · {fl}" for fl in ("chat_only", "serverless_only", "local", "paid") if b.get(fl))
         host = f" · host {b['host']}" if b.get("host") else ""
         rst = f" · restart: {b['last_restart_result']}" if b.get("last_restart_result") else ""
-        fr = (f" · fail_rate {b['fail_rate']:.2f} ({b['gen_fails']}/{b['gen_attempts']})"
-              if b.get("fail_rate") is not None else "")
+        # Two rates, never merged: "conn" says the backend keeps falling over, "exec"
+        # says it is up and burning every job handed to it. A single number hid the
+        # second completely — an execution failure used to count as a clean attempt.
+        fr = ""
+        if b.get("fail_rate") is not None:
+            fr = f" · fail_rate conn {b['fail_rate']:.2f} ({b['gen_fails']}/{b['gen_attempts']})"
+            if b.get("exec_fail_rate") is not None:
+                fr += f" · exec {b['exec_fail_rate']:.2f} ({b['exec_fails']}/{b['gen_attempts']})"
+        # Quarantine DOES change routing, so it must be impossible to miss: a backend
+        # sitting idle while jobs run elsewhere has to say why, right here.
+        qn = ""
+        for q in (b.get("quarantined") or []):
+            qn += (f" · <b>⚠ quarantined for {_esc(q['alias'])}</b> "
+                   f"({max(1, q['for_s'] // 60)} min left, {q['fails']} execution failures)")
         smp = (f" · sampling {_sampling_text(b['sampling_defaults'])}"
                if b.get("sampling_defaults") else "")
         # Cloud credit balance WITH its age: the number is a snapshot from the last
@@ -1407,7 +1419,7 @@ async def backends_page(request: Request):
             cr = f" · credits {b['credits']}"
             if b.get("credits_at"):
                 cr += f" ({_age(b['credits_at'])} ago)"
-        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{cr}{rst}{src}"
+        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{qn}{cr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
