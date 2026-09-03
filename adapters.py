@@ -3532,13 +3532,17 @@ class TripoAdapter(CloudTaskAdapter):
             raise RuntimeError(f"{self.vendor} returned no file_token for {name}")
         return token
 
-    def _collect_inputs(self, req: NormalizedRequest, endpoint: str) -> tuple[dict, dict]:
+    def _collect_inputs(self, req: NormalizedRequest, endpoint: str,
+                        cand: dict, values: dict) -> tuple[dict, dict]:
         """({slot: (filename, bytes)}, {file field: (filename, bytes)}) for the endpoint —
         and every reason to refuse the request, checked BEFORE the first upload.
 
         The pure module refuses the same requests when it builds the body, but by then the
         files are already in the Tripo account: an upload for a request that can never run
-        is litter nobody cleans up. So the slot count and the format sniff happen here."""
+        is litter nobody cleans up. So the slot count, the format sniff and the client's
+        rig type (a 150 MB mesh pushed for a rig the alias's model cannot do) happen
+        here — the rig-type RULE itself stays in the pure module, which build_request
+        reads too."""
         got = req.upload_images or {}
         images = {s: got[s] for s in tripo.SLOTS[endpoint] if got.get(s)}
         if endpoint == "multiview-to-model" and ("input_image_front" not in images
@@ -3555,6 +3559,8 @@ class TripoAdapter(CloudTaskAdapter):
             if not data:
                 raise tripo.TripoInput(f"`files.{fname}` is required")
             files[fname] = (f"{fname}.{tripo.mesh_ext(data)}", data)
+        if endpoint == tripo.RIG_ENDPOINT:
+            tripo.check_rig_type(cand, values)
         return named, files
 
     # ── the run ──────────────────────────────────────────────────────────────
@@ -3576,10 +3582,11 @@ class TripoAdapter(CloudTaskAdapter):
             credits += _to_float(st.credits)
 
         # 1. inputs → file tokens (validated first, see _collect_inputs)
-        images, files = self._collect_inputs(req, endpoint)
+        values = _gen_values(req)
+        images, files = self._collect_inputs(req, endpoint, cand, values)
         tokens = {s: await self._upload(client, n, b) for s, (n, b) in images.items()}
         ftokens = {f: await self._upload(client, n, b) for f, (n, b) in files.items()}
-        body = tripo.build_request(cand, _gen_values(req), tokens, ftokens)
+        body = tripo.build_request(cand, values, tokens, ftokens)
         # The format the primary task delivers ITSELF leads the list: generation is always
         # GLB, a rig its `out_format`. parse_task names that download after formats[0], so
         # an alias asking for obj alone would otherwise ship a GLB called `model.obj`;
@@ -3598,6 +3605,13 @@ class TripoAdapter(CloudTaskAdapter):
             if not cst.riggable:
                 raise RuntimeError(f"{self.vendor} rig-check: mesh is not riggable "
                                    f"(detected rig_type={cst.rig_type or '?'})")
+            if cst.rig_type and cst.rig_type != body.get("rig_type"):
+                # Tripo rigs what the REQUEST asked for; the check only reports what it saw.
+                # A mismatch is a silently wrong skeleton (a quadruped rigged as a biped),
+                # so it is named here — meta.rig_type records the DETECTED type.
+                logger.warning(f"[{self.name}] tripo rig-check for {req.alias}: mesh looks "
+                               f"like {cst.rig_type}, but the request rigs as "
+                               f"{body.get('rig_type')}")
             extra["rig_type"] = cst.rig_type or body.get("rig_type")
         # 3. the primary task
         task_id = await self._create(client, self._api(self._CREATE_PATH[endpoint]), body, endpoint)
@@ -3607,13 +3621,24 @@ class TripoAdapter(CloudTaskAdapter):
         # 4. extra formats — each its own paid convert task. A failed one FAILS the job:
         #    a requested delivery must never silently shrink (same rule as Meshy's
         #    missing url), and the caller asked for that format on purpose.
+        #    From HERE on the job is FINAL, whatever goes wrong: the primary task is done
+        #    and billed (30 credits for a generation), and every failover-class error —
+        #    CloudBusy from a 429 (converts run in Tripo's separate model-processing pool,
+        #    so a rate limit there is routine), ConnectionError from a 5xx or a transport
+        #    fault, TimeoutError from the job's max_wait running out — would otherwise
+        #    escape into main._GEN_FAILOVER_ERRORS and make _run_job re-run the WHOLE
+        #    image-to-model task on this or the next Tripo candidate, paying for it again.
+        #    The message names the format AND the paid task id, so the operator can fetch
+        #    the finished mesh from Tripo's dashboard instead of buying it twice.
         for fmt in formats[1:]:
             cbody = tripo.build_convert(task_id, fmt, endpoint == tripo.RIG_ENDPOINT)
-            cid = await self._create(client, self._api("/models/convert"), cbody, f"convert:{fmt}")
             try:
+                cid = await self._create(client, self._api("/models/convert"), cbody,
+                                         f"convert:{fmt}")
                 cst = await self._poll(client, "convert", cid, [fmt], opts, poll_interval, left())
-            except RuntimeError as e:                # names the format, not just the task
-                raise RuntimeError(f"{self.vendor} convert to {fmt} failed: {e}") from e
+            except (ConnectionError, TimeoutError, RuntimeError) as e:
+                raise RuntimeError(f"{self.vendor} convert to {fmt} failed after the paid "
+                                   f"task {task_id}: {e}") from e
             took(f"convert:{fmt}", cid, cst)
             state.downloads.append((f"{stem}.{fmt}", cst.downloads[0][1]))
         # 5. animation clips (rig only) — a courtesy, like Meshy's: a clip that fails is
@@ -3629,8 +3654,11 @@ class TripoAdapter(CloudTaskAdapter):
                     cst = await self._poll(client, "retarget", cid, [native], opts,
                                            poll_interval, left())
                 except (RuntimeError, ConnectionError, TimeoutError) as e:
-                    # TimeoutError too: the job's max_wait running out on a CLIP must not
-                    # throw away the rigged mesh, which is finished, paid for and in hand.
+                    # Every class, create and poll alike (a 429 on the create is a
+                    # ConnectionError-derived CloudBusy): the job's max_wait running out or
+                    # the clip pool being busy must not throw away the rigged mesh, which is
+                    # finished, paid for and in hand — and must not fail the job into a
+                    # failover that would rig and bill it a second time.
                     logger.warning(f"[{self.name}] tripo clip {preset} skipped: {e}")
                     continue
                 took(f"clip:{preset}", cid, cst)

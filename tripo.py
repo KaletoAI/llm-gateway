@@ -98,6 +98,28 @@ def _rig_types_for(rig_model: str) -> tuple:
     return ("biped",) if rig_model == RIG_MODELS[0] else RIG_TYPES
 
 
+def _check_rig_type(opts: dict, values: dict) -> str:
+    """The rig type a rig request will run with — or TripoInput naming the allowed set.
+
+    REFUSED, not clamped to biped: a caller asking for a quadruped rig on a v1.0 alias
+    must learn that the alias cannot do it, not receive a biped skeleton."""
+    rt = values.get("input_rig_type")
+    if rt in (None, ""):
+        rt = opts["rig_type"]
+    allowed = _rig_types_for(opts["rig_model"])
+    if rt not in allowed:
+        raise TripoInput(f"`input_rig_type` must be one of {', '.join(allowed)} "
+                         f"(rig model {opts['rig_model']})")
+    return rt
+
+
+def check_rig_type(cand: dict, values: dict) -> str:
+    """The same rule, reachable from the adapter BEFORE it uploads anything. Without it a
+    request that can never run still pushes its mesh (up to 150 MB) into the Tripo
+    account, where nobody cleans it up — build_request only refuses after the upload."""
+    return _check_rig_type(options_of(cand), values)
+
+
 def options_of(cand: dict) -> dict:
     """OPTION_DEFAULTS overlaid with the candidate's stored options (unknown keys dropped),
     then normalized. The console editor runs the SAME function on save, so a stored alias
@@ -235,15 +257,7 @@ def build_request(cand: dict, values: dict, images: dict,
         tok = (files or {}).get("input_mesh_path")
         if not tok:
             raise TripoInput("`files.input_mesh_path` is required")
-        allowed = _rig_types_for(opts["rig_model"])
-        rt = values.get("input_rig_type")
-        if rt in (None, ""):
-            rt = opts["rig_type"]
-        if rt not in allowed:
-            # REFUSED, not clamped to biped: a caller asking for a quadruped rig on a v1.0
-            # alias must learn that the alias cannot do it, not receive a biped skeleton.
-            raise TripoInput(f"`input_rig_type` must be one of {', '.join(allowed)} "
-                             f"(rig model {opts['rig_model']})")
+        rt = _check_rig_type(opts, values)      # the adapter ran this before the upload
         return {"input": tok, "model": opts["rig_model"], "rig_type": rt,
                 "spec": opts["spec"], "out_format": opts["target_formats"][0]}
     m = cand.get("model")

@@ -300,6 +300,13 @@ hot-reload-safe.
   `formats[0]` leads the list; a failed CONVERT fails the job (a requested delivery must
   never silently shrink) while a failed or timed-out CLIP is skipped with a warning
   (`clip_name`: `preset:walk` → `walk.glb`) — the rigged mesh is finished and paid for.
+  Once the PRIMARY task is billed, every later failure is FINAL: convert and clip errors
+  of EVERY class (a 429 → `CloudBusy`, a 5xx/transport `ConnectionError`, a `max_wait`
+  `TimeoutError`) are re-raised as a plain `RuntimeError` naming the format and the paid
+  task id, because those classes sit in `main._GEN_FAILOVER_ERRORS` and would otherwise
+  make `_run_job` re-run — and re-bill — the whole image-to-model task on the next
+  candidate; a client's `input_rig_type` is checked (`tripo.check_rig_type`, the same
+  `_rig_types_for` rule) BEFORE the uploads, so a refused rig job never pushes its mesh.
   Meta: `cloud`/`cloud_task_id`/`endpoint`/`ai_model`/`request`/`consumed_credits`
   (SUMMED over every task)/`elapsed_ms`, plus `tasks: [{role, task_id, credits}]` (roles
   `rig-check`, the endpoint, `convert:<fmt>`, `clip:<preset>`) so the job view can name

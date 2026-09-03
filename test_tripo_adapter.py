@@ -31,6 +31,7 @@ class _Stub(BaseHTTPRequestHandler):
     balance = 500.0
     create_status = 200          # HTTP status of a task create
     create_code = 0              # envelope code of a task create
+    fail_path = ""               # only creates on THIS path get create_status/create_code
     task_code = 0                # envelope code of a task POLL (non-0 = a verdict, HTTP 200)
     seq = 0
 
@@ -78,7 +79,8 @@ class _Stub(BaseHTTPRequestHandler):
             _Stub.seq += 1
             return self._json(200, {"code": 0, "data": {"file_token": f"tok{_Stub.seq}"}})
         _Stub.posted.append((self.path, json.loads(raw or b"{}")))
-        if _Stub.create_status != 200 or _Stub.create_code != 0:
+        if ((_Stub.create_status != 200 or _Stub.create_code != 0)
+                and self.path.endswith(_Stub.fail_path)):
             return self._json(_Stub.create_status,
                               {"code": _Stub.create_code, "message": "refused",
                                "suggestion": "top up"})
@@ -110,6 +112,7 @@ class TestTripoAdapter(unittest.TestCase):
     def setUp(self):
         _Stub.script, _Stub.posted, _Stub.uploads, _Stub.seen_auth = {}, [], [], []
         _Stub.balance, _Stub.create_status, _Stub.create_code, _Stub.task_code = 500.0, 200, 0, 0
+        _Stub.fail_path = ""                     # "" = every create path (endswith "")
         _Stub.seq = 0
         self.ctx, self.counts = _ctx()
         self.backend = self._backend(self.url)
@@ -309,6 +312,77 @@ class TestTripoAdapter(unittest.TestCase):
         self.assertEqual([b.name for b in out.blobs], ["rigged.glb"])
         self.assertEqual([t["role"] for t in out.meta["tasks"]], ["rig-check", "rig"])
         self.assertEqual(out.meta["consumed_credits"], 25)
+
+    def test_bad_rig_type_is_refused_before_the_upload(self):
+        """A rig type the alias's rig model cannot do is a final input error — and it is
+        caught BEFORE the mesh (up to 150 MB) is pushed into the Tripo account, where
+        nobody cleans it up. The rule itself lives in tripo._rig_types_for."""
+        with self.assertRaises(tripo.TripoInput) as cm:
+            self._run(self.ad.generate(self._req(
+                endpoint="rig", files={"input_mesh_path": ("m.glb", GLB)},
+                values={"input_rig_type": "quadruped"})))
+        self.assertIn("biped", str(cm.exception))
+        self.assertEqual(_Stub.uploads, [])
+        self.assertEqual(_Stub.posted, [])
+        # …and the rig model that CAN do it lets the same request through
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 25,
+                               "output": {"model_url": f"{self.url}/asset/r.glb",
+                                          "riggable": True, "rig_type": "quadruped"}}]}
+        out = self._run(self.ad.generate(self._req(
+            endpoint="rig", files={"input_mesh_path": ("m.glb", GLB)},
+            rig_model="v2.5-20260210", rig_type="quadruped",
+            values={"input_rig_type": "quadruped"})))
+        self.assertEqual(_Stub.posted[1][1]["rig_type"], "quadruped")
+        self.assertEqual(out.meta["rig_type"], "quadruped")
+
+    def test_rig_check_type_mismatch_is_warned(self):
+        """Tripo rigs what the REQUEST asked for; the check only reports what it saw. A
+        mismatch means a quadruped gets a biped skeleton — silently, unless it is named."""
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 25,
+                               "output": {"model_url": f"{self.url}/asset/r.glb",
+                                          "riggable": True, "rig_type": "quadruped"}}]}
+        with self.assertLogs(adapters.logger, "WARNING") as log:
+            self._run(self.ad.generate(self._req(
+                endpoint="rig", files={"input_mesh_path": ("m.glb", GLB)})))
+        self.assertIn("quadruped", log.output[0])
+        self.assertIn("biped", log.output[0])
+        self.assertIn("Tripo-Object", log.output[0])          # the alias, so it is findable
+
+    def test_convert_create_429_is_final_never_a_second_paid_run(self):
+        """After the primary task is billed, EVERY failure of a follow-up is final. A 429
+        on the convert create (Tripo's model-processing pool is its own queue) would
+        otherwise be a CloudBusy — a main._GEN_FAILOVER_ERRORS member — and _run_job would
+        re-run the whole 30-credit image-to-model task on the next Tripo candidate."""
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 30,
+                               "output": {"model_url": f"{self.url}/asset/m.glb"}}]}
+        _Stub.fail_path = "/models/convert"
+        _Stub.create_status, _Stub.create_code = 429, 2000
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(self.ad.generate(self._req(images={"input_image": PNG},
+                                                 target_formats=["glb", "obj"])))
+        self.assertNotIsInstance(cm.exception, ConnectionError)   # …so it never fails over
+        self.assertNotIsInstance(cm.exception, TimeoutError)
+        self.assertIn("obj", str(cm.exception))                   # names the format…
+        task_id = _Stub.posted[1][1]["input"]                     # …and the PAID task, so the
+        self.assertIn(task_id, str(cm.exception))                 # mesh is fetchable by hand
+        self.assertEqual([p for p, _ in _Stub.posted],
+                         ["/v3/generation/image-to-model", "/v3/models/convert"])
+
+    def test_clip_create_429_is_skipped_not_the_job(self):
+        """The same money rule seen from the other side: a busy retarget queue costs a
+        courtesy clip, never the rigged mesh that is already finished and paid for."""
+        _Stub.script = {"*": [{"status": "success", "credits_consumed": 25,
+                               "output": {"model_url": f"{self.url}/asset/r.glb",
+                                          "riggable": True, "rig_type": "biped"}}]}
+        _Stub.fail_path = "/animations/retarget"
+        _Stub.create_status, _Stub.create_code = 429, 2000
+        with self.assertLogs(adapters.logger, "WARNING") as log:
+            out = self._run(self.ad.generate(self._req(
+                endpoint="rig", files={"input_mesh_path": ("m.glb", GLB)},
+                animations=["preset:walk"])))
+        self.assertIn("preset:walk", log.output[0])
+        self.assertEqual([b.name for b in out.blobs], ["rigged.glb"])
+        self.assertEqual([t["role"] for t in out.meta["tasks"]], ["rig-check", "rig"])
 
     def test_rig_missing_mesh_is_input_error(self):
         with self.assertRaises(tripo.TripoInput):
